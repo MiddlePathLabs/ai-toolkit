@@ -18,6 +18,8 @@ export async function GET() {
     if (!settingsObject.DATASETS_FOLDER || settingsObject.DATASETS_FOLDER === '') {
       settingsObject.DATASETS_FOLDER = defaultDatasetsFolder;
     }
+    settingsObject.OFFLINE_MODE = settingsObject.OFFLINE_MODE === '1';
+
     // MODELS_PATH from the env file always takes precedence over the setting
     if (process.env.MODELS_PATH && process.env.MODELS_PATH.trim() !== '') {
       settingsObject.MODELS_PATH = process.env.MODELS_PATH;
@@ -34,14 +36,20 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { HF_TOKEN, TRAINING_FOLDER, DATASETS_FOLDER, MODELS_PATH } = body;
+    const { HF_TOKEN, OFFLINE_MODE, TRAINING_FOLDER, DATASETS_FOLDER, MODELS_PATH } = body;
+    const offlineModeValue = OFFLINE_MODE ? '1' : '0';
 
-    // Upsert both settings
+    // Persist all settings in the key/value store
     await Promise.all([
       prisma.settings.upsert({
         where: { key: 'HF_TOKEN' },
         update: { value: HF_TOKEN },
         create: { key: 'HF_TOKEN', value: HF_TOKEN },
+      }),
+      prisma.settings.upsert({
+        where: { key: 'OFFLINE_MODE' },
+        update: { value: offlineModeValue },
+        create: { key: 'OFFLINE_MODE', value: offlineModeValue },
       }),
       prisma.settings.upsert({
         where: { key: 'TRAINING_FOLDER' },

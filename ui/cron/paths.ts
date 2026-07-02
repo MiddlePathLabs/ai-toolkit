@@ -41,6 +41,15 @@ export const getHFToken = async () => {
   return token;
 };
 
+export const getOfflineMode = async () => {
+  const row = await prisma.settings.findFirst({
+    where: {
+      key: 'OFFLINE_MODE',
+    },
+  });
+  return row?.value === '1';
+};
+
 export const getModelsPath = async () => {
   const key = 'MODELS_PATH';
   let row = await prisma.settings.findFirst({
