@@ -817,13 +817,13 @@ class SDTrainer(BaseSDTrainProcess):
                         audio_uncond + audio_guidance_scale * (audio_target - audio_uncond)
                     ).to(batch.audio_target.dtype).detach()
 
-            if self.train_config.do_differential_guidance:
-                with torch.no_grad():
-                    guidance_scale = self.train_config.differential_guidance_scale
-                    target = noise_pred + guidance_scale * (target - noise_pred)
-            
         if target is None:
             target = noise
+
+        if self.train_config.do_differential_guidance:
+            with torch.no_grad():
+                guidance_scale = self.train_config.differential_guidance_scale
+                target = noise_pred + guidance_scale * (target - noise_pred)
 
         pred = noise_pred
 
