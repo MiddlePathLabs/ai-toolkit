@@ -379,6 +379,95 @@ class Krea2Model(BaseModel):
 
         # tell the model to invert assistant on inference since we want remove lora effects
         self.invert_assistant_lora = True
+
+    def load_inference_adapter(self, transformer: SingleStreamDiT):
+        self.print_and_status_update("Loading inference (sampling) turbo LoRA")
+        lora_path = self.model_config.inference_lora_path
+        if not os.path.exists(lora_path):
+            # assume it is a hub path
+            lora_splits = lora_path.split("/")
+            if len(lora_splits) != 3:
+                raise ValueError(
+                    f"Inference LoRA path {lora_path} is not a valid local path or hub path."
+                )
+            repo_id = "/".join(lora_splits[:2])
+            filename = lora_splits[2]
+            try:
+                lora_path = huggingface_hub.hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    token=HF_TOKEN,
+                )
+                # upgrade path to the local download
+                self.model_config.inference_lora_path = lora_path
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to download inference LoRA from {lora_path}: {e}"
+                )
+        # Unlike the assistant adapter this is NOT merged into the weights. It
+        # stays dormant during training and is activated only while sampling, so
+        # the turbo effect is added on top of the trained (raw) model.
+        lora_state_dict = load_file(lora_path)
+        # detect the LoRA rank from the first down-projection weight. Supports
+        # both lora_down (kohya/comfy) and lora_A (peft) key conventions.
+        dim_key = next(
+            (k for k in lora_state_dict if k.endswith("lora_down.weight") or k.endswith("lora_A.weight")),
+            None,
+        )
+        if dim_key is None:
+            raise ValueError("No lora_down/lora_A weights found in inference LoRA file")
+        dim = int(lora_state_dict[dim_key].shape[0])
+
+        new_sd = {}
+        for key, value in lora_state_dict.items():
+            new_key = key.replace("diffusion_model.", "transformer.")
+            new_sd[new_key] = value
+        lora_state_dict = new_sd
+
+        # transformer_only=False so the network also covers the modulation /
+        # in-out layers the turbo trains (first, last, tmlp, tproj, txtmlp,
+        # txtfusion). The "blocks" filter at transformer_only=True would drop them.
+        network_config = {
+            "type": "lora",
+            "linear": dim,
+            "linear_alpha": dim,
+            "transformer_only": False,
+        }
+
+        network_config = NetworkConfig(**network_config)
+        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
+        network = LoRASpecialNetwork(
+            text_encoder=None,
+            unet=transformer,
+            lora_dim=network_config.linear,
+            multiplier=1.0,
+            alpha=network_config.linear_alpha,
+            train_unet=True,
+            train_text_encoder=False,
+            network_config=network_config,
+            network_type=network_config.type,
+            transformer_only=network_config.transformer_only,
+            is_transformer=True,
+            target_lin_modules=self.target_lora_modules,
+            is_assistant_adapter=True,
+            is_ara=True,
+        )
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        # move to the device BEFORE building the multiplier: torch_multiplier is a
+        # plain attribute (not a registered buffer), so later force_to calls won't
+        # relocate it and it must match the on-device LoRA output during sampling.
+        network.force_to(self.device_torch, dtype=self.torch_dtype)
+        network.eval()
+        network._update_torch_multiplier()
+        network.load_weights(lora_state_dict)
+
+        # dormant during training: is_active=False short-circuits the module
+        # forward (returns the original output), so the turbo never leaks into
+        # training. It is toggled on only at sample time.
+        # invert_assistant_lora stays False: we want the turbo effect ADDED while
+        # sampling, not subtracted.
+        self.assistant_lora: LoRASpecialNetwork = network
+        self.assistant_lora.is_active = False
     
     def get_quantization_exclude_modules(self):
         # sensitive modules kept in full precision (fnmatch patterns on module
@@ -401,6 +490,15 @@ class Krea2Model(BaseModel):
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
+
+        if (
+            self.model_config.assistant_lora_path is not None
+            and self.model_config.inference_lora_path is not None
+        ):
+            raise ValueError(
+                "assistant_lora_path and inference_lora_path are mutually exclusive "
+                "(they share a single adapter slot)."
+            )
 
         transformer = self._load_transformer()
 
@@ -474,6 +572,12 @@ class Krea2Model(BaseModel):
         self.vl_processor = vl_processor
         self.model = transformer
         self.pipeline = Krea2Pipeline(self)
+
+        # sampling-only turbo LoRA: dormant during training, toggled on at sample
+        # time by BaseModel.generate_images.
+        if self.model_config.inference_lora_path is not None:
+            self.load_inference_adapter(transformer)
+
         self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------
