@@ -461,6 +461,14 @@ class Krea2Model(BaseModel):
         network._update_torch_multiplier()
         network.load_weights(lora_state_dict)
 
+        # NOTE: the file's bias-delta keys (*.diff_b) for the modulation / in-out
+        # layers (first, last.linear, tmlp, tproj, txtmlp) are dropped on load.
+        # Those layers get rank-64 LoRA modules here, which have no bias-delta
+        # slot (that needs FullModule). Their weight-LoRAs still load, so the
+        # turbo effect is near-complete; only the additive bias shifts are lost.
+        # Reported as "Missing keys: [...diff_b]" at load time. Add FullModule
+        # support here if full turbo fidelity is needed.
+
         # dormant during training: is_active=False short-circuits the module
         # forward (returns the original output), so the turbo never leaks into
         # training. It is toggled on only at sample time.
