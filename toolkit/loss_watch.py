@@ -276,23 +276,24 @@ class PerImageAdaptiveLR:
             # Per-resolution raw average loss (marginalized over timestep bucket) — purely a
             # diagnostic, doesn't feed classification. Per-image verdicts can't tell you if a
             # WHOLE resolution tier is systematically worse (VRAM/precision quirk, a bucketing
-            # bug, etc. rather than any individual image's data being bad) — this can. Appended
-            # to the same line as the summary rather than a separate log line to keep it terse.
+            # bug, etc. rather than any individual image's data being bad) — this can. Logged on
+            # its own indented line beneath the summary so a multi-resolution run can't force a
+            # horizontal scroll.
             res_sum: dict[int, float] = {}
             res_cnt: dict[int, int] = {}
             for (b, res), s in self._bsum.items():
                 res_sum[res] = res_sum.get(res, 0.0) + s
                 res_cnt[res] = res_cnt.get(res, 0) + self._bcnt[(b, res)]
-            res_suffix = ""
+            res_avgs = ""
             if len(res_sum) > 1:
                 res_avgs = ", ".join(
                     f"{res}px={res_sum[res] / res_cnt[res]:.4f}"
                     for res in sorted(res_sum) if res_cnt[res]
                 )
-                res_suffix = f" — avg loss by res: {res_avgs}"
 
-            self._log(f"[adaptive-lr] window {epoch}: {len(self.verdicts)} image(s) tracked — "
-                      f"{summary}{res_suffix}")
+            self._log(f"[adaptive-lr] window {epoch}: {len(self.verdicts)} image(s) tracked — {summary}")
+            if res_avgs:
+                self._log(f"[adaptive-lr]   avg loss by res: {res_avgs}")
 
             added = self._confirmed_stuck - self._last_reported_stuck
             removed = self._last_reported_stuck - self._confirmed_stuck
@@ -320,8 +321,9 @@ class PerImageAdaptiveLR:
                     return f"{worst_res}px {os.path.basename(k)}"
 
                 names = ", ".join(tag(k) for k in sorted(added))
-                self._log(f"[adaptive-lr] window {epoch}: confirmed stuck (persistently hard, not "
-                          f"improving) - check caption if remains stuck: {names} — LR x{self.throttle_mult}")
+                self._log(f"[adaptive-lr] window {epoch}: confirmed stuck — LR x{self.throttle_mult} "
+                          f"(not improving; check caption if it persists)")
+                self._log(f"[adaptive-lr]   {names}")
             if removed:
                 # No resolution info here — which resolution was worst is only useful while
                 # deciding whether to go inspect the image, not once it's already cleared.
