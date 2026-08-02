@@ -910,7 +910,9 @@ class SDTrainer(BaseSDTrainProcess):
         # per-image adaptive LR: record each item's raw per-sample loss (pre-multiplier) against
         # its timestep, keyed by file path. Model- and network-agnostic — this is the one shared
         # loss path for every architecture and both LoKr and LoRA. Never raises into training.
-        if getattr(self.train_config, 'per_image_adaptive_lr', False) and self.loss_watch is not None:
+        if (getattr(self.train_config, 'per_image_adaptive_lr', False)
+                or getattr(self.train_config, 'per_image_adaptive_lr_stats_only', False)) \
+                and self.loss_watch is not None:
             try:
                 loss_detached = loss.detach()
                 ts_detached = timesteps.detach()

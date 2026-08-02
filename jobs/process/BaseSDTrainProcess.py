@@ -111,12 +111,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
-        if self.train_config.per_image_adaptive_lr:
+        # Watcher is created when either the live feature OR stats-only mode is on. stats-only
+        # runs observe()/epoch_boundary() (so verdicts/resolution lines print) but the multiplier
+        # write below is skipped — see the train loop. If both flags are set, stats-only wins and
+        # no multiplier is applied.
+        if self.train_config.per_image_adaptive_lr or self.train_config.per_image_adaptive_lr_stats_only:
             from toolkit.loss_watch import PerImageAdaptiveLR
             watch_kwargs = {'log_fn': print_acc}
             if self.train_config.per_image_adaptive_lr_warmup_windows is not None:
                 watch_kwargs['warmup_epochs'] = int(self.train_config.per_image_adaptive_lr_warmup_windows)
             self.loss_watch = PerImageAdaptiveLR(**watch_kwargs)
+            if self.train_config.per_image_adaptive_lr_stats_only:
+                print_acc("[adaptive-lr] stats-only mode: per-image loss is tracked and verdicts are "
+                          "printed, but loss multipliers are NOT applied — training is unaffected.")
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
@@ -2861,9 +2868,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         and self.step_num % self._adaptive_lr_window_steps == 0):
                     window_idx = self.step_num // self._adaptive_lr_window_steps
                     self.loss_watch.epoch_boundary(window_idx)
-                    for ds in get_dataloader_datasets(dataloader):
-                        for file_item in getattr(ds, 'file_list', []):
-                            file_item.loss_multiplier = self.loss_watch.multiplier(file_item.path)
+                    # stats-only mode: epoch_boundary still ran (printing verdicts), but we do NOT
+                    # write any multiplier — training stays identical to the feature being off.
+                    if not getattr(self.train_config, 'per_image_adaptive_lr_stats_only', False):
+                        for ds in get_dataloader_datasets(dataloader):
+                            for file_item in getattr(ds, 'file_list', []):
+                                file_item.loss_multiplier = self.loss_watch.multiplier(file_item.path)
 
 
         ###################################################################

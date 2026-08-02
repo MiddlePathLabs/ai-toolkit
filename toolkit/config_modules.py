@@ -538,6 +538,14 @@ class TrainConfig:
         # already covers every resolution copy of every image, so this can cost more real steps
         # than expected on a short run — lower it if warmup is eating too much of the budget.
         self.per_image_adaptive_lr_warmup_windows = kwargs.get('per_image_adaptive_lr_warmup_windows', None)
+        # INFORMATIONAL ONLY — runs the watcher (observe + epoch_boundary, so the per-window
+        # stuck/suspect/exhausted verdicts and per-resolution loss lines still print) but does
+        # NOT write any multiplier onto file_item.loss_multiplier. Training is completely
+        # unaffected: no throttling, no boost, identical to leaving the feature off. Use this to
+        # inspect what the classifier WOULD do before committing to it. Ignored (has no extra
+        # effect) unless per_image_adaptive_lr is False — if both are set, the stats-only intent
+        # wins and multipliers are still not applied.
+        self.per_image_adaptive_lr_stats_only = kwargs.get('per_image_adaptive_lr_stats_only', False)
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
