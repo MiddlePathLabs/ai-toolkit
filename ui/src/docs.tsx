@@ -179,6 +179,18 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.per_image_adaptive_lr_stats_only': {
+    title: 'Adaptive LR Stats Only',
+    description: (
+      <>
+        Runs the per-image loss watcher in observation-only mode. The stuck / suspect / exhausted
+        / healthy verdicts and per-resolution average loss lines still print each window, but NO
+        loss multiplier is ever applied — training is byte-for-byte identical to leaving adaptive
+        LR off. Useful for inspecting what the classifier would do on your dataset before
+        committing to it. Also applies (stats-only wins) if both this and the live toggle are on.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (

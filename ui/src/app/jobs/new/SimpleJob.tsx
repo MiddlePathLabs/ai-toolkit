@@ -744,6 +744,7 @@ export default function SimpleJob({
                   onChange={value => {
                     if (value) {
                       setJobConfig(true, 'config.process[0].train.per_image_adaptive_lr');
+                      setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_stats_only');
                       setJobConfig(2, 'config.process[0].train.per_image_adaptive_lr_warmup_windows');
                     } else {
                       setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr');
@@ -751,7 +752,23 @@ export default function SimpleJob({
                     }
                   }}
                 />
-                {jobConfig.config.process[0].train.per_image_adaptive_lr && (
+                <Checkbox
+                  label="Adaptive LR Stats Only"
+                  className="pt-2"
+                  checked={jobConfig.config.process[0].train.per_image_adaptive_lr_stats_only || false}
+                  docKey={'train.per_image_adaptive_lr_stats_only'}
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig(true, 'config.process[0].train.per_image_adaptive_lr_stats_only');
+                      setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr');
+                      setJobConfig(2, 'config.process[0].train.per_image_adaptive_lr_warmup_windows');
+                    } else {
+                      setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_stats_only');
+                      setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_warmup_windows');
+                    }
+                  }}
+                />
+                {(jobConfig.config.process[0].train.per_image_adaptive_lr || jobConfig.config.process[0].train.per_image_adaptive_lr_stats_only) && (
                   <NumberInput
                     label="Adaptive LR Warmup (windows)"
                     className="pt-2"
