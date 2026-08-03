@@ -79,6 +79,8 @@ export default function SimpleJob({
 
   const depthConfig = jobConfig.config.process[0].depth_consistency;
   const depthEnabled = (depthConfig?.loss_weight ?? 0) > 0;
+  const normalConfig = jobConfig.config.process[0].normal_id;
+  const normalEnabled = (normalConfig?.loss_weight ?? 0) > 0;
   const globalLossSplit = jobConfig.config.process[0].train.loss_split;
   const globalSplitUi =
     globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
@@ -425,7 +427,7 @@ export default function SimpleJob({
                   label="Low VRAM"
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
-                  disabled={isLowVramLocked(depthEnabled)}
+                  disabled={isLowVramLocked(depthEnabled || normalEnabled)}
                 />
               </FormGroup>
             )}
@@ -1294,7 +1296,8 @@ export default function SimpleJob({
             </div>
           </Card>
         </div>
-        {modelArch?.additionalSections?.includes('depth_consistency') && (
+        {(modelArch?.additionalSections?.includes('depth_consistency') ||
+          modelArch?.additionalSections?.includes('normal_id')) && (
           <div>
             <Card title="Perceptual Anchors" collapsible>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -1520,6 +1523,90 @@ export default function SimpleJob({
                     </FormGroup>
                   )}
                 </div>
+                {modelArch?.additionalSections?.includes('normal_id') && (
+                  <div>
+                    <FormGroup label="Surface-Normal Anchor">
+                      <Checkbox
+                        label="Enable Normal Consistency"
+                        docKey={'normal_id.loss_weight'}
+                        className="pt-1"
+                        checked={normalEnabled}
+                        onChange={checked => {
+                          setJobConfig(
+                            checked ? 0.01 : 0,
+                            'config.process[0].normal_id.loss_weight'
+                          );
+                          if (checked) {
+                            setJobConfig(false, 'config.process[0].model.low_vram');
+                          }
+                        }}
+                      />
+                      {normalEnabled && (
+                        <>
+                          <NumberInput
+                            label="Normal Loss Weight"
+                            className="pt-2"
+                            docKey={'normal_id.loss_weight'}
+                            value={normalConfig?.loss_weight ?? 0}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].normal_id.loss_weight')
+                            }
+                            placeholder="eg. 0.01"
+                            min={0}
+                          />
+                          <SliderInput
+                            label="Minimum Timestep"
+                            className="pt-2"
+                            docKey={'normal_id.loss_min_t'}
+                            value={normalConfig?.loss_min_t ?? 0.4}
+                            onChange={value => {
+                              const maxT = normalConfig?.loss_max_t ?? 0.8;
+                              setJobConfig(
+                                Math.min(value, maxT),
+                                'config.process[0].normal_id.loss_min_t'
+                              );
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <SliderInput
+                            label="Maximum Timestep"
+                            className="pt-2"
+                            docKey={'normal_id.loss_max_t'}
+                            value={normalConfig?.loss_max_t ?? 0.8}
+                            onChange={value => {
+                              const minT = normalConfig?.loss_min_t ?? 0.4;
+                              setJobConfig(
+                                Math.max(value, minT),
+                                'config.process[0].normal_id.loss_max_t'
+                              );
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <NumberInput
+                            label="Preview Every"
+                            className="pt-2"
+                            docKey={'normal_id.preview_every'}
+                            value={normalConfig?.preview_every ?? 100}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].normal_id.preview_every')
+                            }
+                            min={0}
+                          />
+                          <div className="text-xs text-gray-400 pt-2">
+                            Uses a frozen Sapiens 0.3B surface-normal perceptor. The model downloads from
+                            Hugging Face the first time normal loss is enabled. Like depth, the live loss
+                            decodes x0 through the VAE under gradient, so Low VRAM is disabled while normal
+                            is active.
+                          </div>
+                        </>
+                      )}
+                    </FormGroup>
+                  </div>
+                )}
               </div>
             </Card>
           </div>
@@ -1875,6 +1962,59 @@ export default function SimpleJob({
                               { value: 'sum', label: 'Sum (off)' },
                               { value: 'alternate', label: 'Alternate' },
                             ]}
+                          />
+                        </FormGroup>
+                      </div>
+                    )}
+                    {modelArch?.additionalSections?.includes('normal_id') && (
+                      <div>
+                        <FormGroup label="Surface-Normal Anchor">
+                          <NumberInput
+                            label="Normal Loss Weight"
+                            docKey={'datasets.normal_loss_weight'}
+                            value={dataset.normal_loss_weight ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].normal_loss_weight`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                          />
+                          <NumberInput
+                            label="Min Timestep"
+                            className="pt-2"
+                            docKey={'datasets.normal_loss_min_t'}
+                            value={dataset.normal_loss_min_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].normal_loss_min_t`);
+                              const maxV = dataset.normal_loss_max_t;
+                              if (v !== undefined && maxV != null && v > maxV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].normal_loss_max_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                          <NumberInput
+                            label="Max Timestep"
+                            className="pt-2"
+                            docKey={'datasets.normal_loss_max_t'}
+                            value={dataset.normal_loss_max_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].normal_loss_max_t`);
+                              const minV = dataset.normal_loss_min_t;
+                              if (v !== undefined && minV != null && v < minV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].normal_loss_min_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
                           />
                         </FormGroup>
                       </div>

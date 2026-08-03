@@ -638,6 +638,65 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'normal_id.loss_weight': {
+    title: 'Surface-Normal Anchor',
+    description: (
+      <>
+        Enables a frozen Sapiens 0.3B surface-normal perceptor as a perceptual anchor. The anchor decodes the predicted
+        clean latent through the VAE, runs Sapiens to produce a per-pixel unit normal map, and adds a cosine + L1 loss
+        against the cached ground-truth normals of the training image. Enable sets this weight to 0.01 (a starting value,
+        not a performance claim); disable sets it to 0. There is no separate on/off flag. The Sapiens weights download
+        lazily the first time normal loss is enabled. Unlike depth, the normal anchor does not participate in the
+        diffusion/depth loss-split alternation -- it fires every step within its timestep window. Like depth it decodes
+        x0 under gradient, so Low VRAM is disabled while normal is active.
+      </>
+    ),
+  },
+  'normal_id.loss_min_t': {
+    title: 'Minimum Timestep',
+    description: (
+      <>
+        The normal anchor only applies to training steps whose flow-matching timestep ratio is at least this value
+        (0 to 1). Defaults to 0.4 so the anchor skips the low-noise steps where surface detail is already determined.
+      </>
+    ),
+  },
+  'normal_id.loss_max_t': {
+    title: 'Maximum Timestep',
+    description: (
+      <>
+        The normal anchor only applies to training steps whose flow-matching timestep ratio is at most this value
+        (0 to 1). Defaults to 0.8. Must be greater than or equal to the minimum.
+      </>
+    ),
+  },
+  'normal_id.preview_every': {
+    title: 'Preview Every',
+    description: (
+      <>
+        Every N normal-active steps, write a four-panel preview tile (GT RGB | GT normal | predicted RGB | predicted
+        normal) to the normal_previews folder. Set to 0 to disable. Previews are taken from the training-merged base
+        (Krea 2 Turbo merges its training adapter at +1.0 for training), so they may differ from final samples.
+      </>
+    ),
+  },
+  'datasets.normal_loss_weight': {
+    title: 'Per-Dataset Normal Loss Weight',
+    description: (
+      <>
+        Overrides the global normal-anchor loss weight for this dataset only. Leave empty to inherit the global setting;
+        set to 0 to disable the normal anchor for this dataset.
+      </>
+    ),
+  },
+  'datasets.normal_loss_min_t': {
+    title: 'Per-Dataset Minimum Timestep',
+    description: <>Overrides the global normal-anchor minimum timestep for this dataset only. Leave empty to inherit.</>,
+  },
+  'datasets.normal_loss_max_t': {
+    title: 'Per-Dataset Maximum Timestep',
+    description: <>Overrides the global normal-anchor maximum timestep for this dataset only. Leave empty to inherit.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

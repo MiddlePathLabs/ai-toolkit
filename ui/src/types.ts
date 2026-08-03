@@ -139,6 +139,10 @@ export interface DatasetConfig {
   depth_loss_max_t?: number;
   // undefined = inherit global; 'sum' = force off for this dataset; 'diffusion_depth' = alternate.
   loss_split?: 'diffusion_depth' | 'sum';
+  // Per-dataset normal-anchor overrides; undefined means inherit the global normal config.
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
 }
 
 export interface EMAConfig {
@@ -174,6 +178,17 @@ export interface DepthConsistencyConfig {
   grad_weight: number;
   grad_scales: number;
   mask_source: 'none' | 'subject' | 'body';
+  grad_checkpoint: boolean;
+  preview_every: number;
+  preview_only: boolean;
+  preview_max_keep: number;
+}
+
+export interface NormalIDConfig {
+  loss_weight: number;
+  loss_min_t: number;
+  loss_max_t: number;
+  model_id: string;
   grad_checkpoint: boolean;
   preview_every: number;
   preview_only: boolean;
@@ -332,6 +347,8 @@ export interface ProcessConfig {
   sample: SampleConfig;
   // Process-level (not TrainConfig): consumed via get_conf('depth_consistency').
   depth_consistency?: DepthConsistencyConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('normal_id').
+  normal_id?: NormalIDConfig;
 }
 
 export interface ConfigObject {

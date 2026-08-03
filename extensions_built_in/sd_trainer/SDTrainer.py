@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -145,6 +145,69 @@ def preflight_depth_consistency(
     return config
 
 
+def normal_active_for_dataset(
+    normal_config: Optional[NormalIDConfig],
+    dataset_config,
+) -> bool:
+    """Return whether one dataset needs normal-anchor processing.
+
+    A dataset override wins when present; otherwise it inherits the process
+    loss weight. ``preview_only`` is process-wide and still needs matched GT
+    normals for every dataset even though it contributes no anchor loss.
+    """
+    if normal_config is not None and bool(getattr(normal_config, 'preview_only', False)):
+        return True
+    dataset_weight = getattr(dataset_config, 'normal_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            normal_config.loss_weight if normal_config is not None else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
+def preflight_normal_id(
+    normal_config: Optional[NormalIDConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[NormalIDConfig]:
+    """Resolve the effective normal-id config. Returns None when normal is off.
+
+    A dataset-only activation (``normal_loss_weight > 0`` with no process
+    object) builds ``NormalIDConfig(loss_weight=0.0)`` so YAML/API jobs follow
+    the same contract as migrated UI jobs. Normal GT is transform-independent
+    (computed from the raw source image), so -- unlike depth -- there is no
+    random_crop / random_scale / augments preflight and no VAE round-trip.
+
+    Like depth, the live normal loss decodes x0 through the VAE with grad
+    enabled, so Krea 2 with ``low_vram`` true (tiled decode inside the autograd
+    graph) is rejected.
+    """
+    _dataset_normal_active = any(
+        normal_active_for_dataset(normal_config, dc) for dc in dataset_configs
+    )
+
+    config = normal_config
+    if config is None and _dataset_normal_active:
+        config = NormalIDConfig(loss_weight=0.0)
+
+    if config is None:
+        return None
+
+    _normal_active = (
+        config.loss_weight > 0
+        or bool(getattr(config, 'preview_only', False))
+        or _dataset_normal_active
+    )
+    if not _normal_active:
+        return config
+
+    if arch == 'krea2' and low_vram:
+        raise ValueError('Normal-anchor loss for Krea 2 requires model.low_vram: false.')
+
+    return config
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -225,6 +288,18 @@ class SDTrainer(BaseSDTrainProcess):
         # parity so previews render on DEPTH steps regardless of preview_every
         # being even/odd (see _depth_preview_due). Reset in hook_before_train_loop.
         self._depth_step_count = 0
+
+        _normal_raw = self.get_conf('normal_id', None)
+        if _normal_raw is not None:
+            self.normal_config: Optional[NormalIDConfig] = NormalIDConfig(**_normal_raw)
+        else:
+            self.normal_config = None
+        # Normal-step counter for preview cadence (mirrors _depth_step_count).
+        self._normal_step_count = 0
+        # Normal-anchor diagnostics (flushed into loss_dict when present).
+        self._last_normal_loss: Optional[float] = None
+        self._last_normal_loss_applied: Optional[float] = None
+        self._last_normal_cos: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -869,6 +944,221 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_depth_consistency_grad = grad_sum / n
         return applied
 
+    # ------------------------------------------------------------------
+    # Normal-anchor (Sapiens surface normals) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _normal_should_cache(self) -> bool:
+        """True when normal is active and the GT caching pass should run."""
+        cfg = self.normal_config
+        if cfg is None:
+            return False
+        ds_normal = any(
+            normal_active_for_dataset(cfg, dc) for dc in self.dataset_configs
+        )
+        return (
+            cfg.loss_weight > 0
+            or bool(getattr(cfg, 'preview_only', False))
+            or ds_normal
+        )
+
+    def _normal_loss_active(self) -> bool:
+        """True when the normal loss block should engage. Mirrors _normal_should_cache."""
+        return self._normal_should_cache()
+
+    def _load_normal_perceptor(self):
+        """Lazily load the frozen Sapiens normal perceptor; cached on the trainer.
+
+        ``SapiensNormal._load_pretrained`` imports ``huggingface_hub`` and
+        downloads the weights inside the load, so selecting Krea never downloads
+        Sapiens -- only enabling normal loss does.
+        """
+        if getattr(self, '_normal_perceptor', None) is not None:
+            return self._normal_perceptor
+        from toolkit.normal_id import DifferentiableNormalEncoder
+        cfg = self.normal_config
+        self._normal_perceptor = DifferentiableNormalEncoder(
+            device=self.device_torch,
+            grad_checkpoint=bool(getattr(cfg, 'grad_checkpoint', True)),
+        )
+        return self._normal_perceptor
+
+    def _cache_normal_gt_pass(self):
+        """Iterate normal-active datasets and stamp + persist GT normals.
+
+        GT normals are computed from the RAW source image (transform-
+        independent), so there is no VAE round-trip and no bucket-transform
+        fingerprint (unlike depth). The resident tensor is never held on the
+        file-list item; the worker re-reads lazily via get_normal_gt().
+        """
+        from toolkit.normal_id import cache_normal_gt
+        cfg = self.normal_config
+        encoder = self._load_normal_perceptor()
+
+        def _ds_normal_active(dc):
+            return normal_active_for_dataset(cfg, dc)
+
+        def _cache_loader(loader):
+            if loader is None:
+                return
+            for dataset in get_dataloader_datasets(loader):
+                if not _ds_normal_active(dataset.dataset_config):
+                    continue
+                cache_normal_gt(dataset.file_list, cfg, encoder=encoder)
+
+        _cache_loader(self.data_loader)
+        _cache_loader(self.data_loader_reg)
+
+    def _compute_normal_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Run the unified live decode + Sapiens forward + cosine/L1 normal loss.
+
+        Normal loss does NOT participate in the diffusion/depth ``loss_split``
+        alternation: it fires every step on samples inside the timestep window
+        with a positive weight, a cached GT normal, and not a reg sample.
+        Returns the weighted-mean contribution to add to the total loss (a
+        python ``0.0`` when no sample qualifies).
+
+        Note: when depth is also active this performs a SECOND grad-enabled VAE
+        decode of x0 (one per perceptor). On the 96 GB target that is acceptable
+        headroom; the shared-decode optimization is deferred.
+        """
+        from toolkit.normal_id_loss import compute_normal_loss, render_normal_preview
+
+        cfg = self.normal_config
+        normal_gt_list = getattr(batch, 'normal_gt_list', None) or []
+        if len(normal_gt_list) == 0:
+            return 0.0
+
+        encoder = getattr(self, '_normal_perceptor', None)
+        if encoder is None:
+            encoder = self._load_normal_perceptor()
+
+        num_t = self.sd.noise_scheduler.config.num_train_timesteps
+        t_ratio = (timesteps.float() / num_t)
+        is_reg = batch.get_is_reg_list()
+
+        per_ds_w = getattr(batch, 'normal_loss_weight_list', None)
+        has_per_ds = per_ds_w is not None and any(w is not None for w in per_ds_w)
+        global_w = cfg.loss_weight
+        min_t_list = getattr(batch, 'normal_loss_min_t_list', None)
+        max_t_list = getattr(batch, 'normal_loss_max_t_list', None)
+
+        B = noise_pred.shape[0]
+        weights = []
+        valid = torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        for i in range(B):
+            w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
+            weights.append(float(w or 0.0))
+            if is_reg[i] or weights[i] <= 0.0:
+                continue
+            if i >= len(normal_gt_list) or normal_gt_list[i] is None:
+                continue
+            lo = float(min_t_list[i]) if (min_t_list and min_t_list[i] is not None) else cfg.loss_min_t
+            hi = float(max_t_list[i]) if (max_t_list and max_t_list[i] is not None) else cfg.loss_max_t
+            tr = float(t_ratio[i].item())
+            if not (lo <= tr <= hi):
+                continue
+            valid[i] = True
+
+        if not valid.any():
+            self._last_normal_loss = 0.0
+            return 0.0
+
+        self._normal_step_count += 1
+        preview_only = bool(getattr(cfg, 'preview_only', False))
+        preview_due = (
+            int(getattr(cfg, 'preview_every', 0)) > 0
+            and self._normal_step_count % int(cfg.preview_every) == 0
+        )
+        if preview_only and not preview_due:
+            self._last_normal_loss = 0.0
+            return 0.0
+
+        with torch.set_grad_enabled(not preview_only):
+            t_b = t_ratio.view(-1, 1, 1, 1)
+            if getattr(self.sd, 'is_flow_matching', True):
+                x0 = noisy_latents - t_b * noise_pred
+            else:
+                _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                    device=timesteps.device, dtype=noisy_latents.dtype
+                )[timesteps.long()].view(-1, 1, 1, 1)
+                _sa = _ac.sqrt()
+                _s1ma = (1.0 - _ac).sqrt()
+                if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                    x0 = _sa * noisy_latents - _s1ma * noise_pred
+                else:
+                    x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+            if next(self.sd.vae.parameters()).device != self.device_torch:
+                self.sd.vae.to(self.device_torch)
+            decoded = self.sd.decode_latents(
+                x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
+            )
+            pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        idx_map = [i for i in range(B) if valid[i]]
+        gt_tensor = torch.stack(
+            [normal_gt_list[i].to(pixels.device, dtype=torch.float32) for i in idx_map],
+            dim=0,
+        )
+        if preview_only:
+            with torch.no_grad():
+                cos_loss, l1_loss, gen_det, ref_det = compute_normal_loss(
+                    encoder, pixels[idx_map].detach(), gt_tensor,
+                )
+            self._last_normal_loss = 0.0
+            self._last_normal_loss_applied = 0.0
+        else:
+            cos_loss, l1_loss, gen_det, ref_det = compute_normal_loss(
+                encoder, pixels[idx_map], gt_tensor,
+            )
+            per_sample = cos_loss + l1_loss
+            w_tensor = torch.tensor(
+                [weights[i] for i in idx_map],
+                device=pixels.device, dtype=torch.float32,
+            )
+            applied = (per_sample * w_tensor).mean()
+            self._last_normal_loss_applied = float(applied.detach().item())
+            with torch.no_grad():
+                self._last_normal_loss = float(l1_loss.mean().item())
+                self._last_normal_cos = float((1.0 - cos_loss).mean().item())
+
+        if (preview_due and self.save_root is not None
+                and getattr(batch, 'file_items', None) is not None):
+            try:
+                from PIL import Image as _PILImage
+                from PIL.ImageOps import exif_transpose as _exif_t
+                nrm_preview_dir = os.path.join(self.save_root, 'normal_previews')
+                os.makedirs(nrm_preview_dir, exist_ok=True)
+                for j, i in enumerate(idx_map):
+                    if i >= len(batch.file_items):
+                        break
+                    pred_pil = _PILImage.fromarray(
+                        (pixels[i].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255)
+                        .astype("uint8")
+                    )
+                    try:
+                        ref_pil = _exif_t(_PILImage.open(batch.file_items[i].path)).convert("RGB")
+                    except Exception:  # noqa: BLE001
+                        ref_pil = pred_pil
+                    combo = render_normal_preview(
+                        pred_pil, ref_pil,
+                        gen_det[j].unsqueeze(0) if gen_det[j].dim() == 3 else gen_det[j:j + 1],
+                        ref_det[j].unsqueeze(0) if ref_det[j].dim() == 3 else ref_det[j:j + 1],
+                    )
+                    src_name = os.path.splitext(os.path.basename(batch.file_items[i].path))[0]
+                    combo.save(os.path.join(
+                        nrm_preview_dir,
+                        f'{src_name}_step{self.step_num:06d}_t{float(t_ratio[i]):.2f}.jpg',
+                    ))
+                self._prune_preview_dir(
+                    nrm_preview_dir, int(getattr(cfg, 'preview_max_keep', 500))
+                )
+            except Exception as e:  # noqa: BLE001
+                print_acc(f"  normal preview failed: {e}")
+
+        return applied if not preview_only else 0.0
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -886,6 +1176,17 @@ class SDTrainer(BaseSDTrainProcess):
         # onto the device when latents were cached.
         if self._depth_should_cache():
             self._cache_depth_gt_pass()
+        # Normal-anchor preflight + GT caching pass. Fully inert when normal is
+        # inactive (no Sapiens import, no perceptor load, no stamping). Normal
+        # GT is computed from the raw source image -- no VAE round-trip.
+        self.normal_config = preflight_normal_id(
+            self.normal_config, self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
+        self._normal_step_count = 0
+        if self._normal_should_cache():
+            self._cache_normal_gt_pass()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -1142,6 +1443,15 @@ class SDTrainer(BaseSDTrainProcess):
             _depth_gates = self._resolve_depth_sample_gates(
                 batch, timesteps, _is_reg_per_sample,
             )
+
+        # Normal-anchor gate. Fully inert when normal is off: _normal_gates
+        # stays False, so no normal code is reachable. Normal does not interact
+        # with depth loss_split -- it runs independently on its own samples.
+        _normal_active = (
+            self._normal_loss_active()
+            and getattr(batch, 'normal_gt_list', None) is not None
+            and len(noise_pred.shape) == 4
+        )
 
         prior_mask_multiplier = None
         target_mask_multiplier = None
@@ -1686,6 +1996,13 @@ class SDTrainer(BaseSDTrainProcess):
         if _depth_gates is not None:
             loss = loss + self._compute_depth_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch, _depth_gates,
+            )
+
+        # Normal-anchor loss: fires on its own timestep-window samples,
+        # independent of the diffusion/depth loss_split. Inert when normal is off.
+        if _normal_active:
+            loss = loss + self._compute_normal_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch,
             )
 
         if hasattr(self.sd, "get_additional_loss"):
@@ -3113,6 +3430,9 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_weight_noise_norm',
             '_last_weight_norm',
             '_last_fisher_trace',
+            '_last_normal_loss',
+            '_last_normal_loss_applied',
+            '_last_normal_cos',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:

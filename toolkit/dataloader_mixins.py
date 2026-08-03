@@ -807,6 +807,9 @@ class ImageProcessingDTOMixin:
         # cached; sits above the latent/video early returns so every path is covered.
         if self.is_depth_cached:
             self.get_depth_gt()
+        # NormalID GT: lazy read in the worker. No-op unless normal is cached.
+        if self.is_normal_cached:
+            self.get_normal_gt()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1831,6 +1834,56 @@ class DepthCachingFileItemDTOMixin:
         # from the same file.
         if self.is_depth_cached:
             self.depth_gt = None
+
+
+class NormalCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # The up-front caching pass records the cache path + safetensors key
+        # here WITHOUT reading the tensor; the heavy per-file read is deferred
+        # to get_normal_gt(), called from load_and_process_image() in the worker.
+        self.normal_gt: Union[torch.Tensor, None] = None
+        self.is_normal_cached = False
+        self._normal_cache_path: Union[str, None] = None
+        self._normal_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_normal_key(cache_path, key):
+        # Read a single tensor by key without loading the rest of the file.
+        # Returns None on a missing key, unreadable/corrupt header, or a
+        # non-finite/empty tensor so a corrupt cache never silently feeds
+        # garbage through training.
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key not in f.keys():
+                    return None
+                tensor = f.get_tensor(key)
+        except Exception:  # noqa: BLE001 -- corrupt/unreadable cache -> miss
+            return None
+        if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
+            return None
+        return tensor
+
+    def get_normal_gt(self: 'FileItemDTO'):
+        # Lazily load this item's cached GT normal map; held on self.normal_gt
+        # until cleanup_normal() releases it between batches.
+        if not self.is_normal_cached:
+            return self.normal_gt
+        if self.normal_gt is None:
+            self.normal_gt = self._read_normal_key(
+                self._normal_cache_path, self._normal_cache_key
+            )
+        return self.normal_gt
+
+    def cleanup_normal(self: 'FileItemDTO'):
+        # Release the resident map between batches; re-read on next access.
+        # Cache metadata (path/key) is left intact so the next epoch re-reads
+        # from the same file.
+        if self.is_normal_cached:
+            self.normal_gt = None
 
 
 class LatentCachingMixin:

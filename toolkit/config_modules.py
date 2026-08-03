@@ -945,6 +945,43 @@ class DepthConsistencyConfig:
             )
 
 
+class NormalIDConfig:
+    """Surface-normal auxiliary loss via a frozen Sapiens 0.3B perceptor.
+
+    Process-level config (read through ``self.get_conf('normal_id')``), not a
+    TrainConfig field. There is no ``enabled`` flag: enable by setting
+    ``loss_weight > 0``, disable with ``loss_weight == 0``. Safe defaults ship
+    disabled so a partially supplied external object stays inert until
+    explicitly enabled. The Sapiens perceptor downloads lazily only when normal
+    loss is enabled. Normal loss does NOT participate in the diffusion/depth
+    ``loss_split`` alternation -- it fires every step its timestep window is
+    active. GT normals are computed from the raw source image, so the cache is
+    transform-independent (no bucket-transform / VAE fingerprint).
+    """
+
+    def __init__(self, **kwargs):
+        self.loss_weight: float = float(kwargs.get('loss_weight', 0.0))
+        self.loss_min_t: float = float(kwargs.get('loss_min_t', 0.4))
+        self.loss_max_t: float = float(kwargs.get('loss_max_t', 0.8))
+        self.model_id: str = kwargs.get(
+            'model_id', 'facebook/sapiens-normal-0.3b'
+        )
+        self.grad_checkpoint: bool = bool(kwargs.get('grad_checkpoint', True))
+        self.preview_every: int = int(kwargs.get('preview_every', 100))
+        self.preview_only: bool = bool(kwargs.get('preview_only', False))
+        self.preview_max_keep: int = int(kwargs.get('preview_max_keep', 500))
+
+        if self.loss_min_t < 0.0:
+            raise ValueError(f"loss_min_t must be >= 0, got {self.loss_min_t}")
+        if self.loss_max_t > 1.0:
+            raise ValueError(f"loss_max_t must be <= 1, got {self.loss_max_t}")
+        if self.loss_min_t > self.loss_max_t:
+            raise ValueError(
+                f"loss_min_t ({self.loss_min_t}) must be <= "
+                f"loss_max_t ({self.loss_max_t})"
+            )
+
+
 class ReferenceDatasetConfig:
     def __init__(self, **kwargs):
         # can pass with a side by side pait or a folder with pos and neg folder
@@ -1166,6 +1203,12 @@ class DatasetConfig:
                 "Allowed: None (inherit), 'diffusion_depth' (force on), "
                 "'sum' (force off)."
             )
+
+        # Normal-anchor per-dataset overrides. None means inherit the global
+        # normal_id setting. Normal loss does not participate in loss_split.
+        self.normal_loss_weight: Union[float, None] = kwargs.get('normal_loss_weight', None)
+        self.normal_loss_min_t: Union[float, None] = kwargs.get('normal_loss_min_t', None)
+        self.normal_loss_max_t: Union[float, None] = kwargs.get('normal_loss_max_t', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

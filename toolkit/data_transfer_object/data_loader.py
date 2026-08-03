@@ -14,6 +14,7 @@ from toolkit.dataloader_mixins import (
     ImageProcessingDTOMixin,
     LatentCachingFileItemDTOMixin,
     DepthCachingFileItemDTOMixin,
+    NormalCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -46,6 +47,7 @@ def print_once(msg):
 class FileItemDTO(
     LatentCachingFileItemDTOMixin,
     DepthCachingFileItemDTOMixin,
+    NormalCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -194,6 +196,11 @@ class FileItemDTO(
         self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
         self.loss_split: Union[str, None] = self.dataset_config.loss_split
 
+        # normal-anchor per-dataset overrides (None = inherit global)
+        self.normal_loss_weight: Union[float, None] = self.dataset_config.normal_loss_weight
+        self.normal_loss_min_t: Union[float, None] = self.dataset_config.normal_loss_min_t
+        self.normal_loss_max_t: Union[float, None] = self.dataset_config.normal_loss_max_t
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -207,6 +214,7 @@ class FileItemDTO(
         self.audio_tensor = None
         self.cleanup_latent()
         self.cleanup_depth()
+        self.cleanup_normal()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -400,11 +408,30 @@ class DataLoaderBatchDTO:
                 x.loss_split for x in self.file_items
             ]
 
+            # normal-anchor per-dataset scalars (None = inherit global)
+            self.normal_loss_weight_list: List[Union[float, None]] = [
+                x.normal_loss_weight for x in self.file_items
+            ]
+            self.normal_loss_min_t_list: List[Union[float, None]] = [
+                x.normal_loss_min_t for x in self.file_items
+            ]
+            self.normal_loss_max_t_list: List[Union[float, None]] = [
+                x.normal_loss_max_t for x in self.file_items
+            ]
+
             # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
             if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
                 self.depth_gt_list: Union[List, None] = [
                     getattr(x, 'depth_gt', None) for x in self.file_items
+                ]
+
+            # collect GT normal maps (all NORMAL_SIZE x NORMAL_SIZE, but kept as
+            # a list parallel to depth_gt_list); only assigned when at least one
+            # item has a cached map.
+            if any([getattr(x, 'normal_gt', None) is not None for x in self.file_items]):
+                self.normal_gt_list: Union[List, None] = [
+                    getattr(x, 'normal_gt', None) for x in self.file_items
                 ]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):

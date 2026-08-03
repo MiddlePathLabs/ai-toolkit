@@ -37,7 +37,8 @@ type AdditionalSections =
   | 'model.unconditional_lora_path'
   | 'model.model_kwargs.kv_cache'
   | 'ideogram_4_prompt'
-  | 'depth_consistency';
+  | 'depth_consistency'
+  | 'normal_id';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1449,6 +1450,7 @@ export const modelArchs: ModelArch[] = [
       'model.low_vram',
       'model.layer_offloading',
       'depth_consistency',
+      'normal_id',
     ],
   },
   {
@@ -1483,6 +1485,7 @@ export const modelArchs: ModelArch[] = [
       'model.layer_offloading',
       'model.assistant_lora_path',
       'depth_consistency',
+      'normal_id',
     ],
   },
   {
@@ -1521,6 +1524,7 @@ export const modelArchs: ModelArch[] = [
       'model.qie.match_target_res',
       'model.model_kwargs.kv_cache',
       'depth_consistency',
+      'normal_id',
     ],
   },
   {
@@ -1566,6 +1570,7 @@ export const modelArchs: ModelArch[] = [
       'model.qie.match_target_res',
       'model.model_kwargs.kv_cache',
       'depth_consistency',
+      'normal_id',
     ],
   },
   {
