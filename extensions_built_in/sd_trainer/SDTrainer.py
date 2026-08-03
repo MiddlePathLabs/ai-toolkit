@@ -2302,7 +2302,7 @@ class SDTrainer(BaseSDTrainProcess):
             if config.mode == 'absolute':
                 sigma = float(config.sigma)
             elif config.mode == 'relative':
-                rms = float(gradient.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                rms = float(gradient.detach().pow(2).mean().sqrt())
                 sigma = float(config.sigma) * rms
             else:
                 sigma = float(config.eta) / max(1.0, (1.0 + step) ** float(config.gamma))
@@ -2366,7 +2366,7 @@ class SDTrainer(BaseSDTrainProcess):
             if config.mode == 'absolute':
                 sigma = float(config.sigma)
             else:
-                rms = float(weight.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                rms = float(weight.detach().pow(2).mean().sqrt())
                 sigma = float(config.sigma) * rms
             if sigma <= 0:
                 continue
