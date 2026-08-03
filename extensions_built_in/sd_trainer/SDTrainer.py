@@ -369,54 +369,31 @@ class SDTrainer(BaseSDTrainProcess):
     def _depth_vae_roundtrip(self, arr: torch.Tensor) -> torch.Tensor:
         """[0,1] pixels ``(1,3,H,W)`` -> VAE encode -> decode -> [0,1] pixels.
 
-        Krea routes through ``sd.encode_images`` / ``sd.decode_latents``
-        (5D Qwen VAE, ``latents_mean``/``latents_std``). The generic
-        ``vae.encode`` + scalar ``scaling_factor`` path is invalid for Krea's
-        VAE and is the fallback for non-Krea arches only. The cached GT depth
-        is taken from these round-trip pixels so the live depth loss has a
-        VAE-matched target.
+        Arch-agnostic: every target diffusion model implements
+        ``encode_images`` / ``decode_latents``, each handling its own
+        scaling/shift (or ``latents_mean``/``latents_std``) and 5D-frame
+        logic internally. The cached GT depth is taken from these round-trip
+        pixels so the live depth loss has a VAE-matched target. A direct
+        ``vae.encode`` with a scalar ``scaling_factor`` is intentionally
+        avoided -- it mis-normalizes AutoencoderKL / Qwen VAEs.
         """
-        if getattr(self.sd, 'model_config', None) is not None and \
-                self.sd.model_config.arch == 'krea2':
-            pixels_m1 = (arr * 2.0 - 1.0).to(self.sd.vae_torch_dtype)
-            latents = self.sd.encode_images(
-                [image for image in pixels_m1],
-                device=self.device_torch,
-                dtype=self.sd.vae_torch_dtype,
-            )
-            decoded = self.sd.decode_latents(
-                latents,
-                device=self.device_torch,
-                dtype=self.sd.vae_torch_dtype,
-            )
-            return ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
-
-        # Generic fallback (Flux / SDXL / SD): the 4D image VAE. Encode gives
-        # the raw latent; decode reverses it. scaling_factor/shift_factor are
-        # UNet-space conversions that cancel across a pure encode -> decode
-        # round-trip, so they are not applied here.
-        vae_dtype = getattr(self.sd.vae, 'dtype', torch.float32)
-        try:
-            first_param = next(self.sd.vae.parameters())
-            if first_param.device != self.device_torch:
-                self.sd.vae.to(self.device_torch)
-        except StopIteration:
-            pass  # parameter-less VAE -- nothing to move
-        arr_norm = (arr * 2.0 - 1.0).to(vae_dtype)
-        posterior = self.sd.vae.encode(arr_norm)
-        if hasattr(posterior, 'latent_dist'):
-            raw_latent = posterior.latent_dist.mode()
-        elif isinstance(posterior, torch.Tensor):
-            raw_latent = posterior
-        elif hasattr(posterior, 'sample') and callable(getattr(posterior, 'sample')):
-            raw_latent = posterior.sample()
-        else:
-            raw_latent = posterior[0]
-        pixels = self.sd.vae.decode(raw_latent.to(vae_dtype)).sample.float()
-        pixels = (pixels + 1.0) * 0.5
-        if pixels.dim() == 5:
-            pixels = pixels[:, :, 0]
-        return pixels.clamp(0, 1)
+        vae_dtype = self.sd.vae_torch_dtype
+        pixels_m1 = (arr * 2.0 - 1.0).to(vae_dtype)
+        # VAE residency guard: no-op when resident, protects the cached-latents
+        # VAE-offload case (sec. 2.1).
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        latents = self.sd.encode_images(
+            [image for image in pixels_m1],
+            device=self.device_torch,
+            dtype=vae_dtype,
+        )
+        decoded = self.sd.decode_latents(
+            latents,
+            device=self.device_torch,
+            dtype=vae_dtype,
+        )
+        return ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
 
     def _load_depth_perceptor(self):
         """Lazily load the frozen DA2 perceptor; cached on the trainer.
