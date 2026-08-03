@@ -1,6 +1,7 @@
 'use client';
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
+import { migrateNoisingConfig } from '@/helpers/noisingConfig';
 import { JobConfig, SampleConfig, DatasetConfig, SliderConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
@@ -177,23 +178,7 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   }
 
   const train = jobConfig.config.process[0].train;
-  train.weight_noise = {
-    enabled: false,
-    mode: 'relative',
-    sigma: 0.00125,
-    bound_norm: false,
-    log_every: 50,
-    ...(train.weight_noise ?? {}),
-  };
-  train.gradient_noise = {
-    enabled: false,
-    mode: 'neelakantan',
-    sigma: 0.001,
-    eta: 0.01,
-    gamma: 0.55,
-    log_every: 50,
-    ...(train.gradient_noise ?? {}),
-  };
+  migrateNoisingConfig(train);
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';
   }
