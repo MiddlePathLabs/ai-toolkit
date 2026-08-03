@@ -43,6 +43,22 @@
 # requirement), do not install both. Verify with:
 #   python -c "import onnxruntime as ort; print(ort.get_available_providers())"
 # must list 'CUDAExecutionProvider' (and ideally 'TensorrtExecutionProvider').
+#
+# PROBE RESULT (2026-08-03, PASSED on the pinned env):
+#   pip install onnx2torch insightface onnxruntime-gpu  -> installs BOTH
+#   onnxruntime (CPU, via insightface) and onnxruntime-gpu; they share the
+#   onnxruntime/ install dir and clobber, leaving get_available_providers()
+#   CPU-only. FIX that worked:
+#     pip uninstall -y onnxruntime onnxruntime-gpu
+#     pip install --no-deps onnxruntime-gpu
+#   -> providers ['TensorrtExecutionProvider','CUDAExecutionProvider','CPUExecutionProvider']
+#   insightface / onnx2torch / cv2 all import cleanly afterward.
+# Because this two-step fix cannot be expressed in a single requirements.txt
+# line, face_id ships behind LAZY IMPORTS + a clean ImportError (see
+# toolkit/face_id.py). Its deps are NOT in requirements_base.txt until a
+# robust post-install mechanism exists; users enable face_id by running the
+# documented install above. A module is not auto-shipped merely because its
+# probe requirements pass (guide sec. 5.1).
 insightface==1.0.1
 onnx2torch==1.5.15
 onnxruntime-gpu==1.28.0

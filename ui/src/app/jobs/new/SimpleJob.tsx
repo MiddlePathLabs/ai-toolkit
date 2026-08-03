@@ -83,6 +83,8 @@ export default function SimpleJob({
   const normalEnabled = (normalConfig?.loss_weight ?? 0) > 0;
   const bodyProportionConfig = jobConfig.config.process[0].body_proportion;
   const bodyProportionEnabled = (bodyProportionConfig?.loss_weight ?? 0) > 0;
+  const faceIdConfig = jobConfig.config.process[0].face_id;
+  const faceIdEnabled = (faceIdConfig?.identity_loss_weight ?? 0) > 0;
   const globalLossSplit = jobConfig.config.process[0].train.loss_split;
   const globalSplitUi =
     globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
@@ -429,7 +431,9 @@ export default function SimpleJob({
                   label="Low VRAM"
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
-                  disabled={isLowVramLocked(depthEnabled || normalEnabled || bodyProportionEnabled)}
+                  disabled={isLowVramLocked(
+                    depthEnabled || normalEnabled || bodyProportionEnabled || faceIdEnabled
+                  )}
                 />
               </FormGroup>
             )}
@@ -1300,7 +1304,8 @@ export default function SimpleJob({
         </div>
         {(modelArch?.additionalSections?.includes('depth_consistency') ||
           modelArch?.additionalSections?.includes('normal_id') ||
-          modelArch?.additionalSections?.includes('body_proportion')) && (
+          modelArch?.additionalSections?.includes('body_proportion') ||
+          modelArch?.additionalSections?.includes('face_id')) && (
           <div>
             <Card title="Perceptual Anchors" collapsible>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -1688,6 +1693,89 @@ export default function SimpleJob({
                             downloads from Hugging Face the first time this is enabled. Like the other
                             anchors, the live loss decodes x0 through the VAE under gradient, so Low VRAM is
                             disabled while body proportion is active.
+                          </div>
+                        </>
+                      )}
+                    </FormGroup>
+                  </div>
+                )}
+                {modelArch?.additionalSections?.includes('face_id') && (
+                  <div>
+                    <FormGroup label="Face-Identity Anchor">
+                      <Checkbox
+                        label="Enable Face Identity Consistency"
+                        docKey={'face_id.identity_loss_weight'}
+                        className="pt-1"
+                        checked={faceIdEnabled}
+                        onChange={checked => {
+                          setJobConfig(
+                            checked ? 0.05 : 0,
+                            'config.process[0].face_id.identity_loss_weight'
+                          );
+                          if (checked) {
+                            setJobConfig(false, 'config.process[0].model.low_vram');
+                          }
+                        }}
+                      />
+                      {faceIdEnabled && (
+                        <>
+                          <NumberInput
+                            label="Identity Loss Weight"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_weight'}
+                            value={faceIdConfig?.identity_loss_weight ?? 0}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].face_id.identity_loss_weight')
+                            }
+                            placeholder="eg. 0.05"
+                            min={0}
+                          />
+                          <SliderInput
+                            label="Minimum Timestep"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_min_t'}
+                            value={faceIdConfig?.identity_loss_min_t ?? 0}
+                            onChange={value => {
+                              const maxT = faceIdConfig?.identity_loss_max_t ?? 1;
+                              setJobConfig(Math.min(value, maxT), 'config.process[0].face_id.identity_loss_min_t');
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <SliderInput
+                            label="Maximum Timestep"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_max_t'}
+                            value={faceIdConfig?.identity_loss_max_t ?? 1}
+                            onChange={value => {
+                              const minT = faceIdConfig?.identity_loss_min_t ?? 0;
+                              setJobConfig(Math.max(value, minT), 'config.process[0].face_id.identity_loss_max_t');
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <NumberInput
+                            label="Min Cosine Similarity"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_min_cos'}
+                            value={faceIdConfig?.identity_loss_min_cos ?? 0.2}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].face_id.identity_loss_min_cos')
+                            }
+                            placeholder="eg. 0.2"
+                            min={-1}
+                            max={1}
+                          />
+                          <div className="text-xs text-gray-400 pt-2">
+                            Uses a frozen ArcFace (w600k_r50, InsightFace buffalo_l) to match the identity
+                            of the decoded face against the cached GT embedding via bias-corrected cosine
+                            similarity. Requires the manual dep install (insightface + onnx2torch +
+                            onnxruntime-gpu with the CPU-shadowing fix) documented in the README. A SCRFD
+                            quality gate skips generated non-face regions. Like the other anchors, the live
+                            loss decodes x0 through the VAE under gradient, so Low VRAM is disabled while
+                            face identity is active.
                           </div>
                         </>
                       )}
@@ -2150,6 +2238,59 @@ export default function SimpleJob({
                               const minV = dataset.body_proportion_loss_min_t;
                               if (v !== undefined && minV != null && v < minV) {
                                 setJobConfig(v, `config.process[0].datasets[${i}].body_proportion_loss_min_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                        </FormGroup>
+                      </div>
+                    )}
+                    {modelArch?.additionalSections?.includes('face_id') && (
+                      <div>
+                        <FormGroup label="Face-Identity Anchor">
+                          <NumberInput
+                            label="Identity Loss Weight"
+                            docKey={'datasets.identity_loss_weight'}
+                            value={dataset.identity_loss_weight ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].identity_loss_weight`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                          />
+                          <NumberInput
+                            label="Min Timestep"
+                            className="pt-2"
+                            docKey={'datasets.identity_loss_min_t'}
+                            value={dataset.identity_loss_min_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].identity_loss_min_t`);
+                              const maxV = dataset.identity_loss_max_t;
+                              if (v !== undefined && maxV != null && v > maxV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].identity_loss_max_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                          <NumberInput
+                            label="Max Timestep"
+                            className="pt-2"
+                            docKey={'datasets.identity_loss_max_t'}
+                            value={dataset.identity_loss_max_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].identity_loss_max_t`);
+                              const minV = dataset.identity_loss_min_t;
+                              if (v !== undefined && minV != null && v < minV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].identity_loss_min_t`);
                               }
                             }}
                             placeholder="inherit"

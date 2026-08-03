@@ -16,6 +16,7 @@ from toolkit.dataloader_mixins import (
     DepthCachingFileItemDTOMixin,
     NormalCachingFileItemDTOMixin,
     BodyProportionCachingFileItemDTOMixin,
+    FaceIdentityCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -50,6 +51,7 @@ class FileItemDTO(
     DepthCachingFileItemDTOMixin,
     NormalCachingFileItemDTOMixin,
     BodyProportionCachingFileItemDTOMixin,
+    FaceIdentityCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -208,6 +210,12 @@ class FileItemDTO(
         self.body_proportion_loss_min_t: Union[float, None] = self.dataset_config.body_proportion_loss_min_t
         self.body_proportion_loss_max_t: Union[float, None] = self.dataset_config.body_proportion_loss_max_t
 
+        # face-identity per-dataset overrides (None = inherit global)
+        self.identity_loss_weight: Union[float, None] = self.dataset_config.identity_loss_weight
+        self.identity_loss_min_t: Union[float, None] = self.dataset_config.identity_loss_min_t
+        self.identity_loss_max_t: Union[float, None] = self.dataset_config.identity_loss_max_t
+        self.identity_loss_min_cos: Union[float, None] = self.dataset_config.identity_loss_min_cos
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -223,6 +231,7 @@ class FileItemDTO(
         self.cleanup_depth()
         self.cleanup_normal()
         self.cleanup_body_proportion()
+        self.cleanup_face_identity()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -438,6 +447,20 @@ class DataLoaderBatchDTO:
                 x.body_proportion_loss_max_t for x in self.file_items
             ]
 
+            # face-identity per-dataset scalars (None = inherit global)
+            self.identity_loss_weight_list: List[Union[float, None]] = [
+                x.identity_loss_weight for x in self.file_items
+            ]
+            self.identity_loss_min_t_list: List[Union[float, None]] = [
+                x.identity_loss_min_t for x in self.file_items
+            ]
+            self.identity_loss_max_t_list: List[Union[float, None]] = [
+                x.identity_loss_max_t for x in self.file_items
+            ]
+            self.identity_loss_min_cos_list: List[Union[float, None]] = [
+                x.identity_loss_min_cos for x in self.file_items
+            ]
+
             # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
             if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
@@ -468,6 +491,20 @@ class DataLoaderBatchDTO:
                     emb = getattr(x, 'body_proportion_gt', None)
                     bp_embeds.append(emb if emb is not None else torch.zeros(bp_dim))
                 self.body_proportion_gt = torch.stack(bp_embeds, dim=0).to(torch.float32)
+
+            # collect GT face-identity embeddings (512-d ArcFace); batched into
+            # one tensor when at least one item has a cached embedding.
+            if any([getattr(x, 'identity_embedding', None) is not None for x in self.file_items]):
+                id_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'identity_embedding', None)
+                    id_embeds.append(emb if emb is not None else torch.zeros(512))
+                self.identity_embedding = torch.stack(id_embeds, dim=0).to(torch.float32)
+
+            # collect per-item face bboxes (original-image coords); kept as a
+            # list (variable presence). None means no face detected for that item.
+            if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
+                self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base

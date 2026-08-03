@@ -740,6 +740,50 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Per-Dataset Maximum Timestep',
     description: <>Overrides the global body-proportion maximum timestep for this dataset only. Leave empty to inherit.</>,
   },
+  'face_id.identity_loss_weight': {
+    title: 'Face-Identity Anchor',
+    description: (
+      <>
+        Enables a frozen ArcFace (w600k_r50, InsightFace buffalo_l) as a face-identity anchor. The anchor
+        decodes the predicted clean latent through the VAE, crops the face (using the cached face bbox),
+        runs ArcFace, and adds a bias-corrected cosine-similarity loss against the cached GT identity
+        embedding. A SCRFD quality gate skips generated regions where no face is detected. Enable sets this
+        weight to 0.05 (a starting value, not a performance claim); disable sets it to 0. Requires the
+        manual dep install (insightface + onnx2torch + onnxruntime-gpu with the CPU-shadowing fix). The
+        ArcFace model downloads lazily on first enable. Does not participate in diffusion/depth loss-split.
+        Like the other anchors it decodes x0 under gradient, so Low VRAM is disabled while it is active.
+      </>
+    ),
+  },
+  'face_id.identity_loss_min_t': {
+    title: 'Minimum Timestep',
+    description: <>The identity anchor only applies on steps whose timestep ratio is at least this (0 to 1).</>,
+  },
+  'face_id.identity_loss_max_t': {
+    title: 'Maximum Timestep',
+    description: <>The identity anchor only applies on steps whose timestep ratio is at most this (0 to 1).</>,
+  },
+  'face_id.identity_loss_min_cos': {
+    title: 'Min Cosine Similarity',
+    description: (
+      <>
+        Floor (bias-corrected cosine) below which the loss does not push. Prevents pushing on generated
+        regions that score weakly against the reference identity (hallucinated or low-quality faces).
+      </>
+    ),
+  },
+  'datasets.identity_loss_weight': {
+    title: 'Per-Dataset Identity Loss Weight',
+    description: <>Overrides the global face-identity loss weight for this dataset only. Leave empty to inherit; 0 disables.</>,
+  },
+  'datasets.identity_loss_min_t': {
+    title: 'Per-Dataset Minimum Timestep',
+    description: <>Overrides the global identity-anchor minimum timestep for this dataset only. Leave empty to inherit.</>,
+  },
+  'datasets.identity_loss_max_t': {
+    title: 'Per-Dataset Maximum Timestep',
+    description: <>Overrides the global identity-anchor maximum timestep for this dataset only. Leave empty to inherit.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

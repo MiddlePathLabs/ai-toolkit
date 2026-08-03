@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -254,6 +254,48 @@ def preflight_body_proportion(
     return config
 
 
+def face_identity_active_for_dataset(
+    face_id_config: Optional[FaceIDConfig],
+    dataset_config,
+) -> bool:
+    """Return whether one dataset needs face-identity processing."""
+    dataset_weight = getattr(dataset_config, 'identity_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            face_id_config.identity_loss_weight if face_id_config is not None else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
+def preflight_face_id(
+    face_id_config: Optional[FaceIDConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[FaceIDConfig]:
+    """Resolve the effective face-id config. Returns None when inactive.
+
+    Like the other anchors, the live identity loss decodes x0 through the VAE
+    under gradient, so Krea 2 with ``low_vram`` true is rejected. Dep availability
+    (insightface/onnx2torch/onnxruntime-gpu) is checked at perceptor load via a
+    lazy import, not here, so a missing-dep environment still imports cleanly.
+    """
+    _dataset_id_active = any(
+        face_identity_active_for_dataset(face_id_config, dc) for dc in dataset_configs
+    )
+    config = face_id_config
+    if config is None and _dataset_id_active:
+        config = FaceIDConfig(identity_loss_weight=0.0)
+    if config is None:
+        return None
+    _id_active = config.identity_loss_weight > 0 or _dataset_id_active
+    if not _id_active:
+        return config
+    if arch == 'krea2' and low_vram:
+        raise ValueError('Face-identity loss for Krea 2 requires model.low_vram: false.')
+    return config
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -357,6 +399,16 @@ class SDTrainer(BaseSDTrainProcess):
         # Body-proportion diagnostics (flushed into loss_dict when present).
         self._last_body_proportion_loss: Optional[float] = None
         self._last_body_proportion_loss_applied: Optional[float] = None
+
+        _face_id_raw = self.get_conf('face_id', None)
+        if _face_id_raw is not None:
+            self.face_id_config: Optional[FaceIDConfig] = FaceIDConfig(**_face_id_raw)
+        else:
+            self.face_id_config = None
+        # Face-identity diagnostics (flushed into loss_dict when present).
+        self._last_identity_loss: Optional[float] = None
+        self._last_identity_loss_applied: Optional[float] = None
+        self._last_id_sim: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -1365,6 +1417,214 @@ class SDTrainer(BaseSDTrainProcess):
             self._last_body_proportion_loss = float(loss_per_sample.mean().item())
         return applied
 
+    # ------------------------------------------------------------------
+    # Face-identity anchor (ArcFace) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _face_identity_should_cache(self) -> bool:
+        cfg = self.face_id_config
+        if cfg is None:
+            return False
+        return cfg.identity_loss_weight > 0 or any(
+            face_identity_active_for_dataset(cfg, dc) for dc in self.dataset_configs
+        )
+
+    def _face_identity_loss_active(self) -> bool:
+        return self._face_identity_should_cache()
+
+    def _load_face_identity_perceptor(self):
+        """Lazily load ArcFace + the SCRFD quality-gate detector; cached on trainer.
+
+        Also computes the ArcFace bias direction: the mean embedding of 200 noise
+        images. Subtracting + renormalizing collapses ArcFace's ~0.5 cluster bias
+        for non-faces so the loss only rewards genuine identity similarity. The
+        lazy imports surface a clean ImportError if insightface/onnx2torch/
+        onnxruntime-gpu are missing.
+        """
+        if getattr(self, '_id_loss_model', None) is not None:
+            return self._id_loss_model
+        from toolkit.face_id import DifferentiableFaceEncoder
+        cfg = self.face_id_config
+        self._id_loss_model = DifferentiableFaceEncoder(
+            model_name=getattr(cfg, 'face_model', 'buffalo_l'),
+            device=self.device_torch,
+        )
+        # ArcFace bias correction direction.
+        print_acc("  Computing ArcFace bias direction from noise...")
+        with torch.no_grad():
+            noise_embeds = []
+            for _ in range(200):
+                noise_img = (torch.randn(1, 3, 112, 112, device=self.device_torch) * 0.3 + 0.5).clamp(0, 1)
+                noise_embeds.append(self._id_loss_model(noise_img))
+            self._identity_mean_embed = torch.cat(noise_embeds, dim=0).mean(dim=0).cpu()
+        # SCRFD detector for the x0 quality gate (skip generated non-face blobs).
+        try:
+            from insightface.app import FaceAnalysis
+            self._id_face_detector = FaceAnalysis(
+                name=getattr(cfg, 'face_model', 'buffalo_l'),
+                allowed_modules=['detection'],
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+            )
+            self._id_face_detector.prepare(ctx_id=0, det_size=(160, 160))
+        except Exception as e:  # noqa: BLE001 -- gate is best-effort
+            print_acc(f"  [face_id] SCRFD quality-gate detector unavailable ({e}); skipping gate")
+            self._id_face_detector = None
+        return self._id_loss_model
+
+    def _cache_face_identity_gt_pass(self):
+        from toolkit.face_id import cache_face_identity
+        cfg = self.face_id_config
+        encoder = self._load_face_identity_perceptor()
+
+        def _ds_id_active(dc):
+            return face_identity_active_for_dataset(cfg, dc)
+
+        def _cache_loader(loader):
+            if loader is None:
+                return
+            for dataset in get_dataloader_datasets(loader):
+                if not _ds_id_active(dataset.dataset_config):
+                    continue
+                cache_face_identity(dataset.file_list, cfg, encoder=encoder)
+
+        _cache_loader(self.data_loader)
+        _cache_loader(self.data_loader_reg)
+
+    def _compute_face_identity_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Run the unified live decode + ArcFace forward + bias-corrected cosine loss.
+
+        Face-identity does NOT participate in diffusion/depth loss_split; it fires
+        every step on samples in its timestep window with a cached GT embedding and
+        a detected face. The SCRFD quality gate skips generated blobs that ArcFace
+        would otherwise score spuriously. Returns the weighted-mean contribution.
+        """
+        from toolkit.face_id_loss import compute_identity_loss, bias_corrected_cosine
+
+        cfg = self.face_id_config
+        ref_emb = getattr(batch, 'identity_embedding', None)
+        if ref_emb is None:
+            return 0.0
+
+        encoder = getattr(self, '_id_loss_model', None)
+        if encoder is None:
+            encoder = self._load_face_identity_perceptor()
+        mean_emb = getattr(self, '_identity_mean_embed', None)
+        face_detector = getattr(self, '_id_face_detector', None)
+
+        num_t = self.sd.noise_scheduler.config.num_train_timesteps
+        t_ratio = (timesteps.float() / num_t)
+        is_reg = batch.get_is_reg_list()
+
+        per_ds_w = getattr(batch, 'identity_loss_weight_list', None)
+        has_per_ds = per_ds_w is not None and any(w is not None for w in per_ds_w)
+        global_w = cfg.identity_loss_weight
+        min_t_list = getattr(batch, 'identity_loss_min_t_list', None)
+        max_t_list = getattr(batch, 'identity_loss_max_t_list', None)
+        min_cos_list = getattr(batch, 'identity_loss_min_cos_list', None)
+        face_bboxes = getattr(batch, 'face_bboxes', None)
+
+        B = noise_pred.shape[0]
+        weights = []
+        valid = torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        for i in range(B):
+            w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
+            weights.append(float(w or 0.0))
+            if is_reg[i] or weights[i] <= 0.0:
+                continue
+            if ref_emb[i].abs().sum().item() == 0.0:  # no face cached for this item
+                continue
+            lo = float(min_t_list[i]) if (min_t_list and min_t_list[i] is not None) else cfg.identity_loss_min_t
+            hi = float(max_t_list[i]) if (max_t_list and max_t_list[i] is not None) else cfg.identity_loss_max_t
+            tr = float(t_ratio[i].item())
+            if not (lo <= tr <= hi):
+                continue
+            valid[i] = True
+
+        if not valid.any():
+            self._last_identity_loss = 0.0
+            return 0.0
+
+        # x0 recovery + decode (grad-enabled)
+        t_b = t_ratio.view(-1, 1, 1, 1)
+        if getattr(self.sd, 'is_flow_matching', True):
+            x0 = noisy_latents - t_b * noise_pred
+        else:
+            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )[timesteps.long()].view(-1, 1, 1, 1)
+            _sa = _ac.sqrt()
+            _s1ma = (1.0 - _ac).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0 = _sa * noisy_latents - _s1ma * noise_pred
+            else:
+                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        decoded = self.sd.decode_latents(
+            x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
+        )
+        pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        # Scale cached normalized bboxes to x0_pixels coords; None where no face.
+        _, _, px_h, px_w = pixels.shape
+        scaled_bboxes = []
+        for i in range(B):
+            if valid[i] and face_bboxes is not None and i < len(face_bboxes) and face_bboxes[i] is not None:
+                nb = face_bboxes[i]
+                # zero bbox (all zeros) means no face
+                if nb.abs().sum().item() > 0:
+                    scaled_bboxes.append([
+                        float(nb[0]) * px_w, float(nb[1]) * px_h,
+                        float(nb[2]) * px_w, float(nb[3]) * px_h,
+                    ])
+                else:
+                    scaled_bboxes.append(None)
+            else:
+                scaled_bboxes.append(None)
+
+        idx_map = [i for i in range(B) if valid[i]]
+        gen_emb, arcface_crops = encoder(pixels[idx_map], bboxes=[scaled_bboxes[i] for i in idx_map], return_crops=True)
+        ref_subset = ref_emb[idx_map].to(pixels.device, dtype=torch.float32)
+
+        # SCRFD quality gate: skip generated crops where no face is detected.
+        face_detected = torch.ones(len(idx_map), dtype=torch.bool, device=pixels.device)
+        if face_detector is not None and arcface_crops is not None:
+            import cv2 as _cv2
+            with torch.no_grad():
+                for ci in range(arcface_crops.shape[0]):
+                    crop_np = (arcface_crops[ci].clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
+                    crop_bgr = _cv2.cvtColor(crop_np, _cv2.COLOR_RGB2BGR)
+                    faces = face_detector.get(crop_bgr)
+                    if len(faces) == 0:
+                        face_detected[ci] = False
+
+        cos_sim = bias_corrected_cosine(gen_emb, ref_subset, mean_emb)
+
+        # Build the per-index mask in idx_map order.
+        ref_valid = ref_subset.abs().sum(dim=-1) > 0
+        cos_threshold = torch.tensor(
+            [float(min_cos_list[i]) if (min_cos_list and min_cos_list[i] is not None) else cfg.identity_loss_min_cos
+             for i in idx_map],
+            device=pixels.device, dtype=torch.float32,
+        )
+        loss_mask = ref_valid & (cos_sim.detach() > cos_threshold) & face_detected
+        id_weight = t_ratio[idx_map]
+
+        per_sample_loss = (1.0 - cos_sim) * id_weight * loss_mask.float()
+        w_tensor = torch.tensor(
+            [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
+        )
+        if loss_mask.any():
+            applied = (per_sample_loss * w_tensor).sum() / max(int(loss_mask.sum().item()), 1)
+            self._last_identity_loss_applied = float(applied.detach().item())
+            with torch.no_grad():
+                self._last_id_sim = float((cos_sim * loss_mask.float()).sum().item() / max(int(loss_mask.sum().item()), 1))
+                self._last_identity_loss = float(((1.0 - cos_sim) * loss_mask.float()).sum().item() / max(int(loss_mask.sum().item()), 1))
+            return applied
+        self._last_identity_loss = 0.0
+        return 0.0
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -1401,6 +1661,15 @@ class SDTrainer(BaseSDTrainProcess):
         )
         if self._body_proportion_should_cache():
             self._cache_body_proportion_gt_pass()
+        # Face-identity preflight + GT caching pass. Fully inert when inactive;
+        # the lazy import raises a clean ImportError if deps are missing.
+        self.face_id_config = preflight_face_id(
+            self.face_id_config, self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
+        if self._face_identity_should_cache():
+            self._cache_face_identity_gt_pass()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -1671,6 +1940,12 @@ class SDTrainer(BaseSDTrainProcess):
         _body_proportion_active = (
             self._body_proportion_loss_active()
             and getattr(batch, 'body_proportion_gt', None) is not None
+            and len(noise_pred.shape) == 4
+        )
+        # Face-identity gate. Independent of the other anchors.
+        _face_identity_active = (
+            self._face_identity_loss_active()
+            and getattr(batch, 'identity_embedding', None) is not None
             and len(noise_pred.shape) == 4
         )
 
@@ -2229,6 +2504,13 @@ class SDTrainer(BaseSDTrainProcess):
         # Body-proportion loss: fires on its own timestep-window samples.
         if _body_proportion_active:
             loss = loss + self._compute_body_proportion_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch,
+            )
+
+        # Face-identity loss: fires on its own timestep-window samples with a
+        # cached GT embedding and a detected face (SCRFD quality gate).
+        if _face_identity_active:
+            loss = loss + self._compute_face_identity_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch,
             )
 
@@ -3662,6 +3944,9 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_normal_cos',
             '_last_body_proportion_loss',
             '_last_body_proportion_loss_applied',
+            '_last_identity_loss',
+            '_last_identity_loss_applied',
+            '_last_id_sim',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:
