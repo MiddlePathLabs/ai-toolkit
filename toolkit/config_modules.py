@@ -548,6 +548,20 @@ class TrainConfig:
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
 
+        # Depth-anchor loss split. Three serialized states, distinguished by
+        # _loss_split_explicit so absent != explicit null:
+        #   key absent        -> Auto (autodetect from depth weight)
+        #   explicit None     -> force off (diffusion + depth sum every step)
+        #   'diffusion_depth' -> force alternation across optimizer steps
+        self._loss_split_explicit: bool = 'loss_split' in kwargs
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split != 'diffusion_depth':
+            raise ValueError(
+                f"Unknown train.loss_split value: {self.loss_split!r}. "
+                "Allowed: omit the key for Auto, explicit null for off, or "
+                "'diffusion_depth' for alternation."
+            )
+
         # per-image adaptive LR: tracks each dataset item's loss trend across epochs and throttles
         # images that stay hard without improving (likely a bad/mislabeled caption), while giving
         # a small boost to consistently healthy ones. Model- and network-agnostic (works for every
@@ -884,6 +898,53 @@ class EMAConfig:
         self.param_multiplier: float = kwargs.get('param_multiplier', 1.0)
 
 
+class DepthConsistencyConfig:
+    """Depth-consistency auxiliary loss via a frozen Depth-Anything-V2 perceptor.
+
+    Process-level config (read through ``self.get_conf('depth_consistency')``),
+    not a TrainConfig field. There is no ``enabled`` flag: enable by setting
+    ``loss_weight > 0`` (the UI uses 0.001), disable with ``loss_weight == 0``.
+    Safe defaults ship disabled and unmasked so a partially supplied external
+    object stays inert until explicitly enabled. Depth-Anything-V2 HF weights
+    are CC-BY-NC-4.0; the perceptor downloads lazily only when depth is enabled.
+    """
+
+    def __init__(self, **kwargs):
+        self.loss_weight: float = float(kwargs.get('loss_weight', 0.0))
+        self.loss_min_t: float = float(kwargs.get('loss_min_t', 0.0))
+        self.loss_max_t: float = float(kwargs.get('loss_max_t', 1.0))
+        self.model_id: str = kwargs.get(
+            'model_id', 'depth-anything/Depth-Anything-V2-Small-hf'
+        )
+        self.input_size: int = int(kwargs.get('input_size', 518))
+        self.pixel_blur_sigma: float = float(kwargs.get('pixel_blur_sigma', 0.0))
+        self.ssi_weight: float = float(kwargs.get('ssi_weight', 1.0))
+        self.grad_weight: float = float(kwargs.get('grad_weight', 0.5))
+        self.grad_scales: int = int(kwargs.get('grad_scales', 4))
+        self.mask_source: str = kwargs.get('mask_source', 'none')
+        self.grad_checkpoint: bool = bool(kwargs.get('grad_checkpoint', True))
+        self.preview_every: int = int(kwargs.get('preview_every', 100))
+        self.preview_only: bool = bool(kwargs.get('preview_only', False))
+        self.preview_max_keep: int = int(kwargs.get('preview_max_keep', 500))
+
+        if self.loss_min_t < 0.0:
+            raise ValueError(f"loss_min_t must be >= 0, got {self.loss_min_t}")
+        if self.loss_max_t > 1.0:
+            raise ValueError(f"loss_max_t must be <= 1, got {self.loss_max_t}")
+        if self.loss_min_t > self.loss_max_t:
+            raise ValueError(
+                f"loss_min_t ({self.loss_min_t}) must be <= "
+                f"loss_max_t ({self.loss_max_t})"
+            )
+        if self.input_size <= 0:
+            raise ValueError(f"input_size must be > 0, got {self.input_size}")
+        if self.mask_source not in ('none', 'subject', 'body'):
+            raise ValueError(
+                f"Unknown mask_source {self.mask_source!r}. "
+                "Allowed: 'none', 'subject', 'body'."
+            )
+
+
 class ReferenceDatasetConfig:
     def __init__(self, **kwargs):
         # can pass with a side by side pait or a folder with pos and neg folder
@@ -1088,6 +1149,23 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+
+        # Depth-anchor per-dataset overrides. None means inherit the global
+        # depth_consistency / train.loss_split setting.
+        self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
+        self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
+        self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
+        # Per-dataset loss-split mode for this dataset's samples:
+        #   None              -> inherit global train.loss_split
+        #   'diffusion_depth' -> force alternation for this dataset
+        #   'sum'             -> force off for this dataset (sum every step)
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth', 'sum'):
+            raise ValueError(
+                f"Unknown dataset loss_split value: {self.loss_split!r}. "
+                "Allowed: None (inherit), 'diffusion_depth' (force on), "
+                "'sum' (force off)."
+            )
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
