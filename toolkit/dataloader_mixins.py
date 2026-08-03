@@ -12,6 +12,7 @@ import traceback
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -802,6 +803,10 @@ class ImageProcessingDTOMixin:
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
             self.load_prompt_embedding()
+        # DepthConsistency GT: lazy read in the worker. No-op unless depth is
+        # cached; sits above the latent/video early returns so every path is covered.
+        if self.is_depth_cached:
+            self.get_depth_gt()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1777,6 +1782,55 @@ class LatentCachingFileItemDTOMixin:
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
         return self._encoded_latent
+
+
+class DepthCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        # if we have super, call it
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # The up-front caching pass records the cache path + safetensors key
+        # here WITHOUT reading the tensor; the heavy per-file read is deferred
+        # to get_depth_gt(), called from load_and_process_image() in the worker.
+        self.depth_gt: Union[torch.Tensor, None] = None
+        self.is_depth_cached = False
+        self._depth_cache_path: Union[str, None] = None
+        self._depth_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_depth_key(cache_path, key):
+        # Read a single tensor by key without loading the rest of the file.
+        # Returns None on a missing key, unreadable/corrupt header, or a
+        # non-finite/empty tensor so a corrupt cache never silently feeds
+        # garbage through training.
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key not in f.keys():
+                    return None
+                tensor = f.get_tensor(key)
+        except Exception:  # noqa: BLE001 — corrupt/unreadable cache -> miss
+            return None
+        if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
+            return None
+        return tensor
+
+    def get_depth_gt(self: 'FileItemDTO'):
+        # Lazily load this item's cached GT depth map; held on self.depth_gt
+        # until cleanup_depth() releases it between batches.
+        if not self.is_depth_cached:
+            return self.depth_gt
+        if self.depth_gt is None:
+            self.depth_gt = self._read_depth_key(self._depth_cache_path, self._depth_cache_key)
+        return self.depth_gt
+
+    def cleanup_depth(self: 'FileItemDTO'):
+        # Release the resident map between batches; re-read on next access.
+        # Cache metadata (path/key) is left intact so the next epoch re-reads
+        # from the same file.
+        if self.is_depth_cached:
+            self.depth_gt = None
 
 
 class LatentCachingMixin:
