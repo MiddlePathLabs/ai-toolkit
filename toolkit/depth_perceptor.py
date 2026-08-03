@@ -13,8 +13,9 @@ destabilized by the perceptor / caching implementation. The fingerprint and
 safetensors-key helpers are imported from there.
 
 The scale-and-shift-invariant / multi-scale-gradient loss math
-(compute_depth_consistency_loss) and the live decode dispatch belong to the
-depth loss block (Task 5b) and are not ported here.
+(compute_depth_consistency_loss) and the preview renderer live in
+``toolkit.depth_loss`` (Task 5b); the live decode dispatch is wired into
+``SDTrainer.calculate_loss``.
 """
 from __future__ import annotations
 
