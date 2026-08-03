@@ -46,8 +46,13 @@ class Timer:
         if not is_ui:
             print(f"\nTimer '{self.name}':")
         timing_dict = {}
+        # skip buckets that were started but never recorded (e.g. cancelled
+        # when an OOM-skipped step raises out of a `with timer(...)` block);
+        # dividing by len(timings) == 0 would otherwise turn a recovered OOM
+        # into a ZeroDivisionError.
+        recorded = [(name, timings) for name, timings in self.timers.items() if len(timings) > 0]
         # sort by longest at top
-        for timer_name, timings in sorted(self.timers.items(), key=lambda x: sum(x[1]), reverse=True):
+        for timer_name, timings in sorted(recorded, key=lambda x: sum(x[1]), reverse=True):
             avg_time = sum(timings) / len(timings)
             
             if not is_ui:
