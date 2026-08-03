@@ -121,6 +121,12 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         if not self.full_rank:
             torch.nn.init.zeros_(self.lora_up.weight)
 
+        self.lora_down.weight._is_lora = True
+        if hasattr(self.lora_up, 'weight'):
+            self.lora_up.weight._is_lora = True
+        if getattr(self.lora_up, 'bias', None) is not None:
+            self.lora_up.bias._is_lora = True
+
         self.multiplier: Union[float, List[float]] = multiplier
         # wrap the original module so it doesn't get weights updated
         self.org_module = [org_module]
@@ -720,6 +726,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+        for adapter in self.text_encoder_loras + self.unet_loras:
+            for parameter in adapter.parameters():
+                parameter._is_lora = True
 
         if self.full_train_in_out:
             print("full train in out")
