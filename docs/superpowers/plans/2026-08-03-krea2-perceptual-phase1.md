@@ -25,8 +25,8 @@
 - [x] Phase 0 direct Krea decode-gradient evidence recorded.
 - [x] Backend configuration, tagging, injectors, ordering, metrics, and tests committed in `c97cbd9`.
 - [x] TypeScript types, defaults, migration, controls, docs, and UI build committed in `4a248d2`.
-- [x] Final focused Python, UI build, and scope verification completed.
-- [ ] Full end-to-end Krea training-step smoke remains a later Phase 2 acceptance check.
+- [x] Final focused Python, typed UI build, SQLite migration round trip, and scope verification completed.
+- [x] Matched 50-step Krea baseline and relative-weight-noising jobs completed; see `docs/superpowers/evidence/2026-08-03-krea2-phase1-noising-smoke.md`.
 
 ---
 
