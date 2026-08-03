@@ -13,6 +13,7 @@ from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
     LatentCachingFileItemDTOMixin,
+    DepthCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -44,6 +45,7 @@ def print_once(msg):
 
 class FileItemDTO(
     LatentCachingFileItemDTOMixin,
+    DepthCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -186,6 +188,12 @@ class FileItemDTO(
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 
+        # depth-anchor per-dataset overrides (None = inherit global)
+        self.depth_loss_weight: Union[float, None] = self.dataset_config.depth_loss_weight
+        self.depth_loss_min_t: Union[float, None] = self.dataset_config.depth_loss_min_t
+        self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
+        self.loss_split: Union[str, None] = self.dataset_config.loss_split
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -198,6 +206,7 @@ class FileItemDTO(
         self.audio_data = None
         self.audio_tensor = None
         self.cleanup_latent()
+        self.cleanup_depth()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -376,6 +385,27 @@ class DataLoaderBatchDTO:
             self.loss_multiplier_list: List[float] = [
                 x.loss_multiplier for x in self.file_items
             ]
+
+            # depth-anchor per-dataset scalars (None = inherit global)
+            self.depth_loss_weight_list: List[Union[float, None]] = [
+                x.depth_loss_weight for x in self.file_items
+            ]
+            self.depth_loss_min_t_list: List[Union[float, None]] = [
+                x.depth_loss_min_t for x in self.file_items
+            ]
+            self.depth_loss_max_t_list: List[Union[float, None]] = [
+                x.depth_loss_max_t for x in self.file_items
+            ]
+            self.loss_split_list: List[Union[str, None]] = [
+                x.loss_split for x in self.file_items
+            ]
+
+            # collect GT depth maps (variable per-image shape — kept as a list);
+            # only assigned when at least one item has a cached map.
+            if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
+                self.depth_gt_list: Union[List, None] = [
+                    getattr(x, 'depth_gt', None) for x in self.file_items
+                ]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base
