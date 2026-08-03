@@ -29,8 +29,9 @@ const contentTypeMap: { [key: string]: string } = {
   '.ogg': 'audio/ogg',
 };
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string } }) {
-  const { imagePath } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ imagePath: string[] }> }) {
+  const { imagePath: imagePathSegments } = await params;
+  const imagePath = imagePathSegments.join('/');
   try {
     // Decode the path
     const filepath = decodeURIComponent(imagePath);

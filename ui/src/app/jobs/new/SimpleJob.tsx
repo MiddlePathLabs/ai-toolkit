@@ -747,7 +747,7 @@ export default function SimpleJob({
                   <NumberInput
                     label="Adaptive LR Warmup (windows)"
                     className="pt-2"
-                    value={jobConfig.config.process[0].train.per_image_adaptive_lr_warmup_windows}
+                    value={jobConfig.config.process[0].train.per_image_adaptive_lr_warmup_windows ?? null}
                     docKey={'train.per_image_adaptive_lr_warmup_windows'}
                     onChange={value => setJobConfig(value, 'config.process[0].train.per_image_adaptive_lr_warmup_windows')}
                     placeholder="eg. 2"

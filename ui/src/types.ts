@@ -159,6 +159,10 @@ export interface TrainConfig {
   content_or_style: string;
   optimizer: string;
   lr: number;
+  per_image_adaptive_lr?: boolean;
+  per_image_adaptive_lr_stats_only?: boolean;
+  per_image_adaptive_lr_window_steps?: number | null;
+  per_image_adaptive_lr_warmup_windows?: number | null;
   ema_config?: EMAConfig;
   weight_noise?: WeightNoiseConfig;
   gradient_noise?: GradientNoiseConfig;
