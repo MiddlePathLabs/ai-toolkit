@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -78,6 +78,19 @@ export const defaultBodyProportionConfig: BodyProportionConfig = {
   loss_min_t: 0,
   loss_max_t: 1,
   include_head: false,
+};
+
+// Safe disabled defaults for the process-level face-identity anchor. Enable =
+// set identity_loss_weight > 0; disable = 0. No `enabled` field. The ArcFace
+// model (InsightFace buffalo_l) downloads lazily on first enable. Requires the
+// manual dep install documented in requirements_perceptual.txt.
+export const defaultFaceIDConfig: FaceIDConfig = {
+  identity_loss_weight: 0,
+  identity_loss_min_t: 0,
+  identity_loss_max_t: 1,
+  identity_loss_min_cos: 0.2,
+  face_model: 'buffalo_l',
+  identity_loss_decoded_det_threshold: 0.5,
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -178,6 +191,7 @@ export const defaultJobConfig: JobConfig = {
         depth_consistency: { ...defaultDepthConsistencyConfig },
         normal_id: { ...defaultNormalIDConfig },
         body_proportion: { ...defaultBodyProportionConfig },
+        face_id: { ...defaultFaceIDConfig },
       },
     ],
   },
@@ -243,6 +257,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].body_proportion = {
     ...defaultBodyProportionConfig,
     ...(jobConfig.config.process[0].body_proportion ?? {}),
+  };
+  // Merge a complete disabled face-identity object into any partial saved object.
+  jobConfig.config.process[0].face_id = {
+    ...defaultFaceIDConfig,
+    ...(jobConfig.config.process[0].face_id ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';

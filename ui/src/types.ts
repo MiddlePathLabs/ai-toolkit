@@ -124,6 +124,11 @@ export interface DatasetConfig {
   body_proportion_loss_weight?: number;
   body_proportion_loss_min_t?: number;
   body_proportion_loss_max_t?: number;
+  // Per-dataset face-identity overrides; undefined means inherit the global face_id config.
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
 }
 
 export interface EMAConfig {
@@ -181,6 +186,15 @@ export interface BodyProportionConfig {
   loss_min_t: number;
   loss_max_t: number;
   include_head: boolean;
+}
+
+export interface FaceIDConfig {
+  identity_loss_weight: number;
+  identity_loss_min_t: number;
+  identity_loss_max_t: number;
+  identity_loss_min_cos: number;
+  face_model: string;
+  identity_loss_decoded_det_threshold: number;
 }
 
 export interface ValidationItem {
@@ -337,6 +351,8 @@ export interface ProcessConfig {
   normal_id?: NormalIDConfig;
   // Process-level (not TrainConfig): consumed via get_conf('body_proportion').
   body_proportion?: BodyProportionConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('face_id').
+  face_id?: FaceIDConfig;
 }
 
 export interface ConfigObject {

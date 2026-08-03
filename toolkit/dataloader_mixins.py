@@ -825,6 +825,9 @@ class ImageProcessingDTOMixin:
         # BodyProportion GT: lazy read in the worker. No-op unless cached.
         if self.is_body_proportion_cached:
             self.get_body_proportion_gt()
+        # FaceIdentity GT: lazy read in the worker. No-op unless cached.
+        if self.is_face_identity_cached:
+            self.get_face_identity_gt()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1939,6 +1942,52 @@ class BodyProportionCachingFileItemDTOMixin:
     def cleanup_body_proportion(self: 'FileItemDTO'):
         if self.is_body_proportion_cached:
             self.body_proportion_gt = None
+
+
+class FaceIdentityCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # Cached GT ArcFace identity embedding (512,) + face bbox (4,) in
+        # original-image coords. Set lazily in the worker.
+        self.identity_embedding: Union[torch.Tensor, None] = None
+        self.face_bbox: Union[torch.Tensor, None] = None
+        self.is_face_identity_cached = False
+        self._face_cache_path: Union[str, None] = None
+        self._face_cache_key: Union[str, None] = None
+        self._face_bbox_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_face_key(cache_path, key):
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key not in f.keys():
+                    return None
+                tensor = f.get_tensor(key)
+        except Exception:  # noqa: BLE001
+            return None
+        if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
+            return None
+        return tensor
+
+    def get_face_identity_gt(self: 'FileItemDTO'):
+        if not self.is_face_identity_cached:
+            return self.identity_embedding
+        if self.identity_embedding is None:
+            self.identity_embedding = self._read_face_key(
+                self._face_cache_path, self._face_cache_key
+            )
+            self.face_bbox = self._read_face_key(
+                self._face_cache_path, self._face_bbox_key
+            )
+        return self.identity_embedding
+
+    def cleanup_face_identity(self: 'FileItemDTO'):
+        if self.is_face_identity_cached:
+            self.identity_embedding = None
+            self.face_bbox = None
 
 
 class LatentCachingMixin:

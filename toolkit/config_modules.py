@@ -1006,6 +1006,45 @@ class BodyProportionConfig:
             )
 
 
+class FaceIDConfig:
+    """Face-IDENTITY auxiliary loss via a frozen ArcFace (w600k_r50) perceptor.
+
+    Process-level config (read through ``self.get_conf('face_id')``), not a
+    TrainConfig field. Enable by setting ``identity_loss_weight > 0``; disable
+    with ``identity_loss_weight == 0``. This fork ports ONLY the identity loss
+    from the source FaceIDConfig -- face-token conditioning, landmark loss, and
+    face suppression are excluded. The ArcFace model downloads lazily (InsightFace
+    buffalo_l pack) only when identity loss is enabled. Requires the manual dep
+    install documented in requirements_perceptual.txt (insightface + onnx2torch +
+    onnxruntime-gpu with the CPU-shadowing fix). Does NOT participate in
+    diffusion/depth ``loss_split``.
+    """
+
+    def __init__(self, **kwargs):
+        self.identity_loss_weight: float = float(kwargs.get('identity_loss_weight', 0.0))
+        self.identity_loss_min_t: float = float(kwargs.get('identity_loss_min_t', 0.0))
+        self.identity_loss_max_t: float = float(kwargs.get('identity_loss_max_t', 1.0))
+        # Floor below which the loss does not push (prevents pushing on
+        # hallucinated faces). Bias-corrected cosine space.
+        self.identity_loss_min_cos: float = float(kwargs.get('identity_loss_min_cos', 0.2))
+        self.face_model: str = kwargs.get('face_model', 'buffalo_l')
+        # SCRFD x0 quality gate: skip generated crops whose detection score
+        # falls below this (the generated region doesn't look like a face).
+        self.identity_loss_decoded_det_threshold: float = float(
+            kwargs.get('identity_loss_decoded_det_threshold', 0.5)
+        )
+
+        if self.identity_loss_min_t < 0.0:
+            raise ValueError(f"identity_loss_min_t must be >= 0, got {self.identity_loss_min_t}")
+        if self.identity_loss_max_t > 1.0:
+            raise ValueError(f"identity_loss_max_t must be <= 1, got {self.identity_loss_max_t}")
+        if self.identity_loss_min_t > self.identity_loss_max_t:
+            raise ValueError(
+                f"identity_loss_min_t ({self.identity_loss_min_t}) must be <= "
+                f"identity_loss_max_t ({self.identity_loss_max_t})"
+            )
+
+
 class ReferenceDatasetConfig:
     def __init__(self, **kwargs):
         # can pass with a side by side pait or a folder with pos and neg folder
@@ -1232,6 +1271,12 @@ class DatasetConfig:
         self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
         self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
         self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)
+
+        # Face-identity per-dataset overrides. None means inherit the global face_id setting.
+        self.identity_loss_weight: Union[float, None] = kwargs.get('identity_loss_weight', None)
+        self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
+        self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
+        self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

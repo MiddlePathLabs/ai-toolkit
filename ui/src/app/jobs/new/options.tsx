@@ -39,7 +39,8 @@ type AdditionalSections =
   | 'ideogram_4_prompt'
   | 'depth_consistency'
   | 'normal_id'
-  | 'body_proportion';
+  | 'body_proportion'
+  | 'face_id';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1173,6 +1174,7 @@ export const modelArchs: ModelArch[] = [
       'depth_consistency',
       'normal_id',
       'body_proportion',
+      'face_id',
     ],
   },
   {
@@ -1209,6 +1211,7 @@ export const modelArchs: ModelArch[] = [
       'depth_consistency',
       'normal_id',
       'body_proportion',
+      'face_id',
     ],
   },
   {
@@ -1251,6 +1254,7 @@ export const modelArchs: ModelArch[] = [
       'depth_consistency',
       'normal_id',
       'body_proportion',
+      'face_id',
     ],
   },
   {
@@ -1300,6 +1304,7 @@ export const modelArchs: ModelArch[] = [
       'depth_consistency',
       'normal_id',
       'body_proportion',
+      'face_id',
     ],
   },
   {
