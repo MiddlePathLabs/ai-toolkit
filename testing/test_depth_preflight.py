@@ -76,42 +76,41 @@ def test_dataset_only_activation_with_global_disabled_runs_preflight():
 
 def test_random_crop_rejected_when_global_depth_active():
     cfg = DepthConsistencyConfig(loss_weight=0.001)
-    datasets = [_ds(depth_loss_weight=0.5, random_crop=True)]
+    datasets = [_ds(random_crop=True)]
     with pytest.raises(ValueError, match="random_crop"):
         preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
 
 
 def test_random_scale_rejected_when_global_depth_active():
     cfg = DepthConsistencyConfig(loss_weight=0.001)
-    datasets = [_ds(depth_loss_weight=0.5, random_scale=True)]
+    datasets = [_ds(random_scale=True)]
     with pytest.raises(ValueError, match="random_scale"):
         preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
 
 
 def test_augments_rejected_when_global_depth_active():
     cfg = DepthConsistencyConfig(loss_weight=0.001)
-    datasets = [_ds(depth_loss_weight=0.5, augments=['blur', 'noise'])]
+    datasets = [_ds(augments=['blur', 'noise'])]
     with pytest.raises(ValueError, match="augments"):
         preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
 
 
-def test_non_depth_dataset_not_rejected_when_depth_active():
-    # A non-depth dataset (depth_loss_weight unset) must NOT trigger preflight
-    # even when global depth is on; it has no GT depth cache to desync.
+def test_explicit_zero_override_is_inactive_when_global_depth_is_active():
+    # An explicit zero overrides the positive process weight, so this dataset
+    # does not receive depth GT or loss and its random transform is irrelevant.
     cfg = DepthConsistencyConfig(loss_weight=0.001)
-    datasets = [_ds(), _ds(random_scale=True)]
+    datasets = [_ds(depth_loss_weight=0.0, random_scale=True)]
     result = preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
     assert result is cfg
 
 
 def test_mixed_depth_and_non_depth_datasets_allowed():
-    # Inverse coverage: a clean depth-active dataset plus a separate non-depth
-    # dataset using augments/random_scale is a legitimate mixed config and must
-    # NOT raise (the non-depth dataset has no GT depth cache to desync).
+    # A clean inherited depth-active dataset plus a dataset that explicitly
+    # overrides the weight to zero may use non-deterministic transforms.
     cfg = DepthConsistencyConfig(loss_weight=0.001)
     datasets = [
-        _ds(depth_loss_weight=0.5, resolution=512),
-        _ds(augments=['blur'], random_scale=True),
+        _ds(resolution=512),
+        _ds(depth_loss_weight=0.0, augments=['blur'], random_scale=True),
     ]
     result = preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
     assert result is cfg
@@ -136,10 +135,10 @@ def test_fixed_bucket_transforms_and_flips_allowed():
 
 
 def test_preview_only_activates_preflight():
-    # preview_only with loss_weight=0 still activates depth -> preflight runs
-    # and rejects random_crop on a depth-active dataset.
+    # preview_only applies to inherited datasets even with zero loss weight,
+    # because their GT depth still has to match the training transform.
     cfg = DepthConsistencyConfig(loss_weight=0.0, preview_only=True)
-    datasets = [_ds(depth_loss_weight=0.5, random_crop=True)]
+    datasets = [_ds(random_crop=True)]
     with pytest.raises(ValueError, match="random_crop"):
         preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
 

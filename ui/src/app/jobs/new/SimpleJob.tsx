@@ -33,6 +33,11 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import {
+  depthModelOptions,
+  getDepthToggleUpdates,
+  isLowVramLocked,
+} from './depthUiPolicy';
 
 type Props = {
   jobConfig: JobConfig;
@@ -420,6 +425,7 @@ export default function SimpleJob({
                   label="Low VRAM"
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
+                  disabled={isLowVramLocked(depthEnabled)}
                 />
               </FormGroup>
             )}
@@ -1299,13 +1305,11 @@ export default function SimpleJob({
                     className="pt-1"
                     checked={depthEnabled}
                     onChange={checked => {
-                      setJobConfig(
-                        checked ? 0.001 : 0,
-                        'config.process[0].depth_consistency.loss_weight',
-                      );
-                      // low_vram interlock: depth + Krea low_vram raises in the backend. Force it off
-                      // while depth is active; re-enable it (Krea preset default) when depth is disabled.
-                      setJobConfig(checked ? false : true, 'config.process[0].model.low_vram');
+                      const updates = getDepthToggleUpdates(checked);
+                      setJobConfig(updates.lossWeight, 'config.process[0].depth_consistency.loss_weight');
+                      if (updates.lowVram !== undefined) {
+                        setJobConfig(updates.lowVram, 'config.process[0].model.low_vram');
+                      }
                     }}
                   />
                   {depthEnabled && (
@@ -1329,16 +1333,7 @@ export default function SimpleJob({
                         onChange={value =>
                           setJobConfig(value, 'config.process[0].depth_consistency.model_id')
                         }
-                        options={[
-                          {
-                            value: 'depth-anything/Depth-Anything-V2-Large-hf',
-                            label: 'Depth Anything V2 Large',
-                          },
-                          {
-                            value: 'depth-anything/Depth-Anything-V2-Small-hf',
-                            label: 'Depth Anything V2 Small',
-                          },
-                        ]}
+                        options={depthModelOptions}
                       />
                       <div className="text-xs text-gray-500 pt-1">
                         Depth Anything V2 weights are CC-BY-NC-4.0.{' '}
@@ -1509,7 +1504,8 @@ export default function SimpleJob({
                     <FormGroup label="Notes">
                       <div className="text-xs text-gray-400">
                         Depth requires <code>model.low_vram: false</code>. Low VRAM was disabled when you enabled depth
-                        (the trainer refuses to start otherwise) and will be re-enabled when you disable depth.
+                        and remains locked while depth is active. After disabling depth, choose Low VRAM explicitly if
+                        you want to turn it back on.
                       </div>
                       {jobConfig.config.process[0].model.low_vram && (
                         <div className="text-xs text-yellow-500">

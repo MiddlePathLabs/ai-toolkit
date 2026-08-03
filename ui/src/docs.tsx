@@ -579,9 +579,9 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Preview Only',
     description: (
       <>
-        Loads the perceptor and writes previews, but never adds the anchor loss. Useful for inspection. In Phase 2
-        preview-only is best-effort: depth tiles render only on steps where the anchor loss is active (i.e.
-        loss_weight &gt; 0 within the timestep window).
+        Loads the perceptor and writes previews, but never adds the anchor loss or suppresses diffusion. Useful for
+        inspection. Preview evaluation runs without autograd and only at the configured Preview Every cadence within
+        the timestep window.
       </>
     ),
   },

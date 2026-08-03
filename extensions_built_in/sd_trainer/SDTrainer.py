@@ -48,6 +48,30 @@ adapter_transforms = transforms.Compose([
 ])
 
 
+def depth_active_for_dataset(
+    depth_consistency_config: Optional[DepthConsistencyConfig],
+    dataset_config,
+) -> bool:
+    """Return whether one dataset needs Phase 2 depth processing.
+
+    A dataset override wins when present; otherwise it inherits the process
+    loss weight. ``preview_only`` is process-wide and still needs matched GT
+    depth for every dataset even though it contributes no anchor loss.
+    """
+    if depth_consistency_config is not None and bool(
+        getattr(depth_consistency_config, 'preview_only', False)
+    ):
+        return True
+    dataset_weight = getattr(dataset_config, 'depth_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            depth_consistency_config.loss_weight
+            if depth_consistency_config is not None
+            else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
 def preflight_depth_consistency(
     depth_consistency_config: Optional[DepthConsistencyConfig],
     dataset_configs: List,
@@ -74,7 +98,7 @@ def preflight_depth_consistency(
     Inert when depth is not configured and no dataset is depth-active.
     """
     _dataset_depth_active = any(
-        (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+        depth_active_for_dataset(depth_consistency_config, dc)
         for dc in dataset_configs
     )
 
@@ -102,7 +126,7 @@ def preflight_depth_consistency(
         )
 
     for dc in dataset_configs:
-        if (getattr(dc, 'depth_loss_weight', None) or 0) <= 0:
+        if not depth_active_for_dataset(config, dc):
             continue
         if getattr(dc, 'random_crop', False) or getattr(dc, 'random_scale', False):
             raise ValueError(
@@ -390,7 +414,7 @@ class SDTrainer(BaseSDTrainProcess):
         if cfg is None:
             return False
         ds_depth = any(
-            (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+            depth_active_for_dataset(cfg, dc)
             for dc in self.dataset_configs
         )
         return (
@@ -476,12 +500,8 @@ class SDTrainer(BaseSDTrainProcess):
         arch = self.sd.model_config.arch
         vae_id = self._depth_vae_id()
         encoder = self._load_depth_perceptor()
-        global_active = cfg.loss_weight > 0 or bool(getattr(cfg, 'preview_only', False))
-
         def _ds_depth_active(dc):
-            if global_active:
-                return True
-            return (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+            return depth_active_for_dataset(cfg, dc)
 
         def _cache_loader(loader):
             if loader is None:
@@ -519,7 +539,7 @@ class SDTrainer(BaseSDTrainProcess):
         if cfg.loss_weight > 0 or bool(getattr(cfg, 'preview_only', False)):
             return True
         return any(
-            (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+            depth_active_for_dataset(cfg, dc)
             for dc in self.dataset_configs
         )
 
@@ -536,6 +556,8 @@ class SDTrainer(BaseSDTrainProcess):
             prior-preservation (reg) sample.
           * ``depth_objective``-- ``in_band & (eff_weight > 0)``: the samples
             that contribute a depth gradient this step.
+          * ``preview_objective`` -- in-band samples processed without grad on
+            preview cadence when ``preview_only`` is enabled.
           * ``diffusion_zero`` -- alternating samples on a depth step (these
             drop out of the diffusion loss so the two objectives alternate).
           * ``step_is_diffusion`` -- python bool (preview cadence is handled by
@@ -610,7 +632,12 @@ class SDTrainer(BaseSDTrainProcess):
             split_mask = loss_split_diff_depth.to(self.device_torch, dtype=eff_w.dtype)
             eff_w = eff_w * (1.0 - split_mask)
 
-        depth_objective = in_band & (eff_w > 0)
+        preview_only = bool(getattr(cfg, 'preview_only', False))
+        preview_enabled = preview_only and int(getattr(cfg, 'preview_every', 0) or 0) > 0
+        preview_objective = (
+            in_band.clone() if preview_enabled else torch.zeros_like(in_band)
+        )
+        depth_objective = in_band & (eff_w > 0) & (not preview_only)
         # Mirrors the depth gate from the other side: alternating samples skip
         # diffusion on depth steps so the two objectives trade places. Gated on
         # depth_objective so a sample never drops diffusion without gaining
@@ -622,6 +649,7 @@ class SDTrainer(BaseSDTrainProcess):
             'eff_weight': eff_w,
             'in_band': in_band,
             'depth_objective': depth_objective,
+            'preview_objective': preview_objective,
             'diffusion_zero': diffusion_zero,
             'step_is_diffusion': step_is_diffusion,
         }
@@ -701,50 +729,56 @@ class SDTrainer(BaseSDTrainProcess):
         if encoder is None:
             encoder = self._load_depth_perceptor()
         depth_objective = gates['depth_objective']
+        preview_objective = gates.get(
+            'preview_objective', torch.zeros_like(depth_objective)
+        )
+        process_objective = depth_objective | preview_objective
+        preview_only = bool(getattr(cfg, 'preview_only', False))
         t = gates['t']
         eff_w = gates['eff_weight']
 
         processed = []
-        if not depth_objective.any():
+        if not process_objective.any():
             self._last_depth_processed_indices = processed
             self._last_depth_consistency_loss = 0.0
             return 0.0
 
-        # Advance the DEPTH-step counter only on steps where depth actually
-        # runs (past the early-return above). Preview cadence keys off this, not
-        # raw step parity, so an even preview_every no longer aligns exclusively
-        # with diffusion steps.
+        # Advance the processing-step counter after the objective gate. Normal
+        # training counts depth steps; preview-only counts eligible preview
+        # evaluation steps. Both avoid raw parity collisions.
         self._depth_step_count += 1
+        preview_due = self._depth_preview_due(cfg)
+        if preview_only and not preview_due:
+            self._last_depth_processed_indices = processed
+            self._last_depth_consistency_loss = 0.0
+            return 0.0
 
-        # x0 recovery. Flow-matching (Krea): x0 = noisy - t * noise_pred. The
-        # epsilon/v branches are kept for completeness but are not the Phase 2
-        # path.
-        t_b = t.view(-1, 1, 1, 1)
-        if getattr(self.sd, 'is_flow_matching', True):
-            x0 = noisy_latents - t_b * noise_pred
-        else:
-            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
-                device=timesteps.device, dtype=noisy_latents.dtype
-            )[timesteps.long()].view(-1, 1, 1, 1)
-            _sa = _ac.sqrt()
-            _s1ma = (1.0 - _ac).sqrt()
-            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
-                x0 = _sa * noisy_latents - _s1ma * noise_pred
+        # Preview-only evaluates the decode and perceptor without constructing
+        # an autograd graph. Normal depth anchoring keeps the full graph.
+        with torch.set_grad_enabled(not preview_only):
+            # x0 recovery. Flow-matching (Krea): x0 = noisy - t * noise_pred.
+            t_b = t.view(-1, 1, 1, 1)
+            if getattr(self.sd, 'is_flow_matching', True):
+                x0 = noisy_latents - t_b * noise_pred
             else:
-                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+                _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                    device=timesteps.device, dtype=noisy_latents.dtype
+                )[timesteps.long()].view(-1, 1, 1, 1)
+                _sa = _ac.sqrt()
+                _s1ma = (1.0 - _ac).sqrt()
+                if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                    x0 = _sa * noisy_latents - _s1ma * noise_pred
+                else:
+                    x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
 
-        # Unified live decode (no arch branch). Every target model implements
-        # decode_latents and handles its own scaling/shift + frame dim; Phase 0
-        # proved gradients survive for Krea. Residency guard is a no-op when the
-        # VAE is already on the training device (it can be CPU when latents are
-        # cached to disk).
-        if next(self.sd.vae.parameters()).device != self.device_torch:
-            self.sd.vae.to(self.device_torch)
-        decoded = self.sd.decode_latents(
-            x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
-        )
-        pixels = (decoded.float() + 1.0) * 0.5
-        pixels = pixels.clamp(0, 1)
+            # Unified live decode. The model owns scaling, shifting, and frame
+            # dimensions; the residency guard covers cached-latent offload.
+            if next(self.sd.vae.parameters()).device != self.device_torch:
+                self.sd.vae.to(self.device_torch)
+            decoded = self.sd.decode_latents(
+                x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
+            )
+            pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
 
         # Pre-DA2 blur: the SAME gaussian_blur_2d the GT caching pass (Task 5a)
         # applied before DA2, so pred-depth and GT-depth stay apples-to-apples.
@@ -761,22 +795,31 @@ class SDTrainer(BaseSDTrainProcess):
         n = 0
         depth_gt_list = getattr(batch, 'depth_gt_list', None) or []
         for i in range(pixels.shape[0]):
-            if not depth_objective[i]:
+            if not process_objective[i]:
                 continue
             if i >= len(depth_gt_list) or depth_gt_list[i] is None:
                 continue
             gt_t = depth_gt_list[i].to(pixels.device, dtype=torch.float32)
-            loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
-                encoder, pixels_for_da2[i:i + 1], gt_t, None,
-                ssi_weight=cfg.ssi_weight,
-                grad_weight=cfg.grad_weight,
-                grad_scales=cfg.grad_scales,
-            )
-            total = total + loss_i
-            weighted_total = weighted_total + loss_i * eff_w[i]
-            ssi_sum += float(ssi_i)
-            grad_sum += float(grad_i)
-            n += 1
+            if preview_only:
+                with torch.no_grad():
+                    loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
+                        encoder, pixels_for_da2[i:i + 1].detach(), gt_t, None,
+                        ssi_weight=cfg.ssi_weight,
+                        grad_weight=cfg.grad_weight,
+                        grad_scales=cfg.grad_scales,
+                    )
+            else:
+                loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
+                    encoder, pixels_for_da2[i:i + 1], gt_t, None,
+                    ssi_weight=cfg.ssi_weight,
+                    grad_weight=cfg.grad_weight,
+                    grad_scales=cfg.grad_scales,
+                )
+                total = total + loss_i
+                weighted_total = weighted_total + loss_i * eff_w[i]
+                ssi_sum += float(ssi_i)
+                grad_sum += float(grad_i)
+                n += 1
             processed.append(i)
 
             # Preview: four-panel Krea tile every preview_every DEPTH steps.
@@ -784,7 +827,7 @@ class SDTrainer(BaseSDTrainProcess):
             # parity, so an even preview_every no longer collides exclusively
             # with diffusion steps. Best-effort -- a failed render never aborts
             # the training step.
-            if (self._depth_preview_due(cfg) and self.save_root is not None
+            if (preview_due and self.save_root is not None
                     and i < len(batch.file_items)):
                 try:
                     from PIL import Image as _PILImage
