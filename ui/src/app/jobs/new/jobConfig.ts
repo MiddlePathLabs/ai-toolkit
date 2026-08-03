@@ -89,6 +89,21 @@ export const defaultJobConfig: JobConfig = {
             use_ema: false,
             ema_decay: 0.99,
           },
+          weight_noise: {
+            enabled: false,
+            mode: 'relative',
+            sigma: 0.00125,
+            bound_norm: false,
+            log_every: 50,
+          },
+          gradient_noise: {
+            enabled: false,
+            mode: 'neelakantan',
+            sigma: 0.001,
+            eta: 0.01,
+            gamma: 0.55,
+            log_every: 50,
+          },
           skip_first_sample: false,
           force_first_sample: false,
           disable_sampling: false,
@@ -160,6 +175,25 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
       use_ui_logger: true,
     };
   }
+
+  const train = jobConfig.config.process[0].train;
+  train.weight_noise = {
+    enabled: false,
+    mode: 'relative',
+    sigma: 0.00125,
+    bound_norm: false,
+    log_every: 50,
+    ...(train.weight_noise ?? {}),
+  };
+  train.gradient_noise = {
+    enabled: false,
+    mode: 'neelakantan',
+    sigma: 0.001,
+    eta: 0.01,
+    gamma: 0.55,
+    log_every: 50,
+    ...(train.gradient_noise ?? {}),
+  };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';
   }

@@ -389,6 +389,80 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.weight_noise.enabled': {
+    title: 'Weight Noising',
+    description: (
+      <>
+        Adds Gaussian perturbations to LoRA parameter values after each optimizer step. This is disabled by default and
+        affects LoRA adapter parameters only.
+      </>
+    ),
+  },
+  'train.weight_noise.mode': {
+    title: 'Weight Noise Mode',
+    description: (
+      <>
+        Relative mode scales sigma by each parameter's RMS, so zero-initialized LoRA-up weights receive effectively no
+        noise until they learn something. Absolute mode applies the same sigma to every parameter.
+      </>
+    ),
+  },
+  'train.weight_noise.sigma': {
+    title: 'Weight Noise Sigma',
+    description: (
+      <>
+        The noise scale. The conservative starting value is 0.00125; tune it only after comparing the logged noise norm
+        with the clipped gradient norm on your model.
+      </>
+    ),
+  },
+  'train.weight_noise.bound_norm': {
+    title: 'Bound Weight Norm',
+    description: (
+      <>
+        Rescales each tensor back to its pre-noise norm after perturbation. This removes the radial norm growth from a
+        long random walk while preserving the tangential change.
+      </>
+    ),
+  },
+  'train.weight_noise.log_every': {
+    title: 'Weight Noise Metric Cadence',
+    description: <>Set to 0 to disable weight-noise metrics, or log them every N optimizer steps.</>,
+  },
+  'train.gradient_noise.enabled': {
+    title: 'Gradient Noising',
+    description: (
+      <>
+        Adds Gaussian perturbations to clipped LoRA gradients immediately before the optimizer step. This is disabled
+        by default and leaves untagged parameters unchanged.
+      </>
+    ),
+  },
+  'train.gradient_noise.mode': {
+    title: 'Gradient Noise Mode',
+    description: (
+      <>
+        Absolute mode uses a fixed sigma. Relative mode scales sigma by each gradient's RMS. Neelakantan mode starts at
+        eta and anneals it with gamma as training progresses.
+      </>
+    ),
+  },
+  'train.gradient_noise.sigma': {
+    title: 'Gradient Noise Sigma',
+    description: <>The fixed or relative gradient-noise scale used by the selected mode.</>,
+  },
+  'train.gradient_noise.eta': {
+    title: 'Gradient Noise Eta',
+    description: <>The initial noise scale for Neelakantan annealing.</>,
+  },
+  'train.gradient_noise.gamma': {
+    title: 'Gradient Noise Gamma',
+    description: <>The decay exponent for Neelakantan gradient noise; larger values anneal more quickly.</>,
+  },
+  'train.gradient_noise.log_every': {
+    title: 'Gradient Noise Metric Cadence',
+    description: <>Set to 0 to disable gradient-noise metrics, or log them every N optimizer steps.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {
