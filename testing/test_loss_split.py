@@ -13,7 +13,7 @@ from toolkit.config_modules import DatasetConfig, TrainConfig
 
 
 # ----------------------------------------------------------------------
-# resolve_loss_split — per-dataset wins
+# resolve_loss_split -- per-dataset wins
 # ----------------------------------------------------------------------
 
 def test_per_dataset_force_on_overrides_explicit_global_off():
@@ -57,7 +57,7 @@ def test_per_dataset_force_on_overrides_autodetect_off():
 
 
 # ----------------------------------------------------------------------
-# resolve_loss_split — explicit global (per-dataset unset)
+# resolve_loss_split -- explicit global (per-dataset unset)
 # ----------------------------------------------------------------------
 
 def test_explicit_global_force_on_with_per_dataset_unset():
@@ -80,7 +80,7 @@ def test_explicit_global_force_off_with_per_dataset_unset():
 
 
 # ----------------------------------------------------------------------
-# resolve_loss_split — autodetect (per-dataset unset, global not explicit)
+# resolve_loss_split -- autodetect (per-dataset unset, global not explicit)
 # ----------------------------------------------------------------------
 
 def test_autodetect_on_when_depth_weight_positive():
@@ -166,7 +166,7 @@ def test_train_config_loss_split_rejects_unknown(bad):
 # ----------------------------------------------------------------------
 # Batch size does not change step-parity objective selection.
 # The resolver returns a per-sample *mode*; the trainer then gates the
-# active objective on self.step_num parity alone (guide §0.4). This test
+# active objective on self.step_num parity alone (guide sec.0.4). This test
 # locks the invariant that batch size is not an input to that selection.
 # ----------------------------------------------------------------------
 

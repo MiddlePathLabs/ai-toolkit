@@ -551,7 +551,13 @@ const docs: { [key: string]: ConfigDoc } = {
   },
   'depth_consistency.preview_only': {
     title: 'Preview Only',
-    description: <>Loads the perceptor and writes previews, but never adds the anchor loss. Useful for inspection.</>,
+    description: (
+      <>
+        Loads the perceptor and writes previews, but never adds the anchor loss. Useful for inspection. In Phase 2
+        preview-only is best-effort: depth tiles render only on steps where the anchor loss is active (i.e.
+        loss_weight &gt; 0 within the timestep window).
+      </>
+    ),
   },
   'depth_consistency.preview_max_keep': {
     title: 'Preview Max Keep',

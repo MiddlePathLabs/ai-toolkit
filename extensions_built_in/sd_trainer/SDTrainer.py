@@ -559,8 +559,10 @@ class SDTrainer(BaseSDTrainProcess):
 
         depth_objective = in_band & (eff_w > 0)
         # Mirrors the depth gate from the other side: alternating samples skip
-        # diffusion on depth steps so the two objectives trade places.
-        diffusion_zero = loss_split_diff_depth & (not step_is_diffusion)
+        # diffusion on depth steps so the two objectives trade places. Gated on
+        # depth_objective so a sample never drops diffusion without gaining
+        # depth (e.g. preview_only with loss_weight=0, or out-of-band steps).
+        diffusion_zero = loss_split_diff_depth & (not step_is_diffusion) & depth_objective
 
         preview_step = (
             int(getattr(cfg, 'preview_every', 0)) > 0

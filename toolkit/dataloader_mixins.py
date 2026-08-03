@@ -1810,7 +1810,7 @@ class DepthCachingFileItemDTOMixin:
                 if key not in f.keys():
                     return None
                 tensor = f.get_tensor(key)
-        except Exception:  # noqa: BLE001 — corrupt/unreadable cache -> miss
+        except Exception:  # noqa: BLE001 -- corrupt/unreadable cache -> miss
             return None
         if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
             return None
@@ -1920,7 +1920,7 @@ class LatentCachingMixin:
                             else:
                                 state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
                     
-                    # audio (video+audio models only — audio-only models already encoded above via encode_images)
+                    # audio (video+audio models only -- audio-only models already encoded above via encode_images)
                     if not self.is_audio_model and file_item.audio_data is not None:
                         audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
                         if to_disk:

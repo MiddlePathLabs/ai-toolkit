@@ -142,3 +142,15 @@ def test_preview_only_activates_preflight():
     datasets = [_ds(depth_loss_weight=0.5, random_crop=True)]
     with pytest.raises(ValueError, match="random_crop"):
         preflight_depth_consistency(cfg, datasets, arch='flux', low_vram=False)
+
+
+def test_preview_only_activates_preflight_independent_of_dataset_depth_active():
+    # Isolates the preview_only activation branch: the dataset is clean and NOT
+    # depth-active (depth_loss_weight unset -> _dataset_depth_active is False)
+    # and loss_weight is 0. Depth is active only because preview_only=True, so
+    # the Krea 2 low_vram guard must still raise. If preview_only were not wired
+    # into _depth_active, preflight would return the config without raising.
+    cfg = DepthConsistencyConfig(loss_weight=0.0, preview_only=True)
+    datasets = [_ds()]  # clean, not depth-active
+    with pytest.raises(ValueError, match="low_vram"):
+        preflight_depth_consistency(cfg, datasets, arch='krea2', low_vram=True)
