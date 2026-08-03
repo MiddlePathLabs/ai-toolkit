@@ -133,6 +133,12 @@ export interface DatasetConfig {
   control_path_2?: string | null;
   control_path_3?: string | null;
   auto_frame_count?: boolean;
+  // Per-dataset depth overrides; undefined means inherit the global depth config.
+  depth_loss_weight?: number;
+  depth_loss_min_t?: number;
+  depth_loss_max_t?: number;
+  // undefined = inherit global; 'sum' = force off for this dataset; 'diffusion_depth' = alternate.
+  loss_split?: 'diffusion_depth' | 'sum';
 }
 
 export interface EMAConfig {
@@ -155,6 +161,23 @@ export interface GradientNoiseConfig {
   eta: number;
   gamma: number;
   log_every: number;
+}
+
+export interface DepthConsistencyConfig {
+  loss_weight: number;
+  loss_min_t: number;
+  loss_max_t: number;
+  model_id: string;
+  input_size: number;
+  pixel_blur_sigma: number;
+  ssi_weight: number;
+  grad_weight: number;
+  grad_scales: number;
+  mask_source: 'none' | 'subject' | 'body';
+  grad_checkpoint: boolean;
+  preview_every: number;
+  preview_only: boolean;
+  preview_max_keep: number;
 }
 
 export interface ValidationItem {
@@ -189,6 +212,8 @@ export interface TrainConfig {
   ema_config?: EMAConfig;
   weight_noise?: WeightNoiseConfig;
   gradient_noise?: GradientNoiseConfig;
+  // undefined = Auto, null = force sum (off), 'diffusion_depth' = force alternation.
+  loss_split?: 'diffusion_depth' | null;
   dtype: string;
   unload_text_encoder: boolean;
   cache_text_embeddings: boolean;
@@ -305,6 +330,8 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('depth_consistency').
+  depth_consistency?: DepthConsistencyConfig;
 }
 
 export interface ConfigObject {

@@ -489,6 +489,149 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Gradient Noise Metric Cadence',
     description: <>Set to 0 to disable gradient-noise metrics, or log them every N optimizer steps.</>,
   },
+  'depth_consistency.loss_weight': {
+    title: 'Depth Consistency',
+    description: (
+      <>
+        Enables a Depth Anything V2 perceptor as a perceptual anchor. The anchor decodes the predicted clean latent
+        through the VAE, runs DA2 to produce a depth map, and adds an SSI + multi-scale gradient loss against the cached
+        ground-truth depth of the training image. Enable sets this weight to 0.001 (a starting value, not a performance
+        claim); disable sets it to 0. There is no separate on/off flag. Depth keeps or moves the VAE back onto the GPU,
+        so it removes the VAE-offload benefit of latent caching (caching still avoids repeated encodes).
+      </>
+    ),
+  },
+  'depth_consistency.model_id': {
+    title: 'Depth Model',
+    description: (
+      <>
+        The Depth Anything V2 perceptor used for the anchor. Loading is lazy: selecting the model here does not download
+        it; enabling depth does. The Depth Anything V2 Hugging Face weights are published under
+        CC-BY-NC-4.0 (see the{' '}
+        <a
+          className="text-blue-500"
+          href="https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf"
+          target="_blank"
+        >
+          DA2-Small model card
+        </a>
+        ). This is disclosure, not a substitute for the project license review.
+      </>
+    ),
+  },
+  'depth_consistency.input_size': {
+    title: 'Input Size',
+    description: (
+      <>
+        The square resolution DA2 receives. 518 is the shipped baseline. 1024 is an experimental preset for large-VRAM
+        setups and is only promoted to a default with measured memory, throughput, and quality evidence.
+      </>
+    ),
+  },
+  'depth_consistency.loss_min_t': {
+    title: 'Minimum Timestep',
+    description: (
+      <>
+        The anchor loss only applies to training steps whose flow-matching timestep ratio is at least this value (0 to
+        1). Raise it to skip the anchor at low-noise steps.
+      </>
+    ),
+  },
+  'depth_consistency.loss_max_t': {
+    title: 'Maximum Timestep',
+    description: (
+      <>
+        The anchor loss only applies to training steps whose flow-matching timestep ratio is at most this value (0 to
+        1). Lower it to skip the anchor at high-noise steps. Must be greater than or equal to the minimum.
+      </>
+    ),
+  },
+  'depth_consistency.preview_every': {
+    title: 'Preview Every',
+    description: <>Write four-panel Krea depth preview tiles every N optimizer steps. Set to 0 to disable previews.</>,
+  },
+  'depth_consistency.ssi_weight': {
+    title: 'SSI Weight',
+    description: <>Weight of the scale-and-shift-invariant depth term in the anchor loss.</>,
+  },
+  'depth_consistency.grad_weight': {
+    title: 'Gradient Weight',
+    description: <>Weight of the multi-scale image-gradient depth term in the anchor loss.</>,
+  },
+  'depth_consistency.grad_scales': {
+    title: 'Gradient Scales',
+    description: <>Number of dyadic scales used by the multi-scale gradient depth term.</>,
+  },
+  'depth_consistency.pixel_blur_sigma': {
+    title: 'Pixel Blur Sigma',
+    description: (
+      <>
+        Optional Gaussian blur applied to the decoded pixels before DA2 runs. 0 disables it. Useful for reducing
+        high-frequency decode artifacts before depth estimation.
+      </>
+    ),
+  },
+  'depth_consistency.grad_checkpoint': {
+    title: 'Gradient Checkpointing',
+    description: <>Runs DA2 with gradient checkpointing to lower activation memory at the cost of recomputation.</>,
+  },
+  'depth_consistency.preview_only': {
+    title: 'Preview Only',
+    description: <>Loads the perceptor and writes previews, but never adds the anchor loss. Useful for inspection.</>,
+  },
+  'depth_consistency.preview_max_keep': {
+    title: 'Preview Max Keep',
+    description: <>Maximum number of preview tile sets to retain on disk; older sets are pruned.</>,
+  },
+  'train.loss_split': {
+    title: 'Loss Split',
+    description: (
+      <>
+        Controls whether the diffusion loss and the depth anchor loss are summed every step or applied on alternating
+        steps. The three serialized states are distinct: Auto leaves the key absent; Sum (off) stores an explicit null;
+        Alternate stores 'diffusion_depth'. The resolver precedence (sec. 4.1 Step 2) is, in order:
+        <br />
+        <br />
+        1a. dataset value == 'sum' --&gt; None (per-dataset force off)
+        <br />
+        1b. dataset value set (not 'sum') --&gt; that value
+        <br />
+        2. global explicitly set --&gt; global value
+        <br />
+        3. autodetect (nothing set) --&gt; 'diffusion_depth' if depth weight &gt; 0 else None
+        <br />
+        <br />
+        A per-dataset override always wins over the global setting. With Auto selected and depth disabled, the anchor
+        contributes nothing. Batch size alone never changes which step parity is selected.
+      </>
+    ),
+  },
+  'datasets.depth_loss_weight': {
+    title: 'Per-Dataset Depth Loss Weight',
+    description: (
+      <>
+        Overrides the global depth loss weight for this dataset only. Leave empty to inherit the global value. A value
+        greater than 0 activates the depth anchor for this dataset even when the global object is otherwise disabled.
+      </>
+    ),
+  },
+  'datasets.depth_loss_min_t': {
+    title: 'Per-Dataset Min Timestep',
+    description: <>Overrides the global minimum anchor timestep for this dataset only. Leave empty to inherit.</>,
+  },
+  'datasets.depth_loss_max_t': {
+    title: 'Per-Dataset Max Timestep',
+    description: <>Overrides the global maximum anchor timestep for this dataset only. Leave empty to inherit.</>,
+  },
+  'datasets.loss_split': {
+    title: 'Per-Dataset Loss Split',
+    description: (
+      <>
+        Overrides the global loss split for this dataset only. Auto inherits the global / autodetect result; Sum forces
+        the anchor off for this dataset (the resolver maps 'sum' to None); Alternate forces diffusion/depth alternation.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

@@ -36,7 +36,8 @@ type AdditionalSections =
   | 'model.assistant_lora_path'
   | 'model.unconditional_lora_path'
   | 'model.model_kwargs.kv_cache'
-  | 'ideogram_4_prompt';
+  | 'ideogram_4_prompt'
+  | 'depth_consistency';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1437,8 +1438,14 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].network.conv_alpha': [undefined, 16],
       'config.process[0].model.low_vram': [true, false],
     },
-    disableSections: ['network.conv'],
-    additionalSections: ['model.low_vram', 'model.layer_offloading'],
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+      'depth_consistency',
+    ],
   },
   {
     name: 'krea2:turbo',
@@ -1460,8 +1467,15 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.guidance_scale': [1, 4],
       'config.process[0].sample.sample_steps': [9, 25],
     },
-    disableSections: ['network.conv'],
-    additionalSections: ['model.low_vram', 'model.layer_offloading', 'model.assistant_lora_path'],
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+      'model.assistant_lora_path',
+      'depth_consistency',
+    ],
   },
   {
     name: 'krea2:o_edit',
@@ -1494,6 +1508,7 @@ export const modelArchs: ModelArch[] = [
       'model.layer_offloading',
       'model.qie.match_target_res',
       'model.model_kwargs.kv_cache',
+      'depth_consistency',
     ],
   },
   {
@@ -1534,6 +1549,7 @@ export const modelArchs: ModelArch[] = [
       'model.assistant_lora_path',
       'model.qie.match_target_res',
       'model.model_kwargs.kv_cache',
+      'depth_consistency',
     ],
   },
   {
