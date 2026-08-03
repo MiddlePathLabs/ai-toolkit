@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -45,6 +45,76 @@ from toolkit.basic import flush
 adapter_transforms = transforms.Compose([
     transforms.ToTensor(),
 ])
+
+
+def preflight_depth_consistency(
+    depth_consistency_config: Optional[DepthConsistencyConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[DepthConsistencyConfig]:
+    """Resolve the effective depth-consistency config and run backend preflight.
+
+    Returns the config to use for training (possibly a disabled default built
+    from a dataset-only activation), or ``None`` when depth is inactive. A
+    dataset-only activation (``depth_loss_weight > 0`` with no process object)
+    builds ``DepthConsistencyConfig(loss_weight=0.0, mask_source='none')`` so
+    YAML/API jobs follow the same contract as migrated UI jobs.
+
+    Raises ``ValueError`` when depth is active and:
+      - ``arch == 'krea2'`` with ``low_vram`` true (tiled decode inside the
+        autograd graph is unsupported), or
+      - ``mask_source`` is not ``'none'`` (Phase 3 auto-masking is not ported), or
+      - any dataset uses ``random_crop`` / ``random_scale`` / a non-empty
+        ``augments`` list (the GT depth cache requires the same deterministic
+        bucket transform as the training tensor).
+
+    Inert when depth is not configured and no dataset is depth-active.
+    """
+    _dataset_depth_active = any(
+        (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+        for dc in dataset_configs
+    )
+
+    config = depth_consistency_config
+    if config is None and _dataset_depth_active:
+        config = DepthConsistencyConfig(loss_weight=0.0, mask_source='none')
+
+    if config is None:
+        return None
+
+    _depth_active = (
+        config.loss_weight > 0
+        or bool(getattr(config, 'preview_only', False))
+        or _dataset_depth_active
+    )
+
+    if not _depth_active:
+        return config
+
+    if arch == 'krea2' and low_vram:
+        raise ValueError('Depth consistency for Krea 2 requires model.low_vram: false.')
+    if config.mask_source != 'none':
+        raise ValueError(
+            'Depth mask_source subject/body requires the Phase 3 auto-masking pipeline.'
+        )
+
+    for dc in dataset_configs:
+        if getattr(dc, 'random_crop', False) or getattr(dc, 'random_scale', False):
+            raise ValueError(
+                "Depth-active datasets cannot use random_crop or random_scale in "
+                "Phase 2; the GT depth cache requires deterministic bucket "
+                "transforms (set random_crop: false and random_scale: false)."
+            )
+        _augments = getattr(dc, 'augments', None) or []
+        if len(_augments) > 0:
+            raise ValueError(
+                "Depth-active datasets cannot use a non-empty augments list in "
+                "Phase 2; the GT depth cache requires deterministic bucket "
+                f"transforms (remove augments, got {_augments!r})."
+            )
+
+    return config
 
 
 class SDTrainer(BaseSDTrainProcess):
@@ -109,6 +179,13 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+        _depth_consistency_raw = self.get_conf('depth_consistency', None)
+        if _depth_consistency_raw is not None:
+            self.depth_consistency_config: Optional[DepthConsistencyConfig] = DepthConsistencyConfig(
+                **_depth_consistency_raw
+            )
+        else:
+            self.depth_consistency_config = None
 
     def before_model_load(self):
         pass
@@ -245,6 +322,12 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+        self.depth_consistency_config = preflight_depth_consistency(
+            self.depth_consistency_config,
+            self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
