@@ -1,0 +1,59 @@
+# Phase 3 Perceptual Perceptors — Dependency Probe Inventory
+#
+# This file is a PROBE INVENTORY, not an installation mechanism.
+# The manager hashes this file but installs only the requirements file
+# selected by manager/spec.py. When a Phase 3 module ships in the GUI,
+# move its passing pins into requirements_base.txt (ordinary requirements.txt,
+# DGX requirements, Docker, and the normal manager path then consume them).
+#
+# Probe environment (the pinned target):
+#   <embedded-python>  (Python 3.12.10)
+#   transformers==5.5.3  torch==2.13.0+cu130  torchvision==0.28.0+cu130
+#   numpy==1.26.4  opencv-python==4.11.0.86  CUDA available (RTX PRO 6000, 95.59 GiB)
+#
+# Probe date: 2026-08-03
+
+# ---------------------------------------------------------------------------
+# Modules needing NO new pip dependencies (probe PASS — deps already satisfied)
+# ---------------------------------------------------------------------------
+# vae_anchor.py    — torch, safetensors, tqdm only. Downloads Flux 2 VAE weights.
+# normal_id.py     — pure PyTorch Sapiens 0.3B encoder; weights via huggingface_hub
+#                    (facebook/sapiens-normal-0.3b). huggingface_hub already pinned.
+# body_shape.py    — torchvision.models.resnet34 (bundled). HybrIK ResNet-34 weights
+#                    are a MANUAL Google Drive download (~/.cache/hybrik/...) — no pip dep.
+# body_id.py       — transformers 5.5.3 SHIPS VitPoseForPoseEstimation,
+#                    VitPoseImageProcessor, and the vitpose image_processing helpers
+#                    (box_to_center_and_scale, get_warp_matrix). cv2 already pinned.
+#                    Person detector is an ONNX model via huggingface_hub
+#                    (opencv/person_detection_mediapipe). No new pip dep.
+
+# ---------------------------------------------------------------------------
+# face_id.py — HIGH Windows risk. Deps resolve as win_amd64 wheels (probe PARTIAL).
+# Actual install + onnxruntime CUDA-provider bind still required before shipping.
+# ---------------------------------------------------------------------------
+# Resolved wheels (pip --dry-run, 2026-08-03):
+#   insightface==1.0.1
+#   onnx2torch==1.5.15
+#   onnxruntime-gpu==1.28.0  (cp312-cp312-win_amd64)
+# Transitive: onnx==1.22.0  ml_dtypes==0.5.4  flatbuffers==25.12.19
+#
+# HAZARD: insightface depends on plain `onnxruntime` (CPU), which shadows
+# `onnxruntime-gpu` on the provider list. face_id.py:36-61 detects this and
+# warns. Install ONLY onnxruntime-gpu (let it satisfy insightface's onnxruntime
+# requirement), do not install both. Verify with:
+#   python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+# must list 'CUDAExecutionProvider' (and ideally 'TensorrtExecutionProvider').
+insightface==1.0.1
+onnx2torch==1.5.15
+onnxruntime-gpu==1.28.0
+
+# ---------------------------------------------------------------------------
+# subject_mask.py — HIGH Windows risk. Dep resolves as wheel (probe PARTIAL).
+# transformers 5.5.3 already ships Sam2Model, Sam2Processor,
+# SegformerImageProcessor, AutoModelForSemanticSegmentation. cv2 already pinned.
+# ---------------------------------------------------------------------------
+# Resolved wheels (pip --dry-run, 2026-08-03):
+#   ultralytics==8.4.115
+# Transitive: nvidia-ml-py==13.610.43  polars==1.43.2  polars-runtime-32==1.43.2
+#              ultralytics-thop==2.1.6
+ultralytics==8.4.115
