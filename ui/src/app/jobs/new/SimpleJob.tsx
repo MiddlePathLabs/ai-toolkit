@@ -69,6 +69,9 @@ export default function SimpleJob({
     return jobTypeOptions.find(j => j.value === jobConfig.config.process[0].type);
   }, [jobConfig.config.process[0].type]);
 
+  const weightNoise = jobConfig.config.process[0].train.weight_noise;
+  const gradientNoise = jobConfig.config.process[0].train.gradient_noise;
+
   const disableSections = useMemo(() => {
     let sections: string[] = [];
     if (modelArch?.disableSections) {
@@ -1159,6 +1162,122 @@ export default function SimpleJob({
                     />
                   </>
                 )}
+              </div>
+              <div>
+                <FormGroup label="Weight Noising">
+                  <Checkbox
+                    label="Enable Weight Noising"
+                    docKey={'train.weight_noise.enabled'}
+                    className="pt-1"
+                    checked={weightNoise?.enabled || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.enabled')}
+                  />
+                  {weightNoise?.enabled && (
+                    <>
+                      <SelectInput
+                        label="Noise Mode"
+                        className="pt-2"
+                        docKey={'train.weight_noise.mode'}
+                        value={weightNoise.mode}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.mode')}
+                        options={[
+                          { value: 'relative', label: 'Relative (weight RMS)' },
+                          { value: 'absolute', label: 'Absolute (fixed sigma)' },
+                        ]}
+                      />
+                      <NumberInput
+                        label="Noise Sigma"
+                        className="pt-2"
+                        docKey={'train.weight_noise.sigma'}
+                        value={weightNoise.sigma ?? 0.00125}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.sigma')}
+                        placeholder="eg. 0.00125"
+                        min={0}
+                      />
+                      <Checkbox
+                        label="Bound Weight Norm"
+                        className="pt-2"
+                        docKey={'train.weight_noise.bound_norm'}
+                        checked={weightNoise.bound_norm || false}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.bound_norm')}
+                      />
+                      <NumberInput
+                        label="Metric Cadence (steps)"
+                        className="pt-2"
+                        docKey={'train.weight_noise.log_every'}
+                        value={weightNoise.log_every ?? 50}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.log_every')}
+                        min={0}
+                      />
+                    </>
+                  )}
+                </FormGroup>
+              </div>
+              <div>
+                <FormGroup label="Gradient Noising">
+                  <Checkbox
+                    label="Enable Gradient Noising"
+                    docKey={'train.gradient_noise.enabled'}
+                    className="pt-1"
+                    checked={gradientNoise?.enabled || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.enabled')}
+                  />
+                  {gradientNoise?.enabled && (
+                    <>
+                      <SelectInput
+                        label="Noise Mode"
+                        className="pt-2"
+                        docKey={'train.gradient_noise.mode'}
+                        value={gradientNoise.mode}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.mode')}
+                        options={[
+                          { value: 'neelakantan', label: 'Neelakantan (annealed)' },
+                          { value: 'relative', label: 'Relative (gradient RMS)' },
+                          { value: 'absolute', label: 'Absolute (fixed sigma)' },
+                        ]}
+                      />
+                      {(gradientNoise.mode === 'absolute' || gradientNoise.mode === 'relative') && (
+                        <NumberInput
+                          label="Noise Sigma"
+                          className="pt-2"
+                          docKey={'train.gradient_noise.sigma'}
+                          value={gradientNoise.sigma ?? 0.001}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.sigma')}
+                          placeholder="eg. 0.001"
+                          min={0}
+                        />
+                      )}
+                      {gradientNoise.mode === 'neelakantan' && (
+                        <>
+                          <NumberInput
+                            label="Initial Eta"
+                            className="pt-2"
+                            docKey={'train.gradient_noise.eta'}
+                            value={gradientNoise.eta ?? 0.01}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.eta')}
+                            min={0}
+                          />
+                          <NumberInput
+                            label="Decay Gamma"
+                            className="pt-2"
+                            docKey={'train.gradient_noise.gamma'}
+                            value={gradientNoise.gamma ?? 0.55}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.gamma')}
+                            min={0}
+                          />
+                        </>
+                      )}
+                      <NumberInput
+                        label="Metric Cadence (steps)"
+                        className="pt-2"
+                        docKey={'train.gradient_noise.log_every'}
+                        value={gradientNoise.log_every ?? 50}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.gradient_noise.log_every')}
+                        min={0}
+                      />
+                    </>
+                  )}
+                </FormGroup>
               </div>
             </div>
           </Card>

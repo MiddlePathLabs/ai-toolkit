@@ -140,6 +140,23 @@ export interface EMAConfig {
   ema_decay: number;
 }
 
+export interface WeightNoiseConfig {
+  enabled: boolean;
+  mode: 'absolute' | 'relative';
+  sigma: number;
+  bound_norm: boolean;
+  log_every: number;
+}
+
+export interface GradientNoiseConfig {
+  enabled: boolean;
+  mode: 'absolute' | 'relative' | 'neelakantan';
+  sigma: number;
+  eta: number;
+  gamma: number;
+  log_every: number;
+}
+
 export interface ValidationItem {
   image_path: string;
   prompt: string;
@@ -166,6 +183,8 @@ export interface TrainConfig {
   optimizer: string;
   lr: number;
   ema_config?: EMAConfig;
+  weight_noise?: WeightNoiseConfig;
+  gradient_noise?: GradientNoiseConfig;
   dtype: string;
   unload_text_encoder: boolean;
   cache_text_embeddings: boolean;
