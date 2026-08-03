@@ -6,8 +6,9 @@ import { Readable } from 'stream';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 import { catchAllToFilePath } from '@/server/catchAllPath';
 
-export async function GET(request: NextRequest, { params }: { params: { filePath: string | string[] } }) {
-  const { filePath } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ filePath: string[] }> }) {
+  const { filePath: filePathSegments } = await params;
+  const filePath = filePathSegments.join('/');
   try {
     // Segments are already URL-decoded by Next.js; accepts both the legacy
     // single-segment form and the `<folder>/<filename>` form.

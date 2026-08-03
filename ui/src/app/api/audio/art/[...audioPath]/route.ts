@@ -126,8 +126,9 @@ function extractArtFromTag(buf: Buffer): ArtResult {
   return null;
 }
 
-export async function GET(request: NextRequest, { params }: { params: { audioPath: string | string[] } }) {
-  const { audioPath } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ audioPath: string[] }> }) {
+  const { audioPath: audioPathSegments } = await params;
+  const audioPath = audioPathSegments.join('/');
   try {
     // Segments are already URL-decoded by Next.js; accepts both the legacy
     // single-segment form and the `<folder>/<filename>` form.

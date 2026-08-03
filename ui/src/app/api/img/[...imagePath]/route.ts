@@ -30,8 +30,9 @@ const contentTypeMap: { [key: string]: string } = {
   '.ogg': 'audio/ogg',
 };
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string | string[] } }) {
-  const { imagePath } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ imagePath: string[] }> }) {
+  const { imagePath: imagePathSegments } = await params;
+  const imagePath = imagePathSegments.join('/');
   try {
     // Segments are already URL-decoded by Next.js; accepts both the legacy
     // single-segment form and the `<folder>/<filename>` form.
