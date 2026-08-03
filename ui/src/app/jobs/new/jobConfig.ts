@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -50,6 +50,20 @@ export const defaultDepthConsistencyConfig: DepthConsistencyConfig = {
   grad_weight: 0.5,
   grad_scales: 4,
   mask_source: 'none',
+  grad_checkpoint: true,
+  preview_every: 100,
+  preview_only: false,
+  preview_max_keep: 500,
+};
+
+// Safe disabled defaults for the process-level normal anchor. Enable = set
+// loss_weight > 0; disable = loss_weight 0. There is no `enabled` field. The
+// Sapiens 0.3B perceptor downloads lazily only when normal loss is enabled.
+export const defaultNormalIDConfig: NormalIDConfig = {
+  loss_weight: 0,
+  loss_min_t: 0.4,
+  loss_max_t: 0.8,
+  model_id: 'facebook/sapiens-normal-0.3b',
   grad_checkpoint: true,
   preview_every: 100,
   preview_only: false,
@@ -152,6 +166,7 @@ export const defaultJobConfig: JobConfig = {
         },
         sample: defaultSampleConfig,
         depth_consistency: { ...defaultDepthConsistencyConfig },
+        normal_id: { ...defaultNormalIDConfig },
       },
     ],
   },
@@ -207,6 +222,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].depth_consistency = {
     ...defaultDepthConsistencyConfig,
     ...(jobConfig.config.process[0].depth_consistency ?? {}),
+  };
+  // Merge a complete disabled normal object into any partial saved object.
+  jobConfig.config.process[0].normal_id = {
+    ...defaultNormalIDConfig,
+    ...(jobConfig.config.process[0].normal_id ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';
