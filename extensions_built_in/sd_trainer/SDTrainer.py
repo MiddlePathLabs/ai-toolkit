@@ -1997,6 +1997,27 @@ class SDTrainer(BaseSDTrainProcess):
     def after_unet_predict(self):
         pass
 
+    def _mem_diag(self, label: str) -> None:
+        # Phase 2 investigation tooling (env-gated, inert in normal runs).
+        # Captures live vs reserved CUDA memory at step boundaries to
+        # distinguish cross-step tensor retention from activation pressure.
+        import os
+        if os.environ.get('KREA2_MEM_DIAG', '0') != '1':
+            return
+        if not torch.cuda.is_available():
+            return
+        gb = 1024 ** 3
+        alloc = torch.cuda.memory_allocated() / gb
+        reserv = torch.cuda.memory_reserved() / gb
+        peak_a = torch.cuda.max_memory_allocated() / gb
+        peak_r = torch.cuda.max_memory_reserved() / gb
+        free, _ = torch.cuda.mem_get_info()
+        print_acc(
+            f"[memdiag] step={self.step_num} {label:>14} | "
+            f"alloc={alloc:6.2f}G reserv={reserv:6.2f}G | "
+            f"peak_alloc={peak_a:6.2f}G peak_reserv={peak_r:6.2f}G | "
+            f"gpu_free={free / gb:6.2f}G"
+        )
     def end_of_training_loop(self):
         pass
 
@@ -2030,6 +2051,7 @@ class SDTrainer(BaseSDTrainProcess):
     
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+        self._mem_diag('step_start')
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -2812,6 +2834,7 @@ class SDTrainer(BaseSDTrainProcess):
                             **pred_kwargs
                         )
                     self.after_unet_predict()
+                    self._mem_diag('after_forward')
 
                     with self.timer('calculate_loss'):
                         noise = noise.to(self.device_torch, dtype=dtype).detach()
@@ -2831,7 +2854,8 @@ class SDTrainer(BaseSDTrainProcess):
                             mask_multiplier=mask_multiplier,
                             prior_pred=prior_to_calculate_loss,
                         )
-                    
+                    self._mem_diag('after_loss')
+
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
                         with torch.no_grad():
                             if self.train_config.diff_output_preservation:
@@ -2889,6 +2913,7 @@ class SDTrainer(BaseSDTrainProcess):
                     # loss.backward()
                     # else:
                     self.accelerator.backward(loss)
+                    self._mem_diag('after_backward')
 
         return loss.detach()
         # flush()
