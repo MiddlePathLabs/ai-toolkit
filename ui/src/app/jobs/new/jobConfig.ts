@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -34,6 +34,26 @@ export const defaultSliderConfig: SliderConfig = {
 
 export const defaultCompileOptions = {
   block_compile: true,
+};
+
+// Safe disabled defaults for the process-level depth anchor. Enable = set
+// loss_weight > 0 (UI uses 0.001); disable = loss_weight 0. There is no
+// `enabled` field. DA2-Small + input_size 518 is the shipped baseline.
+export const defaultDepthConsistencyConfig: DepthConsistencyConfig = {
+  loss_weight: 0,
+  loss_min_t: 0,
+  loss_max_t: 1,
+  model_id: 'depth-anything/Depth-Anything-V2-Small-hf',
+  input_size: 518,
+  pixel_blur_sigma: 0,
+  ssi_weight: 1,
+  grad_weight: 0.5,
+  grad_scales: 4,
+  mask_source: 'none',
+  grad_checkpoint: true,
+  preview_every: 100,
+  preview_only: false,
+  preview_max_keep: 500,
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -131,6 +151,7 @@ export const defaultJobConfig: JobConfig = {
           compile: false,
         },
         sample: defaultSampleConfig,
+        depth_consistency: { ...defaultDepthConsistencyConfig },
       },
     ],
   },
@@ -179,6 +200,14 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
 
   const train = jobConfig.config.process[0].train;
   migrateNoisingConfig(train);
+  // Merge a complete disabled depth object into any partial saved object.
+  // Preserves saved values, fills fields added after the first depth release.
+  // Do NOT migrate train.loss_split here: omission IS the Auto state, and
+  // inserting null would silently turn Auto into explicit off.
+  jobConfig.config.process[0].depth_consistency = {
+    ...defaultDepthConsistencyConfig,
+    ...(jobConfig.config.process[0].depth_consistency ?? {}),
+  };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';
   }

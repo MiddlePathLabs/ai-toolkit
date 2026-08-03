@@ -72,6 +72,12 @@ export default function SimpleJob({
   const weightNoise = jobConfig.config.process[0].train.weight_noise;
   const gradientNoise = jobConfig.config.process[0].train.gradient_noise;
 
+  const depthConfig = jobConfig.config.process[0].depth_consistency;
+  const depthEnabled = (depthConfig?.loss_weight ?? 0) > 0;
+  const globalLossSplit = jobConfig.config.process[0].train.loss_split;
+  const globalSplitUi =
+    globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
+
   const disableSections = useMemo(() => {
     let sections: string[] = [];
     if (modelArch?.disableSections) {
@@ -1221,6 +1227,232 @@ export default function SimpleJob({
             </div>
           </Card>
         </div>
+        {modelArch?.additionalSections?.includes('depth_consistency') && (
+          <div>
+            <Card title="Perceptual Anchors" collapsible>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div>
+                  <Checkbox
+                    label="Enable Depth Consistency"
+                    docKey={'depth_consistency.loss_weight'}
+                    className="pt-1"
+                    checked={depthEnabled}
+                    onChange={checked => {
+                      setJobConfig(
+                        checked ? 0.001 : 0,
+                        'config.process[0].depth_consistency.loss_weight',
+                      );
+                      // low_vram interlock: depth + Krea low_vram raises in the backend. Force it off
+                      // while depth is active; re-enable it (Krea preset default) when depth is disabled.
+                      setJobConfig(checked ? false : true, 'config.process[0].model.low_vram');
+                    }}
+                  />
+                  {depthEnabled && (
+                    <>
+                      <NumberInput
+                        label="Depth Loss Weight"
+                        className="pt-2"
+                        docKey={'depth_consistency.loss_weight'}
+                        value={depthConfig?.loss_weight ?? 0}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.loss_weight')
+                        }
+                        placeholder="eg. 0.001"
+                        min={0}
+                      />
+                      <SelectInput
+                        label="Depth Model"
+                        className="pt-2"
+                        docKey={'depth_consistency.model_id'}
+                        value={depthConfig?.model_id ?? 'depth-anything/Depth-Anything-V2-Small-hf'}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.model_id')
+                        }
+                        options={[
+                          {
+                            value: 'depth-anything/Depth-Anything-V2-Small-hf',
+                            label: 'Depth Anything V2 Small',
+                          },
+                        ]}
+                      />
+                      <div className="text-xs text-gray-500 pt-1">
+                        Depth Anything V2 weights are CC-BY-NC-4.0.{' '}
+                        <a
+                          className="text-blue-500"
+                          href="https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf"
+                          target="_blank"
+                        >
+                          Model card
+                        </a>
+                      </div>
+                      <NumberInput
+                        label="Input Size"
+                        className="pt-2"
+                        docKey={'depth_consistency.input_size'}
+                        value={depthConfig?.input_size ?? 518}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.input_size')
+                        }
+                        placeholder="eg. 518"
+                        min={1}
+                      />
+                      <SliderInput
+                        label="Minimum Timestep"
+                        className="pt-2"
+                        docKey={'depth_consistency.loss_min_t'}
+                        value={depthConfig?.loss_min_t ?? 0}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t')
+                        }
+                        min={0}
+                        max={1}
+                        step={0.01}
+                      />
+                      <SliderInput
+                        label="Maximum Timestep"
+                        className="pt-2"
+                        docKey={'depth_consistency.loss_max_t'}
+                        value={depthConfig?.loss_max_t ?? 1}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t')
+                        }
+                        min={0}
+                        max={1}
+                        step={0.01}
+                      />
+                      <SelectInput
+                        label="Loss Split"
+                        className="pt-2"
+                        docKey={'train.loss_split'}
+                        value={globalSplitUi}
+                        onChange={value =>
+                          setJobConfig(
+                            value === 'auto' ? undefined : value === 'off' ? null : 'diffusion_depth',
+                            'config.process[0].train.loss_split',
+                          )
+                        }
+                        options={[
+                          { value: 'auto', label: 'Auto' },
+                          { value: 'off', label: 'Sum (off)' },
+                          { value: 'diffusion_depth', label: 'Alternate diffusion + depth' },
+                        ]}
+                      />
+                      <NumberInput
+                        label="Preview Every"
+                        className="pt-2"
+                        docKey={'depth_consistency.preview_every'}
+                        value={depthConfig?.preview_every ?? 100}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.preview_every')
+                        }
+                        placeholder="eg. 100"
+                        min={0}
+                      />
+                    </>
+                  )}
+                </div>
+                <div>
+                  {depthEnabled && (
+                    <FormGroup label="Advanced Depth">
+                      <NumberInput
+                        label="SSI Weight"
+                        docKey={'depth_consistency.ssi_weight'}
+                        value={depthConfig?.ssi_weight ?? 1}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.ssi_weight')
+                        }
+                        placeholder="eg. 1.0"
+                        min={0}
+                      />
+                      <NumberInput
+                        label="Gradient Weight"
+                        className="pt-2"
+                        docKey={'depth_consistency.grad_weight'}
+                        value={depthConfig?.grad_weight ?? 0.5}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.grad_weight')
+                        }
+                        placeholder="eg. 0.5"
+                        min={0}
+                      />
+                      <NumberInput
+                        label="Gradient Scales"
+                        className="pt-2"
+                        docKey={'depth_consistency.grad_scales'}
+                        value={depthConfig?.grad_scales ?? 4}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.grad_scales')
+                        }
+                        placeholder="eg. 4"
+                        min={1}
+                      />
+                      <NumberInput
+                        label="Pixel Blur Sigma"
+                        className="pt-2"
+                        docKey={'depth_consistency.pixel_blur_sigma'}
+                        value={depthConfig?.pixel_blur_sigma ?? 0}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.pixel_blur_sigma')
+                        }
+                        placeholder="eg. 0"
+                        min={0}
+                      />
+                      <Checkbox
+                        label="Gradient Checkpointing"
+                        className="pt-2"
+                        docKey={'depth_consistency.grad_checkpoint'}
+                        checked={depthConfig?.grad_checkpoint ?? true}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.grad_checkpoint')
+                        }
+                      />
+                      <Checkbox
+                        label="Preview Only"
+                        className="pt-2"
+                        docKey={'depth_consistency.preview_only'}
+                        checked={depthConfig?.preview_only ?? false}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.preview_only')
+                        }
+                      />
+                      <NumberInput
+                        label="Preview Max Keep"
+                        className="pt-2"
+                        docKey={'depth_consistency.preview_max_keep'}
+                        value={depthConfig?.preview_max_keep ?? 500}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.preview_max_keep')
+                        }
+                        placeholder="eg. 500"
+                        min={0}
+                      />
+                    </FormGroup>
+                  )}
+                </div>
+                <div>
+                  {depthEnabled && (
+                    <FormGroup label="Notes">
+                      <div className="text-xs text-gray-400">
+                        Depth requires <code>model.low_vram: false</code>. Low VRAM was disabled when you enabled depth
+                        (the trainer refuses to start otherwise) and will be re-enabled when you disable depth.
+                      </div>
+                      {jobConfig.config.process[0].model.low_vram && (
+                        <div className="text-xs text-yellow-500">
+                          Warning: Low VRAM is on with depth enabled. The trainer will refuse to start until one is
+                          turned off.
+                        </div>
+                      )}
+                      <div className="text-xs text-gray-400">
+                        Depth keeps or moves the VAE to the GPU, so the VAE-offload benefit of Cache Latents is lost.
+                        Caching still avoids repeated image encodes.
+                      </div>
+                    </FormGroup>
+                  )}
+                </div>
+              </div>
+            </Card>
+          </div>
+        )}
         <div>
           <Card title="Datasets">
             <>
@@ -1496,6 +1728,78 @@ export default function SimpleJob({
                               </div>
                             ))}
                           </div>
+                        </FormGroup>
+                      </div>
+                    )}
+                    {modelArch?.additionalSections?.includes('depth_consistency') && (
+                      <div>
+                        <FormGroup label="Perceptual">
+                          <NumberInput
+                            label="Depth Loss Weight"
+                            docKey={'datasets.depth_loss_weight'}
+                            value={dataset.depth_loss_weight ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].depth_loss_weight`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                          />
+                          <NumberInput
+                            label="Min Timestep"
+                            className="pt-2"
+                            docKey={'datasets.depth_loss_min_t'}
+                            value={dataset.depth_loss_min_t ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].depth_loss_min_t`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                          <NumberInput
+                            label="Max Timestep"
+                            className="pt-2"
+                            docKey={'datasets.depth_loss_max_t'}
+                            value={dataset.depth_loss_max_t ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].depth_loss_max_t`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                          <SelectInput
+                            label="Loss Split"
+                            className="pt-2"
+                            docKey={'datasets.loss_split'}
+                            value={
+                              dataset.loss_split === undefined
+                                ? 'auto'
+                                : dataset.loss_split === 'sum'
+                                  ? 'sum'
+                                  : 'alternate'
+                            }
+                            onChange={value =>
+                              setJobConfig(
+                                value === 'auto' ? undefined : value === 'sum' ? 'sum' : 'diffusion_depth',
+                                `config.process[0].datasets[${i}].loss_split`,
+                              )
+                            }
+                            options={[
+                              { value: 'auto', label: 'Auto (inherit)' },
+                              { value: 'sum', label: 'Sum (off)' },
+                              { value: 'alternate', label: 'Alternate' },
+                            ]}
+                          />
                         </FormGroup>
                       </div>
                     )}
