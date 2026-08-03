@@ -144,6 +144,10 @@ def _make_trainer(loss_weight=0.001, train_loss_split=None, explicit=False,
     tr.dataset_configs = []
     tr._depth_perceptor = _FakeEncoder()
     tr.save_root = None  # previews disabled in gating tests
+    tr._depth_step_count = 0  # mirrors SDTrainer.__init__
+    # Bind the cadence helper so _compute_depth_anchor_loss can call it as
+    # self._depth_preview_due(cfg) just like a real SDTrainer instance would.
+    tr._depth_preview_due = SDTrainer._depth_preview_due.__get__(tr)
     return tr
 
 
@@ -488,3 +492,47 @@ def test_num_train_timesteps_not_hardcoded():
     ts = torch.tensor([250.0])  # 250 / 500 = 0.5
     g = _gates(tr, batch, ts)
     assert abs(float(g["t"][0]) - 0.5) < 1e-6
+
+
+# ----------------------------------------------------------------------
+# Preview cadence: decoupled from raw step parity (regression)
+# ----------------------------------------------------------------------
+
+def test_depth_preview_renders_under_alternation_with_even_preview_every():
+    # Regression: with alternation on (loss_split='diffusion_depth',
+    # loss_weight > 0) and an EVEN preview_every, previews must still render
+    # on depth steps. The buggy version gated the preview on raw step parity
+    # (step_num % preview_every == 0); with an even cadence every preview step
+    # (10/20/30/...) landed on an even = diffusion step, where the per-sample
+    # preview loop never runs (depth_objective is all False). Previews never
+    # rendered. The fix decouples the cadence: count DEPTH steps and render
+    # every preview_every DEPTH steps.
+    tr = _make_trainer(loss_weight=0.001, train_loss_split='diffusion_depth',
+                       explicit=True)
+    tr.depth_consistency_config.preview_every = 10  # EVEN -- exposes the bug
+    cfg = tr.depth_consistency_config
+
+    # Reset the depth-step counter as hook_before_train_loop would.
+    tr._depth_step_count = 0
+    fired_counts = []  # depth-step-count at which a preview was due
+    for step in range(50):
+        tr.step_num = step
+        step_is_diffusion = (step % 2 == 0)
+        if step_is_diffusion:
+            # diffusion step: depth_objective is all False -> anchor path
+            # early-returns and never advances the counter.
+            continue
+        # depth step: the anchor path increments AFTER its early-return gate.
+        tr._depth_step_count += 1
+        if SDTrainer._depth_preview_due(tr, cfg):
+            fired_counts.append(tr._depth_step_count)
+
+    # The buggy version fired ZERO times. The fix must fire at least once.
+    assert len(fired_counts) >= 1
+    # And at the expected DEPTH-step cadence: depth-step-counts 10 and 20 for
+    # a 50-step run (25 depth steps). Not on raw steps 10/20/30 (all diffusion).
+    assert 10 in fired_counts
+    assert 20 in fired_counts
+    # A preview is never due on step 0 / count 0 -- the first tile is after the
+    # first full cadence window of depth steps.
+    assert 0 not in fired_counts
