@@ -38,7 +38,8 @@ type AdditionalSections =
   | 'model.model_kwargs.kv_cache'
   | 'ideogram_4_prompt'
   | 'depth_consistency'
-  | 'normal_id';
+  | 'normal_id'
+  | 'body_proportion';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1451,6 +1452,7 @@ export const modelArchs: ModelArch[] = [
       'model.layer_offloading',
       'depth_consistency',
       'normal_id',
+      'body_proportion',
     ],
   },
   {
@@ -1486,6 +1488,7 @@ export const modelArchs: ModelArch[] = [
       'model.assistant_lora_path',
       'depth_consistency',
       'normal_id',
+      'body_proportion',
     ],
   },
   {
@@ -1525,6 +1528,7 @@ export const modelArchs: ModelArch[] = [
       'model.model_kwargs.kv_cache',
       'depth_consistency',
       'normal_id',
+      'body_proportion',
     ],
   },
   {
@@ -1571,6 +1575,7 @@ export const modelArchs: ModelArch[] = [
       'model.model_kwargs.kv_cache',
       'depth_consistency',
       'normal_id',
+      'body_proportion',
     ],
   },
   {

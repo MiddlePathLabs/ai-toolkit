@@ -143,6 +143,10 @@ export interface DatasetConfig {
   normal_loss_weight?: number;
   normal_loss_min_t?: number;
   normal_loss_max_t?: number;
+  // Per-dataset body-proportion overrides; undefined means inherit the global config.
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
 }
 
 export interface EMAConfig {
@@ -193,6 +197,13 @@ export interface NormalIDConfig {
   preview_every: number;
   preview_only: boolean;
   preview_max_keep: number;
+}
+
+export interface BodyProportionConfig {
+  loss_weight: number;
+  loss_min_t: number;
+  loss_max_t: number;
+  include_head: boolean;
 }
 
 export interface ValidationItem {
@@ -349,6 +360,8 @@ export interface ProcessConfig {
   depth_consistency?: DepthConsistencyConfig;
   // Process-level (not TrainConfig): consumed via get_conf('normal_id').
   normal_id?: NormalIDConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('body_proportion').
+  body_proportion?: BodyProportionConfig;
 }
 
 export interface ConfigObject {

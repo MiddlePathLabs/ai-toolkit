@@ -697,6 +697,49 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Per-Dataset Maximum Timestep',
     description: <>Overrides the global normal-anchor maximum timestep for this dataset only. Leave empty to inherit.</>,
   },
+  'body_proportion.loss_weight': {
+    title: 'Body-Proportion Anchor',
+    description: (
+      <>
+        Enables a frozen ViTPose-Plus-Base pose estimator as a perceptual anchor. The anchor decodes the
+        predicted clean latent through the VAE, runs ViTPose to get 17 COCO keypoints, derives 8
+        pose-invariant bone-length ratios (10 with head), and adds a visibility-weighted L1 loss plus a
+        missing-keypoint penalty against cached GT ratios. Enable sets this weight to 0.01 (a starting
+        value, not a performance claim); disable sets it to 0. ViTPose weights download lazily on first
+        enable. Body-proportion does not participate in the diffusion/depth loss-split alternation. Like
+        the other anchors it decodes x0 under gradient, so Low VRAM is disabled while it is active.
+      </>
+    ),
+  },
+  'body_proportion.loss_min_t': {
+    title: 'Minimum Timestep',
+    description: <>The body-proportion anchor only applies on steps whose timestep ratio is at least this (0 to 1).</>,
+  },
+  'body_proportion.loss_max_t': {
+    title: 'Maximum Timestep',
+    description: <>The body-proportion anchor only applies on steps whose timestep ratio is at most this (0 to 1).</>,
+  },
+  'body_proportion.include_head': {
+    title: 'Include Head Ratios',
+    description: (
+      <>
+        Add two head ratios (nose-to-shoulder height and ear-to-ear width) to the 8 body ratios. Useful for
+        character likenesses where head proportions matter. Changing this invalidates the GT cache.
+      </>
+    ),
+  },
+  'datasets.body_proportion_loss_weight': {
+    title: 'Per-Dataset Body-Proportion Weight',
+    description: <>Overrides the global body-proportion loss weight for this dataset only. Leave empty to inherit; 0 disables.</>,
+  },
+  'datasets.body_proportion_loss_min_t': {
+    title: 'Per-Dataset Minimum Timestep',
+    description: <>Overrides the global body-proportion minimum timestep for this dataset only. Leave empty to inherit.</>,
+  },
+  'datasets.body_proportion_loss_max_t': {
+    title: 'Per-Dataset Maximum Timestep',
+    description: <>Overrides the global body-proportion maximum timestep for this dataset only. Leave empty to inherit.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

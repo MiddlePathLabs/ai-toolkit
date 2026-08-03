@@ -982,6 +982,35 @@ class NormalIDConfig:
             )
 
 
+class BodyProportionConfig:
+    """Body-proportion auxiliary loss via a frozen ViTPose-Plus-Base perceptor.
+
+    Process-level config (read through ``self.get_conf('body_proportion')``),
+    not a TrainConfig field. Enable by setting ``loss_weight > 0``; disable with
+    ``loss_weight == 0``. Computes 8 pose-invariant bone-length ratios (10 with
+    head) from ViTPose keypoints and matches them against cached GT ratios.
+    ViTPose weights download lazily only when this is enabled. Does NOT
+    participate in diffusion/depth ``loss_split``. GT ratios come from the raw
+    source image (transform-independent cache).
+    """
+
+    def __init__(self, **kwargs):
+        self.loss_weight: float = float(kwargs.get('loss_weight', 0.0))
+        self.loss_min_t: float = float(kwargs.get('loss_min_t', 0.0))
+        self.loss_max_t: float = float(kwargs.get('loss_max_t', 1.0))
+        self.include_head: bool = bool(kwargs.get('include_head', False))
+
+        if self.loss_min_t < 0.0:
+            raise ValueError(f"loss_min_t must be >= 0, got {self.loss_min_t}")
+        if self.loss_max_t > 1.0:
+            raise ValueError(f"loss_max_t must be <= 1, got {self.loss_max_t}")
+        if self.loss_min_t > self.loss_max_t:
+            raise ValueError(
+                f"loss_min_t ({self.loss_min_t}) must be <= "
+                f"loss_max_t ({self.loss_max_t})"
+            )
+
+
 class ReferenceDatasetConfig:
     def __init__(self, **kwargs):
         # can pass with a side by side pait or a folder with pos and neg folder
@@ -1209,6 +1238,12 @@ class DatasetConfig:
         self.normal_loss_weight: Union[float, None] = kwargs.get('normal_loss_weight', None)
         self.normal_loss_min_t: Union[float, None] = kwargs.get('normal_loss_min_t', None)
         self.normal_loss_max_t: Union[float, None] = kwargs.get('normal_loss_max_t', None)
+
+        # Body-proportion per-dataset overrides. None means inherit the global
+        # body_proportion setting. include_head is global-only (no per-dataset).
+        self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
+        self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
+        self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

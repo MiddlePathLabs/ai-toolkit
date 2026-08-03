@@ -81,6 +81,8 @@ export default function SimpleJob({
   const depthEnabled = (depthConfig?.loss_weight ?? 0) > 0;
   const normalConfig = jobConfig.config.process[0].normal_id;
   const normalEnabled = (normalConfig?.loss_weight ?? 0) > 0;
+  const bodyProportionConfig = jobConfig.config.process[0].body_proportion;
+  const bodyProportionEnabled = (bodyProportionConfig?.loss_weight ?? 0) > 0;
   const globalLossSplit = jobConfig.config.process[0].train.loss_split;
   const globalSplitUi =
     globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
@@ -427,7 +429,7 @@ export default function SimpleJob({
                   label="Low VRAM"
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
-                  disabled={isLowVramLocked(depthEnabled || normalEnabled)}
+                  disabled={isLowVramLocked(depthEnabled || normalEnabled || bodyProportionEnabled)}
                 />
               </FormGroup>
             )}
@@ -1297,7 +1299,8 @@ export default function SimpleJob({
           </Card>
         </div>
         {(modelArch?.additionalSections?.includes('depth_consistency') ||
-          modelArch?.additionalSections?.includes('normal_id')) && (
+          modelArch?.additionalSections?.includes('normal_id') ||
+          modelArch?.additionalSections?.includes('body_proportion')) && (
           <div>
             <Card title="Perceptual Anchors" collapsible>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -1601,6 +1604,90 @@ export default function SimpleJob({
                             Hugging Face the first time normal loss is enabled. Like depth, the live loss
                             decodes x0 through the VAE under gradient, so Low VRAM is disabled while normal
                             is active.
+                          </div>
+                        </>
+                      )}
+                    </FormGroup>
+                  </div>
+                )}
+                {modelArch?.additionalSections?.includes('body_proportion') && (
+                  <div>
+                    <FormGroup label="Body-Proportion Anchor">
+                      <Checkbox
+                        label="Enable Body Proportion Consistency"
+                        docKey={'body_proportion.loss_weight'}
+                        className="pt-1"
+                        checked={bodyProportionEnabled}
+                        onChange={checked => {
+                          setJobConfig(
+                            checked ? 0.01 : 0,
+                            'config.process[0].body_proportion.loss_weight'
+                          );
+                          if (checked) {
+                            setJobConfig(false, 'config.process[0].model.low_vram');
+                          }
+                        }}
+                      />
+                      {bodyProportionEnabled && (
+                        <>
+                          <NumberInput
+                            label="Body Proportion Loss Weight"
+                            className="pt-2"
+                            docKey={'body_proportion.loss_weight'}
+                            value={bodyProportionConfig?.loss_weight ?? 0}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].body_proportion.loss_weight')
+                            }
+                            placeholder="eg. 0.01"
+                            min={0}
+                          />
+                          <SliderInput
+                            label="Minimum Timestep"
+                            className="pt-2"
+                            docKey={'body_proportion.loss_min_t'}
+                            value={bodyProportionConfig?.loss_min_t ?? 0}
+                            onChange={value => {
+                              const maxT = bodyProportionConfig?.loss_max_t ?? 1;
+                              setJobConfig(
+                                Math.min(value, maxT),
+                                'config.process[0].body_proportion.loss_min_t'
+                              );
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <SliderInput
+                            label="Maximum Timestep"
+                            className="pt-2"
+                            docKey={'body_proportion.loss_max_t'}
+                            value={bodyProportionConfig?.loss_max_t ?? 1}
+                            onChange={value => {
+                              const minT = bodyProportionConfig?.loss_min_t ?? 0;
+                              setJobConfig(
+                                Math.max(value, minT),
+                                'config.process[0].body_proportion.loss_max_t'
+                              );
+                            }}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                          />
+                          <Checkbox
+                            label="Include Head Ratios"
+                            className="pt-2"
+                            docKey={'body_proportion.include_head'}
+                            checked={bodyProportionConfig?.include_head ?? false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].body_proportion.include_head')
+                            }
+                          />
+                          <div className="text-xs text-gray-400 pt-2">
+                            Uses a frozen ViTPose-Plus-Base pose estimator to compute 8 pose-invariant
+                            bone-length ratios (10 with head) and matches them against cached GT. The model
+                            downloads from Hugging Face the first time this is enabled. Like the other
+                            anchors, the live loss decodes x0 through the VAE under gradient, so Low VRAM is
+                            disabled while body proportion is active.
                           </div>
                         </>
                       )}
@@ -2010,6 +2097,59 @@ export default function SimpleJob({
                               const minV = dataset.normal_loss_min_t;
                               if (v !== undefined && minV != null && v < minV) {
                                 setJobConfig(v, `config.process[0].datasets[${i}].normal_loss_min_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                        </FormGroup>
+                      </div>
+                    )}
+                    {modelArch?.additionalSections?.includes('body_proportion') && (
+                      <div>
+                        <FormGroup label="Body-Proportion Anchor">
+                          <NumberInput
+                            label="Body Proportion Loss Weight"
+                            docKey={'datasets.body_proportion_loss_weight'}
+                            value={dataset.body_proportion_loss_weight ?? null}
+                            onChange={value =>
+                              setJobConfig(
+                                value === null || value === undefined ? undefined : value,
+                                `config.process[0].datasets[${i}].body_proportion_loss_weight`,
+                              )
+                            }
+                            placeholder="inherit"
+                            min={0}
+                          />
+                          <NumberInput
+                            label="Min Timestep"
+                            className="pt-2"
+                            docKey={'datasets.body_proportion_loss_min_t'}
+                            value={dataset.body_proportion_loss_min_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].body_proportion_loss_min_t`);
+                              const maxV = dataset.body_proportion_loss_max_t;
+                              if (v !== undefined && maxV != null && v > maxV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].body_proportion_loss_max_t`);
+                              }
+                            }}
+                            placeholder="inherit"
+                            min={0}
+                            max={1}
+                          />
+                          <NumberInput
+                            label="Max Timestep"
+                            className="pt-2"
+                            docKey={'datasets.body_proportion_loss_max_t'}
+                            value={dataset.body_proportion_loss_max_t ?? null}
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].body_proportion_loss_max_t`);
+                              const minV = dataset.body_proportion_loss_min_t;
+                              if (v !== undefined && minV != null && v < minV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].body_proportion_loss_min_t`);
                               }
                             }}
                             placeholder="inherit"

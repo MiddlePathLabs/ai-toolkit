@@ -15,6 +15,7 @@ from toolkit.dataloader_mixins import (
     LatentCachingFileItemDTOMixin,
     DepthCachingFileItemDTOMixin,
     NormalCachingFileItemDTOMixin,
+    BodyProportionCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -48,6 +49,7 @@ class FileItemDTO(
     LatentCachingFileItemDTOMixin,
     DepthCachingFileItemDTOMixin,
     NormalCachingFileItemDTOMixin,
+    BodyProportionCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -201,6 +203,11 @@ class FileItemDTO(
         self.normal_loss_min_t: Union[float, None] = self.dataset_config.normal_loss_min_t
         self.normal_loss_max_t: Union[float, None] = self.dataset_config.normal_loss_max_t
 
+        # body-proportion per-dataset overrides (None = inherit global)
+        self.body_proportion_loss_weight: Union[float, None] = self.dataset_config.body_proportion_loss_weight
+        self.body_proportion_loss_min_t: Union[float, None] = self.dataset_config.body_proportion_loss_min_t
+        self.body_proportion_loss_max_t: Union[float, None] = self.dataset_config.body_proportion_loss_max_t
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -215,6 +222,7 @@ class FileItemDTO(
         self.cleanup_latent()
         self.cleanup_depth()
         self.cleanup_normal()
+        self.cleanup_body_proportion()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -419,6 +427,17 @@ class DataLoaderBatchDTO:
                 x.normal_loss_max_t for x in self.file_items
             ]
 
+            # body-proportion per-dataset scalars (None = inherit global)
+            self.body_proportion_loss_weight_list: List[Union[float, None]] = [
+                x.body_proportion_loss_weight for x in self.file_items
+            ]
+            self.body_proportion_loss_min_t_list: List[Union[float, None]] = [
+                x.body_proportion_loss_min_t for x in self.file_items
+            ]
+            self.body_proportion_loss_max_t_list: List[Union[float, None]] = [
+                x.body_proportion_loss_max_t for x in self.file_items
+            ]
+
             # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
             if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
@@ -433,6 +452,22 @@ class DataLoaderBatchDTO:
                 self.normal_gt_list: Union[List, None] = [
                     getattr(x, 'normal_gt', None) for x in self.file_items
                 ]
+
+            # collect GT body-proportion ratio vectors (2*N,); batched into one
+            # tensor when at least one item has cached ratios. Variable N
+            # (include_head) is constant within a run, so cat is safe.
+            if any([getattr(x, 'body_proportion_gt', None) is not None for x in self.file_items]):
+                bp_first = next(
+                    (getattr(x, 'body_proportion_gt', None) for x in self.file_items
+                     if getattr(x, 'body_proportion_gt', None) is not None),
+                    None,
+                )
+                bp_dim = bp_first.shape[-1] if bp_first is not None else 16
+                bp_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'body_proportion_gt', None)
+                    bp_embeds.append(emb if emb is not None else torch.zeros(bp_dim))
+                self.body_proportion_gt = torch.stack(bp_embeds, dim=0).to(torch.float32)
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base
