@@ -264,6 +264,40 @@ def test_batch_size_alone_never_flips_parity():
 
 
 # ----------------------------------------------------------------------
+# preview_only: loss_weight=0 must not drop diffusion without gaining depth
+# ----------------------------------------------------------------------
+
+def test_preview_only_never_drops_diffusion_without_depth():
+    # preview_only with loss_weight=0 and an explicit diffusion_depth split on a
+    # depth step: depth_objective is all-False (effective weight is 0), so the
+    # diffusion_zero mask must ALSO be all-False. A sample never loses diffusion
+    # without gaining depth. The anchor path returns 0.0 and the diffusion mean
+    # is not masked (reduces to the plain mean).
+    tr = _make_trainer(loss_weight=0.0, preview_only=True,
+                       train_loss_split='diffusion_depth', explicit=True,
+                       step_num=1)  # odd -> depth step
+    batch = _FakeBatch(2, loss_split_list=[None, None])
+    ts = torch.tensor([500.0, 500.0])
+    g = _gates(tr, batch, ts)
+    assert [bool(x) for x in g['depth_objective']] == [False, False]
+    assert [bool(x) for x in g['diffusion_zero']] == [False, False]
+    assert not bool(g['diffusion_zero'].any())
+
+    # anchor path returns 0.0; no sample reaches the perceptor
+    noise_pred = torch.zeros(2, 16, 4, 4)
+    noisy = torch.zeros(2, 16, 4, 4)
+    out = SDTrainer._compute_depth_anchor_loss(tr, noise_pred, noisy, ts, batch, g)
+    assert float(out) == 0.0
+    assert tr._depth_perceptor.calls == 0
+
+    # diffusion mean is NOT masked: an all-False diffusion_zero reduces to the
+    # plain mean (the trainer's else-branch in calculate_loss).
+    loss_per_sample = torch.tensor([2.0, 4.0])
+    masked = SDTrainer._apply_diffusion_split_mask(tr, loss_per_sample, g['diffusion_zero'])
+    assert float(masked) == float(loss_per_sample.mean())
+
+
+# ----------------------------------------------------------------------
 # Timestep window: depth loss only within [loss_min_t, loss_max_t]
 # ----------------------------------------------------------------------
 

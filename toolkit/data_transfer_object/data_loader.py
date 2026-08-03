@@ -400,7 +400,7 @@ class DataLoaderBatchDTO:
                 x.loss_split for x in self.file_items
             ]
 
-            # collect GT depth maps (variable per-image shape — kept as a list);
+            # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
             if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
                 self.depth_gt_list: Union[List, None] = [

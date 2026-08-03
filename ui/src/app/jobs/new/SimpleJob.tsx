@@ -1331,6 +1331,10 @@ export default function SimpleJob({
                         }
                         options={[
                           {
+                            value: 'depth-anything/Depth-Anything-V2-Large-hf',
+                            label: 'Depth Anything V2 Large',
+                          },
+                          {
                             value: 'depth-anything/Depth-Anything-V2-Small-hf',
                             label: 'Depth Anything V2 Small',
                           },
@@ -1340,7 +1344,9 @@ export default function SimpleJob({
                         Depth Anything V2 weights are CC-BY-NC-4.0.{' '}
                         <a
                           className="text-blue-500"
-                          href="https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf"
+                          href={`https://huggingface.co/${
+                            depthConfig?.model_id ?? 'depth-anything/Depth-Anything-V2-Small-hf'
+                          }`}
                           target="_blank"
                         >
                           Model card
@@ -1362,9 +1368,13 @@ export default function SimpleJob({
                         className="pt-2"
                         docKey={'depth_consistency.loss_min_t'}
                         value={depthConfig?.loss_min_t ?? 0}
-                        onChange={value =>
-                          setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t')
-                        }
+                        onChange={value => {
+                          setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t');
+                          const maxV = depthConfig?.loss_max_t ?? 1;
+                          if (value > maxV) {
+                            setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t');
+                          }
+                        }}
                         min={0}
                         max={1}
                         step={0.01}
@@ -1374,9 +1384,13 @@ export default function SimpleJob({
                         className="pt-2"
                         docKey={'depth_consistency.loss_max_t'}
                         value={depthConfig?.loss_max_t ?? 1}
-                        onChange={value =>
-                          setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t')
-                        }
+                        onChange={value => {
+                          setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t');
+                          const minV = depthConfig?.loss_min_t ?? 0;
+                          if (value < minV) {
+                            setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t');
+                          }
+                        }}
                         min={0}
                         max={1}
                         step={0.01}
@@ -1814,12 +1828,14 @@ export default function SimpleJob({
                             className="pt-2"
                             docKey={'datasets.depth_loss_min_t'}
                             value={dataset.depth_loss_min_t ?? null}
-                            onChange={value =>
-                              setJobConfig(
-                                value === null || value === undefined ? undefined : value,
-                                `config.process[0].datasets[${i}].depth_loss_min_t`,
-                              )
-                            }
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].depth_loss_min_t`);
+                              const maxV = dataset.depth_loss_max_t;
+                              if (v !== undefined && maxV != null && v > maxV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].depth_loss_max_t`);
+                              }
+                            }}
                             placeholder="inherit"
                             min={0}
                             max={1}
@@ -1829,12 +1845,14 @@ export default function SimpleJob({
                             className="pt-2"
                             docKey={'datasets.depth_loss_max_t'}
                             value={dataset.depth_loss_max_t ?? null}
-                            onChange={value =>
-                              setJobConfig(
-                                value === null || value === undefined ? undefined : value,
-                                `config.process[0].datasets[${i}].depth_loss_max_t`,
-                              )
-                            }
+                            onChange={value => {
+                              const v = value === null || value === undefined ? undefined : value;
+                              setJobConfig(v, `config.process[0].datasets[${i}].depth_loss_max_t`);
+                              const minV = dataset.depth_loss_min_t;
+                              if (v !== undefined && minV != null && v < minV) {
+                                setJobConfig(v, `config.process[0].datasets[${i}].depth_loss_min_t`);
+                              }
+                            }}
                             placeholder="inherit"
                             min={0}
                             max={1}

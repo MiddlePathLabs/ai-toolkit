@@ -1,6 +1,6 @@
 """End-to-end round-trip test for the depth-caching dataloader path.
 
-This is the load-bearing test for the whole depth feature (guide §4.3 item 4):
+This is the load-bearing test for the whole depth feature (guide sec.4.3 item 4):
 without it, a cache file can exist on disk while every training batch still
 receives ``depth_gt_list=None`` because nothing wires the file-item's lazy read
 into the batch DTO.

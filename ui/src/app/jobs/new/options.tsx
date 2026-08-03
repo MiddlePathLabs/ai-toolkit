@@ -1437,6 +1437,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].network.conv': [undefined, 16],
       'config.process[0].network.conv_alpha': [undefined, 16],
       'config.process[0].model.low_vram': [true, false],
+      'config.process[0].depth_consistency.model_id': [
+        'depth-anything/Depth-Anything-V2-Large-hf',
+        'depth-anything/Depth-Anything-V2-Small-hf',
+      ],
     },
     disableSections: [
       'network.conv',
@@ -1460,6 +1464,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].network.conv': [undefined, 16],
       'config.process[0].network.conv_alpha': [undefined, 16],
       'config.process[0].model.low_vram': [true, false],
+      'config.process[0].depth_consistency.model_id': [
+        'depth-anything/Depth-Anything-V2-Large-hf',
+        'depth-anything/Depth-Anything-V2-Small-hf',
+      ],
       'config.process[0].model.assistant_lora_path': [
         'ostris/krea2_turbo_training_adapter/krea2_turbo_training_adapter_v1.safetensors',
         undefined,
@@ -1490,6 +1498,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].network.conv': [undefined, 16],
       'config.process[0].network.conv_alpha': [undefined, 16],
       'config.process[0].model.low_vram': [true, false],
+      'config.process[0].depth_consistency.model_id': [
+        'depth-anything/Depth-Anything-V2-Large-hf',
+        'depth-anything/Depth-Anything-V2-Small-hf',
+      ],
       'config.process[0].train.unload_text_encoder': [false, false],
       'config.process[0].model.model_kwargs': [
         {
@@ -1524,6 +1536,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].network.conv': [undefined, 16],
       'config.process[0].network.conv_alpha': [undefined, 16],
       'config.process[0].model.low_vram': [true, false],
+      'config.process[0].depth_consistency.model_id': [
+        'depth-anything/Depth-Anything-V2-Large-hf',
+        'depth-anything/Depth-Anything-V2-Small-hf',
+      ],
       'config.process[0].model.assistant_lora_path': [
         'ostris/krea2_turbo_training_adapter/krea2_turbo_training_adapter_v1.safetensors',
         undefined,
