@@ -2270,6 +2270,120 @@ class SDTrainer(BaseSDTrainProcess):
         return loss.detach()
         # flush()
 
+    def _iter_lora_params_with_grad(self):
+        """Yield tagged LoRA parameters whose gradients are populated."""
+        groups = self.params
+        if not groups:
+            return
+        if isinstance(groups[0], dict):
+            iterable = (p for group in groups for p in group.get('params', []))
+        else:
+            iterable = iter(groups)
+        for parameter in iterable:
+            if not getattr(parameter, '_is_lora', False):
+                continue
+            if parameter.grad is None:
+                continue
+            yield parameter
+
+    def _inject_gradient_noise(self) -> None:
+        """Inject configured Gaussian noise into tagged LoRA gradients."""
+        config = self.train_config.gradient_noise
+        if not config.enabled:
+            return
+
+        step = max(0, int(getattr(self, 'step_num', 0)))
+        should_log = config.log_every > 0 and step % config.log_every == 0
+        gradient_sq = 0.0
+        noise_sq = 0.0
+
+        for parameter in self._iter_lora_params_with_grad():
+            gradient = parameter.grad
+            if config.mode == 'absolute':
+                sigma = float(config.sigma)
+            elif config.mode == 'relative':
+                rms = float(gradient.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = float(config.sigma) * rms
+            else:
+                sigma = float(config.eta) / max(1.0, (1.0 + step) ** float(config.gamma))
+
+            if sigma <= 0:
+                continue
+            noise = torch.randn_like(gradient) * sigma
+            if should_log:
+                gradient_sq += float(gradient.detach().pow(2).sum())
+                noise_sq += float(noise.pow(2).sum())
+            gradient.add_(noise)
+
+        if should_log:
+            gradient_norm = gradient_sq ** 0.5
+            noise_norm = noise_sq ** 0.5
+            self._last_grad_noise_norm = noise_norm
+            self._last_grad_noise_snr = gradient_norm / noise_norm if noise_norm > 1e-12 else 0.0
+
+    def _record_fisher_trace(self) -> None:
+        """Record the diagonal Fisher trace when optimizer state provides it."""
+        if self.optimizer is None:
+            return
+        total = 0.0
+        found_state = False
+        for group in self.optimizer.param_groups:
+            for parameter in group.get('params', []):
+                if not getattr(parameter, '_is_lora', False):
+                    continue
+                state = self.optimizer.state.get(parameter)
+                if state is None or state.get('exp_avg_sq') is None:
+                    continue
+                total += float(state['exp_avg_sq'].sum())
+                found_state = True
+        if found_state:
+            self._last_fisher_trace = total
+
+    def _inject_weight_noise(self) -> None:
+        """Inject configured Gaussian noise into tagged LoRA parameter values."""
+        config = self.train_config.weight_noise
+        if not config.enabled:
+            return
+
+        groups = self.params
+        if not groups:
+            return
+        if isinstance(groups[0], dict):
+            iterable = (p for group in groups for p in group.get('params', []))
+        else:
+            iterable = iter(groups)
+
+        step = max(0, int(getattr(self, 'step_num', 0)))
+        should_log = config.log_every > 0 and step % config.log_every == 0
+        noise_sq = 0.0
+        weight_sq = 0.0
+        for parameter in iterable:
+            if not getattr(parameter, '_is_lora', False):
+                continue
+            weight = parameter.data
+            if should_log:
+                weight_sq += float(weight.detach().pow(2).sum())
+            if config.mode == 'absolute':
+                sigma = float(config.sigma)
+            else:
+                rms = float(weight.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = float(config.sigma) * rms
+            if sigma <= 0:
+                continue
+            pre_noise_norm = float(weight.norm()) if config.bound_norm else 0.0
+            noise = torch.randn_like(weight) * sigma
+            if should_log:
+                noise_sq += float(noise.pow(2).sum())
+            weight.add_(noise)
+            if config.bound_norm and pre_noise_norm > 0.0:
+                post_noise_norm = float(weight.norm())
+                if post_noise_norm > 0.0:
+                    weight.mul_(pre_noise_norm / post_noise_norm)
+
+        if should_log:
+            self._last_weight_noise_norm = noise_sq ** 0.5
+            self._last_weight_norm = weight_sq ** 0.5
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = batch
@@ -2311,6 +2425,7 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+            self._inject_gradient_noise()
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
@@ -2321,6 +2436,8 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
+            self._record_fisher_trace()
+            self._inject_weight_noise()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
@@ -2341,6 +2458,18 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+
+        for metric_name in (
+            '_last_grad_noise_norm',
+            '_last_grad_noise_snr',
+            '_last_weight_noise_norm',
+            '_last_weight_norm',
+            '_last_fisher_trace',
+        ):
+            metric_value = getattr(self, metric_name, None)
+            if metric_value is not None:
+                loss_dict[metric_name.removeprefix('_last_')] = metric_value
+                setattr(self, metric_name, None)
 
         self.end_of_training_loop()
 

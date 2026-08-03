@@ -372,6 +372,29 @@ ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 
+class WeightNoiseConfig:
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.mode: str = str(kwargs.get('mode', 'relative'))
+        self.sigma: float = float(kwargs.get('sigma', 0.00125))
+        self.bound_norm: bool = bool(kwargs.get('bound_norm', False))
+        self.log_every: int = int(kwargs.get('log_every', 50))
+        if self.mode not in ('absolute', 'relative'):
+            raise ValueError(f'Invalid weight noise mode: {self.mode}')
+
+
+class GradientNoiseConfig:
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.mode: str = str(kwargs.get('mode', 'neelakantan'))
+        self.sigma: float = float(kwargs.get('sigma', 0.001))
+        self.eta: float = float(kwargs.get('eta', 0.01))
+        self.gamma: float = float(kwargs.get('gamma', 0.55))
+        self.log_every: int = int(kwargs.get('log_every', 50))
+        if self.mode not in ('absolute', 'relative', 'neelakantan'):
+            raise ValueError(f'Invalid gradient noise mode: {self.mode}')
+
+
 class TrainConfig:
     def __init__(self, **kwargs):
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
@@ -386,6 +409,8 @@ class TrainConfig:
         self.adapter_lr = kwargs.get('adapter_lr', self.lr)
         self.optimizer = kwargs.get('optimizer', 'adamw')
         self.optimizer_params = kwargs.get('optimizer_params', {})
+        self.weight_noise = WeightNoiseConfig(**(kwargs.get('weight_noise', {}) or {}))
+        self.gradient_noise = GradientNoiseConfig(**(kwargs.get('gradient_noise', {}) or {}))
         self.lr_scheduler = kwargs.get('lr_scheduler', 'constant')
         self.lr_scheduler_params = kwargs.get('lr_scheduler_params', {})
         self.min_denoising_steps: int = kwargs.get('min_denoising_steps', 0)
