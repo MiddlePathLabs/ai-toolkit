@@ -3,9 +3,9 @@
 Uses a FAKE Krea model that records calls -- no DA2 weights, no GPU. Enforces
 the four load-bearing contracts of the depth-GT caching pipeline:
 
-  1. The VAE round-trip callback routes Krea through sd.encode_images and
-     sd.decode_latents, NEVER a direct vae.encode (the generic
-     scaling_factor path mis-normalizes the 5D Qwen VAE).
+  1. The VAE round-trip callback routes every arch through sd.encode_images
+     and sd.decode_latents, NEVER a direct vae.encode (a scalar
+     scaling_factor mis-normalizes AutoencoderKL / Qwen VAEs).
   2. The round-trip returns finite pixels in [0, 1].
   3. Active Krea depth with low_vram: true raises at backend preflight.
   4. mask_source subject/body raise during Phase 2 (auto-masking is Phase 3).
@@ -32,14 +32,19 @@ from extensions_built_in.sd_trainer.SDTrainer import SDTrainer, preflight_depth_
 # ----------------------------------------------------------------------
 
 class _FakeVAE:
-    """A VAE whose .encode must NEVER be reached on the Krea branch."""
+    """A VAE whose .encode must NEVER be reached by the depth round-trip."""
 
     def __init__(self):
         self.config = None
 
+    def parameters(self):
+        # Residency-guard probe: yield a CPU tensor so the trainer's device
+        # check is a no-op against the CPU fake.
+        yield torch.zeros(1, device="cpu")
+
     def encode(self, *args, **kwargs):
         raise AssertionError(
-            "Krea depth round-trip must NOT call vae.encode directly; "
+            "Depth round-trip must NOT call vae.encode directly; "
             "it must route through sd.encode_images / sd.decode_latents."
         )
 
@@ -109,10 +114,10 @@ class _StubFileItem:
 
 
 # ----------------------------------------------------------------------
-# Contract 1 + 2: Krea round-trip routing and output range
+# Contract 1 + 2: round-trip routing and output range
 # ----------------------------------------------------------------------
 
-def test_roundtrip_krea_routes_through_encode_images_and_decode_latents():
+def test_roundtrip_routes_through_encode_images_and_decode_latents():
     trainer = _FakeTrainer()
     sd = _FakeKreaSD()
     trainer.sd = sd
