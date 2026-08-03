@@ -20,6 +20,14 @@
 - The Phase 0 probe must use a real Krea decode and `torch.autograd.grad(decoded_pixels.mean(), noise_pred)`; static inspection cannot satisfy the gate.
 - Depth, `rose`, loss splitting, caching, masking, and remaining perceptors are outside this branch.
 
+## Execution Status
+
+- [x] Phase 0 direct Krea decode-gradient evidence recorded.
+- [x] Backend configuration, tagging, injectors, ordering, metrics, and tests committed in `c97cbd9`.
+- [x] TypeScript types, defaults, migration, controls, docs, and UI build committed in `4a248d2`.
+- [x] Final focused Python, UI build, and scope verification completed.
+- [ ] Full end-to-end Krea training-step smoke remains a later Phase 2 acceptance check.
+
 ---
 
 ## File Map
@@ -201,10 +209,11 @@ Temporarily add the guide's Krea-only guard inside `calculate_loss` after
 `self.sd.decode_latents(noisy_latents - t * noise_pred)`, then assert
 `torch.autograd.grad(decoded_pixels.float().mean(), noise_pred, retain_graph=True,
 allow_unused=True)` is finite and non-zero and the result is `(B, 3, H, W)`.
-Run one real Krea2 job with `low_vram=false`, batch 1, and the target dtype;
-record model preset, resolution, dtype, quantization, allocated peak, and
-reserved peak. Remove the temporary block whether the probe passes or is
-blocked by the environment, and report the evidence accurately.
+Run the direct Krea2 decode contract with `low_vram=false`, batch 1, and the
+target dtype; record model preset, resolution, dtype, quantization, allocated
+peak, and reserved peak. A full training-step smoke is intentionally left for
+Phase 2 because this checkout has no training dataset/config fixture. Record
+the direct evidence and do not present it as end-to-end training coverage.
 
 - [ ] **Step 7: Run the focused tests and commit.**
 
@@ -316,4 +325,3 @@ Report the branch path, commit hashes, focused test counts, UI build result,
 known warnings, and whether the real Krea Phase 0 probe passed or could not be
 run in the available environment. Do not claim Phase 2 readiness from static
 inspection or unit tests alone.
-
