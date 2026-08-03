@@ -66,9 +66,10 @@ def preflight_depth_consistency(
       - ``arch == 'krea2'`` with ``low_vram`` true (tiled decode inside the
         autograd graph is unsupported), or
       - ``mask_source`` is not ``'none'`` (Phase 3 auto-masking is not ported), or
-      - any dataset uses ``random_crop`` / ``random_scale`` / a non-empty
-        ``augments`` list (the GT depth cache requires the same deterministic
-        bucket transform as the training tensor).
+      - any depth-active dataset (``depth_loss_weight > 0``) uses
+        ``random_crop`` / ``random_scale`` / a non-empty ``augments`` list (the
+        GT depth cache requires the same deterministic bucket transform as the
+        training tensor).
 
     Inert when depth is not configured and no dataset is depth-active.
     """
@@ -101,6 +102,8 @@ def preflight_depth_consistency(
         )
 
     for dc in dataset_configs:
+        if (getattr(dc, 'depth_loss_weight', None) or 0) <= 0:
+            continue
         if getattr(dc, 'random_crop', False) or getattr(dc, 'random_scale', False):
             raise ValueError(
                 "Depth-active datasets cannot use random_crop or random_scale in "
