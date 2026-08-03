@@ -447,6 +447,315 @@ class SDTrainer(BaseSDTrainProcess):
         _cache_loader(self.data_loader)
         _cache_loader(self.data_loader_reg)
 
+    # ------------------------------------------------------------------
+    # Depth-anchor calculate_loss block (Task 5b)
+    # ------------------------------------------------------------------
+
+    def _depth_loss_active(self) -> bool:
+        """True when the depth loss block should engage for this process.
+
+        Mirrors ``_depth_should_cache``: depth is on when the process object
+        has a positive ``loss_weight``, when ``preview_only`` is set, or when
+        any dataset sets ``depth_loss_weight > 0``. When this is False the
+        entire ``calculate_loss`` depth block (gating, decode, perceptor,
+        diffusion-side masking) is unreachable, so a depth-inactive job runs
+        the exact same path as before.
+        """
+        cfg = self.depth_consistency_config
+        if cfg is None:
+            return False
+        if cfg.loss_weight > 0 or bool(getattr(cfg, 'preview_only', False)):
+            return True
+        return any(
+            (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+            for dc in self.dataset_configs
+        )
+
+    def _resolve_depth_sample_gates(self, batch, timesteps, is_reg_per_sample):
+        """Resolve per-sample depth-anchor gates for one optimizer microbatch.
+
+        Returns a dict of ``(B,)`` tensors (and two python bools):
+
+          * ``t``              -- flow-matching ratio ``timesteps / num_train_timesteps``.
+          * ``eff_weight``     -- per-sample effective depth weight (dataset
+            override else global), zeroed for alternating samples on diffusion
+            steps so they skip the depth perceptor entirely.
+          * ``in_band``        -- ``loss_min_t <= t <= loss_max_t`` and not a
+            prior-preservation (reg) sample.
+          * ``depth_objective``-- ``in_band & (eff_weight > 0)``: the samples
+            that contribute a depth gradient this step.
+          * ``diffusion_zero`` -- alternating samples on a depth step (these
+            drop out of the diffusion loss so the two objectives alternate).
+          * ``step_is_diffusion`` / ``preview_step`` -- python bools.
+
+        Per-sample split resolution uses ``resolve_loss_split`` (Task 2): a
+        dataset ``'sum'`` forces the sample off (it sums every step); a dataset
+        ``'diffusion_depth'`` forces it on; absent -> Auto (autodetect from the
+        effective depth weight); an explicit global wins otherwise. Step parity
+        (``self.step_num % 2``) selects the active objective for alternating
+        samples -- batch size never affects it.
+        """
+        from toolkit.loss_split import resolve_loss_split
+
+        cfg = self.depth_consistency_config
+        nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        t = (timesteps.float() / nt).to(self.device_torch)
+        if t.dim() == 0:
+            t = t.view(1)
+        b = t.shape[0]
+
+        split_raw = getattr(batch, 'loss_split_list', None) or [None] * b
+        global_split = getattr(self.train_config, 'loss_split', None)
+        global_explicit = bool(getattr(self.train_config, '_loss_split_explicit', False))
+        global_dc_w = float(cfg.loss_weight) if cfg is not None else 0.0
+        per_sample_dc_w = getattr(batch, 'depth_loss_weight_list', None)
+
+        def _eff_dc_weight(idx: int) -> float:
+            if per_sample_dc_w is not None and idx < len(per_sample_dc_w):
+                v = per_sample_dc_w[idx]
+                if v is not None:
+                    return float(v)
+            return global_dc_w
+
+        split_list = [
+            resolve_loss_split(
+                ds_value=v,
+                global_value=global_split,
+                global_explicit=global_explicit,
+                effective_depth_weight=_eff_dc_weight(i),
+            )
+            for i, v in enumerate(split_raw)
+        ]
+        loss_split_diff_depth = torch.tensor(
+            [s == 'diffusion_depth' for s in split_list],
+            device=self.device_torch, dtype=torch.bool,
+        )
+        step_is_diffusion = (self.step_num % 2 == 0)
+
+        min_list = getattr(batch, 'depth_loss_min_t_list', None) or [None] * b
+        max_list = getattr(batch, 'depth_loss_max_t_list', None) or [None] * b
+        t_min = torch.tensor(
+            [float(v) if v is not None else float(cfg.loss_min_t) for v in min_list],
+            device=self.device_torch, dtype=t.dtype,
+        )
+        t_max = torch.tensor(
+            [float(v) if v is not None else float(cfg.loss_max_t) for v in max_list],
+            device=self.device_torch, dtype=t.dtype,
+        )
+        # inclusive on both ends so loss_min_t=0, loss_max_t=1 spans the full
+        # range, including t=1.0 (pure noise) when sampling is biased that way.
+        in_band = (t >= t_min) & (t <= t_max)
+        in_band = in_band & (~is_reg_per_sample.to(self.device_torch))
+
+        w_list = getattr(batch, 'depth_loss_weight_list', None) or [None] * b
+        eff_w = torch.tensor(
+            [float(w) if w is not None else global_dc_w for w in w_list],
+            device=self.device_torch, dtype=t.dtype,
+        )
+        # Loss-split gate: alternating samples skip depth on diffusion steps.
+        if loss_split_diff_depth.any() and step_is_diffusion:
+            split_mask = loss_split_diff_depth.to(self.device_torch, dtype=eff_w.dtype)
+            eff_w = eff_w * (1.0 - split_mask)
+
+        depth_objective = in_band & (eff_w > 0)
+        # Mirrors the depth gate from the other side: alternating samples skip
+        # diffusion on depth steps so the two objectives trade places.
+        diffusion_zero = loss_split_diff_depth & (not step_is_diffusion)
+
+        preview_step = (
+            int(getattr(cfg, 'preview_every', 0)) > 0
+            and self.step_num % int(getattr(cfg, 'preview_every', 0)) == 0
+        )
+
+        return {
+            't': t,
+            'eff_weight': eff_w,
+            'in_band': in_band,
+            'depth_objective': depth_objective,
+            'diffusion_zero': diffusion_zero,
+            'step_is_diffusion': step_is_diffusion,
+            'preview_step': preview_step,
+        }
+
+    def _apply_diffusion_split_mask(self, loss_per_sample, diffusion_zero):
+        """Mean of the per-sample diffusion loss, dropping depth-step samples.
+
+        ``diffusion_zero`` is a ``(B,)`` bool tensor: True for alternating
+        samples on a depth step (they contribute depth instead of diffusion).
+        With nothing dropped this is the plain ``.mean()`` -- so a depth-off or
+        non-alternating step reduces identically to the original path. With all
+        samples dropped (pure depth step) returns ``0.0``.
+        """
+        if not torch.is_tensor(diffusion_zero):
+            return loss_per_sample.mean()
+        keep = (~diffusion_zero).to(device=loss_per_sample.device, dtype=loss_per_sample.dtype)
+        n_keep = int(keep.sum().item())
+        if n_keep == 0:
+            return loss_per_sample.sum() * 0.0
+        if n_keep == loss_per_sample.shape[0]:
+            return loss_per_sample.mean()
+        return (loss_per_sample * keep).sum() / n_keep
+
+    def _prune_preview_dir(self, directory, max_keep):
+        """Keep the newest ``max_keep`` files in ``directory``; delete the rest."""
+        try:
+            files = [
+                os.path.join(directory, f)
+                for f in os.listdir(directory)
+                if os.path.isfile(os.path.join(directory, f))
+            ]
+            if len(files) <= max_keep:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p))
+            for p in files[: len(files) - max_keep]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _compute_depth_anchor_loss(self, noise_pred, noisy_latents, timesteps,
+                                   batch, gates):
+        """Run the unified live decode + DA2 forward + SSI/grad loss.
+
+        Adds depth-consistency loss only on ``gates['depth_objective']`` samples
+        (in timestep band, positive weight, not reg, and not an alternating
+        sample on a diffusion step). Returns the weighted-mean contribution to
+        add to the total loss (a python ``0.0`` when no sample qualifies), and
+        records ``self._last_depth_processed_indices`` for diagnostics.
+
+        Krea2 Turbo note: Turbo merges the training adapter at +1.0 for training
+        and inverts it at sample time (``krea2.py:301``). Depth previews are
+        decoded from the training-merged base, so they may differ from final
+        sampled images -- a training-time diagnostic, not a sample preview.
+        """
+        from toolkit.depth_loss import compute_depth_consistency_loss, render_depth_preview
+        from toolkit.depth_perceptor import gaussian_blur_2d
+
+        cfg = self.depth_consistency_config
+        # Reuse the perceptor the caching pass (Task 5a) loaded and cached; only
+        # fall back to the loader if it was never created.
+        encoder = getattr(self, '_depth_perceptor', None)
+        if encoder is None:
+            encoder = self._load_depth_perceptor()
+        depth_objective = gates['depth_objective']
+        t = gates['t']
+        eff_w = gates['eff_weight']
+
+        processed = []
+        if not depth_objective.any():
+            self._last_depth_processed_indices = processed
+            self._last_depth_consistency_loss = 0.0
+            return 0.0
+
+        # x0 recovery. Flow-matching (Krea): x0 = noisy - t * noise_pred. The
+        # epsilon/v branches are kept for completeness but are not the Phase 2
+        # path.
+        t_b = t.view(-1, 1, 1, 1)
+        if getattr(self.sd, 'is_flow_matching', True):
+            x0 = noisy_latents - t_b * noise_pred
+        else:
+            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )[timesteps.long()].view(-1, 1, 1, 1)
+            _sa = _ac.sqrt()
+            _s1ma = (1.0 - _ac).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0 = _sa * noisy_latents - _s1ma * noise_pred
+            else:
+                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+        # Unified live decode (no arch branch). Every target model implements
+        # decode_latents and handles its own scaling/shift + frame dim; Phase 0
+        # proved gradients survive for Krea. Residency guard is a no-op when the
+        # VAE is already on the training device (it can be CPU when latents are
+        # cached to disk).
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        decoded = self.sd.decode_latents(
+            x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
+        )
+        pixels = (decoded.float() + 1.0) * 0.5
+        pixels = pixels.clamp(0, 1)
+
+        # Pre-DA2 blur: the SAME gaussian_blur_2d the GT caching pass (Task 5a)
+        # applied before DA2, so pred-depth and GT-depth stay apples-to-apples.
+        # pixels itself is left untouched so preview tiles show the real decode.
+        blur_sigma = float(getattr(cfg, 'pixel_blur_sigma', 0.0) or 0.0)
+        pixels_for_da2 = gaussian_blur_2d(pixels, blur_sigma) if blur_sigma > 0 else pixels
+
+        # mask_source ships 'none' in Phase 2 (subject/body raise at preflight);
+        # the loss is full-image. No mask is read from the batch.
+        total = pixels.new_zeros(())
+        weighted_total = pixels.new_zeros(())
+        ssi_sum = 0.0
+        grad_sum = 0.0
+        n = 0
+        depth_gt_list = getattr(batch, 'depth_gt_list', None) or []
+        for i in range(pixels.shape[0]):
+            if not depth_objective[i]:
+                continue
+            if i >= len(depth_gt_list) or depth_gt_list[i] is None:
+                continue
+            gt_t = depth_gt_list[i].to(pixels.device, dtype=torch.float32)
+            loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
+                encoder, pixels_for_da2[i:i + 1], gt_t, None,
+                ssi_weight=cfg.ssi_weight,
+                grad_weight=cfg.grad_weight,
+                grad_scales=cfg.grad_scales,
+            )
+            total = total + loss_i
+            weighted_total = weighted_total + loss_i * eff_w[i]
+            ssi_sum += float(ssi_i)
+            grad_sum += float(grad_i)
+            n += 1
+            processed.append(i)
+
+            # Preview: four-panel Krea tile every preview_every steps. Lightweight
+            # and best-effort -- a failed render never aborts the training step.
+            if (gates['preview_step'] and self.save_root is not None
+                    and i < len(batch.file_items)):
+                try:
+                    from PIL import Image as _PILImage
+                    from PIL.ImageOps import exif_transpose as _exif
+                    from torchvision.transforms import functional as _TF
+                    pred_rgb = pixels[i].detach().clamp(0, 1).cpu()
+                    pred_pil = _TF.to_pil_image(pred_rgb)
+                    ref_path = batch.file_items[i].path
+                    ref_pil = _exif(_PILImage.open(ref_path)).convert('RGB')
+                    combo = render_depth_preview(
+                        pred_pil, ref_pil,
+                        dpred_i.squeeze(0) if dpred_i.dim() == 3 else dpred_i,
+                        dgt_i.squeeze(0) if dgt_i.dim() == 3 else dgt_i,
+                    )
+                    dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                    os.makedirs(dc_preview_dir, exist_ok=True)
+                    _t_val = float(t[i].item())
+                    _dc_val = float(loss_i.detach())
+                    src_name = os.path.splitext(os.path.basename(ref_path))[0]
+                    _h_px, _w_px = int(pred_rgb.shape[-2]), int(pred_rgb.shape[-1])
+                    combo.save(os.path.join(
+                        dc_preview_dir,
+                        f'{src_name}_step{self.step_num:06d}_'
+                        f't{_t_val:.2f}_dc{_dc_val:.4f}_s{_w_px}x{_h_px}.jpg'
+                    ))
+                    self._prune_preview_dir(
+                        dc_preview_dir, int(getattr(cfg, 'preview_max_keep', 500))
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print_acc(f"  depth preview failed: {e}")
+
+        self._last_depth_processed_indices = processed
+        if n == 0:
+            self._last_depth_consistency_loss = 0.0
+            return 0.0
+        applied = weighted_total / n
+        self._last_depth_consistency_loss = (total / n).detach().item()
+        self._last_depth_consistency_ssi = ssi_sum / n
+        self._last_depth_consistency_grad = grad_sum / n
+        return applied
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -714,8 +1023,24 @@ class SDTrainer(BaseSDTrainProcess):
             **kwargs
     ):
         loss_target = self.train_config.loss_target
-        is_reg = any(batch.get_is_reg_list())
+        _is_reg_list = batch.get_is_reg_list()
+        is_reg = any(_is_reg_list)
         additional_loss = 0.0
+
+        # Depth-anchor sample gating (Task 5b). Fully inert when depth is off:
+        # _depth_gates stays None, so no depth code is reachable and the loss
+        # path below is byte-for-byte the original.
+        _depth_gates = None
+        if (self._depth_loss_active()
+                and getattr(batch, 'depth_gt_list', None) is not None
+                and len(noise_pred.shape) == 4):
+            _is_reg_per_sample = torch.tensor(
+                [bool(v) for v in _is_reg_list],
+                device=self.device_torch, dtype=torch.bool,
+            )
+            _depth_gates = self._resolve_depth_sample_gates(
+                batch, timesteps, _is_reg_per_sample,
+            )
 
         prior_mask_multiplier = None
         target_mask_multiplier = None
@@ -1175,7 +1500,13 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
-        loss = loss.mean()
+        # Depth-anchor alternation: alternating samples on a depth step drop out
+        # of the diffusion mean. With no split active (or depth off) this is the
+        # original plain .mean().
+        if _depth_gates is not None and _depth_gates['diffusion_zero'].any():
+            loss = self._apply_diffusion_split_mask(loss, _depth_gates['diffusion_zero'])
+        else:
+            loss = loss.mean()
         
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
@@ -1197,7 +1528,15 @@ class SDTrainer(BaseSDTrainProcess):
 
 
         loss = loss + additional_loss
-        
+
+        # Depth-anchor loss: added only on depth-objective samples (in timestep
+        # band, positive weight, not reg, not an alternating sample on a
+        # diffusion step). Inert when depth is off (_depth_gates is None).
+        if _depth_gates is not None:
+            loss = loss + self._compute_depth_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch, _depth_gates,
+            )
+
         if hasattr(self.sd, "get_additional_loss"):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
             if additional_model_loss is not None:
