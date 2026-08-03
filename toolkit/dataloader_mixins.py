@@ -822,6 +822,9 @@ class ImageProcessingDTOMixin:
         # NormalID GT: lazy read in the worker. No-op unless normal is cached.
         if self.is_normal_cached:
             self.get_normal_gt()
+        # BodyProportion GT: lazy read in the worker. No-op unless cached.
+        if self.is_body_proportion_cached:
+            self.get_body_proportion_gt()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1896,6 +1899,46 @@ class NormalCachingFileItemDTOMixin:
         # from the same file.
         if self.is_normal_cached:
             self.normal_gt = None
+
+
+class BodyProportionCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # Cached GT body-proportion ratios (2*N,) -- ratios then visibilities.
+        # Set on the file item lazily in the worker.
+        self.body_proportion_gt: Union[torch.Tensor, None] = None
+        self.is_body_proportion_cached = False
+        self._bp_cache_path: Union[str, None] = None
+        self._bp_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_bp_key(cache_path, key):
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key not in f.keys():
+                    return None
+                tensor = f.get_tensor(key)
+        except Exception:  # noqa: BLE001
+            return None
+        if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
+            return None
+        return tensor
+
+    def get_body_proportion_gt(self: 'FileItemDTO'):
+        if not self.is_body_proportion_cached:
+            return self.body_proportion_gt
+        if self.body_proportion_gt is None:
+            self.body_proportion_gt = self._read_bp_key(
+                self._bp_cache_path, self._bp_cache_key
+            )
+        return self.body_proportion_gt
+
+    def cleanup_body_proportion(self: 'FileItemDTO'):
+        if self.is_body_proportion_cached:
+            self.body_proportion_gt = None
 
 
 class LatentCachingMixin:

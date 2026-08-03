@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -68,6 +68,16 @@ export const defaultNormalIDConfig: NormalIDConfig = {
   preview_every: 100,
   preview_only: false,
   preview_max_keep: 500,
+};
+
+// Safe disabled defaults for the process-level body-proportion anchor. Enable
+// = set loss_weight > 0; disable = loss_weight 0. No `enabled` field. ViTPose
+// weights download lazily only when body-proportion is enabled.
+export const defaultBodyProportionConfig: BodyProportionConfig = {
+  loss_weight: 0,
+  loss_min_t: 0,
+  loss_max_t: 1,
+  include_head: false,
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -167,6 +177,7 @@ export const defaultJobConfig: JobConfig = {
         sample: defaultSampleConfig,
         depth_consistency: { ...defaultDepthConsistencyConfig },
         normal_id: { ...defaultNormalIDConfig },
+        body_proportion: { ...defaultBodyProportionConfig },
       },
     ],
   },
@@ -227,6 +238,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].normal_id = {
     ...defaultNormalIDConfig,
     ...(jobConfig.config.process[0].normal_id ?? {}),
+  };
+  // Merge a complete disabled body-proportion object into any partial saved object.
+  jobConfig.config.process[0].body_proportion = {
+    ...defaultBodyProportionConfig,
+    ...(jobConfig.config.process[0].body_proportion ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';

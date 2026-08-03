@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -207,6 +207,52 @@ def preflight_normal_id(
     return config
 
 
+def body_proportion_active_for_dataset(
+    body_proportion_config: Optional[BodyProportionConfig],
+    dataset_config,
+) -> bool:
+    """Return whether one dataset needs body-proportion processing."""
+    dataset_weight = getattr(dataset_config, 'body_proportion_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            body_proportion_config.loss_weight
+            if body_proportion_config is not None
+            else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
+def preflight_body_proportion(
+    body_proportion_config: Optional[BodyProportionConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[BodyProportionConfig]:
+    """Resolve the effective body-proportion config. Returns None when inactive.
+
+    A dataset-only activation builds ``BodyProportionConfig(loss_weight=0.0)``.
+    Like depth/normal, the live body-proportion loss decodes x0 through the VAE
+    under gradient, so Krea 2 with ``low_vram`` true is rejected.
+    """
+    _dataset_bp_active = any(
+        body_proportion_active_for_dataset(body_proportion_config, dc)
+        for dc in dataset_configs
+    )
+    config = body_proportion_config
+    if config is None and _dataset_bp_active:
+        config = BodyProportionConfig(loss_weight=0.0)
+    if config is None:
+        return None
+    _bp_active = config.loss_weight > 0 or _dataset_bp_active
+    if not _bp_active:
+        return config
+    if arch == 'krea2' and low_vram:
+        raise ValueError(
+            'Body-proportion loss for Krea 2 requires model.low_vram: false.'
+        )
+    return config
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -292,6 +338,17 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_normal_loss: Optional[float] = None
         self._last_normal_loss_applied: Optional[float] = None
         self._last_normal_cos: Optional[float] = None
+
+        _body_proportion_raw = self.get_conf('body_proportion', None)
+        if _body_proportion_raw is not None:
+            self.body_proportion_config: Optional[BodyProportionConfig] = BodyProportionConfig(
+                **_body_proportion_raw
+            )
+        else:
+            self.body_proportion_config = None
+        # Body-proportion diagnostics (flushed into loss_dict when present).
+        self._last_body_proportion_loss: Optional[float] = None
+        self._last_body_proportion_loss_applied: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -1111,6 +1168,155 @@ class SDTrainer(BaseSDTrainProcess):
 
         return applied if not preview_only else 0.0
 
+    # ------------------------------------------------------------------
+    # Body-proportion anchor (ViTPose) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _body_proportion_should_cache(self) -> bool:
+        cfg = self.body_proportion_config
+        if cfg is None:
+            return False
+        return cfg.loss_weight > 0 or any(
+            body_proportion_active_for_dataset(cfg, dc) for dc in self.dataset_configs
+        )
+
+    def _body_proportion_loss_active(self) -> bool:
+        return self._body_proportion_should_cache()
+
+    def _load_body_proportion_perceptor(self):
+        """Lazily load the frozen ViTPose perceptor; cached on the trainer.
+
+        The transformers ViTPose import + HF download live inside __init__, so
+        selecting Krea never downloads ViTPose -- only enabling body-proportion
+        loss does.
+        """
+        if getattr(self, '_body_proportion_perceptor', None) is not None:
+            return self._body_proportion_perceptor
+        from toolkit.body_proportion import DifferentiableBodyProportionEncoder
+        self._body_proportion_perceptor = DifferentiableBodyProportionEncoder(
+            device=self.device_torch,
+        )
+        return self._body_proportion_perceptor
+
+    def _cache_body_proportion_gt_pass(self):
+        """Iterate body-proportion-active datasets and stamp + persist GT ratios."""
+        from toolkit.body_proportion import cache_body_proportion
+        cfg = self.body_proportion_config
+        encoder = self._load_body_proportion_perceptor()
+
+        def _ds_bp_active(dc):
+            return body_proportion_active_for_dataset(cfg, dc)
+
+        def _cache_loader(loader):
+            if loader is None:
+                return
+            for dataset in get_dataloader_datasets(loader):
+                if not _ds_bp_active(dataset.dataset_config):
+                    continue
+                cache_body_proportion(dataset.file_list, cfg, encoder=encoder)
+
+        _cache_loader(self.data_loader)
+        _cache_loader(self.data_loader_reg)
+
+    def _compute_body_proportion_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Run the unified live decode + ViTPose forward + ratio L1 loss.
+
+        Body-proportion does NOT participate in diffusion/depth loss_split; it
+        fires every step on samples in its timestep window with a positive
+        weight, a cached GT ratio vector, and not a reg sample. Returns the
+        weighted-mean contribution (a python 0.0 when no sample qualifies).
+
+        Like normal, this performs its own grad-enabled x0 decode (a second one
+        when depth/normal are also active) -- acceptable headroom on 96 GB.
+        """
+        from toolkit.body_proportion_loss import compute_body_proportion_loss
+
+        cfg = self.body_proportion_config
+        ref_bp = getattr(batch, 'body_proportion_gt', None)
+        if ref_bp is None:
+            return 0.0
+
+        encoder = getattr(self, '_body_proportion_perceptor', None)
+        if encoder is None:
+            encoder = self._load_body_proportion_perceptor()
+
+        num_t = self.sd.noise_scheduler.config.num_train_timesteps
+        t_ratio = (timesteps.float() / num_t)
+        is_reg = batch.get_is_reg_list()
+
+        per_ds_w = getattr(batch, 'body_proportion_loss_weight_list', None)
+        has_per_ds = per_ds_w is not None and any(w is not None for w in per_ds_w)
+        global_w = cfg.loss_weight
+        min_t_list = getattr(batch, 'body_proportion_loss_min_t_list', None)
+        max_t_list = getattr(batch, 'body_proportion_loss_max_t_list', None)
+        include_head = bool(getattr(cfg, 'include_head', False))
+
+        B = noise_pred.shape[0]
+        weights = []
+        valid = torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        for i in range(B):
+            w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
+            weights.append(float(w or 0.0))
+            if is_reg[i] or weights[i] <= 0.0:
+                continue
+            # ref_bp is (B, 2N); a zero row means no body detected for that item
+            if ref_bp[i].abs().sum().item() == 0.0:
+                continue
+            lo = float(min_t_list[i]) if (min_t_list and min_t_list[i] is not None) else cfg.loss_min_t
+            hi = float(max_t_list[i]) if (max_t_list and max_t_list[i] is not None) else cfg.loss_max_t
+            tr = float(t_ratio[i].item())
+            if not (lo <= tr <= hi):
+                continue
+            valid[i] = True
+
+        if not valid.any():
+            self._last_body_proportion_loss = 0.0
+            return 0.0
+
+        # x0 recovery + decode (grad-enabled)
+        t_b = t_ratio.view(-1, 1, 1, 1)
+        if getattr(self.sd, 'is_flow_matching', True):
+            x0 = noisy_latents - t_b * noise_pred
+        else:
+            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )[timesteps.long()].view(-1, 1, 1, 1)
+            _sa = _ac.sqrt()
+            _s1ma = (1.0 - _ac).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0 = _sa * noisy_latents - _s1ma * noise_pred
+            else:
+                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        decoded = self.sd.decode_latents(
+            x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype,
+        )
+        pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        idx_map = [i for i in range(B) if valid[i]]
+        ref_subset = ref_bp[idx_map].to(pixels.device, dtype=torch.float32)
+        n = ref_subset.shape[-1] // 2
+        ref_ratios = ref_subset[:, :n]
+        ref_vis = ref_subset[:, n:]
+
+        # Linear timestep weight (higher noise -> more weight, per source).
+        bp_weight = t_ratio[idx_map]
+        gen_ratios, gen_vis = encoder(pixels[idx_map], ref_ratios=ref_ratios, include_head=include_head)
+        loss_per_sample, _missing = compute_body_proportion_loss(
+            gen_ratios, gen_vis, ref_ratios, ref_vis,
+        )
+        loss_per_sample = loss_per_sample * bp_weight
+        w_tensor = torch.tensor(
+            [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
+        )
+        applied = (loss_per_sample * w_tensor).mean()
+        self._last_body_proportion_loss_applied = float(applied.detach().item())
+        with torch.no_grad():
+            self._last_body_proportion_loss = float(loss_per_sample.mean().item())
+        return applied
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -1139,6 +1345,14 @@ class SDTrainer(BaseSDTrainProcess):
         self._normal_step_count = 0
         if self._normal_should_cache():
             self._cache_normal_gt_pass()
+        # Body-proportion preflight + GT caching pass. Fully inert when inactive.
+        self.body_proportion_config = preflight_body_proportion(
+            self.body_proportion_config, self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
+        if self._body_proportion_should_cache():
+            self._cache_body_proportion_gt_pass()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -1417,6 +1631,13 @@ class SDTrainer(BaseSDTrainProcess):
         _normal_active = (
             self._normal_loss_active()
             and getattr(batch, 'normal_gt_list', None) is not None
+            and len(noise_pred.shape) == 4
+        )
+        # Body-proportion gate. Independent of depth/normal; fires on its own
+        # timestep-window samples with cached GT ratios.
+        _body_proportion_active = (
+            self._body_proportion_loss_active()
+            and getattr(batch, 'body_proportion_gt', None) is not None
             and len(noise_pred.shape) == 4
         )
 
@@ -1919,6 +2140,12 @@ class SDTrainer(BaseSDTrainProcess):
         # independent of the diffusion/depth loss_split. Inert when normal is off.
         if _normal_active:
             loss = loss + self._compute_normal_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch,
+            )
+
+        # Body-proportion loss: fires on its own timestep-window samples.
+        if _body_proportion_active:
+            loss = loss + self._compute_body_proportion_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch,
             )
 
@@ -3310,6 +3537,8 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_normal_loss',
             '_last_normal_loss_applied',
             '_last_normal_cos',
+            '_last_body_proportion_loss',
+            '_last_body_proportion_loss_applied',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:
