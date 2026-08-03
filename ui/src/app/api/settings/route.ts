@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import { defaultTrainFolder, defaultDatasetsFolder } from '@/paths';
+import { defaultTrainFolder, defaultDatasetsFolder, defaultModelsFolder } from '@/paths';
 import { flushCache } from '@/server/settings';
 
 export async function GET() {
@@ -19,6 +19,14 @@ export async function GET() {
       settingsObject.DATASETS_FOLDER = defaultDatasetsFolder;
     }
     settingsObject.OFFLINE_MODE = settingsObject.OFFLINE_MODE === '1';
+
+    // MODELS_PATH from the env file always takes precedence over the setting
+    if (process.env.MODELS_PATH && process.env.MODELS_PATH.trim() !== '') {
+      settingsObject.MODELS_PATH = process.env.MODELS_PATH;
+    } else if (!settingsObject.MODELS_PATH || settingsObject.MODELS_PATH === '') {
+      // if MODELS_PATH is not set, use default
+      settingsObject.MODELS_PATH = defaultModelsFolder;
+    }
     return NextResponse.json(settingsObject);
   } catch (error) {
     return NextResponse.json({ error: 'Failed to fetch settings' }, { status: 500 });
@@ -28,7 +36,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { HF_TOKEN, OFFLINE_MODE, TRAINING_FOLDER, DATASETS_FOLDER } = body;
+    const { HF_TOKEN, OFFLINE_MODE, TRAINING_FOLDER, DATASETS_FOLDER, MODELS_PATH } = body;
     const offlineModeValue = OFFLINE_MODE ? '1' : '0';
 
     // Persist all settings in the key/value store
@@ -52,6 +60,11 @@ export async function POST(request: Request) {
         where: { key: 'DATASETS_FOLDER' },
         update: { value: DATASETS_FOLDER },
         create: { key: 'DATASETS_FOLDER', value: DATASETS_FOLDER },
+      }),
+      prisma.settings.upsert({
+        where: { key: 'MODELS_PATH' },
+        update: { value: MODELS_PATH },
+        create: { key: 'MODELS_PATH', value: MODELS_PATH },
       }),
     ]);
 

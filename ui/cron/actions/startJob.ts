@@ -3,7 +3,7 @@ import { Job } from '@prisma/client';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getOfflineMode } from '../paths';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getOfflineMode, getModelsPath } from '../paths';
 import { resolveDetachedPythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
@@ -252,6 +252,15 @@ const startAndWatchJob = (job: Job) => {
 
     if (await getOfflineMode()) {
       additionalEnv.HF_HUB_OFFLINE = '1';
+    }
+
+    // MODELS_PATH - one set in the env always takes precedence (it passes
+    // through via process.env); only fall back to the setting if it is not set
+    if (!process.env.MODELS_PATH || process.env.MODELS_PATH.trim() === '') {
+      const modelsPath = await getModelsPath();
+      if (modelsPath && modelsPath.trim() !== '') {
+        additionalEnv.MODELS_PATH = modelsPath;
+      }
     }
 
     const args = [runFilePath, configPath];

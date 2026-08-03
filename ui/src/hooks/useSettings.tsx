@@ -8,6 +8,7 @@ export interface Settings {
   OFFLINE_MODE: boolean;
   TRAINING_FOLDER: string;
   DATASETS_FOLDER: string;
+  MODELS_PATH: string;
 }
 
 export default function useSettings() {
@@ -16,6 +17,7 @@ export default function useSettings() {
     OFFLINE_MODE: false,
     TRAINING_FOLDER: '',
     DATASETS_FOLDER: '',
+    MODELS_PATH: '',
   });
   const [isSettingsLoaded, setIsLoaded] = useState(false);
   useEffect(() => {
@@ -29,6 +31,7 @@ export default function useSettings() {
           OFFLINE_MODE: data.OFFLINE_MODE,
           TRAINING_FOLDER: data.TRAINING_FOLDER || '',
           DATASETS_FOLDER: data.DATASETS_FOLDER || '',
+          MODELS_PATH: data.MODELS_PATH || '',
         });
         setIsLoaded(true);
       })
