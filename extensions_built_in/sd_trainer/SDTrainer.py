@@ -323,6 +323,153 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    # ------------------------------------------------------------------
+    # Depth-consistency GT caching (Task 5a)
+    # ------------------------------------------------------------------
+
+    def _depth_should_cache(self) -> bool:
+        """True when depth is active and the GT caching pass should run.
+
+        Mirrors the activity test in ``preflight_depth_consistency`` so the
+        pass stays fully inert (no DA2 import, no perceptor load, no
+        file-item stamping) whenever depth is off.
+        """
+        cfg = self.depth_consistency_config
+        if cfg is None:
+            return False
+        ds_depth = any(
+            (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+            for dc in self.dataset_configs
+        )
+        return (
+            cfg.loss_weight > 0
+            or bool(getattr(cfg, 'preview_only', False))
+            or ds_depth
+        )
+
+    def _depth_vae_id(self) -> str:
+        """Stable VAE identity for the cache fingerprint.
+
+        VAE class fully-qualified name + ``vae.config._name_or_path``, falling
+        back to ``model.model_kwargs.vae_path``. Changing the VAE forces a
+        cache miss because the round-trip pixels change.
+        """
+        vae = self.sd.vae
+        class_fqn = f"{type(vae).__module__}.{type(vae).__name__}"
+        vae_cfg = getattr(vae, 'config', None)
+        name_or_path = getattr(vae_cfg, '_name_or_path', None)
+        if name_or_path:
+            return f"{class_fqn}:{name_or_path}"
+        model_kwargs = getattr(self.model_config, 'model_kwargs', None)
+        vae_path = getattr(model_kwargs, 'vae_path', None) if model_kwargs else None
+        if vae_path:
+            return f"{class_fqn}:{vae_path}"
+        return class_fqn
+
+    def _depth_vae_roundtrip(self, arr: torch.Tensor) -> torch.Tensor:
+        """[0,1] pixels ``(1,3,H,W)`` -> VAE encode -> decode -> [0,1] pixels.
+
+        Krea routes through ``sd.encode_images`` / ``sd.decode_latents``
+        (5D Qwen VAE, ``latents_mean``/``latents_std``). The generic
+        ``vae.encode`` + scalar ``scaling_factor`` path is invalid for Krea's
+        VAE and is the fallback for non-Krea arches only. The cached GT depth
+        is taken from these round-trip pixels so the live depth loss has a
+        VAE-matched target.
+        """
+        if getattr(self.sd, 'model_config', None) is not None and \
+                self.sd.model_config.arch == 'krea2':
+            pixels_m1 = (arr * 2.0 - 1.0).to(self.sd.vae_torch_dtype)
+            latents = self.sd.encode_images(
+                [image for image in pixels_m1],
+                device=self.device_torch,
+                dtype=self.sd.vae_torch_dtype,
+            )
+            decoded = self.sd.decode_latents(
+                latents,
+                device=self.device_torch,
+                dtype=self.sd.vae_torch_dtype,
+            )
+            return ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        # Generic fallback (Flux / SDXL / SD): the 4D image VAE. Encode gives
+        # the raw latent; decode reverses it. scaling_factor/shift_factor are
+        # UNet-space conversions that cancel across a pure encode -> decode
+        # round-trip, so they are not applied here.
+        vae_dtype = getattr(self.sd.vae, 'dtype', torch.float32)
+        try:
+            first_param = next(self.sd.vae.parameters())
+            if first_param.device != self.device_torch:
+                self.sd.vae.to(self.device_torch)
+        except StopIteration:
+            pass  # parameter-less VAE -- nothing to move
+        arr_norm = (arr * 2.0 - 1.0).to(vae_dtype)
+        posterior = self.sd.vae.encode(arr_norm)
+        if hasattr(posterior, 'latent_dist'):
+            raw_latent = posterior.latent_dist.mode()
+        elif isinstance(posterior, torch.Tensor):
+            raw_latent = posterior
+        elif hasattr(posterior, 'sample') and callable(getattr(posterior, 'sample')):
+            raw_latent = posterior.sample()
+        else:
+            raw_latent = posterior[0]
+        pixels = self.sd.vae.decode(raw_latent.to(vae_dtype)).sample.float()
+        pixels = (pixels + 1.0) * 0.5
+        if pixels.dim() == 5:
+            pixels = pixels[:, :, 0]
+        return pixels.clamp(0, 1)
+
+    def _load_depth_perceptor(self):
+        """Lazily load the frozen DA2 perceptor; cached on the trainer.
+
+        ``DepthAnythingForDepthEstimation`` imports inside the load so simply
+        selecting Krea never downloads DA2 -- only enabling depth does.
+        """
+        if getattr(self, '_depth_perceptor', None) is not None:
+            return self._depth_perceptor
+        from toolkit.depth_perceptor import DifferentiableDepthEncoder
+        cfg = self.depth_consistency_config
+        self._depth_perceptor = DifferentiableDepthEncoder(
+            model_id=cfg.model_id,
+            input_size=int(cfg.input_size),
+            device=self.device_torch,
+            grad_checkpoint=bool(getattr(cfg, 'grad_checkpoint', True)),
+        )
+        return self._depth_perceptor
+
+    def _cache_depth_gt_pass(self):
+        """Iterate depth-active datasets and stamp + persist GT depth.
+
+        Loads the perceptor once, computes a stable ``vae_id``, and stamps every
+        depth-active file item with the cache path/key Task 3's mixin reads.
+        """
+        from toolkit.depth_perceptor import cache_depth_gt
+        cfg = self.depth_consistency_config
+        arch = self.sd.model_config.arch
+        vae_id = self._depth_vae_id()
+        encoder = self._load_depth_perceptor()
+        global_active = cfg.loss_weight > 0 or bool(getattr(cfg, 'preview_only', False))
+
+        def _ds_depth_active(dc):
+            if global_active:
+                return True
+            return (getattr(dc, 'depth_loss_weight', None) or 0) > 0
+
+        def _cache_loader(loader):
+            if loader is None:
+                return
+            for dataset in get_dataloader_datasets(loader):
+                if not _ds_depth_active(dataset.dataset_config):
+                    continue
+                cache_depth_gt(
+                    dataset.file_list, cfg,
+                    encoder=encoder, arch=arch, vae_id=vae_id,
+                    device=self.device_torch,
+                    roundtrip_fn=self._depth_vae_roundtrip,
+                )
+
+        _cache_loader(self.data_loader)
+        _cache_loader(self.data_loader_reg)
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -331,6 +478,12 @@ class SDTrainer(BaseSDTrainProcess):
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
         )
+        # Depth-GT caching pass: runs AFTER preflight and AFTER dataloaders
+        # exist. Fully inert when depth is inactive (no DA2 import, no perceptor
+        # load, no file-item stamping). The VAE round-trip pulls the VAE back
+        # onto the device when latents were cached.
+        if self._depth_should_cache():
+            self._cache_depth_gt_pass()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
