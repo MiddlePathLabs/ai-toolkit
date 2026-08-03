@@ -189,6 +189,10 @@ class SDTrainer(BaseSDTrainProcess):
             )
         else:
             self.depth_consistency_config = None
+        # Depth-step counter for preview cadence. Decoupled from raw step
+        # parity so previews render on DEPTH steps regardless of preview_every
+        # being even/odd (see _depth_preview_due). Reset in hook_before_train_loop.
+        self._depth_step_count = 0
 
     def before_model_load(self):
         pass
@@ -486,7 +490,8 @@ class SDTrainer(BaseSDTrainProcess):
             that contribute a depth gradient this step.
           * ``diffusion_zero`` -- alternating samples on a depth step (these
             drop out of the diffusion loss so the two objectives alternate).
-          * ``step_is_diffusion`` / ``preview_step`` -- python bools.
+          * ``step_is_diffusion`` -- python bool (preview cadence is handled by
+            ``_depth_preview_due``, which counts DEPTH steps).
 
         Per-sample split resolution uses ``resolve_loss_split`` (Task 2): a
         dataset ``'sum'`` forces the sample off (it sums every step); a dataset
@@ -564,11 +569,6 @@ class SDTrainer(BaseSDTrainProcess):
         # depth (e.g. preview_only with loss_weight=0, or out-of-band steps).
         diffusion_zero = loss_split_diff_depth & (not step_is_diffusion) & depth_objective
 
-        preview_step = (
-            int(getattr(cfg, 'preview_every', 0)) > 0
-            and self.step_num % int(getattr(cfg, 'preview_every', 0)) == 0
-        )
-
         return {
             't': t,
             'eff_weight': eff_w,
@@ -576,8 +576,19 @@ class SDTrainer(BaseSDTrainProcess):
             'depth_objective': depth_objective,
             'diffusion_zero': diffusion_zero,
             'step_is_diffusion': step_is_diffusion,
-            'preview_step': preview_step,
         }
+
+    def _depth_preview_due(self, cfg) -> bool:
+        """Whether a depth preview tile should render on this DEPTH step.
+
+        Cadence counts DEPTH steps (``self._depth_step_count``), not raw
+        ``step_num``. Gating on raw step parity made every preview land on a
+        diffusion step when ``preview_every`` was even, so the per-sample
+        preview loop never executed. Returns False when previews are off
+        (``preview_every <= 0``).
+        """
+        every = int(getattr(cfg, 'preview_every', 0) or 0)
+        return every > 0 and (self._depth_step_count % every == 0)
 
     def _apply_diffusion_split_mask(self, loss_per_sample, diffusion_zero):
         """Mean of the per-sample diffusion loss, dropping depth-step samples.
@@ -651,6 +662,12 @@ class SDTrainer(BaseSDTrainProcess):
             self._last_depth_consistency_loss = 0.0
             return 0.0
 
+        # Advance the DEPTH-step counter only on steps where depth actually
+        # runs (past the early-return above). Preview cadence keys off this, not
+        # raw step parity, so an even preview_every no longer aligns exclusively
+        # with diffusion steps.
+        self._depth_step_count += 1
+
         # x0 recovery. Flow-matching (Krea): x0 = noisy - t * noise_pred. The
         # epsilon/v branches are kept for completeness but are not the Phase 2
         # path.
@@ -714,9 +731,12 @@ class SDTrainer(BaseSDTrainProcess):
             n += 1
             processed.append(i)
 
-            # Preview: four-panel Krea tile every preview_every steps. Lightweight
-            # and best-effort -- a failed render never aborts the training step.
-            if (gates['preview_step'] and self.save_root is not None
+            # Preview: four-panel Krea tile every preview_every DEPTH steps.
+            # Cadence keys off _depth_step_count (advanced above), not raw step
+            # parity, so an even preview_every no longer collides exclusively
+            # with diffusion steps. Best-effort -- a failed render never aborts
+            # the training step.
+            if (self._depth_preview_due(cfg) and self.save_root is not None
                     and i < len(batch.file_items)):
                 try:
                     from PIL import Image as _PILImage
@@ -766,6 +786,9 @@ class SDTrainer(BaseSDTrainProcess):
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
         )
+        # Fresh start for a re-run / reattempt: preview cadence counts DEPTH
+        # steps, so a stale counter would desync the tile cadence.
+        self._depth_step_count = 0
         # Depth-GT caching pass: runs AFTER preflight and AFTER dataloaders
         # exist. Fully inert when depth is inactive (no DA2 import, no perceptor
         # load, no file-item stamping). The VAE round-trip pulls the VAE back
