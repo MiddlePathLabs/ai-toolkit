@@ -167,19 +167,21 @@ def test_krea_depth_without_low_vram_does_not_raise():
 
 
 # ----------------------------------------------------------------------
-# Contract 4: mask_source subject/body raise during Phase 2
+# Contract 4 (Phase 3): mask_source subject/body are now ALLOWED at preflight
+# (auto-masking ships them). The cross-check that subject_mask is enabled runs
+# in hook_before_train_loop; preflight itself no longer rejects them.
 # ----------------------------------------------------------------------
 
-def test_mask_source_subject_raises_in_phase2():
+def test_mask_source_subject_allowed_in_phase3():
     cfg = DepthConsistencyConfig(loss_weight=0.001, mask_source="subject")
-    with pytest_raises(ValueError, match="mask_source"):
-        preflight_depth_consistency(cfg, [], arch="krea2", low_vram=False)
+    result = preflight_depth_consistency(cfg, [], arch="krea2", low_vram=False)
+    assert result is cfg
 
 
-def test_mask_source_body_raises_in_phase2():
+def test_mask_source_body_allowed_in_phase3():
     cfg = DepthConsistencyConfig(loss_weight=0.001, mask_source="body")
-    with pytest_raises(ValueError, match="mask_source"):
-        preflight_depth_consistency(cfg, [], arch="flux", low_vram=False)
+    result = preflight_depth_consistency(cfg, [], arch="flux", low_vram=False)
+    assert result is cfg
 
 
 def test_mask_source_none_is_allowed():

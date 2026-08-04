@@ -85,6 +85,8 @@ export default function SimpleJob({
   const bodyProportionEnabled = (bodyProportionConfig?.loss_weight ?? 0) > 0;
   const faceIdConfig = jobConfig.config.process[0].face_id;
   const faceIdEnabled = (faceIdConfig?.identity_loss_weight ?? 0) > 0;
+  const subjectMaskConfig = jobConfig.config.process[0].subject_mask;
+  const subjectMaskEnabled = subjectMaskConfig?.enabled ?? false;
   const globalLossSplit = jobConfig.config.process[0].train.loss_split;
   const globalSplitUi =
     globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
@@ -1392,6 +1394,26 @@ export default function SimpleJob({
                         placeholder="eg. 100"
                         min={0}
                       />
+                      <SelectInput
+                        label="Mask Source"
+                        className="pt-2"
+                        docKey={'depth_consistency.mask_source'}
+                        value={depthConfig?.mask_source ?? 'none'}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].depth_consistency.mask_source')
+                        }
+                        options={[
+                          { value: 'none', label: 'None (full image)' },
+                          { value: 'subject', label: 'Subject (person)' },
+                          { value: 'body', label: 'Body (skin/hair/limbs)' },
+                        ]}
+                      />
+                      {depthConfig?.mask_source && depthConfig.mask_source !== 'none' && !subjectMaskEnabled && (
+                        <div className="text-xs text-yellow-500 pt-1">
+                          Warning: Mask Source requires Auto-Masking to be enabled below, or the trainer
+                          will refuse to start.
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -1745,6 +1767,100 @@ export default function SimpleJob({
                     </FormGroup>
                   </div>
                 )}
+              </div>
+            </Card>
+          </div>
+        )}
+        {modelArch?.additionalSections?.includes('subject_mask') && (
+          <div>
+            <Card title="Auto-Masking" collapsible>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div>
+                  <FormGroup label="Subject Masking">
+                    <Checkbox
+                      label="Enable Auto-Masking"
+                      docKey={'subject_mask.enabled'}
+                      className="pt-1"
+                      checked={subjectMaskEnabled}
+                      onChange={value => setJobConfig(value, 'config.process[0].subject_mask.enabled')}
+                    />
+                    {subjectMaskEnabled && (
+                      <>
+                        <SelectInput
+                          label="SAM 2 Size"
+                          className="pt-2"
+                          docKey={'subject_mask.sam_size'}
+                          value={subjectMaskConfig?.sam_size ?? 'small'}
+                          onChange={value => setJobConfig(value, 'config.process[0].subject_mask.sam_size')}
+                          options={[
+                            { value: 'tiny', label: 'Tiny' },
+                            { value: 'small', label: 'Small' },
+                            { value: 'base_plus', label: 'Base Plus' },
+                            { value: 'large', label: 'Large' },
+                          ]}
+                        />
+                        <NumberInput
+                          label="Background Loss Weight"
+                          className="pt-2"
+                          docKey={'subject_mask.background_loss_weight'}
+                          value={subjectMaskConfig?.background_loss_weight ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.background_loss_weight',
+                            )
+                          }
+                          placeholder="1.0 (inherit)"
+                          min={0}
+                        />
+                        <NumberInput
+                          label="Body Loss Weight"
+                          className="pt-2"
+                          docKey={'subject_mask.body_loss_weight'}
+                          value={subjectMaskConfig?.body_loss_weight ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.body_loss_weight',
+                            )
+                          }
+                          placeholder="1.0 (inherit)"
+                          min={0}
+                        />
+                        <NumberInput
+                          label="Clothing Loss Weight"
+                          className="pt-2"
+                          docKey={'subject_mask.clothing_loss_weight'}
+                          value={subjectMaskConfig?.clothing_loss_weight ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.clothing_loss_weight',
+                            )
+                          }
+                          placeholder="1.0 (inherit)"
+                          min={0}
+                        />
+                        <Checkbox
+                          label="Restrict Perceptual Anchors to Body"
+                          className="pt-2"
+                          docKey={'subject_mask.perceptual_restrict_to_body'}
+                          checked={subjectMaskConfig?.perceptual_restrict_to_body ?? false}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].subject_mask.perceptual_restrict_to_body')
+                          }
+                        />
+                        <div className="text-xs text-gray-400 pt-2">
+                          Extracts per-image person/body/clothing masks via YOLO + SAM 2 + SegFormer
+                          (preflight, non-differentiable). The loss weights above region-weight the
+                          diffusion loss multiplicatively. Enable Depth Mask Source (in Perceptual
+                          Anchors) to restrict the depth anchor to the subject/body. Models download
+                          lazily from Hugging Face / ultralytics on first enable.
+                        </div>
+                      </>
+                    )}
+                  </FormGroup>
+                </div>
               </div>
             </Card>
           </div>

@@ -197,6 +197,25 @@ export interface FaceIDConfig {
   identity_loss_decoded_det_threshold: number;
 }
 
+export interface SubjectMaskConfig {
+  enabled: boolean;
+  yolo_ckpt: string;
+  yolo_conf: number;
+  primary_only: boolean;
+  sam_size: string;
+  segformer_res: number;
+  cache_resolution: number;
+  dtype: string;
+  body_close_radius: number;
+  mask_dilate_radius: number;
+  skin_bias: number;
+  background_loss_weight?: number | null;
+  clothing_loss_weight?: number | null;
+  body_loss_weight?: number | null;
+  perceptual_restrict_to_body: boolean;
+  save_debug_previews: boolean;
+}
+
 export interface ValidationItem {
   image_path: string;
   prompt: string;
@@ -353,6 +372,8 @@ export interface ProcessConfig {
   body_proportion?: BodyProportionConfig;
   // Process-level (not TrainConfig): consumed via get_conf('face_id').
   face_id?: FaceIDConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('subject_mask').
+  subject_mask?: SubjectMaskConfig;
 }
 
 export interface ConfigObject {

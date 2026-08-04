@@ -758,6 +758,49 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Per-Dataset Maximum Timestep',
     description: <>Overrides the global identity-anchor maximum timestep for this dataset only. Leave empty to inherit.</>,
   },
+  'depth_consistency.mask_source': {
+    title: 'Depth Mask Source',
+    description: (
+      <>
+        Restricts the depth-anchor loss to a cached region. None applies the full-image loss; Subject uses
+        the person mask (body + clothing); Body uses only skin/hair/limbs. Subject/Body require
+        Auto-Masking to be enabled, or the trainer will refuse to start. The depth loss gracefully
+        degrades to full-image for any sample whose mask is missing.
+      </>
+    ),
+  },
+  'subject_mask.enabled': {
+    title: 'Auto-Masking',
+    description: (
+      <>
+        Extracts per-image person/body/clothing masks via YOLO (person detection) + SAM 2 (silhouette) +
+        SegFormer-clothes (semantic source of truth). Masks are cached at preflight time (non-
+        differentiable) and used to region-weight the diffusion loss and restrict the perceptual anchors.
+        SegFormer is the semantic source of truth; YOLO detects people; SAM 2 provides a reference
+        silhouette. Models download lazily on first enable. Requires ultralytics + transformers + opencv.
+      </>
+    ),
+  },
+  'subject_mask.background_loss_weight': {
+    title: 'Background Loss Weight',
+    description: <>Multiplies the diffusion loss OUTSIDE the person region by this factor. Lower (eg. 0) de-emphasizes the background; null/1.0 inherits (no change).</>,
+  },
+  'subject_mask.body_loss_weight': {
+    title: 'Body Loss Weight',
+    description: <>Multiplies the diffusion loss INSIDE the body region (skin/hair/limbs) by this factor. Higher (eg. 2) emphasizes identity-relevant regions.</>,
+  },
+  'subject_mask.clothing_loss_weight': {
+    title: 'Clothing Loss Weight',
+    description: <>Multiplies the diffusion loss INSIDE the clothing region by this factor.</>,
+  },
+  'subject_mask.perceptual_restrict_to_body': {
+    title: 'Restrict Perceptual Anchors to Body',
+    description: <>When on, the surface-normal anchor loss is computed only inside the body region (per-sample normalized so unrestricted items keep their magnitude).</>,
+  },
+  'subject_mask.sam_size': {
+    title: 'SAM 2 Size',
+    description: <>The SAM 2 checkpoint size used for the reference silhouette. Small is the default; larger is slower but sharper.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

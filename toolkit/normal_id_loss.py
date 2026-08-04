@@ -20,6 +20,7 @@ def compute_normal_loss(
     encoder,
     x0_pixels: torch.Tensor,
     gt_normals: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Surface-normal matching loss for a batch.
 
@@ -29,6 +30,11 @@ def compute_normal_loss(
         gt_normals: ``(B, 3, Hg, Wg)`` cached GT unit normals (any resolution;
             resized to the perceptor output grid). All-zero maps mark an item
             with no usable GT (filtered by the caller's valid mask).
+        mask: optional ``(B, Hm, Wm)`` spatial weight in ``[0, 1]``. When given,
+            the per-pixel cosine/L1 are weighted by it before a per-sample
+            *normalized* spatial average (``sum(p*mask)/sum(mask)``), so a
+            uniform mask reproduces the plain mean and a body-restriction mask
+            focuses the loss on the body region.
 
     Returns:
         ``(cos_loss, l1_loss, gen_detached, ref_detached)`` -- ``cos_loss`` and
@@ -48,17 +54,27 @@ def compute_normal_loss(
         )
     ref = ref.to(gen.device, dtype=gen.dtype)
 
-    # Cosine dissimilarity per pixel (both are unit-normalized -> dot = cosine),
-    # averaged spatially -> (B,).
     cos_per_pixel = (ref * gen).sum(dim=1)  # (B, H, W)
-    cos_mean = cos_per_pixel.mean(dim=(1, 2))  # (B,)
-    cos_loss = 1.0 - cos_mean  # (B,)
-
-    # L1 per pixel, averaged spatially -> (B,).
     l1_per_pixel = (ref - gen).abs().mean(dim=1)  # (B, H, W)
-    l1_loss = l1_per_pixel.mean(dim=(1, 2))  # (B,)
 
-    return cos_loss, l1_loss, gen.detach(), ref.detach()
+    if mask is not None:
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.shape[-2:] != cos_per_pixel.shape[-2:]:
+            mask = F.interpolate(
+                mask.unsqueeze(1).float(), size=cos_per_pixel.shape[-2:],
+                mode="nearest",
+            ).squeeze(1)
+        mask = mask.to(cos_per_pixel.device, dtype=cos_per_pixel.dtype)
+        denom = mask.sum(dim=(1, 2)).clamp(min=1e-6)
+        cos_mean = (cos_per_pixel * mask).sum(dim=(1, 2)) / denom
+        l1_mean = (l1_per_pixel * mask).sum(dim=(1, 2)) / denom
+    else:
+        cos_mean = cos_per_pixel.mean(dim=(1, 2))  # (B,)
+        l1_mean = l1_per_pixel.mean(dim=(1, 2))  # (B,)
+
+    cos_loss = 1.0 - cos_mean  # (B,)
+    return cos_loss, l1_mean, gen.detach(), ref.detach()
 
 
 def render_normal_preview(pred_pil, ref_pil, gen_normals, ref_normals):
