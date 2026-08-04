@@ -1076,6 +1076,33 @@ class BodyShapeConfig:
             )
 
 
+class VAEAnchorConfig:
+    """Cross-VAE perceptual anchor using a frozen Flux 2 VAE encoder.
+
+    Process-level config (read through ``self.get_conf('vae_anchor')``). Enable
+    by setting ``loss_weight > 0``. Decodes the predicted x0 through the training
+    model's VAE, encodes those pixels with a SEPARATE frozen Flux 2 VAE encoder,
+    and matches the multi-scale features against cached GT via cosine similarity.
+    The Flux 2 VAE weights auto-download from HuggingFace (ai-toolkit/flux2_vae).
+    Requires einops (for the flux2 autoencoder). Does NOT participate in loss_split.
+    """
+
+    def __init__(self, **kwargs):
+        self.loss_weight: float = float(kwargs.get('loss_weight', 0.0))
+        self.loss_min_t: float = float(kwargs.get('loss_min_t', 0.0))
+        self.loss_max_t: float = float(kwargs.get('loss_max_t', 0.5))
+        self.vae_model_path: str = kwargs.get('vae_model_path', '')
+
+        if self.loss_min_t < 0.0:
+            raise ValueError(f"loss_min_t must be >= 0, got {self.loss_min_t}")
+        if self.loss_max_t > 1.0:
+            raise ValueError(f"loss_max_t must be <= 1, got {self.loss_max_t}")
+        if self.loss_min_t > self.loss_max_t:
+            raise ValueError(
+                f"loss_min_t ({self.loss_min_t}) must be <= loss_max_t ({self.loss_max_t})"
+            )
+
+
 class SubjectMaskConfig:
     """Auto-masking via YOLO + SAM 2 + SegFormer-clothes (Phase 3).
 
@@ -1355,6 +1382,11 @@ class DatasetConfig:
         self.body_shape_loss_min_t: Union[float, None] = kwargs.get('body_shape_loss_min_t', None)
         self.body_shape_loss_max_t: Union[float, None] = kwargs.get('body_shape_loss_max_t', None)
         self.body_shape_loss_min_cos: Union[float, None] = kwargs.get('body_shape_loss_min_cos', None)
+
+        # VAE-anchor per-dataset overrides. None means inherit the global vae_anchor setting.
+        self.vae_anchor_loss_weight: Union[float, None] = kwargs.get('vae_anchor_loss_weight', None)
+        self.vae_anchor_loss_min_t: Union[float, None] = kwargs.get('vae_anchor_loss_min_t', None)
+        self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
 
         # Subject-mask per-dataset overrides. None means inherit the global SubjectMaskConfig.
         self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)

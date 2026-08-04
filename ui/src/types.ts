@@ -157,6 +157,10 @@ export interface DatasetConfig {
   body_shape_loss_min_t?: number;
   body_shape_loss_max_t?: number;
   body_shape_loss_min_cos?: number;
+  // Per-dataset vae-anchor overrides; undefined means inherit the global vae_anchor config.
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
 }
 
 export interface EMAConfig {
@@ -249,6 +253,13 @@ export interface BodyShapeConfig {
   loss_min_t: number;
   loss_max_t: number;
   loss_min_cos: number;
+}
+
+export interface VAEAnchorConfig {
+  loss_weight: number;
+  loss_min_t: number;
+  loss_max_t: number;
+  vae_model_path: string;
 }
 
 export interface ValidationItem {
@@ -413,6 +424,8 @@ export interface ProcessConfig {
   subject_mask?: SubjectMaskConfig;
   // Process-level (not TrainConfig): consumed via get_conf('body_shape').
   body_shape?: BodyShapeConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('vae_anchor').
+  vae_anchor?: VAEAnchorConfig;
 }
 
 export interface ConfigObject {

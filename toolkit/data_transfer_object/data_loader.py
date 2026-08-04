@@ -18,6 +18,7 @@ from toolkit.dataloader_mixins import (
     BodyProportionCachingFileItemDTOMixin,
     FaceIdentityCachingFileItemDTOMixin,
     BodyShapeCachingFileItemDTOMixin,
+    VAEAnchorCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -54,6 +55,7 @@ class FileItemDTO(
     BodyProportionCachingFileItemDTOMixin,
     FaceIdentityCachingFileItemDTOMixin,
     BodyShapeCachingFileItemDTOMixin,
+    VAEAnchorCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -224,6 +226,11 @@ class FileItemDTO(
         self.body_shape_loss_max_t: Union[float, None] = self.dataset_config.body_shape_loss_max_t
         self.body_shape_loss_min_cos: Union[float, None] = self.dataset_config.body_shape_loss_min_cos
 
+        # vae-anchor per-dataset overrides (None = inherit global)
+        self.vae_anchor_loss_weight: Union[float, None] = self.dataset_config.vae_anchor_loss_weight
+        self.vae_anchor_loss_min_t: Union[float, None] = self.dataset_config.vae_anchor_loss_min_t
+        self.vae_anchor_loss_max_t: Union[float, None] = self.dataset_config.vae_anchor_loss_max_t
+
         # subject-mask per-dataset overrides (None = inherit global SubjectMaskConfig)
         self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
         self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
@@ -252,6 +259,7 @@ class FileItemDTO(
         self.cleanup_body_proportion()
         self.cleanup_face_identity()
         self.cleanup_body_shape()
+        self.cleanup_vae_anchor()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -495,6 +503,17 @@ class DataLoaderBatchDTO:
                 x.body_shape_loss_min_cos for x in self.file_items
             ]
 
+            # vae-anchor per-dataset scalars (None = inherit global)
+            self.vae_anchor_loss_weight_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_weight for x in self.file_items
+            ]
+            self.vae_anchor_loss_min_t_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_min_t for x in self.file_items
+            ]
+            self.vae_anchor_loss_max_t_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_max_t for x in self.file_items
+            ]
+
             # subject-mask per-dataset overrides (None = inherit global)
             self.background_loss_weight_list: List[Union[float, None]] = [
                 x.background_loss_weight for x in self.file_items
@@ -562,6 +581,34 @@ class DataLoaderBatchDTO:
                     emb = getattr(x, 'body_shape_gt', None)
                     bs_embeds.append(emb if emb is not None else torch.zeros(10))
                 self.body_shape_gt = torch.stack(bs_embeds, dim=0).to(torch.float32)
+
+            # collect GT vae-anchor features (dict of 5 per-level tensors); batch
+            # each level into (B, C, H, W) zero-padding missing items. Only built
+            # when at least one item has cached features.
+            if any([getattr(x, 'vae_anchor_features', None) is not None for x in self.file_items]):
+                from toolkit.vae_anchor import FEATURE_LEVELS
+                self.vae_anchor_features = {}
+                for level in FEATURE_LEVELS:
+                    per_item = []
+                    ref_shape = None
+                    for x in self.file_items:
+                        feats = getattr(x, 'vae_anchor_features', None) or {}
+                        t = feats.get(level)
+                        if t is not None:
+                            # cached features carry a leading batch dim (1,C,H,W); squeeze it.
+                            if t.dim() == 4 and t.shape[0] == 1:
+                                t = t.squeeze(0)
+                            if ref_shape is None:
+                                ref_shape = t.shape
+                            per_item.append(t)
+                        else:
+                            per_item.append(None)
+                    if ref_shape is None:
+                        continue
+                    padded = [
+                        (t if t is not None else torch.zeros(ref_shape)) for t in per_item
+                    ]
+                    self.vae_anchor_features[level] = torch.stack(padded, dim=0).to(torch.float32)
 
             # Stack cached subject masks if any (direct-set by cache_subject_masks).
             # Missing items are zero-padded so per-sample weight composition stays

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -330,6 +330,40 @@ def preflight_body_shape(
     return config
 
 
+def vae_anchor_active_for_dataset(
+    vae_anchor_config: Optional[VAEAnchorConfig],
+    dataset_config,
+) -> bool:
+    dataset_weight = getattr(dataset_config, 'vae_anchor_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            vae_anchor_config.loss_weight if vae_anchor_config is not None else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
+def preflight_vae_anchor(
+    vae_anchor_config: Optional[VAEAnchorConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[VAEAnchorConfig]:
+    _dataset_va_active = any(
+        vae_anchor_active_for_dataset(vae_anchor_config, dc) for dc in dataset_configs
+    )
+    config = vae_anchor_config
+    if config is None and _dataset_va_active:
+        config = VAEAnchorConfig(loss_weight=0.0)
+    if config is None:
+        return None
+    _va_active = config.loss_weight > 0 or _dataset_va_active
+    if not _va_active:
+        return config
+    if arch == 'krea2' and low_vram:
+        raise ValueError('VAE-anchor loss for Krea 2 requires model.low_vram: false.')
+    return config
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -458,6 +492,14 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_body_shape_loss: Optional[float] = None
         self._last_body_shape_loss_applied: Optional[float] = None
         self._last_body_shape_cos: Optional[float] = None
+
+        _vae_anchor_raw = self.get_conf('vae_anchor', None)
+        if _vae_anchor_raw is not None:
+            self.vae_anchor_config: Optional[VAEAnchorConfig] = VAEAnchorConfig(**_vae_anchor_raw)
+        else:
+            self.vae_anchor_config = None
+        self._last_vae_anchor_loss: Optional[float] = None
+        self._last_vae_anchor_loss_applied: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -1914,6 +1956,126 @@ class SDTrainer(BaseSDTrainProcess):
             self._last_body_shape_loss = float((l1 * gate.float()).sum().item() / n_valid)
         return applied
 
+    # ------------------------------------------------------------------
+    # VAE-anchor (Flux 2 VAE perceptual) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _vae_anchor_should_cache(self) -> bool:
+        cfg = self.vae_anchor_config
+        if cfg is None:
+            return False
+        return cfg.loss_weight > 0 or any(
+            vae_anchor_active_for_dataset(cfg, dc) for dc in self.dataset_configs
+        )
+
+    def _vae_anchor_loss_active(self) -> bool:
+        return self._vae_anchor_should_cache()
+
+    def _load_vae_anchor_perceptor(self):
+        if getattr(self, '_vae_anchor_encoder', None) is not None:
+            return self._vae_anchor_encoder
+        from toolkit.vae_anchor import VAEAnchorEncoder
+        cfg = self.vae_anchor_config
+        enc = VAEAnchorEncoder(vae_path=getattr(cfg, 'vae_model_path', ''))
+        enc.load(device=self.device_torch, dtype=torch.float32)
+        self._vae_anchor_encoder = enc
+        return enc
+
+    def _cache_vae_anchor_gt_pass(self):
+        from toolkit.vae_anchor import cache_vae_anchor
+        cfg = self.vae_anchor_config
+        encoder = self._load_vae_anchor_perceptor()
+        for loader in (self.data_loader, self.data_loader_reg):
+            if loader is None:
+                continue
+            for dataset in get_dataloader_datasets(loader):
+                if not vae_anchor_active_for_dataset(cfg, dataset.dataset_config):
+                    continue
+                cache_vae_anchor(dataset.file_list, cfg, encoder=encoder)
+
+    def _compute_vae_anchor_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Live decode (training VAE) + Flux 2 encode + multi-scale cosine feature loss."""
+        from toolkit.vae_anchor import VAEAnchorEncoder, FEATURE_LEVELS
+
+        cfg = self.vae_anchor_config
+        ref_features = getattr(batch, 'vae_anchor_features', None)
+        if not ref_features:
+            return 0.0
+        encoder = getattr(self, '_vae_anchor_encoder', None)
+        if encoder is None:
+            encoder = self._load_vae_anchor_perceptor()
+
+        num_t = self.sd.noise_scheduler.config.num_train_timesteps
+        t_ratio = (timesteps.float() / num_t)
+        is_reg = batch.get_is_reg_list()
+        per_ds_w = getattr(batch, 'vae_anchor_loss_weight_list', None)
+        has_per_ds = per_ds_w is not None and any(w is not None for w in per_ds_w)
+        global_w = cfg.loss_weight
+        min_t_list = getattr(batch, 'vae_anchor_loss_min_t_list', None)
+        max_t_list = getattr(batch, 'vae_anchor_loss_max_t_list', None)
+
+        B = noise_pred.shape[0]
+        weights, valid = [], torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        for i in range(B):
+            w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
+            weights.append(float(w or 0.0))
+            if is_reg[i] or weights[i] <= 0.0:
+                continue
+            # ref valid if all levels present and non-zero
+            ref_ok = all(
+                ref_features[lv][i].abs().sum().item() > 0
+                for lv in FEATURE_LEVELS if lv in ref_features
+            ) if ref_features else False
+            if not ref_ok:
+                continue
+            lo = float(min_t_list[i]) if (min_t_list and min_t_list[i] is not None) else cfg.loss_min_t
+            hi = float(max_t_list[i]) if (max_t_list and max_t_list[i] is not None) else cfg.loss_max_t
+            tr = float(t_ratio[i].item())
+            if not (lo <= tr <= hi):
+                continue
+            valid[i] = True
+
+        if not valid.any():
+            self._last_vae_anchor_loss = 0.0
+            return 0.0
+
+        t_b = t_ratio.view(-1, 1, 1, 1)
+        if getattr(self.sd, 'is_flow_matching', True):
+            x0 = noisy_latents - t_b * noise_pred
+        else:
+            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )[timesteps.long()].view(-1, 1, 1, 1)
+            _sa = _ac.sqrt()
+            _s1ma = (1.0 - _ac).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0 = _sa * noisy_latents - _s1ma * noise_pred
+            else:
+                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        decoded = self.sd.decode_latents(x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype)
+        pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        idx_map = [i for i in range(B) if valid[i]]
+        pixel_input = (pixels[idx_map] * 2.0 - 1.0)  # [0,1] -> [-1,1] for the Flux encoder
+        with torch.amp.autocast('cuda', enabled=False):
+            _, pred_features = encoder.encode_with_features(pixel_input.float())
+        ref_subset = {lv: ref_features[lv][idx_map].to(pixels.device, dtype=torch.float32)
+                      for lv in FEATURE_LEVELS if lv in ref_features}
+        loss_per_sample, _per_level = VAEAnchorEncoder.compute_loss(pred_features, ref_subset)
+
+        w_tensor = torch.tensor(
+            [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
+        )
+        n_valid = len(idx_map)
+        applied = (loss_per_sample * w_tensor).sum() / max(n_valid, 1)
+        self._last_vae_anchor_loss_applied = float(applied.detach().item())
+        with torch.no_grad():
+            self._last_vae_anchor_loss = float(loss_per_sample.mean().item())
+        return applied
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -1967,6 +2129,14 @@ class SDTrainer(BaseSDTrainProcess):
         )
         if self._body_shape_should_cache():
             self._cache_body_shape_gt_pass()
+        # VAE-anchor preflight + GT caching pass.
+        self.vae_anchor_config = preflight_vae_anchor(
+            self.vae_anchor_config, self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
+        if self._vae_anchor_should_cache():
+            self._cache_vae_anchor_gt_pass()
         # Auto-masking (YOLO + SAM 2 + SegFormer): cache person/body/clothing
         # masks when subject_mask is enabled. Fully inert (no model downloads,
         # no extraction) when disabled.
@@ -2271,6 +2441,12 @@ class SDTrainer(BaseSDTrainProcess):
         _body_shape_active = (
             self._body_shape_loss_active()
             and getattr(batch, 'body_shape_gt', None) is not None
+            and len(noise_pred.shape) == 4
+        )
+        # VAE-anchor gate.
+        _vae_anchor_active = (
+            self._vae_anchor_loss_active()
+            and getattr(batch, 'vae_anchor_features', None)
             and len(noise_pred.shape) == 4
         )
 
@@ -2851,6 +3027,13 @@ class SDTrainer(BaseSDTrainProcess):
         # Body-shape loss: L1 on SMPL betas, cosine-gated.
         if _body_shape_active:
             loss = loss + self._compute_body_shape_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch,
+            )
+
+        # VAE-anchor loss: cross-VAE (training VAE decode -> Flux 2 VAE encode)
+        # multi-scale cosine feature loss.
+        if _vae_anchor_active:
+            loss = loss + self._compute_vae_anchor_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch,
             )
 
@@ -4290,6 +4473,8 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_body_shape_loss',
             '_last_body_shape_loss_applied',
             '_last_body_shape_cos',
+            '_last_vae_anchor_loss',
+            '_last_vae_anchor_loss_applied',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:

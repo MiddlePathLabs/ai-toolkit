@@ -819,6 +819,9 @@ class ImageProcessingDTOMixin:
         # BodyShape GT: lazy read in the worker. No-op unless cached.
         if self.is_body_shape_cached:
             self.get_body_shape_gt()
+        # VAEAnchor features: lazy read in the worker. No-op unless cached.
+        if self.is_vae_anchor_cached:
+            self.get_vae_anchor_features()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -2017,6 +2020,40 @@ class BodyShapeCachingFileItemDTOMixin:
     def cleanup_body_shape(self: 'FileItemDTO'):
         if self.is_body_shape_cached:
             self.body_shape_gt = None
+
+
+class VAEAnchorCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        self.vae_anchor_features: Union[dict, None] = None
+        self.is_vae_anchor_cached = False
+        self._vae_cache_path: Union[str, None] = None
+
+    def get_vae_anchor_features(self: 'FileItemDTO'):
+        if not self.is_vae_anchor_cached:
+            return self.vae_anchor_features
+        if self.vae_anchor_features is None and self._vae_cache_path is not None:
+            from toolkit.vae_anchor import FEATURE_LEVELS, CACHE_VERSION_KEY
+            feats = {}
+            try:
+                with safe_open(self._vae_cache_path, framework="pt", device="cpu") as f:
+                    keys = set(f.keys())
+                    if CACHE_VERSION_KEY in keys and all(
+                        f"vae_anchor_{lv}" in keys for lv in FEATURE_LEVELS
+                    ):
+                        for lv in FEATURE_LEVELS:
+                            t = f.get_tensor(f"vae_anchor_{lv}")
+                            if t is not None and t.numel() > 0 and torch.isfinite(t).all():
+                                feats[lv] = t
+            except Exception:  # noqa: BLE001
+                feats = {}
+            self.vae_anchor_features = feats if len(feats) == len(FEATURE_LEVELS) else None
+        return self.vae_anchor_features
+
+    def cleanup_vae_anchor(self: 'FileItemDTO'):
+        if self.is_vae_anchor_cached:
+            self.vae_anchor_features = None
 
 
 class LatentCachingMixin:

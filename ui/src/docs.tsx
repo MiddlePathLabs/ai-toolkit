@@ -855,6 +855,27 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Per-Dataset Body-Shape Weight',
     description: <>Overrides the global body-shape loss weight for this dataset only. Leave empty to inherit; 0 disables.</>,
   },
+  'vae_anchor.loss_weight': {
+    title: 'VAE Anchor',
+    description: (
+      <>
+        Cross-VAE perceptual anchor: decodes the predicted x0 through the training model's VAE, encodes
+        those pixels with a SEPARATE frozen Flux 2 VAE encoder, and matches the multi-scale features
+        against cached GT via cosine similarity (5 levels, higher-resolution weighted more). The Flux 2
+        VAE downloads from Hugging Face on first enable. Anchors to the Flux 2 VAE feature space
+        (independent of Krea 2's VAE). Like the other anchors it decodes x0 under gradient, so Low VRAM
+        is disabled while it is active.
+      </>
+    ),
+  },
+  'vae_anchor.loss_min_t': {
+    title: 'Minimum Timestep',
+    description: <>The VAE anchor only applies on steps whose timestep ratio is at least this (0 to 1).</>,
+  },
+  'vae_anchor.loss_max_t': {
+    title: 'Maximum Timestep',
+    description: <>The VAE anchor only applies on steps whose timestep ratio is at most this (0 to 1). Defaults to 0.5 (low-noise region where structure is set).</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

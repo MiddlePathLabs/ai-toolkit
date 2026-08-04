@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -125,6 +125,15 @@ export const defaultBodyShapeConfig: BodyShapeConfig = {
   loss_min_cos: 0.2,
 };
 
+// Safe disabled defaults for the process-level vae-anchor. Enable = set
+// loss_weight > 0. The Flux 2 VAE downloads lazily from HuggingFace.
+export const defaultVAEAnchorConfig: VAEAnchorConfig = {
+  loss_weight: 0,
+  loss_min_t: 0,
+  loss_max_t: 0.5,
+  vae_model_path: '',
+};
+
 export const defaultJobConfig: JobConfig = {
   job: 'extension',
   config: {
@@ -226,6 +235,7 @@ export const defaultJobConfig: JobConfig = {
         face_id: { ...defaultFaceIDConfig },
         subject_mask: { ...defaultSubjectMaskConfig },
         body_shape: { ...defaultBodyShapeConfig },
+        vae_anchor: { ...defaultVAEAnchorConfig },
       },
     ],
   },
@@ -306,6 +316,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].body_shape = {
     ...defaultBodyShapeConfig,
     ...(jobConfig.config.process[0].body_shape ?? {}),
+  };
+  // Merge a complete disabled vae-anchor object into any partial saved object.
+  jobConfig.config.process[0].vae_anchor = {
+    ...defaultVAEAnchorConfig,
+    ...(jobConfig.config.process[0].vae_anchor ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';
