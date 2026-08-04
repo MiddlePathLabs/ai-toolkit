@@ -41,7 +41,8 @@ type AdditionalSections =
   | 'normal_id'
   | 'body_proportion'
   | 'face_id'
-  | 'subject_mask';
+  | 'subject_mask'
+  | 'body_shape';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1177,6 +1178,7 @@ export const modelArchs: ModelArch[] = [
       'body_proportion',
       'face_id',
       'subject_mask',
+      'body_shape',
     ],
   },
   {
@@ -1215,6 +1217,7 @@ export const modelArchs: ModelArch[] = [
       'body_proportion',
       'face_id',
       'subject_mask',
+      'body_shape',
     ],
   },
   {
@@ -1259,6 +1262,7 @@ export const modelArchs: ModelArch[] = [
       'body_proportion',
       'face_id',
       'subject_mask',
+      'body_shape',
     ],
   },
   {
@@ -1310,6 +1314,7 @@ export const modelArchs: ModelArch[] = [
       'body_proportion',
       'face_id',
       'subject_mask',
+      'body_shape',
     ],
   },
   {

@@ -1045,6 +1045,32 @@ class FaceIDConfig:
             )
 
 
+class BodyShapeConfig:
+    """Body-shape auxiliary loss via a frozen HybrIK ResNet-34 perceptor.
+
+    Process-level config (read through ``self.get_conf('body_shape')``). Enable
+    by setting ``loss_weight > 0``. Regresses 10-dim SMPL betas and matches them
+    against cached GT via L1 (with a cosine gate). Requires the HybrIK checkpoint
+    (Google-Drive-only; gdown auto-downloads or manual fetch). Distinct from
+    body-proportion (ViTPose ratios). Does NOT participate in loss_split.
+    """
+
+    def __init__(self, **kwargs):
+        self.loss_weight: float = float(kwargs.get('loss_weight', 0.0))
+        self.loss_min_t: float = float(kwargs.get('loss_min_t', 0.4))
+        self.loss_max_t: float = float(kwargs.get('loss_max_t', 0.8))
+        self.loss_min_cos: float = float(kwargs.get('loss_min_cos', 0.2))
+
+        if self.loss_min_t < 0.0:
+            raise ValueError(f"loss_min_t must be >= 0, got {self.loss_min_t}")
+        if self.loss_max_t > 1.0:
+            raise ValueError(f"loss_max_t must be <= 1, got {self.loss_max_t}")
+        if self.loss_min_t > self.loss_max_t:
+            raise ValueError(
+                f"loss_min_t ({self.loss_min_t}) must be <= loss_max_t ({self.loss_max_t})"
+            )
+
+
 class SubjectMaskConfig:
     """Auto-masking via YOLO + SAM 2 + SegFormer-clothes (Phase 3).
 
@@ -1311,6 +1337,12 @@ class DatasetConfig:
         self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
         self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
         self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+
+        # Body-shape per-dataset overrides. None means inherit the global body_shape setting.
+        self.body_shape_loss_weight: Union[float, None] = kwargs.get('body_shape_loss_weight', None)
+        self.body_shape_loss_min_t: Union[float, None] = kwargs.get('body_shape_loss_min_t', None)
+        self.body_shape_loss_max_t: Union[float, None] = kwargs.get('body_shape_loss_max_t', None)
+        self.body_shape_loss_min_cos: Union[float, None] = kwargs.get('body_shape_loss_min_cos', None)
 
         # Subject-mask per-dataset overrides. None means inherit the global SubjectMaskConfig.
         self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)

@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -115,6 +115,16 @@ export const defaultSubjectMaskConfig: SubjectMaskConfig = {
   save_debug_previews: false,
 };
 
+// Safe disabled defaults for the process-level body-shape anchor. Enable =
+// set loss_weight > 0. Requires the HybrIK checkpoint (Google-Drive-only;
+// gdown auto-downloads or manual fetch).
+export const defaultBodyShapeConfig: BodyShapeConfig = {
+  loss_weight: 0,
+  loss_min_t: 0.4,
+  loss_max_t: 0.8,
+  loss_min_cos: 0.2,
+};
+
 export const defaultJobConfig: JobConfig = {
   job: 'extension',
   config: {
@@ -215,6 +225,7 @@ export const defaultJobConfig: JobConfig = {
         body_proportion: { ...defaultBodyProportionConfig },
         face_id: { ...defaultFaceIDConfig },
         subject_mask: { ...defaultSubjectMaskConfig },
+        body_shape: { ...defaultBodyShapeConfig },
       },
     ],
   },
@@ -290,6 +301,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].subject_mask = {
     ...defaultSubjectMaskConfig,
     ...(jobConfig.config.process[0].subject_mask ?? {}),
+  };
+  // Merge a complete disabled body-shape object into any partial saved object.
+  jobConfig.config.process[0].body_shape = {
+    ...defaultBodyShapeConfig,
+    ...(jobConfig.config.process[0].body_shape ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';

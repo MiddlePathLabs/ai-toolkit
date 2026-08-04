@@ -17,6 +17,7 @@ from toolkit.dataloader_mixins import (
     NormalCachingFileItemDTOMixin,
     BodyProportionCachingFileItemDTOMixin,
     FaceIdentityCachingFileItemDTOMixin,
+    BodyShapeCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -48,6 +49,7 @@ class FileItemDTO(
     NormalCachingFileItemDTOMixin,
     BodyProportionCachingFileItemDTOMixin,
     FaceIdentityCachingFileItemDTOMixin,
+    BodyShapeCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -195,6 +197,12 @@ class FileItemDTO(
         self.identity_loss_max_t: Union[float, None] = self.dataset_config.identity_loss_max_t
         self.identity_loss_min_cos: Union[float, None] = self.dataset_config.identity_loss_min_cos
 
+        # body-shape per-dataset overrides (None = inherit global)
+        self.body_shape_loss_weight: Union[float, None] = self.dataset_config.body_shape_loss_weight
+        self.body_shape_loss_min_t: Union[float, None] = self.dataset_config.body_shape_loss_min_t
+        self.body_shape_loss_max_t: Union[float, None] = self.dataset_config.body_shape_loss_max_t
+        self.body_shape_loss_min_cos: Union[float, None] = self.dataset_config.body_shape_loss_min_cos
+
         # subject-mask per-dataset overrides (None = inherit global SubjectMaskConfig)
         self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
         self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
@@ -222,6 +230,7 @@ class FileItemDTO(
         self.cleanup_normal()
         self.cleanup_body_proportion()
         self.cleanup_face_identity()
+        self.cleanup_body_shape()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()
@@ -418,6 +427,20 @@ class DataLoaderBatchDTO:
                 x.identity_loss_min_cos for x in self.file_items
             ]
 
+            # body-shape per-dataset scalars (None = inherit global)
+            self.body_shape_loss_weight_list: List[Union[float, None]] = [
+                x.body_shape_loss_weight for x in self.file_items
+            ]
+            self.body_shape_loss_min_t_list: List[Union[float, None]] = [
+                x.body_shape_loss_min_t for x in self.file_items
+            ]
+            self.body_shape_loss_max_t_list: List[Union[float, None]] = [
+                x.body_shape_loss_max_t for x in self.file_items
+            ]
+            self.body_shape_loss_min_cos_list: List[Union[float, None]] = [
+                x.body_shape_loss_min_cos for x in self.file_items
+            ]
+
             # subject-mask per-dataset overrides (None = inherit global)
             self.background_loss_weight_list: List[Union[float, None]] = [
                 x.background_loss_weight for x in self.file_items
@@ -476,6 +499,15 @@ class DataLoaderBatchDTO:
             # list (variable presence). None means no face detected for that item.
             if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
                 self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
+
+            # collect GT body-shape betas (10-dim); batched into one tensor when
+            # at least one item has cached betas.
+            if any([getattr(x, 'body_shape_gt', None) is not None for x in self.file_items]):
+                bs_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'body_shape_gt', None)
+                    bs_embeds.append(emb if emb is not None else torch.zeros(10))
+                self.body_shape_gt = torch.stack(bs_embeds, dim=0).to(torch.float32)
 
             # Stack cached subject masks if any (direct-set by cache_subject_masks).
             # Missing items are zero-padded so per-sample weight composition stays

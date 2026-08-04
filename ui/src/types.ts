@@ -129,6 +129,11 @@ export interface DatasetConfig {
   identity_loss_min_t?: number;
   identity_loss_max_t?: number;
   identity_loss_min_cos?: number;
+  // Per-dataset body-shape overrides; undefined means inherit the global body_shape config.
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  body_shape_loss_min_cos?: number;
 }
 
 export interface EMAConfig {
@@ -214,6 +219,13 @@ export interface SubjectMaskConfig {
   body_loss_weight?: number | null;
   perceptual_restrict_to_body: boolean;
   save_debug_previews: boolean;
+}
+
+export interface BodyShapeConfig {
+  loss_weight: number;
+  loss_min_t: number;
+  loss_max_t: number;
+  loss_min_cos: number;
 }
 
 export interface ValidationItem {
@@ -374,6 +386,8 @@ export interface ProcessConfig {
   face_id?: FaceIDConfig;
   // Process-level (not TrainConfig): consumed via get_conf('subject_mask').
   subject_mask?: SubjectMaskConfig;
+  // Process-level (not TrainConfig): consumed via get_conf('body_shape').
+  body_shape?: BodyShapeConfig;
 }
 
 export interface ConfigObject {
