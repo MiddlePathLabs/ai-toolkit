@@ -89,8 +89,15 @@ def run_krea_job(
     # before GC so the next test can load a fresh model without OOM.
     try:
         if hasattr(process, "sd") and process.sd is not None:
-            if hasattr(process.sd, "unet") and process.sd.unet is not None:
-                process.sd.unet.cpu()
+            # Krea 2 stores its DiT as .model (not .unet); handle both so the
+            # transformer is actually moved off GPU between tests.
+            for attr in ("unet", "model"):
+                sub = getattr(process.sd, attr, None)
+                if sub is not None:
+                    try:
+                        sub.cpu()
+                    except Exception:
+                        pass
             if hasattr(process.sd, "vae") and process.sd.vae is not None:
                 process.sd.vae.cpu()
             te = getattr(process.sd, "text_encoder", None)
@@ -101,6 +108,21 @@ def run_krea_job(
                 else:
                     te.cpu()
             process.sd = None
+        # Release Phase 2 anchor perceptors (DA2 / Sapiens / etc.) that live on
+        # the process outside process.sd. Without this, sequential depth tests
+        # in one pytest process orphan a perceptor each run until OOM.
+        for perceptor_attr in (
+            "_depth_perceptor", "_normal_perceptor", "_body_shape_perceptor",
+            "_face_identity_model",
+        ):
+            perc = getattr(process, perceptor_attr, None)
+            if perc is None:
+                continue
+            try:
+                perc.cpu()
+            except Exception:
+                pass
+            setattr(process, perceptor_attr, None)
         process.optimizer = None
         process.network = None
         process.ema = None
