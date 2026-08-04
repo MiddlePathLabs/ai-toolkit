@@ -41,6 +41,32 @@ def find_saved_lora(save_root: str, name: str) -> str | None:
     return None
 
 
+def find_all_saved_loras(save_root: str, name: str) -> list[str]:
+    """Find every saved LoRA safetensors for *name*, sorted by embedded step number.
+
+    Used by the strict depth-only proof to compare consecutive optimizer-step
+    checkpoints (mirrors evidence/compare_safetensors_delta.py). Falls back to
+    mtime order when filenames lack a step suffix.
+    """
+    import re
+
+    save_dir = os.path.join(save_root, name)
+    search_dirs = [save_dir, save_root]
+    collected: list[str] = []
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        collected.extend(glob.glob(os.path.join(d, f"{name}*.safetensors")))
+    # dedupe while preserving a deterministic order
+    collected = sorted(set(collected))
+
+    def _step_key(path: str):
+        m = re.search(r"(\d{6,})", os.path.basename(path))
+        return int(m.group(1)) if m else 0
+
+    return sorted(collected, key=_step_key)
+
+
 def load_lora_tensors(path: str) -> dict[str, torch.Tensor]:
     """Load all tensors from a safetensors LoRA file."""
     return load_file(path)
