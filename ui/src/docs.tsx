@@ -827,6 +827,34 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'SAM 2 Size',
     description: <>The SAM 2 checkpoint size used for the reference silhouette. Small is the default; larger is slower but sharper.</>,
   },
+  'body_shape.loss_weight': {
+    title: 'Body-Shape Anchor',
+    description: (
+      <>
+        Enables a frozen HybrIK ResNet-34 to regress 10-dim SMPL body-shape betas from the decoded x0 and
+        match them against cached GT via L1 (cosine-gated). Requires the HybrIK checkpoint
+        (Google-Drive-only; install gdown for auto-download, or place hybrik_resnet34.pth in
+        ~/.cache/hybrik/). Distinct from body-proportion (ViTPose ratios). Enable sets this weight to 0.05.
+        Like the other anchors it decodes x0 under gradient, so Low VRAM is disabled while it is active.
+      </>
+    ),
+  },
+  'body_shape.loss_min_t': {
+    title: 'Minimum Timestep',
+    description: <>The body-shape anchor only applies on steps whose timestep ratio is at least this (0 to 1). Defaults to 0.4.</>,
+  },
+  'body_shape.loss_max_t': {
+    title: 'Maximum Timestep',
+    description: <>The body-shape anchor only applies on steps whose timestep ratio is at most this (0 to 1). Defaults to 0.8.</>,
+  },
+  'body_shape.loss_min_cos': {
+    title: 'Min Cosine Similarity',
+    description: <>Floor (beta cosine) below which the loss does not push, preventing pushing on poorly-matched body shapes.</>,
+  },
+  'datasets.body_shape_loss_weight': {
+    title: 'Per-Dataset Body-Shape Weight',
+    description: <>Overrides the global body-shape loss weight for this dataset only. Leave empty to inherit; 0 disables.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

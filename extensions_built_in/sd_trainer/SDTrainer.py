@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -296,6 +296,40 @@ def preflight_face_id(
     return config
 
 
+def body_shape_active_for_dataset(
+    body_shape_config: Optional[BodyShapeConfig],
+    dataset_config,
+) -> bool:
+    dataset_weight = getattr(dataset_config, 'body_shape_loss_weight', None)
+    if dataset_weight is None:
+        dataset_weight = (
+            body_shape_config.loss_weight if body_shape_config is not None else 0.0
+        )
+    return float(dataset_weight or 0.0) > 0.0
+
+
+def preflight_body_shape(
+    body_shape_config: Optional[BodyShapeConfig],
+    dataset_configs: List,
+    arch: Optional[str],
+    low_vram: bool,
+) -> Optional[BodyShapeConfig]:
+    _dataset_bs_active = any(
+        body_shape_active_for_dataset(body_shape_config, dc) for dc in dataset_configs
+    )
+    config = body_shape_config
+    if config is None and _dataset_bs_active:
+        config = BodyShapeConfig(loss_weight=0.0)
+    if config is None:
+        return None
+    _bs_active = config.loss_weight > 0 or _dataset_bs_active
+    if not _bs_active:
+        return config
+    if arch == 'krea2' and low_vram:
+        raise ValueError('Body-shape loss for Krea 2 requires model.low_vram: false.')
+    return config
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -415,6 +449,15 @@ class SDTrainer(BaseSDTrainProcess):
             self.subject_mask_config: Optional[SubjectMaskConfig] = SubjectMaskConfig(**_subject_mask_raw)
         else:
             self.subject_mask_config = None
+
+        _body_shape_raw = self.get_conf('body_shape', None)
+        if _body_shape_raw is not None:
+            self.body_shape_config: Optional[BodyShapeConfig] = BodyShapeConfig(**_body_shape_raw)
+        else:
+            self.body_shape_config = None
+        self._last_body_shape_loss: Optional[float] = None
+        self._last_body_shape_loss_applied: Optional[float] = None
+        self._last_body_shape_cos: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -1748,6 +1791,129 @@ class SDTrainer(BaseSDTrainProcess):
         ).view(B, 1, 1)
         return restrict_vec * body_f + (1.0 - restrict_vec) * torch.ones_like(body_f)
 
+    # ------------------------------------------------------------------
+    # Body-shape anchor (HybrIK SMPL betas) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _body_shape_should_cache(self) -> bool:
+        cfg = self.body_shape_config
+        if cfg is None:
+            return False
+        return cfg.loss_weight > 0 or any(
+            body_shape_active_for_dataset(cfg, dc) for dc in self.dataset_configs
+        )
+
+    def _body_shape_loss_active(self) -> bool:
+        return self._body_shape_should_cache()
+
+    def _load_body_shape_perceptor(self):
+        if getattr(self, '_body_shape_perceptor', None) is not None:
+            return self._body_shape_perceptor
+        from toolkit.body_shape import DifferentiableBodyShapeEncoder
+        self._body_shape_perceptor = DifferentiableBodyShapeEncoder(device=self.device_torch)
+        return self._body_shape_perceptor
+
+    def _cache_body_shape_gt_pass(self):
+        from toolkit.body_shape import cache_body_shape
+        cfg = self.body_shape_config
+        encoder = self._load_body_shape_perceptor()
+
+        def _ds_bs_active(dc):
+            return body_shape_active_for_dataset(cfg, dc)
+
+        for loader in (self.data_loader, self.data_loader_reg):
+            if loader is None:
+                continue
+            for dataset in get_dataloader_datasets(loader):
+                if not _ds_bs_active(dataset.dataset_config):
+                    continue
+                cache_body_shape(dataset.file_list, cfg, encoder=encoder)
+
+    def _compute_body_shape_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Live decode + HybrIK forward + L1 on 10 SMPL betas (cosine-gated)."""
+        from toolkit.body_shape_loss import compute_body_shape_loss
+
+        cfg = self.body_shape_config
+        ref_bs = getattr(batch, 'body_shape_gt', None)
+        if ref_bs is None:
+            return 0.0
+        encoder = getattr(self, '_body_shape_perceptor', None)
+        if encoder is None:
+            encoder = self._load_body_shape_perceptor()
+
+        num_t = self.sd.noise_scheduler.config.num_train_timesteps
+        t_ratio = (timesteps.float() / num_t)
+        is_reg = batch.get_is_reg_list()
+        per_ds_w = getattr(batch, 'body_shape_loss_weight_list', None)
+        has_per_ds = per_ds_w is not None and any(w is not None for w in per_ds_w)
+        global_w = cfg.loss_weight
+        min_t_list = getattr(batch, 'body_shape_loss_min_t_list', None)
+        max_t_list = getattr(batch, 'body_shape_loss_max_t_list', None)
+        min_cos_list = getattr(batch, 'body_shape_loss_min_cos_list', None)
+
+        B = noise_pred.shape[0]
+        weights, valid = [], torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        for i in range(B):
+            w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
+            weights.append(float(w or 0.0))
+            if is_reg[i] or weights[i] <= 0.0:
+                continue
+            if ref_bs[i].abs().sum().item() == 0.0:
+                continue
+            lo = float(min_t_list[i]) if (min_t_list and min_t_list[i] is not None) else cfg.loss_min_t
+            hi = float(max_t_list[i]) if (max_t_list and max_t_list[i] is not None) else cfg.loss_max_t
+            tr = float(t_ratio[i].item())
+            if not (lo <= tr <= hi):
+                continue
+            valid[i] = True
+
+        if not valid.any():
+            self._last_body_shape_loss = 0.0
+            return 0.0
+
+        t_b = t_ratio.view(-1, 1, 1, 1)
+        if getattr(self.sd, 'is_flow_matching', True):
+            x0 = noisy_latents - t_b * noise_pred
+        else:
+            _ac = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )[timesteps.long()].view(-1, 1, 1, 1)
+            _sa = _ac.sqrt()
+            _s1ma = (1.0 - _ac).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0 = _sa * noisy_latents - _s1ma * noise_pred
+            else:
+                x0 = (noisy_latents - _s1ma * noise_pred) / _sa.clamp(min=1e-8)
+
+        if next(self.sd.vae.parameters()).device != self.device_torch:
+            self.sd.vae.to(self.device_torch)
+        decoded = self.sd.decode_latents(x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype)
+        pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+        idx_map = [i for i in range(B) if valid[i]]
+        ref_subset = ref_bs[idx_map].to(pixels.device, dtype=torch.float32)
+        gen_betas = encoder(pixels[idx_map])  # (V, 10)
+        l1, cos = compute_body_shape_loss(gen_betas, ref_subset)
+
+        cos_threshold = torch.tensor(
+            [float(min_cos_list[i]) if (min_cos_list and min_cos_list[i] is not None) else cfg.loss_min_cos
+             for i in idx_map],
+            device=pixels.device, dtype=torch.float32,
+        )
+        gate = (cos > cos_threshold)
+        bs_weight = t_ratio[idx_map]
+        per_sample = l1 * bs_weight * gate.float()
+        w_tensor = torch.tensor(
+            [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
+        )
+        n_valid = max(int(gate.sum().item()), 1)
+        applied = (per_sample * w_tensor).sum() / n_valid
+        self._last_body_shape_loss_applied = float(applied.detach().item())
+        with torch.no_grad():
+            self._last_body_shape_cos = float((cos * gate.float()).sum().item() / n_valid)
+            self._last_body_shape_loss = float((l1 * gate.float()).sum().item() / n_valid)
+        return applied
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -1793,6 +1959,14 @@ class SDTrainer(BaseSDTrainProcess):
         )
         if self._face_identity_should_cache():
             self._cache_face_identity_gt_pass()
+        # Body-shape preflight + GT caching pass.
+        self.body_shape_config = preflight_body_shape(
+            self.body_shape_config, self.dataset_configs,
+            getattr(self.sd.model_config, 'arch', None),
+            self.model_config.low_vram,
+        )
+        if self._body_shape_should_cache():
+            self._cache_body_shape_gt_pass()
         # Auto-masking (YOLO + SAM 2 + SegFormer): cache person/body/clothing
         # masks when subject_mask is enabled. Fully inert (no model downloads,
         # no extraction) when disabled.
@@ -2091,6 +2265,12 @@ class SDTrainer(BaseSDTrainProcess):
         _face_identity_active = (
             self._face_identity_loss_active()
             and getattr(batch, 'identity_embedding', None) is not None
+            and len(noise_pred.shape) == 4
+        )
+        # Body-shape gate.
+        _body_shape_active = (
+            self._body_shape_loss_active()
+            and getattr(batch, 'body_shape_gt', None) is not None
             and len(noise_pred.shape) == 4
         )
 
@@ -2665,6 +2845,12 @@ class SDTrainer(BaseSDTrainProcess):
         # cached GT embedding and a detected face (SCRFD quality gate).
         if _face_identity_active:
             loss = loss + self._compute_face_identity_anchor_loss(
+                noise_pred, noisy_latents, timesteps, batch,
+            )
+
+        # Body-shape loss: L1 on SMPL betas, cosine-gated.
+        if _body_shape_active:
+            loss = loss + self._compute_body_shape_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch,
             )
 
@@ -4101,6 +4287,9 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_identity_loss',
             '_last_identity_loss_applied',
             '_last_id_sim',
+            '_last_body_shape_loss',
+            '_last_body_shape_loss_applied',
+            '_last_body_shape_cos',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:

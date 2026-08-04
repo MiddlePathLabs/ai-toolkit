@@ -816,6 +816,9 @@ class ImageProcessingDTOMixin:
         # FaceIdentity GT: lazy read in the worker. No-op unless cached.
         if self.is_face_identity_cached:
             self.get_face_identity_gt()
+        # BodyShape GT: lazy read in the worker. No-op unless cached.
+        if self.is_body_shape_cached:
+            self.get_body_shape_gt()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1976,6 +1979,44 @@ class FaceIdentityCachingFileItemDTOMixin:
         if self.is_face_identity_cached:
             self.identity_embedding = None
             self.face_bbox = None
+
+
+class BodyShapeCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        self.body_shape_gt: Union[torch.Tensor, None] = None
+        self.is_body_shape_cached = False
+        self._body_shape_cache_path: Union[str, None] = None
+        self._body_shape_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_body_shape_key(cache_path, key):
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key not in f.keys():
+                    return None
+                tensor = f.get_tensor(key)
+        except Exception:  # noqa: BLE001
+            return None
+        if tensor is None or tensor.numel() == 0 or not torch.isfinite(tensor).all():
+            return None
+        return tensor
+
+    def get_body_shape_gt(self: 'FileItemDTO'):
+        if not self.is_body_shape_cached:
+            return self.body_shape_gt
+        if self.body_shape_gt is None:
+            self.body_shape_gt = self._read_body_shape_key(
+                self._body_shape_cache_path, self._body_shape_cache_key
+            )
+        return self.body_shape_gt
+
+    def cleanup_body_shape(self: 'FileItemDTO'):
+        if self.is_body_shape_cached:
+            self.body_shape_gt = None
 
 
 class LatentCachingMixin:
