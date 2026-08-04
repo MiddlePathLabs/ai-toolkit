@@ -850,6 +850,32 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Maximum Timestep',
     description: <>The VAE anchor only applies on steps whose timestep ratio is at most this (0 to 1). Defaults to 0.5 (low-noise region where structure is set).</>,
   },
+  'train.optimizer.rose': {
+    title: 'Rose Optimizer',
+    description: (
+      <>
+        Rose (Range-Of-Slice Equilibration) is a <strong>stateless</strong> optimizer: it keeps no
+        per-parameter momentum or variance buffers, so optimizer-state memory is zero. It rescales
+        each gradient slice by its <code>|max| - min</code> range.
+        <br />
+        <br />
+        Its learning rate is <strong>not comparable to Adam's</strong> — range-based normalization
+        produces very different effective step sizes, so tune <code>lr</code> independently rather
+        than reusing Adam defaults.
+        <br />
+        <br />
+        The default <code>compute_dtype: fp64</code> promotes parameters and gradients to FP64 for
+        the update. This trades speed and working memory for update precision and is recommended
+        because the intermediate range/division arithmetic benefits from it.
+        <br />
+        <br />
+        In this release Rose is selectable here with documented backend parameters. Advanced
+        parameters (<code>weight_decay</code>, <code>wd_schedule</code>, <code>centralize</code>,{' '}
+        <code>stabilize</code>, <code>bf16_sr</code>, <code>compute_dtype</code>) are YAML/config
+        only and are not exposed as GUI controls.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {
