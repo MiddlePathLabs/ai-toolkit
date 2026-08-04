@@ -72,4 +72,12 @@ onnxruntime-gpu==1.28.0
 #   ultralytics==8.4.115
 # Transitive: nvidia-ml-py==13.610.43  polars==1.43.2  polars-runtime-32==1.43.2
 #              ultralytics-thop==2.1.6
+#
+# PROBE RESULT (2026-08-03, PASSED on the pinned env): ultralytics + transformers
+# Sam2/SegFormer import cleanly together. ultralytics adds polars/nvidia-ml-py
+# transitively. Like face_id, subject_mask ships behind lazy imports (inside
+# SubjectMaskExtractor.__init__) and is NOT in requirements_base.txt until a
+# robust post-install mechanism exists; users enable it by running the
+# documented install. YOLO (yolo11n.pt), SAM 2, and SegFormer weights all
+# auto-download on first enable.
 ultralytics==8.4.115

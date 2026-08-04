@@ -40,7 +40,8 @@ type AdditionalSections =
   | 'depth_consistency'
   | 'normal_id'
   | 'body_proportion'
-  | 'face_id';
+  | 'face_id'
+  | 'subject_mask';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -1455,6 +1456,7 @@ export const modelArchs: ModelArch[] = [
       'normal_id',
       'body_proportion',
       'face_id',
+      'subject_mask',
     ],
   },
   {
@@ -1492,6 +1494,7 @@ export const modelArchs: ModelArch[] = [
       'normal_id',
       'body_proportion',
       'face_id',
+      'subject_mask',
     ],
   },
   {
@@ -1533,6 +1536,7 @@ export const modelArchs: ModelArch[] = [
       'normal_id',
       'body_proportion',
       'face_id',
+      'subject_mask',
     ],
   },
   {
@@ -1581,6 +1585,7 @@ export const modelArchs: ModelArch[] = [
       'normal_id',
       'body_proportion',
       'face_id',
+      'subject_mask',
     ],
   },
   {

@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -91,6 +91,28 @@ export const defaultFaceIDConfig: FaceIDConfig = {
   identity_loss_min_cos: 0.2,
   face_model: 'buffalo_l',
   identity_loss_decoded_det_threshold: 0.5,
+};
+
+// Safe disabled defaults for the process-level auto-masking section. Enable =
+// set enabled: true. The YOLO/SAM2/SegFormer models download lazily on first
+// enable. Requires ultralytics + transformers (Sam2/SegFormer) + opencv.
+export const defaultSubjectMaskConfig: SubjectMaskConfig = {
+  enabled: false,
+  yolo_ckpt: 'yolo11n.pt',
+  yolo_conf: 0.25,
+  primary_only: true,
+  sam_size: 'small',
+  segformer_res: 768,
+  cache_resolution: 256,
+  dtype: 'fp16',
+  body_close_radius: 2,
+  mask_dilate_radius: 0,
+  skin_bias: 0,
+  background_loss_weight: null,
+  clothing_loss_weight: null,
+  body_loss_weight: null,
+  perceptual_restrict_to_body: false,
+  save_debug_previews: false,
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -192,6 +214,7 @@ export const defaultJobConfig: JobConfig = {
         normal_id: { ...defaultNormalIDConfig },
         body_proportion: { ...defaultBodyProportionConfig },
         face_id: { ...defaultFaceIDConfig },
+        subject_mask: { ...defaultSubjectMaskConfig },
       },
     ],
   },
@@ -262,6 +285,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   jobConfig.config.process[0].face_id = {
     ...defaultFaceIDConfig,
     ...(jobConfig.config.process[0].face_id ?? {}),
+  };
+  // Merge a complete disabled subject-mask object into any partial saved object.
+  jobConfig.config.process[0].subject_mask = {
+    ...defaultSubjectMaskConfig,
+    ...(jobConfig.config.process[0].subject_mask ?? {}),
   };
   if (isMac()) {
     jobConfig.config.process[0].device = 'mps';

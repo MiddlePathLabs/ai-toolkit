@@ -1050,6 +1050,40 @@ class FaceIDConfig:
             )
 
 
+class SubjectMaskConfig:
+    """Auto-masking via YOLO + SAM 2 + SegFormer-clothes (Phase 3).
+
+    Process-level config (read through ``self.get_conf('subject_mask')``).
+    Extracts per-image person/body/clothing masks (preflight only, non-
+    differentiable) used to region-weight the diffusion loss and to restrict
+    the perceptual anchors. SegFormer is the semantic source of truth; YOLO
+    detects people; SAM 2 provides a reference silhouette. Enable by setting
+    ``enabled: true``. The masks cache from dataloader-transformed pixels at
+    crop-dim resolution (v2 cache), so changing the bucket transform or
+    ``body_close_radius`` invalidates the cache. Requires ultralytics +
+    transformers (Sam2/SegFormer) + opencv; lazy-imported so selecting Krea
+    never pulls them.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
+        self.yolo_conf: float = float(kwargs.get('yolo_conf', 0.25))
+        self.primary_only: bool = bool(kwargs.get('primary_only', True))
+        self.sam_size: str = kwargs.get('sam_size', 'small')
+        self.segformer_res: int = int(kwargs.get('segformer_res', 768))
+        self.cache_resolution: int = int(kwargs.get('cache_resolution', 256))
+        self.dtype: str = kwargs.get('dtype', 'fp16')
+        self.body_close_radius: int = int(kwargs.get('body_close_radius', 2))
+        self.mask_dilate_radius: int = int(kwargs.get('mask_dilate_radius', 0))
+        self.skin_bias: float = float(kwargs.get('skin_bias', 0.0))
+        self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: bool = bool(kwargs.get('perceptual_restrict_to_body', False))
+        self.save_debug_previews: bool = bool(kwargs.get('save_debug_previews', False))
+
+
 class ReferenceDatasetConfig:
     def __init__(self, **kwargs):
         # can pass with a side by side pait or a folder with pos and neg folder
@@ -1289,6 +1323,12 @@ class DatasetConfig:
         self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
         self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
         self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+
+        # Subject-mask per-dataset overrides. None means inherit the global SubjectMaskConfig.
+        self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Union[float, None] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: Union[bool, None] = kwargs.get('perceptual_restrict_to_body', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

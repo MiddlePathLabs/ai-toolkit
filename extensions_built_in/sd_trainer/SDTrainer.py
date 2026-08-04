@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -120,10 +120,10 @@ def preflight_depth_consistency(
 
     if arch == 'krea2' and low_vram:
         raise ValueError('Depth consistency for Krea 2 requires model.low_vram: false.')
-    if config.mask_source != 'none':
-        raise ValueError(
-            'Depth mask_source subject/body requires the Phase 3 auto-masking pipeline.'
-        )
+    # mask_source subject|body is now allowed (Phase 3 auto-masking). The
+    # cross-check that subject_mask is actually enabled runs in
+    # hook_before_train_loop where both configs are visible; the depth loss
+    # gracefully degrades to full-image when a sample lacks its mask.
 
     for dc in dataset_configs:
         if not depth_active_for_dataset(config, dc):
@@ -409,6 +409,12 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_identity_loss: Optional[float] = None
         self._last_identity_loss_applied: Optional[float] = None
         self._last_id_sim: Optional[float] = None
+
+        _subject_mask_raw = self.get_conf('subject_mask', None)
+        if _subject_mask_raw is not None:
+            self.subject_mask_config: Optional[SubjectMaskConfig] = SubjectMaskConfig(**_subject_mask_raw)
+        else:
+            self.subject_mask_config = None
 
     def before_model_load(self):
         pass
@@ -970,8 +976,12 @@ class SDTrainer(BaseSDTrainProcess):
         blur_sigma = float(getattr(cfg, 'pixel_blur_sigma', 0.0) or 0.0)
         pixels_for_da2 = gaussian_blur_2d(pixels, blur_sigma) if blur_sigma > 0 else pixels
 
-        # mask_source ships 'none' in Phase 2 (subject/body raise at preflight);
-        # the loss is full-image. No mask is read from the batch.
+        # mask_source: select the cached subject/body mask per sample (Phase 3
+        # auto-masking). 'none' -> full-image (None). Graceful degrade: a sample
+        # whose mask is missing falls back to full-image loss.
+        _dc_mask_source = getattr(cfg, 'mask_source', 'none')
+        _dc_subject_masks = getattr(batch, 'subject_masks', None)
+        _dc_body_masks = getattr(batch, 'body_masks', None)
         total = pixels.new_zeros(())
         weighted_total = pixels.new_zeros(())
         ssi_sum = 0.0
@@ -984,17 +994,25 @@ class SDTrainer(BaseSDTrainProcess):
             if i >= len(depth_gt_list) or depth_gt_list[i] is None:
                 continue
             gt_t = depth_gt_list[i].to(pixels.device, dtype=torch.float32)
+            # Resolve this sample's spatial mask from mask_source.
+            _dc_mask_t = None
+            if _dc_mask_source == 'subject' and _dc_subject_masks is not None and i < _dc_subject_masks.shape[0]:
+                _dc_mask_t = _dc_subject_masks[i].float().to(pixels.device)
+            elif _dc_mask_source == 'body' and _dc_body_masks is not None and i < _dc_body_masks.shape[0]:
+                _dc_mask_t = _dc_body_masks[i].float().to(pixels.device)
+            if _dc_mask_t is not None and _dc_mask_t.dim() == 3:
+                _dc_mask_t = _dc_mask_t.squeeze(0)
             if preview_only:
                 with torch.no_grad():
                     loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
-                        encoder, pixels_for_da2[i:i + 1].detach(), gt_t, None,
+                        encoder, pixels_for_da2[i:i + 1].detach(), gt_t, _dc_mask_t,
                         ssi_weight=cfg.ssi_weight,
                         grad_weight=cfg.grad_weight,
                         grad_scales=cfg.grad_scales,
                     )
             else:
                 loss_i, ssi_i, grad_i, dpred_i, dgt_i = compute_depth_consistency_loss(
-                    encoder, pixels_for_da2[i:i + 1], gt_t, None,
+                    encoder, pixels_for_da2[i:i + 1], gt_t, _dc_mask_t,
                     ssi_weight=cfg.ssi_weight,
                     grad_weight=cfg.grad_weight,
                     grad_scales=cfg.grad_scales,
@@ -1210,16 +1228,22 @@ class SDTrainer(BaseSDTrainProcess):
             [normal_gt_list[i].to(pixels.device, dtype=torch.float32) for i in idx_map],
             dim=0,
         )
+        # Optional body-region restriction (Phase 3 auto-masking). Built on the
+        # full batch then sliced to the valid subset; None when no item opts in.
+        from toolkit.normal_id import NORMAL_SIZE
+        _body_restrict = self._build_body_restrict_mask(batch, (B, NORMAL_SIZE, NORMAL_SIZE))
+        if _body_restrict is not None:
+            _body_restrict = _body_restrict.to(pixels.device, dtype=torch.float32)[idx_map]
         if preview_only:
             with torch.no_grad():
                 cos_loss, l1_loss, gen_det, ref_det = compute_normal_loss(
-                    encoder, pixels[idx_map].detach(), gt_tensor,
+                    encoder, pixels[idx_map].detach(), gt_tensor, mask=_body_restrict,
                 )
             self._last_normal_loss = 0.0
             self._last_normal_loss_applied = 0.0
         else:
             cos_loss, l1_loss, gen_det, ref_det = compute_normal_loss(
-                encoder, pixels[idx_map], gt_tensor,
+                encoder, pixels[idx_map], gt_tensor, mask=_body_restrict,
             )
             per_sample = cos_loss + l1_loss
             w_tensor = torch.tensor(
@@ -1625,6 +1649,105 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_identity_loss = 0.0
         return 0.0
 
+    # ------------------------------------------------------------------
+    # Subject-mask region weighting (auto-masking) -- Phase 3
+    # ------------------------------------------------------------------
+
+    def _build_subject_mask_weight(self, batch, latent_shape, dtype=None):
+        """Build a per-latent region weight map from cached subject masks.
+
+        Returns ``None`` (no-op) when auto-masking is disabled, no masks are
+        present, or all of background/clothing/body loss weights resolve to
+        None. Otherwise a ``(B, C_lat, lat_h, lat_w)`` float tensor composed
+        multiplicatively: weight_map = ones; *= where(person, 1, bg_w);
+        *= where(clothing, clothing_w, 1); *= where(body, body_w, 1). Per-item
+        weight resolution: non-None per-dataset override > non-None global > None.
+        """
+        import torch.nn.functional as _F
+        smc = self.subject_mask_config
+        if smc is None or not smc.enabled:
+            return None
+        person = getattr(batch, 'subject_masks', None)
+        body = getattr(batch, 'body_masks', None)
+        clothing = getattr(batch, 'clothing_masks', None)
+        if person is None and body is None and clothing is None:
+            return None
+
+        B = len(batch.file_items)
+        _, C, lat_h, lat_w = latent_shape
+        device = self.device_torch
+
+        def _per_item(global_val, attr_name):
+            lst = getattr(batch, attr_name + '_list', None)
+            if lst is None:
+                return [global_val] * B
+            return [(v if v is not None else global_val) for v in lst]
+
+        bg = _per_item(smc.background_loss_weight, 'background_loss_weight')
+        cl = _per_item(smc.clothing_loss_weight, 'clothing_loss_weight')
+        bd = _per_item(smc.body_loss_weight, 'body_loss_weight')
+        if all(w is None for w in bg) and all(w is None for w in cl) and all(w is None for w in bd):
+            return None
+
+        def _resize_mask(stacked):
+            if stacked is None:
+                return None
+            m = stacked.to(device=device, dtype=torch.float32)
+            return _F.interpolate(m, size=(lat_h, lat_w), mode='nearest')
+
+        person_lat = _resize_mask(person)
+        body_lat = _resize_mask(body)
+        clothing_lat = _resize_mask(clothing)
+        weight_map = torch.ones((B, 1, lat_h, lat_w), device=device, dtype=torch.float32)
+
+        for i in range(B):
+            if bg[i] is not None and person_lat is not None:
+                weight_map[i] = weight_map[i] * torch.where(
+                    person_lat[i] > 0.5, torch.ones_like(person_lat[i]), torch.full_like(person_lat[i], float(bg[i]))
+                )
+            if cl[i] is not None and clothing_lat is not None:
+                weight_map[i] = weight_map[i] * torch.where(
+                    clothing_lat[i] > 0.5, torch.full_like(clothing_lat[i], float(cl[i])), torch.ones_like(clothing_lat[i])
+                )
+            if bd[i] is not None and body_lat is not None:
+                weight_map[i] = weight_map[i] * torch.where(
+                    body_lat[i] > 0.5, torch.full_like(body_lat[i], float(bd[i])), torch.ones_like(body_lat[i])
+                )
+
+        if dtype is not None:
+            weight_map = weight_map.to(dtype)
+        return weight_map.expand(B, C, lat_h, lat_w).contiguous()
+
+    def _build_body_restrict_mask(self, batch, spatial_shape):
+        """Per-sample body-restriction mask for perceptual anchors.
+
+        Returns ``None`` when disabled or no item opts into
+        ``perceptual_restrict_to_body``. Otherwise ``(B, H, W)`` float: 1.0
+        inside the body, 0.0 outside; items that didn't opt in are all-ones.
+        """
+        import torch.nn.functional as _F
+        smc = self.subject_mask_config
+        if smc is None or not smc.enabled:
+            return None
+        body = getattr(batch, 'body_masks', None)
+        if body is None:
+            return None
+        g_restrict = bool(getattr(smc, 'perceptual_restrict_to_body', False))
+        per_item = [
+            (v if v is not None else g_restrict)
+            for v in getattr(batch, 'perceptual_restrict_to_body_list', [])
+        ]
+        if not any(per_item):
+            return None
+        _, H, W = spatial_shape
+        B = len(per_item)
+        body_f = body.to(torch.float32)
+        body_f = _F.interpolate(body_f, size=(H, W), mode='nearest').squeeze(1)  # (B, H, W)
+        restrict_vec = torch.tensor(
+            [1.0 if v else 0.0 for v in per_item], dtype=torch.float32, device=body_f.device
+        ).view(B, 1, 1)
+        return restrict_vec * body_f + (1.0 - restrict_vec) * torch.ones_like(body_f)
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.depth_consistency_config = preflight_depth_consistency(
@@ -1670,6 +1793,28 @@ class SDTrainer(BaseSDTrainProcess):
         )
         if self._face_identity_should_cache():
             self._cache_face_identity_gt_pass()
+        # Auto-masking (YOLO + SAM 2 + SegFormer): cache person/body/clothing
+        # masks when subject_mask is enabled. Fully inert (no model downloads,
+        # no extraction) when disabled.
+        if self.subject_mask_config is not None and self.subject_mask_config.enabled:
+            from toolkit.subject_mask import cache_subject_masks
+            print_acc("Auto-masking: Extracting and caching subject masks...")
+            _sm_preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
+            for loader in (self.data_loader, self.data_loader_reg):
+                if loader is None:
+                    continue
+                for dataset in get_dataloader_datasets(loader):
+                    cache_subject_masks(dataset.file_list, self.subject_mask_config,
+                                        preview_dir=_sm_preview_dir)
+        # Cross-check: depth mask_source subject|body requires subject_mask enabled.
+        if (self.depth_consistency_config is not None
+                and self.depth_consistency_config.loss_weight > 0
+                and self.depth_consistency_config.mask_source != 'none'
+                and not (self.subject_mask_config is not None and self.subject_mask_config.enabled)):
+            raise ValueError(
+                f"depth_consistency.mask_source={self.depth_consistency_config.mask_source!r} "
+                "requires subject_mask.enabled: true (enable the auto-masking section)."
+            )
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -2359,6 +2504,15 @@ class SDTrainer(BaseSDTrainProcess):
 
         if self.train_config.do_prior_divergence and prior_pred is not None:
             loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
+
+        # Subject-mask region weighting (Phase 3 auto-masking). Composes
+        # multiplicatively into mask_multiplier; no-op (None) when disabled.
+        _subject_weight = self._build_subject_mask_weight(batch, noisy_latents.shape, dtype=dtype)
+        if _subject_weight is not None:
+            if not isinstance(mask_multiplier, torch.Tensor):
+                mask_multiplier = _subject_weight
+            else:
+                mask_multiplier = mask_multiplier * _subject_weight
 
         if self.train_config.train_turbo:
             mask_multiplier = mask_multiplier[:, 3:, :, :]

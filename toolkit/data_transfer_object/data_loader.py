@@ -216,6 +216,17 @@ class FileItemDTO(
         self.identity_loss_max_t: Union[float, None] = self.dataset_config.identity_loss_max_t
         self.identity_loss_min_cos: Union[float, None] = self.dataset_config.identity_loss_min_cos
 
+        # subject-mask per-dataset overrides (None = inherit global SubjectMaskConfig)
+        self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
+        self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
+        self.body_loss_weight: Union[float, None] = self.dataset_config.body_loss_weight
+        self.perceptual_restrict_to_body: Union[bool, None] = self.dataset_config.perceptual_restrict_to_body
+        # Populated by cache_subject_masks when subject_mask.enabled (direct-set;
+        # masks are small bool tensors held resident). None when disabled.
+        self.subject_mask: Union[torch.Tensor, None] = None
+        self.body_mask: Union[torch.Tensor, None] = None
+        self.clothing_mask: Union[torch.Tensor, None] = None
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -461,6 +472,20 @@ class DataLoaderBatchDTO:
                 x.identity_loss_min_cos for x in self.file_items
             ]
 
+            # subject-mask per-dataset overrides (None = inherit global)
+            self.background_loss_weight_list: List[Union[float, None]] = [
+                x.background_loss_weight for x in self.file_items
+            ]
+            self.clothing_loss_weight_list: List[Union[float, None]] = [
+                x.clothing_loss_weight for x in self.file_items
+            ]
+            self.body_loss_weight_list: List[Union[float, None]] = [
+                x.body_loss_weight for x in self.file_items
+            ]
+            self.perceptual_restrict_to_body_list: List[Union[bool, None]] = [
+                x.perceptual_restrict_to_body for x in self.file_items
+            ]
+
             # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
             if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
@@ -505,6 +530,29 @@ class DataLoaderBatchDTO:
             # list (variable presence). None means no face detected for that item.
             if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
                 self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
+
+            # Stack cached subject masks if any (direct-set by cache_subject_masks).
+            # Missing items are zero-padded so per-sample weight composition stays
+            # a no-op for them. Shape (B, 1, H_c, W_c) bool.
+            def _stack_mask(attr):
+                tensors = [getattr(x, attr, None) for x in self.file_items]
+                if not any(t is not None for t in tensors):
+                    return None
+                ref = next(t for t in tensors if t is not None)
+                H, W = ref.shape[-2], ref.shape[-1]
+                filled = []
+                for t in tensors:
+                    if t is None:
+                        filled.append(torch.zeros((1, H, W), dtype=torch.bool))
+                    else:
+                        if t.dim() == 2:
+                            t = t.unsqueeze(0)
+                        filled.append(t.to(torch.bool))
+                return torch.stack(filled, dim=0)
+
+            self.subject_masks = _stack_mask('subject_mask')
+            self.body_masks = _stack_mask('body_mask')
+            self.clothing_masks = _stack_mask('clothing_mask')
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base
