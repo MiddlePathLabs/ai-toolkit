@@ -389,6 +389,7 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+
   'train.weight_noise.enabled': {
     title: 'Weight Noising',
     description: (
@@ -873,6 +874,16 @@ const docs: { [key: string]: ConfigDoc } = {
         parameters (<code>weight_decay</code>, <code>wd_schedule</code>, <code>centralize</code>,{' '}
         <code>stabilize</code>, <code>bf16_sr</code>, <code>compute_dtype</code>) are YAML/config
         only and are not exposed as GUI controls.
+      </>
+    ),
+  },
+
+  'train.guidance_loss_target': {
+    title: 'Guidance Loss Target',
+    description: (
+      <>
+        For contrastive guidance loss, this is the target CGF to amplify predictions to. 
+
       </>
     ),
   },
