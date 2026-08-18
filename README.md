@@ -2,7 +2,50 @@
 
 AI Toolkit is an easy to use all in one training suite for diffusion models. I try to support all the latest models on consumer grade hardware. Image and video models. It can be run as a GUI or CLI. It is designed to be easy to use but still have every feature imaginable. Free and open source.
 
+> [!NOTE]
+> This is a fork of [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit). See [What's different from upstream](#whats-different-from-upstream) below for the additions in this fork.
 
+## What's different from upstream
+
+This fork tracks `upstream/main` closely (currently 0 commits behind) and adds the following on top:
+
+> [!NOTE]
+> The perceptual anchors, weight/gradient noising, rose optimizer, and auto-masking features were ported from [BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) (MIT licensed) and adapted to work with Krea 2 on top of this fork's newer upstream base. Full credit to that project for the original implementation.
+
+### Krea 2 perceptual anchor training
+
+Auxiliary losses that anchor a Krea 2 LoRA to structural ground truth, so edits preserve identity/geometry instead of drifting. Each anchor can be enabled independently, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):
+
+- **Depth anchor** — Depth Anything V2 (incl. DA2-Large option) depth-GT loss with a caching pipeline (depth maps are precomputed and round-tripped through the Krea VAE so train-time decode matches), unified latent decode, and depth-step-based preview rendering.
+- **Face identity anchor** — ArcFace embedding loss.
+- **Body proportion anchor** — ViTPose keypoint-based loss.
+- **Surface normal anchor** — Sapiens normal-map loss.
+- **Body shape anchor** — HybrIK-based loss.
+- **Cross-VAE anchor** — perceptual loss through a frozen Flux 2 VAE encoder.
+- **Auto subject masking + region-weighted loss** — YOLO person detection + SegFormer semantics restrict anchor losses to the subject.
+- A **loss split resolver** and **loss watch** instrumentation manage how the anchor losses combine with the base flow-matching loss, and a **Perceptual Anchors UI panel** (with safe depth-config migration) exposes all of it in the GUI.
+
+Extra dependencies live in `requirements_perceptual.txt`.
+
+### Perceptual noising
+
+Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.gradient_noise`) with UI controls. Zero-RMS parameters are preserved (skipped) so sparse/perceptual parameters are not corrupted.
+
+### Per-image adaptive learning rate
+
+`per_image_adaptive_lr` adjusts LR per training image based on rolling loss-window statistics, with logging, warmup windows (`per_image_adaptive_lr_warmup_windows`), resolution-aware adjustment scaling, and a `per_image_adaptive_lr_stats_only` mode that logs adjustments without applying them.
+
+### Rose optimizer
+
+Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other optimizer in the config.
+
+### Other additions
+
+- `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples.
+- UI settings **offline mode** — starts jobs with `HF_HUB_OFFLINE=1`.
+- Env-gated CUDA memory diagnostics (`KREA2_MEM_DIAG`) in the SD trainer.
+- Fix: timer no longer divides by zero on empty buckets after OOM recovery.
+- Test infrastructure: unit tests in `testing/` plus a real-data integration harness in `testing/integration/` (perceptual noising QA, depth consistency, gradient-contract probes).
 
 ## Supported Models
 
