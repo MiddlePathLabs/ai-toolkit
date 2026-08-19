@@ -7,7 +7,7 @@
 # DGX requirements, Docker, and the normal manager path then consume them).
 #
 # Probe environment (the pinned target):
-#   <embedded-python>  (Python 3.12.10)
+#   local embedded python 3.12.10
 #   transformers==5.5.3  torch==2.13.0+cu130  torchvision==0.28.0+cu130
 #   numpy==1.26.4  opencv-python==4.11.0.86  CUDA available (RTX PRO 6000, 95.59 GiB)
 #

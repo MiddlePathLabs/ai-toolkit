@@ -8,7 +8,7 @@
 # mirrors that: each test runs in its OWN python process so GPU memory starts
 # at ~0 every time.
 #
-# Usage (from <repo>):
+# Usage (from the repo root):
 #   powershell -ExecutionPolicy Bypass -File testing\integration\run_phase2_depth_tests.ps1
 #
 # Optional env knobs (passed through):
@@ -23,8 +23,8 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$Repo = "<repo>"
-$PyExe = "python"
+$Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$PyExe = if ($env:AI_TOOLKIT_TEST_PYTHON) { $env:AI_TOOLKIT_TEST_PYTHON } else { "python" }
 $Module = "testing/integration/test_depth_consistency_real_data.py"
 $TestFile = Join-Path $Repo $Module
 

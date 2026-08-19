@@ -5,7 +5,7 @@ All tests skip unless AI_TOOLKIT_RUN_KREA_INTEGRATION=1.
 
 Run strict Layer A tests:
     $env:AI_TOOLKIT_RUN_KREA_INTEGRATION="1"
-    $env:AI_TOOLKIT_TEST_DATASET="<repo>\\datasets"
+    $env:AI_TOOLKIT_TEST_DATASET=".\datasets"
     pytest testing/integration/test_perceptual_noising_real_data.py -m "integration and gpu" -v -s
 
 Run operational smoke (Layer B):

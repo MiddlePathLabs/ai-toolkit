@@ -7,20 +7,20 @@ Tests that prove weight noising / gradient noising (Phase 1) and the depth-consi
 - CUDA GPU with >= 24 GB VRAM (tested on RTX PRO 6000 Blackwell 102 GB)
 - Krea-2-Raw + Depth-Anything-V2 models cached locally
 - Dataset with images + captions under `datasets/` or path set via `AI_TOOLKIT_TEST_DATASET`
-- **Runtime:** run pytest under `python` (has all deps; the system Python lacks `diffusers`). Set `$env:PYTHONPATH="."`.
+- **Runtime:** run pytest under a Python that has all deps (the system Python may lack `diffusers`); optionally point `AI_TOOLKIT_TEST_PYTHON` at it. Set `$env:PYTHONPATH="."`.
 
 ## Fast unit tests (no GPU needed)
 
 ```bash
-& "python" -m pytest testing/test_perceptual_noising.py testing/test_depth_config.py testing/test_loss_split.py -q
+python -m pytest testing/test_perceptual_noising.py testing/test_depth_config.py testing/test_loss_split.py -q
 ```
 
 ## Phase 1: noising integration tests
 
 ```powershell
 $env:AI_TOOLKIT_RUN_KREA_INTEGRATION="1"
-$env:AI_TOOLKIT_TEST_DATASET="<repo>\datasets"
-& "python" -m pytest testing/integration/test_perceptual_noising_real_data.py -m "integration and gpu" -v -s
+$env:AI_TOOLKIT_TEST_DATASET=".\datasets"
+python -m pytest testing/integration/test_perceptual_noising_real_data.py -m "integration and gpu" -v -s
 ```
 
 ## Phase 2: depth-anchor integration tests
@@ -36,8 +36,8 @@ powershell -ExecutionPolicy Bypass -File testing\integration\run_phase2_depth_te
 
 # Or one test in isolation (each is a fresh process):
 $env:PYTHONPATH="."; $env:AI_TOOLKIT_RUN_KREA_DEPTH_INTEGRATION="1"
-$env:AI_TOOLKIT_TEST_DATASET="<repo>\datasets"
-& "python" -m pytest `
+$env:AI_TOOLKIT_TEST_DATASET=".\datasets"
+python -m pytest `
     testing/integration/test_depth_consistency_real_data.py::test_strict_depth_only_lora_update `
     -m "depth" -v
 ```
@@ -53,6 +53,7 @@ reloaded LoRA parameter.
 | `AI_TOOLKIT_RUN_KREA_INTEGRATION` | `0` | Must be `1` to run Phase 1 tests |
 | `AI_TOOLKIT_RUN_KREA_DEPTH_INTEGRATION` | `0` | Must be `1` to run Phase 2 tests |
 | `AI_TOOLKIT_RUN_DEPTH_EXTENDED_MATRIX` | `0` | Must be `1` for the Layer D extended matrix |
+| `AI_TOOLKIT_TEST_PYTHON` | `python` | Python executable used for training-env tests |
 | `AI_TOOLKIT_TEST_DATASET` | repo `datasets/` | Dataset root with images + captions |
 | `AI_TOOLKIT_KREA_MODEL` | `krea/Krea-2-Raw` | HuggingFace model ID |
 | `AI_TOOLKIT_DEPTH_MODEL` | `depth-anything/Depth-Anything-V2-Small-hf` | DA2 perceptor (shipped default is Small@518) |

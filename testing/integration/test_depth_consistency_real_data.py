@@ -17,8 +17,8 @@ testing/test_loss_split.py, which stay fast and deterministic.
 Run strict Layer B tests:
 
     $env:AI_TOOLKIT_RUN_KREA_DEPTH_INTEGRATION="1"
-    $env:AI_TOOLKIT_TEST_DATASET="<repo>\\datasets"
-    & "python" -m pytest `
+    $env:AI_TOOLKIT_TEST_DATASET=".\datasets"
+    python -m pytest `
         testing/integration/test_depth_consistency_real_data.py `
         -m "integration and gpu and depth" -v -s
 
