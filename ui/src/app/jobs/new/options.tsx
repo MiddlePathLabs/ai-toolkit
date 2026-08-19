@@ -1448,9 +1448,7 @@ export const modelArchs: ModelArch[] = [
         'depth-anything/Depth-Anything-V2-Small-hf',
       ],
     },
-    disableSections: [
-      'network.conv',
-    ],
+    disableSections: ['network.conv'],
     additionalSections: [
       'model.low_vram',
       'model.layer_offloading',
@@ -1487,9 +1485,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.guidance_scale': [1, 4],
       'config.process[0].sample.sample_steps': [9, 25],
     },
-    disableSections: [
-      'network.conv',
-    ],
+    disableSections: ['network.conv'],
     additionalSections: [
       'model.low_vram',
       'model.layer_offloading',
