@@ -539,6 +539,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
                     encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
+                    dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
                     text_embedding_space_version=self.sd.text_embedding_space_version if self.sd else "sd1",
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
@@ -704,7 +705,9 @@ def get_dataloader_from_datasets(
     for config in dataset_config_list:
 
         if config.type == 'image':
-            dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
+            # dataset level batch_size overrides the train config batch_size when set
+            dataset_batch_size = config.batch_size if config.batch_size is not None else batch_size
+            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd)
             datasets.append(dataset)
             if config.buckets:
                 has_buckets = True
@@ -753,6 +756,13 @@ def get_dataloader_from_datasets(
             **dataloader_kwargs
         )
     else:
+        # without buckets the dataloader batches across all datasets at once,
+        # so a dataset level batch_size cannot apply
+        for config in dataset_config_list:
+            if config.batch_size is not None:
+                raise ValueError(
+                    f"Dataset level batch_size requires buckets to be enabled. Dataset {config.folder_path or config.dataset_path} has buckets disabled."
+                )
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=batch_size,

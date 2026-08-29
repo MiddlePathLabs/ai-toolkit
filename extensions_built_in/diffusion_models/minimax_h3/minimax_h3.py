@@ -49,22 +49,25 @@ from toolkit.accelerator import unwrap_model
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
-from toolkit.memory_management import MemoryManager
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
+from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
+from toolkit.models.v2.resolver import (
+    find_file_recursive,
+    repo_id_from_name_or_path,
+    resolve_comfy_file,
+)
 from toolkit.paths import MODELS_PATH
 from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
 from toolkit.util.ostris_quant import OstrisLinear
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from toolkit.util.quantize import get_qtype, quantize, quantize_model
-from optimum.quanto import freeze
 
 from .src import packing
 
 packing_video_exts = [".mp4", ".avi", ".mov", ".webm", ".mkv", ".wmv", ".m4v", ".flv"]
-from .src.audio_vae import MiniMaxH3AudioVAE, fold_audio_vae_weight_norm
+from .src.audio_vae import MiniMaxH3AudioVAE
 from .src.packing import (
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG_T,
@@ -77,7 +80,12 @@ from .src.packing import (
     unpatchify_video_tokens,
 )
 from .src.pipeline import MiniMaxH3Pipeline
-from .src.ref_video_cache import load_ref_video_latent, load_video_ref_for_te
+from .src.ref_video_cache import (
+    load_ref_video_latent,
+    load_video_ref_for_te,
+    ref_frame_indices,
+    static_image_video_ref,
+)
 from .src.text_encoder import (
     TEXT_ENCODER_LAYER,
     VideoRef,
@@ -228,64 +236,23 @@ class MinimaxH3Model(BaseModel):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
-    @staticmethod
-    def _find_file_recursive(root_dir: str, filename: str) -> Optional[str]:
-        """First (breadth-stable, sorted) match of ``filename`` anywhere under
-        ``root_dir``."""
-        if not os.path.isdir(root_dir):
-            return None
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            dirnames.sort()
-            if filename in filenames:
-                return os.path.join(dirpath, filename)
-        return None
-
     def _resolve_comfy_file(self, component: str) -> str:
-        """Find a weight file at its local location, or download it there
-        when (and only when) it is missing.
-
-        Search order: model_kwargs override, the repo-relative path under
-        MODELS_PATH (diffusion_models/, text_encoders/, vae/), the bare
-        filename at the root, any subfolder of the component's category
-        folder (recursive — e.g. diffusion_models/my_custom_sub/), the same
-        spots under name_or_path when it is a local folder, then the hub —
-        downloaded to the repo-relative path under MODELS_PATH.
-        """
-        override = self.model_config.model_kwargs.get(f"{component}_path", None)
-        if override is not None:
-            if not os.path.exists(override):
-                raise FileNotFoundError(
-                    f"model_kwargs.{component}_path does not exist: {override}"
-                )
-            return override
-
-        rel_path = COMFY_FILES[component]
-        filename = os.path.basename(rel_path)
-        category = os.path.dirname(rel_path)
-        roots = [MODELS_PATH]
+        """Find a weight file at its local location (model_kwargs override,
+        comfy layout under MODELS_PATH or a local name_or_path dir), or
+        download it there when (and only when) it is missing — see
+        toolkit/models/v2/resolver.py for the search order."""
         name_or_path = self.model_config.name_or_path
-        if name_or_path and os.path.isdir(name_or_path):
-            roots.append(name_or_path)
-        for root in roots:
-            for rel in (rel_path, filename):
-                candidate = os.path.join(root, rel)
-                if os.path.exists(candidate):
-                    return candidate
-        for root in roots:
-            found = self._find_file_recursive(os.path.join(root, category), filename)
-            if found is not None:
-                return found
-
-        import huggingface_hub
-
-        repo_id = COMFY_REPO
-        if name_or_path and not os.path.exists(name_or_path) and "/" in name_or_path:
-            repo_id = name_or_path
-        self.print_and_status_update(
-            f"Downloading {rel_path} from {repo_id} into {MODELS_PATH}"
+        extra_roots = (
+            [name_or_path] if name_or_path and os.path.isdir(name_or_path) else []
         )
-        return huggingface_hub.hf_hub_download(
-            repo_id=repo_id, filename=rel_path, local_dir=MODELS_PATH
+        return resolve_comfy_file(
+            COMFY_FILES[component],
+            repo_id=repo_id_from_name_or_path(name_or_path, COMFY_REPO),
+            override_path=self.model_config.model_kwargs.get(
+                f"{component}_path", None
+            ),
+            extra_roots=extra_roots,
+            status_fn=self.print_and_status_update,
         )
 
     def _dit_component(self) -> str:
@@ -317,7 +284,7 @@ class MinimaxH3Model(BaseModel):
         lora_path = self.model_config.assistant_lora_path
         if not os.path.exists(lora_path):
             filename = os.path.basename(lora_path)
-            found = self._find_file_recursive(
+            found = find_file_recursive(
                 os.path.join(MODELS_PATH, "loras"), filename
             )
             if found is not None:
@@ -404,46 +371,12 @@ class MinimaxH3Model(BaseModel):
         self.invert_assistant_lora = False
 
     def _load_transformer(self) -> MiniMaxH3Transformer:
-        dtype = self.torch_dtype
         dit_path = self._resolve_comfy_file(self._dit_component())
         self.print_and_status_update(f"Loading transformer from {dit_path}")
-        state_dict = load_file(dit_path)
-
-        params = MiniMaxH3TransformerParams()
-        table = state_dict.get("adaln_t_table", None)
-        if table is not None:
-            # pruned checkpoint: factored timestep table instead of the MLP
-            params.adaln_t_table_size = table.shape[0]
-            params.time_embed_dim = table.shape[1]
-
-        with torch.device("meta"):
-            transformer = MiniMaxH3Transformer(params)
-
-        # attach the pre-quantized (int8 ConvRot) linears onto the toolkit's
-        # quantization backends; the rest loads at its stored precision (the
-        # checkpoint's bf16/fp16/fp32 mix is deliberate)
-        state_dict, num_quantized = import_comfy_quantized_layers(
-            transformer, state_dict, orig_dtype=dtype
-        )
-        if num_quantized:
-            self.print_and_status_update(
-                f" - attached {num_quantized} pre-quantized ConvRot layers"
-            )
-        result = transformer.load_state_dict(state_dict, assign=True, strict=False)
-        quantized_weight_keys = {
-            f"{name}.weight"
-            for name, m in transformer.named_modules()
-            if isinstance(m, OstrisLinear)
-        }
-        bad_missing = [k for k in result.missing_keys if k not in quantized_weight_keys]
-        if bad_missing or result.unexpected_keys:
-            raise ValueError(
-                f"MiniMax-H3 transformer load mismatch: missing {bad_missing[:8]}, "
-                f"unexpected {result.unexpected_keys[:8]}"
-            )
-        del state_dict
-        flush()
-        return transformer
+        # the mixin single-file path: config sniffed from the checkpoint
+        # (adaln_t_table), pre-quantized ConvRot linears attached, everything
+        # else at its stored precision (the bf16/fp16/fp32 mix is deliberate)
+        return MiniMaxH3Transformer.load_model(dit_path, dtype=self.torch_dtype)
 
     def _load_text_encoder(self):
         from accelerate import init_empty_weights
@@ -469,7 +402,7 @@ class MinimaxH3Model(BaseModel):
             )
             config = AutoConfig.from_pretrained(te_path)
             config.text_config.num_hidden_layers = TEXT_ENCODER_LAYER
-            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+            text_encoder = Qwen3VLTextEncoder.from_pretrained(
                 te_path, config=config, torch_dtype=self.te_torch_dtype
             )
         else:
@@ -491,7 +424,7 @@ class MinimaxH3Model(BaseModel):
             config.text_config.num_hidden_layers = TEXT_ENCODER_LAYER
             config.tie_word_embeddings = False
             with init_empty_weights():
-                text_encoder = Qwen3VLForConditionalGeneration(config)
+                text_encoder = Qwen3VLTextEncoder(config)
             text_encoder.lm_head = None
 
             state_dict = load_file(te_file)
@@ -546,38 +479,9 @@ class MinimaxH3Model(BaseModel):
 
     def _load_vaes(self) -> MiniMaxH3VaeBundle:
         self.print_and_status_update("Loading video VAE")
-        video_sd = load_file(self._resolve_comfy_file("video_vae"))
-        # normalization stats ride along in the comfy file; the module holds
-        # them as non-persistent buffers, keep them float32
-        video_stats = {
-            k: video_sd.pop(k).float()
-            for k in ("latents_mean", "latents_std")
-            if k in video_sd
-        }
-        video_vae = MiniMaxH3VideoVAE()
-        video_vae.load_state_dict(video_sd, strict=True, assign=True)
-        for k, v in video_stats.items():
-            getattr(video_vae, k).copy_(v)
-        video_vae.eval().requires_grad_(False)
-        del video_sd
-
+        video_vae = MiniMaxH3VideoVAE.load_model(self._resolve_comfy_file("video_vae"))
         self.print_and_status_update("Loading audio VAE")
-        audio_sd = load_file(self._resolve_comfy_file("audio_vae"))
-        audio_stats = {
-            k: audio_sd.pop(k).float()
-            for k in ("latents_mean", "latents_std")
-            if k in audio_sd
-        }
-        # comfy repack ships the weight norm already folded; fold only if the
-        # raw parametrization is present (original-repo file)
-        if any(k.endswith("weight_g") for k in audio_sd.keys()):
-            audio_sd = fold_audio_vae_weight_norm(audio_sd)
-        audio_vae = MiniMaxH3AudioVAE()
-        audio_vae.load_state_dict(audio_sd, strict=True, assign=True)
-        for k, v in audio_stats.items():
-            getattr(audio_vae, k).copy_(v)
-        audio_vae.to(torch.float32).eval().requires_grad_(False)
-        del audio_sd
+        audio_vae = MiniMaxH3AudioVAE.load_model(self._resolve_comfy_file("audio_vae"))
         flush()
         return MiniMaxH3VaeBundle(video_vae, audio_vae)
 
@@ -591,54 +495,16 @@ class MinimaxH3Model(BaseModel):
         if self.model_config.assistant_lora_path is not None:
             self.load_training_adapter(transformer)
 
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-            )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Keeping transformer on CPU")
-            transformer.to("cpu")
-        else:
-            transformer.to(self.device_torch)
+        # quantize + offload + placement, all driven by model_config
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
 
         tokenizer, processor, text_encoder = self._load_text_encoder()
-        te_prequantized = any(
-            isinstance(m, OstrisLinear) for m in text_encoder.modules()
-        )
-        if self.model_config.quantize_te and not te_prequantized:
-            self.print_and_status_update("Quantizing text encoder")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-        elif self.model_config.quantize_te:
-            self.print_and_status_update(
-                "Text encoder is already nvfp4/int8 quantized; skipping quantize_te"
-            )
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-        if self.model_config.low_vram:
-            text_encoder.to("cpu")
-        else:
-            text_encoder.to(self.device_torch)
+        if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
+            # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
+            text_encoder.aitk_is_quantized = True
+        # quantize + offload + placement, all driven by model_config
+        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
         flush()
 
         vae_bundle = self._load_vaes()
@@ -656,6 +522,12 @@ class MinimaxH3Model(BaseModel):
     # ------------------------------------------------------------------
     # Text conditioning
     # ------------------------------------------------------------------
+    def _present_image_control(self, image: Image.Image):
+        """Hook: how a control IMAGE enters the Qwen3-VL presentation. The
+        default is a plain ``<Picture i>`` image; ref2va can turn it into a
+        static video reference (``image_refs_as_video``)."""
+        return image
+
     def get_prompt_embeds(self, prompt, control_images=None) -> AdvancedPromptEmbeds:
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -681,7 +553,9 @@ class MinimaxH3Model(BaseModel):
                         img = img[0]
                     arr = (img.float().clamp(0, 1) * 255).round().to(torch.uint8)
                     pil_images.append(
-                        Image.fromarray(arr.permute(1, 2, 0).cpu().numpy())
+                        self._present_image_control(
+                            Image.fromarray(arr.permute(1, 2, 0).cpu().numpy())
+                        )
                     )
                 elif isinstance(img, str):
                     # a control VIDEO path: 2 fps timestamped presentation over
@@ -1213,20 +1087,9 @@ class MinimaxH3Model(BaseModel):
             "*adaln_proj*",
         ]
 
-    def convert_lora_weights_before_save(self, state_dict):
-        # ComfyUI's MiniMax-H3 keys are the original checkpoint keys, so the
-        # standard diffusion_model prefix maps directly
-        return {
-            k.replace("transformer.", "diffusion_model."): v
-            for k, v in state_dict.items()
-        }
-
-    def convert_lora_weights_before_load(self, state_dict):
-        return {
-            k.replace("diffusion_model.", "transformer."): v
-            for k, v in state_dict.items()
-        }
-
+    # ComfyUI's MiniMax-H3 keys are the original checkpoint keys, so the
+    # standard diffusion_model prefix maps directly
+    lora_keys_use_comfy_prefix = True
 
 class MinimaxH3Ref2VAModel(MinimaxH3Model):
     """Reference-to-video (ref2va): the control images ride along as reference
@@ -1241,9 +1104,39 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
     clock by 1.0.
 
     At sampling, ctrl images are ALWAYS references, never first frames.
+
+    ``model_kwargs.image_refs_as_video`` (default off) routes still-image
+    references through the VIDEO reference path instead: the image is held
+    for ``image_ref_video_frames`` frames (17n+5, default 5) as a silent
+    static clip — video sizing (true area match), multi-frame latent block,
+    temporal-span rotary advance, and a ``<Video k>: `` timestamped Qwen
+    presentation — so a LoRA trained on image references exercises the same
+    pathway that video references use at inference.
     """
 
     arch = "minimax_h3_ref2va"
+
+    def _image_ref_video_frames(self) -> int:
+        """Frames a still reference is held for when presented as a static
+        video (0 = keep native ``<Picture>`` image references)."""
+        kw = self.model_config.model_kwargs
+        if not bool(kw.get("image_refs_as_video", False)):
+            return 0
+        return packing.align_num_frames_down(int(kw.get("image_ref_video_frames", 5)))
+
+    @property
+    def text_embedding_space_version(self):
+        # the presentation of image references changes the embeds -> new cache key
+        n = self._image_ref_video_frames()
+        if n:
+            return f"{self.arch}:img_as_vid{n}"
+        return self.arch
+
+    def _present_image_control(self, image: Image.Image):
+        n = self._image_ref_video_frames()
+        if n:
+            return static_image_video_ref(image, n, fps=packing.FPS)
+        return image
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1254,6 +1147,15 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # control VIDEOS are cached like dataset items and consumed as
         # multi-frame reference blocks
         self.supports_video_control_images = True
+        # D-OPSD: a no-grad teacher pass with the target as its own reference
+        # becomes the training target for the reference-free student pass
+        self.dopsd = bool(self.model_config.model_kwargs.get("dopsd", False))
+        if self.dopsd:
+            self.dopsd_self_ref = True
+            self.require_pixel_tensor_cache = True
+            self.dopsd_bleed_strength = float(
+                self.model_config.model_kwargs.get("dopsd_bleed_strength", 1.0)
+            )
 
     def _dit_component(self) -> str:
         partition = str(
@@ -1276,6 +1178,10 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # pixel area with its own aspect kept, then encoded on its own grid
         if batch is None:
             return None, None, (), ()
+        if getattr(batch, "dopsd_teacher_pass", False):
+            return self._build_dopsd_teacher_condition(
+                batch, latent_shape, device, dtype
+            )
         controls_per_item = None
         if batch.control_tensor_list is not None:
             controls_per_item = batch.control_tensor_list
@@ -1298,18 +1204,23 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
 
         _, h_lat, w_lat = latent_shape
         target_h, target_w = h_lat * 16, w_lat * 16
+        # still refs as static video clips: video sizing + multi-frame block
+        as_video_frames = self._image_ref_video_frames()
+        size_fn = (
+            packing.reference_video_pixel_size
+            if as_video_frames
+            else packing.reference_pixel_size
+        )
 
         all_rows = []
-        ref_shapes = []
+        blocks = []
         for ref_idx in range(ref_count):
             resized = []
             for c in controls_per_item:
                 img = c[ref_idx]
                 if img.ndim == 4:
                     img = img[0]
-                ph, pw = packing.reference_pixel_size(
-                    img.shape[2], img.shape[1], target_h, target_w
-                )
+                ph, pw = size_fn(img.shape[2], img.shape[1], target_h, target_w)
                 # LANCZOS like ComfyUI / the sampling path
                 resized.append(
                     torch.nn.functional.interpolate(
@@ -1326,20 +1237,23 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                     f"(got pixel shapes {sorted(shapes)}); use batch_size 1 for "
                     "mixed-aspect references"
                 )
-            frames = torch.stack(resized)
-            # [0, 1] control -> [-1, 1] pixels, single-frame keyframe encode
-            ref_latents = self.encode_keyframe_latents(
-                (frames * 2.0 - 1.0).unsqueeze(2)
-            )
+            # [0, 1] control -> [-1, 1] pixels; (B, 3, T, H, W) with T = 1
+            # for a keyframe-style image ref, or the still held for
+            # ``image_ref_video_frames`` frames as a static clip
+            frames = (torch.stack(resized) * 2.0 - 1.0).unsqueeze(2)
+            if as_video_frames:
+                frames = frames.expand(-1, -1, as_video_frames, -1, -1).contiguous()
+            ref_latents = self.encode_keyframe_latents(frames)
             ref_noise = torch.randn_like(ref_latents)
             ref_latents = (
                 KEYFRAME_NOISE_AUG_T * ref_latents
                 + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
             )
-            ref_shapes.append((ref_latents.shape[3], ref_latents.shape[4]))
+            blocks.append(
+                (ref_latents.shape[2], ref_latents.shape[3], ref_latents.shape[4], 0)
+            )
             all_rows.append(patchify_video_latents(ref_latents).to(dtype))
 
-        blocks = [(1, h, w, 0) for h, w in ref_shapes]
         audio_rows = []
         self._append_video_ref_blocks(
             batch, all_rows, audio_rows, blocks, device, dtype, target_h, target_w
@@ -1349,12 +1263,61 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         cond_audio = torch.cat(audio_rows, dim=1) if audio_rows else None
         return torch.cat(all_rows, dim=1), cond_audio, (), tuple(blocks)
 
+    def _build_dopsd_teacher_condition(self, batch, latent_shape, device, dtype):
+        """D-OPSD teacher: the target is its own (only) reference, built from
+        the batch's cached pixel tensors; its soundtrack rides as clean
+        reference audio rows."""
+        if batch.tensor is None:
+            raise ValueError(
+                "D-OPSD teacher pass needs pixel tensors on the batch; set "
+                "cache_tensors_to_disk: true on this dataset"
+            )
+        px = batch.tensor.detach().to(device, torch.float32)
+        if px.ndim == 4:
+            # image items: single-frame ref, or a static clip for image_refs_as_video
+            frames = px.unsqueeze(2)
+            as_video_frames = self._image_ref_video_frames()
+            if as_video_frames:
+                frames = frames.expand(-1, -1, as_video_frames, -1, -1).contiguous()
+        else:
+            # video items: (B, T, C, H, W) -> (B, C, T, H, W)
+            frames = px.permute(0, 2, 1, 3, 4).contiguous()
+        ref_latents = self.encode_keyframe_latents(frames)
+        ref_noise = torch.randn_like(ref_latents)
+        ref_latents = (
+            KEYFRAME_NOISE_AUG_T * ref_latents
+            + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
+        )
+        audio_rows = None
+        a_lat = 0
+        if (
+            batch.dataset_config is not None
+            and batch.dataset_config.do_audio
+            and batch.audio_latents is not None
+            and getattr(batch, "num_frames", 1) > 1
+        ):
+            a_lat = packing.audio_latent_num_frames(batch.num_frames)
+            audio_rows = torch.stack(
+                [
+                    self._fit_audio_rows(
+                        batch.audio_latents[b].detach().to(device, torch.float32),
+                        a_lat,
+                    )
+                    for b in range(batch.audio_latents.shape[0])
+                ]
+            ).to(dtype)
+        blocks = (
+            (ref_latents.shape[2], ref_latents.shape[3], ref_latents.shape[4], a_lat),
+        )
+        return patchify_video_latents(ref_latents).to(dtype), audio_rows, (), blocks
+
     @torch.no_grad()
     def _encode_ref_video_for_sampling(self, path: str, gen_config) -> torch.Tensor:
-        """Decode a reference video, sample it evenly onto the 17n+5 grid
-        (capped at the sample's frame count), area-match it to the target with
-        its own aspect, and encode with the released keyframe recipe. Returns
-        normalized latents (C, T, h, w)."""
+        """Decode a reference video with the SAME temporal treatment training
+        uses (real-time pacing from frame 0 at 24 fps, tail trimmed, snapped
+        down to 17n+5, capped at the sample's frame count), area-match it to
+        the target with its own aspect, and encode with the released keyframe
+        recipe. Returns normalized latents (C, T, h, w)."""
         import cv2
         import numpy as np
 
@@ -1362,8 +1325,10 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         if not cap.isOpened():
             raise ValueError(f"Could not open reference video {path}")
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        n = packing.align_num_frames_down(min(total, max(gen_config.num_frames, 5)))
-        indices = [round(i * (total - 1) / max(n - 1, 1)) for i in range(n)]
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or packing.FPS
+        n = int(total / src_fps * packing.FPS)
+        n = packing.align_num_frames_down(min(n, max(gen_config.num_frames, 5)))
+        indices = ref_frame_indices(total, src_fps, n, packing.FPS, trim_tail=True)
         from .src.ref_video_cache import read_frames_at
 
         frames = [
@@ -1404,6 +1369,10 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             import torchaudio
 
             waveform, sample_rate = torchaudio.load(path)
+            # frames cover [0, n / 24) seconds; trim the soundtrack to the
+            # same window (matches the training cache) before encoding
+            keep = int(round(n / packing.FPS * sample_rate))
+            waveform = waveform[:, :keep]
             rows = self.encode_audio(
                 [{"waveform": waveform, "sample_rate": sample_rate}]
             )[0]
@@ -1412,6 +1381,29 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         except Exception:
             pass
         return {"latent": latents[0].float(), "audio_rows": audio_rows}
+
+    @torch.no_grad()
+    def _encode_static_image_ref_for_sampling(
+        self, image: Image.Image, gen_config
+    ) -> dict:
+        """A still ctrl image as a silent static reference clip
+        (``image_refs_as_video``): held for ``image_ref_video_frames`` frames,
+        video-sized to the target's pixel area with its own aspect, encoded
+        with the released keyframe recipe. Same shape of entry as
+        :meth:`_encode_ref_video_for_sampling`."""
+        import numpy as np
+
+        n = self._image_ref_video_frames()
+        ph, pw = packing.reference_video_pixel_size(
+            image.size[0], image.size[1], gen_config.height, gen_config.width
+        )
+        if image.size != (pw, ph):
+            image = image.resize((pw, ph), Image.Resampling.LANCZOS)
+        pixels = torch.from_numpy(np.asarray(image)).float() / 255.0 * 2.0 - 1.0
+        pixels = pixels.permute(2, 0, 1)[None, :, None]  # (1, 3, 1, H, W)
+        pixels = pixels.expand(-1, -1, n, -1, -1).contiguous()
+        latents = self.encode_keyframe_latents(pixels)
+        return {"latent": latents[0].float(), "audio_rows": None}
 
     def _append_video_ref_blocks(
         self, batch, all_rows, audio_rows, blocks, device, dtype, target_h, target_w
@@ -1527,11 +1519,16 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                 )
             else:
                 img = Image.open(path).convert("RGB")
-                ref_images.append(
-                    packing.prepare_reference_image(
-                        img, gen_config.height, gen_config.width
+                if self._image_ref_video_frames():
+                    ref_images.append(
+                        self._encode_static_image_ref_for_sampling(img, gen_config)
                     )
-                )
+                else:
+                    ref_images.append(
+                        packing.prepare_reference_image(
+                            img, gen_config.height, gen_config.width
+                        )
+                    )
 
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
 

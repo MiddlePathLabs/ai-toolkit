@@ -793,6 +793,7 @@ export const modelArchs: ModelArch[] = [
           { value: 'cg', label: 'Contrastive Guidance' },
           { value: 'ta', label: 'Training Adapter' },
           { value: 'both', label: 'Contrastive Guidance + Training Adapter (default)' },
+          { value: 'none', label: 'None' },
         ],
         getValue: (config: JobConfig) => {
           const assistantLoraPath = config?.config?.process?.[0]?.model?.assistant_lora_path;
@@ -804,7 +805,10 @@ export const modelArchs: ModelArch[] = [
           if (hasAssistantLoraPath) {
             return 'ta';
           }
-          return 'cg';
+          if (hasContrastiveGuidance) {
+            return 'cg';
+          }
+          return 'none';
         },
         onChange: (value: string, config: JobConfig, setJobConfig: (value: any, key: string) => void) => {
           if (value === 'cg') {
@@ -829,6 +833,10 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+          } else if (value === 'none') {
+            setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].model.assistant_lora_path');
           }
         },
         doc: {
@@ -941,8 +949,13 @@ export const modelArchs: ModelArch[] = [
           { value: 'cg', label: 'Contrastive Guidance' },
           { value: 'ta', label: 'Training Adapter' },
           { value: 'both', label: 'Contrastive Guidance + Training Adapter (default)' },
+          { value: 'dopsd', label: 'D-OPSD' },
+          { value: 'none', label: 'None' },
         ],
         getValue: (config: JobConfig) => {
+          if (config?.config?.process?.[0]?.model?.model_kwargs?.dopsd) {
+            return 'dopsd';
+          }
           const assistantLoraPath = config?.config?.process?.[0]?.model?.assistant_lora_path;
           const hasAssistantLoraPath = assistantLoraPath && assistantLoraPath.trim() !== '';
           const hasContrastiveGuidance = config?.config?.process?.[0]?.train?.do_guidance_loss;
@@ -952,9 +965,21 @@ export const modelArchs: ModelArch[] = [
           if (hasAssistantLoraPath) {
             return 'ta';
           }
-          return 'cg';
+          if (hasContrastiveGuidance) {
+            return 'cg';
+          }
+          return 'none';
         },
         onChange: (value: string, config: JobConfig, setJobConfig: (value: any, key: string) => void) => {
+          const kwargs = { ...(config?.config?.process?.[0]?.model?.model_kwargs ?? {}) };
+          if (value === 'dopsd') {
+            kwargs.dopsd = true;
+            kwargs.dopsd_bleed_strength = 1.0;
+          } else {
+            delete kwargs.dopsd;
+            delete kwargs.dopsd_bleed_strength;
+          }
+          setJobConfig(kwargs, 'config.process[0].model.model_kwargs');
           if (value === 'cg') {
             setJobConfig(true, 'config.process[0].train.do_guidance_loss');
             setJobConfig(undefined, 'config.process[0].model.assistant_lora_path');
@@ -977,6 +1002,10 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+          } else if (value === 'dopsd' || value === 'none') {
+            setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].model.assistant_lora_path');
           }
         },
         doc: {
@@ -987,7 +1016,53 @@ export const modelArchs: ModelArch[] = [
               break down. There are two different ways to train on this model without breaking the guidance
               distillation: Contrastive Guidance and Training Adapter. Both have their pros and cons. The adapter is
               faster, but will still break down over a long run. Contrastive Guidance is slower, but is less likely to
-              break down.
+              break down. D-OPSD instead self-distills: a no-grad teacher pass sees the training target as its own
+              reference and its prediction becomes the training target for a reference-free pass, baking the reference
+              into your trigger word (or the caption itself when no trigger word is set). Re-caches latents with pixel
+              tensors.
+            </div>
+          ),
+        },
+      },
+      {
+        label: 'Image Reference Presentation',
+        options: [
+          { value: 'picture', label: 'Picture (default)' },
+          { value: 'video', label: 'Static video clip' },
+        ],
+        getValue: (config: JobConfig) => {
+          return config?.config?.process?.[0]?.model?.model_kwargs?.image_refs_as_video ? 'video' : 'picture';
+        },
+        onChange: (value: string, config: JobConfig, setJobConfig: (value: any, key: string) => void) => {
+          const kwargs = { ...(config?.config?.process?.[0]?.model?.model_kwargs ?? {}) };
+          if (value === 'video') {
+            kwargs.image_refs_as_video = true;
+          } else {
+            delete kwargs.image_refs_as_video;
+            delete kwargs.image_ref_video_frames;
+          }
+          setJobConfig(kwargs, 'config.process[0].model.model_kwargs');
+        },
+        doc: {
+          title: 'MiniMax-H3 Image Reference Presentation',
+          description: (
+            <div className="space-y-2">
+              <p>
+                How still-image references (dataset control images and sample ctrl images) are shown to the model. Video
+                references always use the video path.
+              </p>
+              <p>
+                <strong>Picture</strong>: the native ref2va recipe — a single-frame reference block, shown to Qwen3-VL
+                as a <code>&lt;Picture i&gt;</code> block, scaled down only.
+              </p>
+              <p>
+                <strong>Static video clip</strong>: the image is held for 5 frames (2 latent frames) and routed through
+                the exact path a reference VIDEO takes — video sizing (matched to the target's pixel area), multi-frame
+                reference block, <code>&lt;Video k&gt;</code> timestamped presentation. Use this when training on image
+                references but sampling with video references, so the LoRA learns the pathway it will be used through.
+                Adds a handful of rows per reference. Frame count is adjustable with{' '}
+                <code>model_kwargs.image_ref_video_frames</code> (17n+5). Changing this re-caches text embeddings.
+              </p>
             </div>
           ),
         },
@@ -996,12 +1071,13 @@ export const modelArchs: ModelArch[] = [
     modelNotes: (
       <div className="space-y-2">
         <p>
-          Reference-to-video: control images condition the output as subject/style references (never as a first frame).
-          References keep their own aspect and are matched to the target's pixel area (images scale down only, never up;
-          a same-aspect video reference is exactly the target size). Each rides into the packed sequence as a reference
-          block, and is also shown to the Qwen3-VL conditioner as a <code>&lt;Picture i&gt;</code> vision block.
-          Training references come from the dataset control path(s); sampling uses the sample ctrl images — always as
-          references. Image references only for now (no reference video/audio).
+          Reference-to-video: control images and videos condition the output as subject/style references (never as a
+          first frame). References keep their own aspect and are matched to the target's pixel area (images scale down
+          only, never up; a same-aspect video reference is exactly the target size). Each rides into the packed sequence
+          as a reference block, and is also shown to the Qwen3-VL conditioner as a <code>&lt;Picture i&gt;</code>{' '}
+          (image) or timestamped <code>&lt;Video k&gt;</code> (video) vision block. Training references come from the
+          dataset control path(s); sampling uses the sample ctrl images — always as references. The Image Reference
+          Presentation option can route still images through the video-reference path as short static clips.
         </p>
         <p>
           Weights load like MiniMax-H3 (see that arch's notes) from the{' '}
