@@ -24,6 +24,7 @@ from toolkit.basic import flush, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
+from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt
@@ -1792,14 +1793,26 @@ def _waveform_from_int16(waveform: torch.Tensor, dtype: torch.dtype = torch.floa
     return (waveform.to(torch.float32) / 32767.0).to(dtype)
 
 
+def _dto_extras_from_state_dict(state_dict) -> dict:
+    """Extra latent streams in a cache file: legacy named keys written by
+    older versions plus the generic dto.<name> keys new caches write."""
+    extras = {}
+    if 'audio_latent' in state_dict:
+        extras['audio'] = state_dict['audio_latent']
+    for k, v in state_dict.items():
+        if k.startswith(DISK_PREFIX):
+            extras[k[len(DISK_PREFIX):]] = v
+    return extras
+
+
 class LatentCachingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
+        # a plain tensor, or a DTO carrying extra streams (audio rows, ...)
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
-        self._cached_audio_latent: Union[torch.Tensor, None] = None
         self._cached_tensor_uint8: Union[torch.Tensor, None] = None
         self._cached_waveform_int16: Union[torch.Tensor, None] = None
         self._cached_waveform_sample_rate: Union[int, None] = None
@@ -1882,17 +1895,14 @@ class LatentCachingFileItemDTOMixin:
                 # we are caching on disk, don't save in memory
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
-                self._cached_audio_latent = None
                 self._cached_tensor_uint8 = None
                 self._cached_waveform_int16 = None
                 self._cached_waveform_sample_rate = None
             else:
-                # move it back to cpu
+                # move it back to cpu (a DTO carries its extras along)
                 self._encoded_latent = self._encoded_latent.to('cpu')
                 if self._cached_first_frame_latent is not None:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
-                if self._cached_audio_latent is not None:
-                    self._cached_audio_latent = self._cached_audio_latent.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1912,8 +1922,9 @@ class LatentCachingFileItemDTOMixin:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
                 if self._cached_first_frame_latent.dtype == torch.uint8:
                     self._cached_first_frame_latent = _latent_from_uint8(self._cached_first_frame_latent)
-            if 'audio_latent' in state_dict:
-                self._cached_audio_latent = state_dict['audio_latent']
+            extras = _dto_extras_from_state_dict(state_dict)
+            if extras:
+                self._encoded_latent = DTO(self._encoded_latent, **extras)
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
             if 'tensor' in state_dict:
@@ -2234,12 +2245,13 @@ class LatentCachingMixin:
                 except Exception as e:
                     print_acc(f"Error processing image: {prep_item.path}")
                     print_acc(f"Error: {str(e)}")
-                    raise e
+                    print_acc(" - Skipping file and removing it from the dataset")
+                    return prep_item, None, None, False
                 return prep_item, prep_latent_path, None, True
 
             # use tqdm to show progress
             i = 0
-
+            failed_items = []
             pbar = tqdm(total=len(self.file_list), desc=f'Caching latents{" to disk" if to_disk else ""}')
             executor = ThreadPoolExecutor(max_workers=num_workers)
             try:
@@ -2253,6 +2265,11 @@ class LatentCachingMixin:
                     next_item = next(file_iter, None)
                     if next_item is not None:
                         pending.append(executor.submit(_prep, next_item))
+                    if latent_path is None:
+                        # file failed to load; drop it from the dataset and keep going
+                        failed_items.append(file_item)
+                        pbar.update(1)
+                        continue
                     if needs_encode and not did_move:
                         self.sd.set_device_state_preset('cache_latents')
                         did_move = True
@@ -2264,10 +2281,32 @@ class LatentCachingMixin:
                 executor.shutdown(wait=True, cancel_futures=True)
                 pbar.close()
 
+            if failed_items:
+                print_acc(f"Removed {len(failed_items)} files from the dataset that failed to load")
+                self._remove_file_items(failed_items)
 
             # restore device state
             if did_move:
                 self.sd.restore_device_state()
+
+    def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
+        # buckets hold raw indices into file_list, so removal requires remapping them
+        remove_ids = {id(item) for item in items_to_remove}
+        old_to_new = {}
+        new_file_list = []
+        for old_idx, item in enumerate(self.file_list):
+            if id(item) in remove_ids:
+                continue
+            old_to_new[old_idx] = len(new_file_list)
+            new_file_list.append(item)
+        self.file_list = new_file_list
+        if self.dataset_config.buckets and getattr(self, 'buckets', None):
+            for key in list(self.buckets.keys()):
+                bucket = self.buckets[key]
+                bucket.file_list_idx = [old_to_new[idx] for idx in bucket.file_list_idx if idx in old_to_new]
+                if len(bucket.file_list_idx) == 0:
+                    del self.buckets[key]
+            self.build_batch_indices()
 
     def _cache_one_latent(
             self: 'AiToolkitDataset',
@@ -2287,14 +2326,15 @@ class LatentCachingMixin:
                 if cached_latent.dtype == torch.uint8:
                     # pixel-space latents cached as uint8
                     cached_latent = _latent_from_uint8(cached_latent)
+                extras = _dto_extras_from_state_dict(state_dict)
+                if extras:
+                    cached_latent = DTO(cached_latent, **extras)
                 file_item._encoded_latent = cached_latent.to('cpu', dtype=self.sd.torch_dtype)
                 if 'first_frame_latent' in state_dict:
                     cached_first_frame = state_dict['first_frame_latent']
                     if cached_first_frame.dtype == torch.uint8:
                         cached_first_frame = _latent_from_uint8(cached_first_frame)
                     file_item._cached_first_frame_latent = cached_first_frame.to('cpu', dtype=self.sd.torch_dtype)
-                if 'audio_latent' in state_dict:
-                    file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
                 if 'tensor' in state_dict:
                     file_item._cached_tensor_uint8 = state_dict['tensor']
                 if 'waveform' in state_dict:
@@ -2330,12 +2370,19 @@ class LatentCachingMixin:
                         file_item._cached_waveform_sample_rate = sample_rate
             try:
                 imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                latent = self.sd.encode_images(imgs).squeeze(0)
+                latent = self.sd.encode_images(imgs)
+                # a model can return a DTO carrying extra streams alongside the latent
+                latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
                 if to_disk:
+                    main_latent = latent.tensor if isinstance(latent, DTO) else latent
                     if cache_uint8:
-                        state_dict['latent'] = _latent_to_uint8(latent).cpu()
+                        state_dict['latent'] = _latent_to_uint8(main_latent).cpu()
                     else:
-                        state_dict['latent'] = latent.clone().detach().cpu()
+                        state_dict['latent'] = main_latent.clone().detach().cpu()
+                    if isinstance(latent, DTO):
+                        for k, v in latent.extras.items():
+                            if torch.is_tensor(v):
+                                state_dict[f'{DISK_PREFIX}{k}'] = v.clone().detach().cpu()
             except Exception as e:
                 print_acc(f"Error processing image: {file_item.path}")
                 print_acc(f"Error: {str(e)}")
@@ -2374,12 +2421,12 @@ class LatentCachingMixin:
                 save_file(state_dict, latent_path, metadata=meta)
 
             if to_memory:
-                # keep it in memory
+                # keep it in memory; audio rides inside the latent DTO
+                if audio_latent is not None:
+                    latent = DTO(latent, audio=audio_latent)
                 file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
                 if first_frame_latent is not None:
                     file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
-                if audio_latent is not None:
-                    file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
 
             del imgs
             del latent

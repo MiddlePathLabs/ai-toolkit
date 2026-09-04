@@ -49,6 +49,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
+from toolkit.dto import DTO
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
@@ -118,7 +119,15 @@ COMFY_FILES = {
     "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
     "video_vae": "vae/minimax_h3_video_vae_fp16.safetensors",
     "audio_vae": "vae/minimax_h3_audio_vae_fp32.safetensors",
+    "dit_fasth3": "diffusion_models/minimax_h3_fasth3_preview_v0.2_int8_convrot.safetensors",
 }
+# FastH3 (FastVideo 4-step VSA distill) int8-convrot repack, produced by
+# scripts/convert_minimax_h2_fastvideo.py from the FastVideo diffusers repo.
+# Hub fallback repo for the file (flat at the repo root, downloaded into
+# MODELS_PATH/diffusion_models/); not published there yet — until it is, the
+# file must exist locally or be built with the converter.
+FASTH3_REPO = "Kijai/MiniMax-H3-experimental"
+FASTH3_SOURCE_REPO = "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2"
 # tokenizer/processor/text-encoder config come from the original repo (tiny files)
 ORIGINAL_REPO = "MiniMaxAI/MiniMax-H3"
 
@@ -248,9 +257,7 @@ class MinimaxH3Model(BaseModel):
         return resolve_comfy_file(
             COMFY_FILES[component],
             repo_id=repo_id_from_name_or_path(name_or_path, COMFY_REPO),
-            override_path=self.model_config.model_kwargs.get(
-                f"{component}_path", None
-            ),
+            override_path=self.model_config.model_kwargs.get(f"{component}_path", None),
             extra_roots=extra_roots,
             status_fn=self.print_and_status_update,
         )
@@ -284,9 +291,7 @@ class MinimaxH3Model(BaseModel):
         lora_path = self.model_config.assistant_lora_path
         if not os.path.exists(lora_path):
             filename = os.path.basename(lora_path)
-            found = find_file_recursive(
-                os.path.join(MODELS_PATH, "loras"), filename
-            )
+            found = find_file_recursive(os.path.join(MODELS_PATH, "loras"), filename)
             if found is not None:
                 lora_path = found
             else:
@@ -775,17 +780,6 @@ class MinimaxH3Model(BaseModel):
         if self.model.device == torch.device("cpu"):
             self.model.to(device)
 
-        # a grad-enabled prediction is the primary (loss carrying) one unless
-        # the trainer declared a secondary slot on the batch (prior /
-        # guidance-unconditional / preservation passes). Trainers that make
-        # several grad predictions per step (e.g. turbo rollouts) get one
-        # primary per prediction, last writer wins.
-        is_primary_pred = (
-            torch.is_grad_enabled()
-            and batch is not None
-            and batch.audio_pred_slot is None
-        )
-
         batch_size, _, t_lat, h_lat, w_lat = latent_model_input.shape
 
         with torch.no_grad():
@@ -832,6 +826,8 @@ class MinimaxH3Model(BaseModel):
                 )
 
             sa = sigma_a.view(-1, 1, 1)
+            audio_target = None
+            noisy_audio_rows = None
             if raw_audio is not None:
                 expected_rows = a_lat * packing.AUDIO_CHANNELS
                 if raw_audio.shape[1] > expected_rows:
@@ -842,31 +838,29 @@ class MinimaxH3Model(BaseModel):
                     )
                 # the audio noise is drawn once per step and shared by every
                 # pass (prior, primary, cfg/guidance, preservation) so they all
-                # see the same soundtrack and the stored target keeps matching
-                if (
-                    batch.audio_noise is not None
-                    and batch.audio_noise.shape == raw_audio.shape
-                ):
-                    audio_noise = batch.audio_noise.to(device, torch.float32)
+                # see the same soundtrack and every pass's target matches. It
+                # rides on the latents DTO along with the trimmed audio so
+                # on-the-fly encodes aren't repeated per pass.
+                audio_noise = (
+                    batch.latents.get("audio_noise")
+                    if isinstance(batch.latents, DTO)
+                    else None
+                )
+                if audio_noise is not None and audio_noise.shape == raw_audio.shape:
+                    audio_noise = audio_noise.to(device, torch.float32)
                 else:
                     audio_noise = torch.randn_like(raw_audio)
-                    batch.audio_noise = audio_noise
+                    if batch.latents is not None:
+                        batch.latents = DTO(
+                            batch.latents, audio=raw_audio, audio_noise=audio_noise
+                        )
                 audio_rows = (1.0 - sa) * raw_audio + sa * audio_noise
-                batch.audio_latents = raw_audio
-                if batch.audio_target is None:
-                    # model predicts clean - noise; audio_pred is negated below
-                    # so the stored target follows ai-toolkit's noise - clean.
-                    # With the shared noise this is the same value on every
-                    # pass, so first writer is fine (and it keeps a guidance
-                    # extrapolated target from being overwritten).
-                    batch.audio_target = (audio_noise - raw_audio).detach()
-                if is_primary_pred:
-                    # expose what audio perceptual losses need to rebuild the
-                    # clean estimate (x0 = noisy - sigma_a * pred). Tied to the
-                    # primary pass so they always match audio_pred, even when a
-                    # trainer makes primary predictions at several sigmas.
-                    batch.audio_noisy = audio_rows
-                    batch.audio_sigma = sigma_a
+                # model predicts clean - noise; audio_pred is negated below so
+                # the target follows ai-toolkit's noise - clean convention
+                audio_target = (audio_noise - raw_audio).detach()
+                # what audio perceptual losses need to rebuild the clean
+                # estimate (x0 = noisy - sigma_a * pred); rides the pred DTO
+                noisy_audio_rows = audio_rows
             else:
                 # no soundtrack: silence (zeros) noised at the audio sigma
                 # rides along without contributing to the loss
@@ -955,20 +949,26 @@ class MinimaxH3Model(BaseModel):
             video_indices=video_indices.to(device),
             audio_indices=audio_indices.to(device),
             text_indices=text_indices.to(device),
+            # target-video token grid (patch 1x2x2); consumed only by VSA models
+            vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
         )
 
         if num_cond_audio > 0:
             # reference soundtrack rows are conditioning, not targets
             audio_pred = audio_pred[:, num_cond_audio:]
-        if batch is not None and batch.audio_target is not None:
-            # flip to ai-toolkit's noise - clean convention
-            if is_primary_pred:
-                batch.audio_pred = -audio_pred
-            else:
-                batch.set_secondary_audio_pred(-audio_pred)
 
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
+        if audio_target is not None:
+            # every pass's DTO carries its own audio stream; preds flipped to
+            # ai-toolkit's noise - clean convention
+            return DTO(
+                -noise_pred,
+                audio=-audio_pred,
+                audio_target=audio_target,
+                audio_noisy=noisy_audio_rows,
+                audio_sigma=sigma_a,
+            )
         return -noise_pred
 
     def get_loss_target(self, *args, **kwargs):
@@ -1090,6 +1090,7 @@ class MinimaxH3Model(BaseModel):
     # ComfyUI's MiniMax-H3 keys are the original checkpoint keys, so the
     # standard diffusion_model prefix maps directly
     lora_keys_use_comfy_prefix = True
+
 
 class MinimaxH3Ref2VAModel(MinimaxH3Model):
     """Reference-to-video (ref2va): the control images ride along as reference
@@ -1548,3 +1549,109 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         if is_video:
             return result  # dict consumed by new_save_image_function
         return result[0]
+
+
+class MinimaxH3FastModel(MinimaxH3Model):
+    """FastH3: FastVideo's DMD2-distilled 4-step MiniMax-H3 preview, trained
+    with VSA (Video Sparse Attention) at 90% sparsity. Text-to-video(+audio)
+    only — no first-frame or reference conditioning.
+
+    The DiT is the int8-ConvRot repack of
+    ``FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2`` (built with
+    scripts/convert_minimax_h2_fastvideo.py): the pruned comfy layout plus a
+    ``blocks.N.attn.to_gate_compress`` linear per block. Attention runs the
+    trained VSA policy — pooled 64-token (4,4,4) tile top-k block-sparse
+    attention with the gated compression branch — via FlexAttention
+    (src/vsa.py), in training and sampling alike. Text encoder and VAEs are
+    shared with the base model.
+
+    ``model_kwargs``:
+      - ``vsa`` (default true): false runs dense attention with the gate
+        branch off, matching FastVideo's dense LoRA-preview mode
+      - ``vsa_sparsity`` (default 0.9, the checkpoint's trained policy)
+
+    Sample with 4 steps (the distilled schedule) and guidance_scale 1.
+    """
+
+    arch = "minimax_h3_vsa"
+    # FastH3 samples on its trained ladder: [999, 749, 500, 250] on the
+    # shared 1000-step grid, each scheduler applying its own shift
+    t1000_sample_ladder = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        kw = self.model_config.model_kwargs
+        self.vsa_sparsity: Optional[float] = None
+        if bool(kw.get("vsa", True)):
+            self.vsa_sparsity = float(kw.get("vsa_sparsity", 0.9))
+
+    def _dit_component(self) -> str:
+        return "dit_fasth3"
+
+    def _resolve_comfy_file(self, component: str) -> str:
+        if component != "dit_fasth3":
+            return super()._resolve_comfy_file(component)
+        # local search at the comfy-layout locations first; the hub file sits
+        # at the FastH3 repo's root, so the download is done directly here
+        name_or_path = self.model_config.name_or_path
+        extra_roots = (
+            [name_or_path] if name_or_path and os.path.isdir(name_or_path) else []
+        )
+        rel_path = COMFY_FILES[component]
+        found = resolve_comfy_file(
+            rel_path,
+            repo_id=FASTH3_REPO,
+            override_path=self.model_config.model_kwargs.get(f"{component}_path", None),
+            extra_roots=extra_roots,
+            status_fn=self.print_and_status_update,
+            local_only=True,
+        )
+        if found is not None:
+            return found
+        import huggingface_hub
+
+        target_dir = os.path.join(MODELS_PATH, "diffusion_models")
+        os.makedirs(target_dir, exist_ok=True)
+        self.print_and_status_update(
+            f"Downloading {os.path.basename(rel_path)} from {FASTH3_REPO}"
+        )
+        try:
+            return huggingface_hub.hf_hub_download(
+                repo_id=FASTH3_REPO,
+                filename=os.path.basename(rel_path),
+                local_dir=target_dir,
+            )
+        except Exception as e:
+            raise FileNotFoundError(
+                f"{os.path.basename(rel_path)} was not found locally or on "
+                f"{FASTH3_REPO}. Build it from the FastVideo release with:\n"
+                f"  python scripts/convert_minimax_h2_fastvideo.py "
+                f"{FASTH3_SOURCE_REPO} {os.path.join(target_dir, os.path.basename(rel_path))}\n"
+                f"or point model_kwargs.dit_fasth3_path at an existing "
+                f"FastH3 int8-convrot file."
+            ) from e
+
+    def _load_transformer(self) -> MiniMaxH3Transformer:
+        transformer = super()._load_transformer()
+        if not transformer.params.gate_compress:
+            raise ValueError(
+                "minimax_h3_vsa needs a VSA-trained checkpoint with "
+                "blocks.N.attn.to_gate_compress weights (FastH3); this file "
+                "has none. Use arch minimax_h3 for the base checkpoints."
+            )
+        transformer.vsa_sparsity = self.vsa_sparsity
+        return transformer
+
+    def _build_condition(
+        self, batch: "DataLoaderBatchDTO", latent_shape, device, dtype
+    ):
+        # t2v only: no keyframe or reference conditioning
+        return None, None, (), ()
+
+    def get_base_model_version(self):
+        return "minimax_h3_vsa"
+
+    @property
+    def text_embedding_space_version(self):
+        # same Qwen3-VL presentation as the base model: share the embed cache
+        return "minimax_h3"
