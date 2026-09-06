@@ -2302,6 +2302,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if user_set_cache_limit:
                     torch._dynamo.config.cache_size_limit = cache_size_limit
                 torch._dynamo.config.suppress_errors = False
+                # torch.compile + gradient checkpointing: during backward recompute,
+                # dynamo can serve a different cached graph variant than the forward
+                # pass used (LRU cache reordering), which fails checkpoint's
+                # saved-vs-recomputed metadata check with CheckpointError. Keep
+                # forward and recompute on the same graph (pytorch/pytorch#166926).
+                if hasattr(torch._C._dynamo.eval_frame, '_set_lru_cache'):
+                    torch._C._dynamo.eval_frame._set_lru_cache(False)
                 # torch 2.9 inductor bug: the new memory-coalescing tiling analysis
                 # crashes on some dynamic-shape index expressions (sympy PowByNatural
                 # "assert p >= 0", seen with Qwen Image). The analysis doesn't apply
