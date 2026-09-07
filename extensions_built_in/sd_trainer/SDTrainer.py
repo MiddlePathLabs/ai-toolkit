@@ -2269,11 +2269,11 @@ class SDTrainer(BaseSDTrainProcess):
                 sd=self.sd
             )
             self.dfe.to(self.device_torch)
-            if hasattr(self.dfe, 'vision_encoder') and self.train_config.gradient_checkpointing:
+            if hasattr(self.dfe, 'vision_encoder'):
                 # must be set to train for gradient checkpointing to work
                 self.dfe.vision_encoder.train()
                 self.dfe.vision_encoder.gradient_checkpointing = True
-            elif hasattr(self.dfe, 'model') and self.train_config.gradient_checkpointing:
+            elif hasattr(self.dfe, 'model'):
                 if hasattr(self.dfe.model, 'enable_gradient_checkpointing'): 
                     self.dfe.model.train()
                     self.dfe.model.enable_gradient_checkpointing()
@@ -2666,6 +2666,8 @@ class SDTrainer(BaseSDTrainProcess):
                     batch=batch,
                     scheduler=self.sd.noise_scheduler
                 )
+                dfe_loss = dfe_loss.mean()
+                self.additional_logs['loss/dfe'] = dfe_loss.item()
                 additional_loss += dfe_loss * self.train_config.diffusion_feature_extractor_weight 
             else:
                 raise ValueError(f"Unknown diffusion feature extractor version {self.dfe.version}")
@@ -3434,7 +3436,10 @@ class SDTrainer(BaseSDTrainProcess):
         )
     
 
-    def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+    def train_single_accumulation(self, batch: DataLoaderBatchDTO, accum_scale: float = 1.0):
+        # accum_scale: 1 / number of micro-batches accumulated per optimizer step, so the
+        # summed gradients equal the mean over the effective batch. Applied to the backward
+        # only; the returned loss stays unscaled for logging.
         self._mem_diag('step_start')
         with torch.no_grad():
             self.timer.start('preprocess_batch')
@@ -4307,7 +4312,7 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
-                    self.accelerator.backward(loss)
+                    self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
                     self._mem_diag('after_backward')
 
         return loss.detach()
@@ -4434,6 +4439,12 @@ class SDTrainer(BaseSDTrainProcess):
             batch_list = [batch]
         total_loss = None
         self.optimizer.zero_grad()
+        # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
+        # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
+        n_accum = len(batch_list)
+        if self.train_config.gradient_accumulation_steps > 1:
+            n_accum *= self.train_config.gradient_accumulation_steps
+        accum_scale = 1.0 / n_accum
         for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
@@ -4447,7 +4458,7 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
-            loss = self.train_single_accumulation(batch)
+            loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss

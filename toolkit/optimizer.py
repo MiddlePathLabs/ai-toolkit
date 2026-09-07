@@ -114,6 +114,11 @@ def get_optimizer(
         # independently — Adam defaults are NOT appropriate.
         from toolkit.optimizers.rose import Rose
         optimizer = Rose(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'adamconvrot':
+        from toolkit.optimizers.adamconvrot import AdamConvRot
+        if 'eps' not in optimizer_params:
+            optimizer_params['eps'] = 1e-6
+        optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer
