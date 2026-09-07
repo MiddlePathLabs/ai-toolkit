@@ -78,6 +78,10 @@ from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
 
 
+def _use_block_compile(block_compile: bool, gradient_checkpointing: bool) -> bool:
+    return block_compile and not gradient_checkpointing
+
+
 class BaseSDTrainProcess(BaseTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, custom_pipeline=None):
@@ -2279,20 +2283,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #
         # compile: true
         # block_compile: true
-        #     -> block-level compilation
+        #     -> block-level compilation unless gradient checkpointing is enabled
         # ============================================================
         if self.model_config.compile:
             compiled_refs = []  # (block_list, index, original_block) for rollback on failure
+            original_unet = self.sd.unet
             try:
                 inner_unet_check = unwrap_model(self.sd.unet)
                 is_unet_offloaded = hasattr(inner_unet_check, '_memory_manager')
 
-                text_encoder = getattr(self.sd, "text_encoder", None)
-                text_encoder_check = unwrap_model(text_encoder) if text_encoder is not None else None
-                is_te_offloaded = hasattr(text_encoder_check, '_memory_manager') if text_encoder_check is not None else False
-
                 is_unet_quantized = getattr(self.model_config, 'quantize', False)
-                is_quantized = is_unet_quantized or getattr(self.model_config, 'quantize_te', False)
 
                 if not is_unet_offloaded:
                     self.sd.unet.to(self.device_torch)
@@ -2301,14 +2301,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 user_set_cache_limit = cache_size_limit is not None
                 if user_set_cache_limit:
                     torch._dynamo.config.cache_size_limit = cache_size_limit
-                torch._dynamo.config.suppress_errors = False
-                # torch.compile + gradient checkpointing: during backward recompute,
-                # dynamo can serve a different cached graph variant than the forward
-                # pass used (LRU cache reordering), which fails checkpoint's
-                # saved-vs-recomputed metadata check with CheckpointError. Keep
-                # forward and recompute on the same graph (pytorch/pytorch#166926).
-                if hasattr(torch._C._dynamo.eval_frame, '_set_lru_cache'):
-                    torch._C._dynamo.eval_frame._set_lru_cache(False)
+                # torch.compile is lazy; backend failures happen on the first
+                # forward, outside this setup block. Compilation is optional, so
+                # let Dynamo fall back to eager instead of aborting training.
+                torch._dynamo.config.suppress_errors = True
                 # torch 2.9 inductor bug: the new memory-coalescing tiling analysis
                 # crashes on some dynamic-shape index expressions (sympy PowByNatural
                 # "assert p >= 0", seen with Qwen Image). The analysis doesn't apply
@@ -2319,7 +2315,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 compile_mode = getattr(self.model_config, 'compile_mode', 'default')
                 compile_dynamic = getattr(self.model_config, 'compile_dynamic', True)
                 compile_fullgraph = getattr(self.model_config, 'compile_fullgraph', False)
-                block_compile = getattr(self.model_config, 'block_compile', False)
+                requested_block_compile = getattr(self.model_config, 'block_compile', False)
+                block_compile = _use_block_compile(
+                    requested_block_compile,
+                    self.train_config.gradient_checkpointing,
+                )
+                if requested_block_compile and not block_compile:
+                    print_acc(
+                        "Gradient checkpointing is enabled: using whole-model torch.compile "
+                        "instead of block_compile so checkpoint recomputation stays inside "
+                        "the same compiled graph."
+                    )
 
                 # quantized + offloaded unet is incompatible with fullgraph; force it off
                 if is_unet_quantized and is_unet_offloaded and compile_fullgraph:
@@ -2395,7 +2401,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             torch._dynamo.config.cache_size_limit = auto_cache_limit
                             cache_info = f", cache_size_limit={auto_cache_limit} (auto)"
                         print_acc(
-                            f"Compiled {compiled_block_count} transformer block(s) "
+                            f"Wrapped {compiled_block_count} transformer block(s) "
                             f"with torch.compile (mode='{compile_mode}', fullgraph={compile_fullgraph}, dynamic={compile_dynamic}{cache_info})."
                         )
                         print_acc("The first forward pass will be slow during compile. This is normal.")
@@ -2436,19 +2442,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc("Compiling model with torch.compile (whole-model compile).")
                     print_acc("The first forward pass will hang for a while. This is normal.")
 
-                    print_acc(
-                        f"Using torch.compile settings: "
-                        f"mode={compile_mode}, "
-                        f"dynamic={compile_dynamic}, "
-                        f"fullgraph={compile_fullgraph}{cache_info}"
-                    )
-
                     if compile_fullgraph:
                         print_acc(
                             "fullgraph=True is incompatible with whole-model compile, "
                             "switching to fullgraph=False."
                         )
                         compile_fullgraph = False
+                    print_acc(
+                        f"Using torch.compile settings: "
+                        f"mode={compile_mode}, "
+                        f"dynamic={compile_dynamic}, "
+                        f"fullgraph={compile_fullgraph}{cache_info}"
+                    )
 
                     if compile_mode == 'default':
                         self.sd.unet = torch.compile(
@@ -2464,7 +2469,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             fullgraph=compile_fullgraph,
                         )
 
-                if not is_unet_offloaded:
+                if is_unet_quantized and not is_unet_offloaded:
                     # once compiled, dynamo guards hold weakrefs to the params;
                     # .to() on quantized params requires swap_tensors, which fails
                     # on tensors with weakrefs. The model stays on device anyway,
@@ -2478,6 +2483,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if len(compiled_refs) > 0:
                     for block_list, i, original_block in compiled_refs:
                         block_list[i] = original_block
+                self.sd.unet = original_unet
 
                 if 'triton' in str(e).lower():
                     print_acc("WARNING: compile is disabled.")

@@ -343,7 +343,7 @@ export interface ModelConfig {
   unconditional_lora_path?: string;
   compile?: boolean;
   block_compile?: boolean;
-  compile_mode?: 'default' | 'max-autotune' | 'fastest';
+  compile_mode?: 'default' | 'lite' | 'reduce-overhead' | 'max-autotune' | 'max-autotune-no-cudagraphs';
   compile_fullgraph?: boolean;
   compile_dynamic?: boolean;
   cache_size_limit?: number;
@@ -469,7 +469,7 @@ export interface CaptionProcessConfig {
     batch_size?: number;
     layer_offloading?: boolean;
     layer_offloading_percent?: number;
-  }
+  };
 }
 
 export interface CaptionConfigObject {
