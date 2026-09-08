@@ -350,6 +350,18 @@ export default function JobLossGraph({ job }: Props) {
           const min = c ? c.min : dataMin;
           const max = c ? c.max : dataMax;
           if (min == null || max == null) return [null, null];
+          // A constant series (lr_member_count / lr_window_scale on a bs=1 run)
+          // is flat at the float64-ULP level after smoothing. uPlot's increment
+          // search then picks a tick increment smaller than one ULP at that
+          // magnitude, and numAxisSplits' `val + incr` rounds back to the same
+          // value forever — an unbounded Array.push that freezes the tab
+          // (RangeError: Invalid array length at best, slow-script dialog at
+          // worst). Widen zero/sub-ULP-width ranges like uPlot's own rangeNum
+          // does, for both the linear and the log path below.
+          if (max - min <= Math.abs(max || min || 0) * 1e-12) {
+            const pad = Math.max(Math.abs(max || min || 0) * 0.01, 1e-12);
+            return [min - pad, max + pad];
+          }
           // uPlot's log tick generator (logAxisSplits) assumes the scale min
           // sits on a magnitude boundary — its default log range snaps via
           // rangeLog before ticks are computed. Handing it raw data extents
