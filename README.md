@@ -33,7 +33,7 @@ Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.
 
 ### Per-image adaptive learning rate
 
-`per_image_adaptive_lr` adjusts LR per training image based on rolling loss-window statistics, with logging, warmup windows (`per_image_adaptive_lr_warmup_windows`), resolution-aware adjustment scaling, and a `per_image_adaptive_lr_stats_only` mode that logs adjustments without applying them.
+`per_image_adaptive_lr` adjusts LR per training image based on rolling loss-window statistics, with logging, warmup windows (`per_image_adaptive_lr_warmup_windows`), resolution-aware adjustment scaling, and a `per_image_adaptive_lr_stats_only` mode that logs adjustments without applying them. Default application is `train.per_image_adaptive_lr_mode: loss`. The experimental `lr` mode is documented below.
 
 ### Rose optimizer
 
@@ -46,6 +46,15 @@ Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other
 - Env-gated CUDA memory diagnostics (`KREA2_MEM_DIAG`) in the SD trainer.
 - Fix: timer no longer divides by zero on empty buckets after OOM recovery.
 - Test infrastructure: unit tests in `testing/` plus a real-data integration harness in `testing/integration/` (perceptual noising QA, depth consistency, gradient-contract probes).
+
+### Experimental
+
+Default-off. Fail-closed at startup when the optimizer cannot honor the requested mode.
+
+- **Per-image adaptive LR `lr` mode** — `train.per_image_adaptive_lr_mode: lr` (default `loss`). Requires `train.per_image_adaptive_lr: true`. `loss` multiplies only the per-sample visual diffusion loss before backward; prior, audio, adapter, preservation, and anchor terms stay at full LR. `lr` leaves every loss component unscaled and multiplies the optimizer's applied update for the whole window. Requires an optimizer that `supports_step_scale`. Discrete watcher multipliers are not min/max LR bounds.
+- **MiniMax-H3 Turbo preview LoRA** — `model.preview_lora_path` (default off) and `model.preview_lora_strength` (default `1.0`). Sampling-only; never trained or saved. Path is a local file, a filename under `models/loras`, or `user/repo/file.safetensors`. H3-only (`model.arch: minimax_h3`). Mutually exclusive with `model.inference_lora_path`.
+- **H3 modality block routing** — `train.modality_block_routing` with optional `photo_blocks`, `clip_blocks`, `voice_blocks`. Default off; a blank/omitted key leaves that modality unrestricted. Spec is a range list such as `"3-12, 14-15, 22,27,31-33"`, parsed against `len(transformer.blocks)`. H3 LoRA/LoKr only. Requires an optimizer that `supports_active_param_mask` (Automagic3 is rejected). Mixed-modality windows use the union of those blocks; refiners and non-trunk adapters stay active.
+- **H3 standalone voice recordings** — on MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
 
 ## Supported Models
 
