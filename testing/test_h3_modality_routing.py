@@ -58,6 +58,7 @@ def test_classify_file_item_photo_clip_voice():
     assert classify_file_item(SimpleNamespace(is_video=False)) == "photo"
     assert classify_file_item(SimpleNamespace(is_video=True)) == "clip"
     assert classify_file_item(SimpleNamespace(is_video=True, is_audio_only=True)) == "voice"
+    assert classify_file_item(SimpleNamespace(is_video=False, is_audio_only=True)) == "voice"
     assert window_kind({"photo"}) == "photo"
     assert window_kind({"photo", "clip"}) == "mixed"
     assert window_kind(set()) == "mixed"

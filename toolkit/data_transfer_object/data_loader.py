@@ -37,9 +37,10 @@ if TYPE_CHECKING:
 
 printed_messages = []
 
-# keep in sync with video_extensions in toolkit/data_loader.py (importing it
-# here would be circular)
+# keep in sync with video_extensions / audio_extensions in toolkit/data_loader.py
+# (importing it here would be circular)
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+audio_extensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a']
 
 
 def print_once(msg):
@@ -77,12 +78,27 @@ class FileItemDTO(
         dataset_is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
         self.is_video = dataset_is_video and os.path.splitext(self.path)[1].lower() in video_extensions
         self.is_audio_model = kwargs.get("is_audio_model", False)
+        # H3 standalone voice file — not ACE-Step `is_audio_model`
+        self.is_audio_only = False
+        _sd = kwargs.get("sd", None)
+        if (
+            not self.is_audio_model
+            and self.dataset_config is not None
+            and bool(getattr(self.dataset_config, "do_audio", False))
+            and os.path.splitext(self.path)[1].lower() in audio_extensions
+        ):
+            arch = getattr(getattr(_sd, "model_config", None), "arch", None)
+            if str(arch or "").startswith("minimax_h3"):
+                self.is_audio_only = True
         self.sample_rate = kwargs.get("sample_rate", 48000)
+        if self.is_audio_only:
+            from toolkit.h3_audio_only import AUDIO_SAMPLE_RATE
+            self.sample_rate = AUDIO_SAMPLE_RATE
         self.num_frames = self.dataset_config.num_frames if self.is_video else 1
+        self.placeholder_latent = None
         self.temporal_compression = kwargs.get("temporal_compression", 8)
         # module-level function (picklable) for models whose valid frame
         # counts are not temporal_compression * n + 1; None = default math
-        _sd = kwargs.get("sd", None)
         self.frame_count_snapper = (
             _sd.get_frame_count_snapper()
             if _sd is not None and hasattr(_sd, "get_frame_count_snapper")
@@ -123,7 +139,20 @@ class FileItemDTO(
                 use_db_entry = True
         video_total_frames = None
         video_fps = None
-        if self.is_audio_model:
+        if self.is_audio_only:
+            from toolkit.h3_audio_only import (
+                AUDIO_PLACEHOLDER_PIXELS,
+                admit_voice_file,
+            )
+            if use_db_entry and len(db_entry) >= 5 and db_entry[4] == "audio_only":
+                w, h, _, self.num_frames, _ = db_entry[:5]
+            else:
+                self.num_frames = admit_voice_file(self.path)
+                w = h = AUDIO_PLACEHOLDER_PIXELS
+                size_database[file_key] = (
+                    w, h, file_signature, self.num_frames, "audio_only",
+                )
+        elif self.is_audio_model:
             # get the length of the audio file in ms
             with av.open(self.path) as c:
                 if c.duration is not None:
@@ -315,11 +344,17 @@ class DataLoaderBatchDTO:
             self.dopsd_teacher_pass: bool = False
 
             self.num_frames: int = self.file_items[0].num_frames
+            audio_only_batch = all(
+                getattr(x, "is_audio_only", False) for x in self.file_items
+            )
 
             if (
-                not is_latents_cached
-                or self.file_items[0].dataset_config.load_image_when_caching_latents
-                or self.file_items[0].dataset_config.cache_tensors_to_disk
+                not audio_only_batch
+                and (
+                    not is_latents_cached
+                    or self.file_items[0].dataset_config.load_image_when_caching_latents
+                    or self.file_items[0].dataset_config.cache_tensors_to_disk
+                )
             ):
                 # only return a tensor if latents are not cached, or if we are explicitly
                 # loading the raw image alongside the cached latents
@@ -349,6 +384,14 @@ class DataLoaderBatchDTO:
                             for x in self.file_items
                         ]
                     )
+            elif audio_only_batch:
+                placeholders = [x.placeholder_latent for x in self.file_items]
+                if any(p is None for p in placeholders):
+                    raise ValueError(
+                        "audio-only item missing placeholder latents; "
+                        "load_and_process_image must run first"
+                    )
+                self.latents = torch.stack(placeholders)
             self.prompt_embeds: Union[PromptEmbeds, None] = None
             # diff output preservation embeds (trigger word replaced with class)
             self.dop_prompt_embeds: Union[PromptEmbeds, None] = None

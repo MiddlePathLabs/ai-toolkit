@@ -97,7 +97,7 @@ def format_block_spec(indices: Iterable[int]) -> str:
 
 
 def classify_file_item(item: Any) -> str:
-    """photo | clip | voice. Voice exists once WS5 sets ``is_audio_only``."""
+    """photo | clip | voice. Voice is ``is_audio_only`` (WS5 standalone recordings)."""
     if bool(getattr(item, "is_audio_only", False)):
         return "voice"
     if bool(getattr(item, "is_video", False)):

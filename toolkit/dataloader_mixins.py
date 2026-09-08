@@ -241,6 +241,24 @@ class BucketsMixin:
                     self.buckets[bucket_key] = Bucket(file_item.width, 1)
                 self.buckets[bucket_key].file_list_idx.append(idx)
                 continue
+            if getattr(file_item, "is_audio_only", False):
+                from toolkit.h3_audio_only import AUDIO_PLACEHOLDER_PIXELS
+                file_item.scale_to_width = AUDIO_PLACEHOLDER_PIXELS
+                file_item.scale_to_height = AUDIO_PLACEHOLDER_PIXELS
+                file_item.crop_width = AUDIO_PLACEHOLDER_PIXELS
+                file_item.crop_height = AUDIO_PLACEHOLDER_PIXELS
+                file_item.crop_x = 0
+                file_item.crop_y = 0
+                bucket_key = (
+                    f"{file_item.crop_width}x{file_item.crop_height}"
+                    f"x{file_item.num_frames}fxa"
+                )
+                if bucket_key not in self.buckets:
+                    self.buckets[bucket_key] = Bucket(
+                        file_item.crop_width, file_item.crop_height
+                    )
+                self.buckets[bucket_key].file_list_idx.append(idx)
+                continue
             width = int(file_item.width * file_item.dataset_config.scale)
             height = int(file_item.height * file_item.dataset_config.scale)
 
@@ -495,6 +513,27 @@ class AudioProcessingDTOMixin:
         except Exception as e:
             # if issue with libtorchcodec "Could not load libtorchcodec"
             raise Exception(f"** WARNING ** - Error Processing audio for {self.path}. Error: {e}")
+
+    def load_and_process_h3_audio_only(self: 'FileItemDTO'):
+        from toolkit.h3_audio_only import (
+            grid_frames_for_samples,
+            load_h3_voice_waveform,
+            make_placeholder_latents,
+            trim_to_grid,
+            AUDIO_SAMPLE_RATE,
+        )
+
+        wav = load_h3_voice_waveform(self.path)
+        frames = grid_frames_for_samples(wav.shape[-1], os.path.basename(self.path))
+        wav = trim_to_grid(wav, frames)
+        self.num_frames = frames
+        self.audio_tensor = wav
+        self.audio_data = {"waveform": wav, "sample_rate": int(AUDIO_SAMPLE_RATE)}
+        self.tensor = None
+        self.placeholder_latent = make_placeholder_latents(
+            frames, self.crop_height, self.crop_width
+        )
+
         
 
 class ImageProcessingDTOMixin:
@@ -909,7 +948,11 @@ class ImageProcessingDTOMixin:
             self.get_latent()
             # if load_image_when_caching_latents is set, we still need the raw image
             # tensor in addition to the cached latent, so fall through to load it below
-            if not self.dataset_config.load_image_when_caching_latents:
+            skip_pixels = (
+                not self.dataset_config.load_image_when_caching_latents
+                or getattr(self, "is_audio_only", False)
+            )
+            if skip_pixels:
                 if self.has_control_image:
                     self.load_control_image()
                 if self.has_inpaint_image:
@@ -921,6 +964,9 @@ class ImageProcessingDTOMixin:
                 if self.has_unconditional:
                     self.load_unconditional_image()
                 return
+        if getattr(self, "is_audio_only", False):
+            self.load_and_process_h3_audio_only()
+            return
         if self.is_audio_model:
             self.load_and_process_audio()
             return
@@ -1867,6 +1913,11 @@ class LatentCachingFileItemDTOMixin:
         if self.is_audio_model:
             item["is_audio_model"] = True
             item["sample_rate"] = self.sample_rate
+        if getattr(self, "is_audio_only", False):
+            item["audio_only"] = True
+            item["num_frames"] = int(self.num_frames)
+            item["do_audio"] = True
+            item["sample_rate"] = int(self.sample_rate)
         if self.dataset_config.cache_tensors_to_disk:
             # tensor is stored in the cache file, invalidate caches made without it
             item["cache_tensors_to_disk"] = True
@@ -1927,6 +1978,8 @@ class LatentCachingFileItemDTOMixin:
                 self._encoded_latent = DTO(self._encoded_latent, **extras)
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
+            if 'audio_only' in state_dict:
+                self.is_audio_only = bool(state_dict['audio_only'].item())
             if 'tensor' in state_dict:
                 self._cached_tensor_uint8 = state_dict['tensor']
             if 'waveform' in state_dict:
@@ -2352,7 +2405,7 @@ class LatentCachingMixin:
             # add batch dimension
             cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
             if self.dataset_config.cache_tensors_to_disk:
-                if not self.is_audio_model:
+                if not self.is_audio_model and not getattr(file_item, "is_audio_only", False):
                     tensor_uint8 = _latent_to_uint8(file_item.tensor).cpu()
                     if to_disk:
                         state_dict['tensor'] = tensor_uint8
@@ -2368,21 +2421,32 @@ class LatentCachingMixin:
                     if to_memory:
                         file_item._cached_waveform_int16 = waveform_int16
                         file_item._cached_waveform_sample_rate = sample_rate
+            imgs = None
             try:
-                imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                latent = self.sd.encode_images(imgs)
-                # a model can return a DTO carrying extra streams alongside the latent
-                latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
-                if to_disk:
-                    main_latent = latent.tensor if isinstance(latent, DTO) else latent
-                    if cache_uint8:
-                        state_dict['latent'] = _latent_to_uint8(main_latent).cpu()
-                    else:
-                        state_dict['latent'] = main_latent.clone().detach().cpu()
-                    if isinstance(latent, DTO):
-                        for k, v in latent.extras.items():
-                            if torch.is_tensor(v):
-                                state_dict[f'{DISK_PREFIX}{k}'] = v.clone().detach().cpu()
+                if getattr(file_item, "is_audio_only", False):
+                    latent = file_item.placeholder_latent
+                    if latent is None:
+                        raise ValueError(
+                            f"audio-only item has no placeholder latents: {file_item.path}"
+                        )
+                    if to_disk:
+                        state_dict['latent'] = latent.clone().detach().cpu()
+                        state_dict['audio_only'] = torch.tensor(True)
+                else:
+                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                    latent = self.sd.encode_images(imgs)
+                    # a model can return a DTO carrying extra streams alongside the latent
+                    latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
+                    if to_disk:
+                        main_latent = latent.tensor if isinstance(latent, DTO) else latent
+                        if cache_uint8:
+                            state_dict['latent'] = _latent_to_uint8(main_latent).cpu()
+                        else:
+                            state_dict['latent'] = main_latent.clone().detach().cpu()
+                        if isinstance(latent, DTO):
+                            for k, v in latent.extras.items():
+                                if torch.is_tensor(v):
+                                    state_dict[f'{DISK_PREFIX}{k}'] = v.clone().detach().cpu()
             except Exception as e:
                 print_acc(f"Error processing image: {file_item.path}")
                 print_acc(f"Error: {str(e)}")
@@ -2404,13 +2468,13 @@ class LatentCachingMixin:
                     else:
                         state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
 
-            # audio (video+audio models only -- audio-only models already encoded above via encode_images)
+            # audio (video+audio models only -- ACE-Step already encoded above via encode_images)
             if not self.is_audio_model and file_item.audio_data is not None:
                 audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
                 if to_disk:
                     state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
 
-            if is_video:
+            if is_video or getattr(file_item, "is_audio_only", False):
                 state_dict['num_frames'] = torch.tensor(file_item.num_frames, dtype=torch.int32)
 
             # save_latent
@@ -2423,7 +2487,10 @@ class LatentCachingMixin:
             if to_memory:
                 # keep it in memory; audio rides inside the latent DTO
                 if audio_latent is not None:
-                    latent = DTO(latent, audio=audio_latent)
+                    extras = {"audio": audio_latent}
+                    if getattr(file_item, "is_audio_only", False):
+                        extras["audio_only"] = torch.tensor(True)
+                    latent = DTO(latent, **extras)
                 file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
                 if first_frame_latent is not None:
                     file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)

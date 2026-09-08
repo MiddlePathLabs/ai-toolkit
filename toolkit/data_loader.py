@@ -22,6 +22,8 @@ from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
+from toolkit.h3_audio_only import uses_h3_standalone_audio
+
 from toolkit.accelerator import get_accelerator
 
 import platform
@@ -434,6 +436,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # look for videos and images. Video models can train on both;
                 # images are bucketed separately as single-frame items
                 extensions = video_extensions + image_extensions
+            if uses_h3_standalone_audio(self.sd, dataset_config):
+                # H3 do_audio: also train standalone voice files (not ACE-Step)
+                extensions = list(extensions) + [
+                    ext for ext in audio_extensions if ext not in extensions
+                ]
             # prune hidden dirs (.thumbs, .tmp) so their contents never train
             file_list = []
             for root, dirs, files in os.walk(self.dataset_path):
@@ -474,6 +481,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         print_acc(f"Dataset: {self.dataset_path}")
         if self.is_video:
             print_acc(f"  -  Preprocessing video dimensions")
+        elif uses_h3_standalone_audio(self.sd, dataset_config):
+            print_acc(f"  -  Preprocessing audio / image dimensions")
         else:
             print_acc(f"  -  Preprocessing image dimensions")
         dataset_folder = self.dataset_path
@@ -549,7 +558,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.file_list.append(file_item)
             except Exception as e:
                 print_acc(traceback.format_exc())
-                if self.is_video:
+                if os.path.splitext(file)[1].lower() in audio_extensions:
+                    print_acc(f"Error processing audio: {file}")
+                elif self.is_video:
                     print_acc(f"Error processing video: {file}")
                 else:
                     print_acc(f"Error processing image: {file}")
@@ -562,22 +573,38 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         
         if self.is_video:
             num_videos = len([x for x in self.file_list if x.is_video])
-            num_images = len(self.file_list) - num_videos
+            num_audio = len([x for x in self.file_list if getattr(x, "is_audio_only", False)])
+            num_images = len(self.file_list) - num_videos - num_audio
+            parts = [f"{num_videos} videos"]
             if num_images > 0:
-                print_acc(f"  -  Found {num_videos} videos and {num_images} images")
-            else:
-                print_acc(f"  -  Found {num_videos} videos")
+                parts.append(f"{num_images} images")
+            if num_audio > 0:
+                parts.append(f"{num_audio} audio")
+            print_acc(f"  -  Found {' and '.join(parts)}")
             assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
         else:
-            print_acc(f"  -  Found {len(self.file_list)} images")
+            num_audio = len([x for x in self.file_list if getattr(x, "is_audio_only", False)])
+            if num_audio and num_audio == len(self.file_list):
+                print_acc(f"  -  Found {num_audio} audio")
+            elif num_audio:
+                print_acc(f"  -  Found {len(self.file_list) - num_audio} images and {num_audio} audio")
+            else:
+                print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
+
+        if any(getattr(x, "is_audio_only", False) for x in self.file_list) and not self.dataset_config.buckets:
+            raise ValueError(
+                f"H3 standalone voice recordings require buckets: true "
+                f"(dataset {self.dataset_path})"
+            )
 
         # handle x axis flips
         if self.dataset_config.flip_x:
             print_acc("  -  adding x axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
-                # create a copy that is flipped on the x axis
+                if getattr(file_item, "is_audio_only", False):
+                    continue
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_x = True
                 self.file_list.append(new_file_item)
@@ -587,7 +614,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             print_acc("  -  adding y axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
-                # create a copy that is flipped on the y axis
+                if getattr(file_item, "is_audio_only", False):
+                    continue
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_y = True
                 self.file_list.append(new_file_item)

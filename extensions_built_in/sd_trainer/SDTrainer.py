@@ -24,6 +24,8 @@ from toolkit.custom_adapter import CustomAdapter
 from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
 from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
+from toolkit.h3_audio_only import compute_audio_only_objective, is_audio_only_batch
+
 
 
 
@@ -2392,6 +2394,71 @@ class SDTrainer(BaseSDTrainProcess):
 
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
+    def _loss_for_audio_only_batch(
+            self,
+            audio_pred,
+            audio_target,
+            audio_sigma,
+            noisy_latents,
+            timesteps,
+            batch: 'DataLoaderBatchDTO',
+            additional_loss,
+    ):
+        """Joint forward already ran. Omit video MSE; do not multiply it by zero."""
+        if self.train_config.do_guidance_loss and audio_target is not None:
+            with torch.no_grad():
+                unconditional_embeds = concat_prompt_embeds(
+                    [self.unconditional_embeds] * noisy_latents.shape[0],
+                )
+                unconditional_target = self.predict_noise(
+                    noisy_latents=noisy_latents,
+                    timesteps=timesteps,
+                    conditional_embeds=unconditional_embeds,
+                    unconditional_embeds=None,
+                    batch=batch,
+                )
+                audio_uncond = (
+                    unconditional_target.get('audio')
+                    if isinstance(unconditional_target, DTO)
+                    else None
+                )
+                if audio_uncond is not None:
+                    a_dtype = audio_target.dtype
+                    a_target = audio_target.float()
+                    audio_uncond = audio_uncond.float()
+                    audio_dims = [1] * (a_target.dim() - 1)
+                    if self.train_config.do_guidance_loss_cfg_zero:
+                        batch_size = a_target.shape[0]
+                        a_pos_flat = a_target.view(batch_size, -1)
+                        a_neg_flat = audio_uncond.view(batch_size, -1)
+                        a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
+                        a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
+                        audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+                    audio_guidance_scale = self._guidance_loss_target_batch
+                    if isinstance(audio_guidance_scale, list):
+                        audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
+                            a_target.device, dtype=a_target.dtype
+                        ).view(-1, *audio_dims)
+                    if self.train_config.guidance_loss_schedule == 'sigma':
+                        a_sigma = audio_sigma
+                        if a_sigma is None:
+                            a_sigma = timesteps / 1000.0
+                        a_sigma = a_sigma.to(
+                            a_target.device, dtype=a_target.dtype
+                        ).view(-1, *audio_dims)
+                        audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * a_sigma
+                    audio_target = (
+                        audio_uncond + audio_guidance_scale * (a_target - audio_uncond)
+                    ).to(a_dtype).detach()
+
+        audio_loss = compute_audio_only_objective(
+            audio_pred,
+            audio_target,
+            self.train_config.audio_loss_multiplier,
+        )
+        self.additional_logs['loss/audio'] = audio_loss.item()
+        return audio_loss + additional_loss
+
     # you can expand these in a child class to make customization easier
     def calculate_loss(
             self,
@@ -2468,6 +2535,18 @@ class SDTrainer(BaseSDTrainProcess):
         audio_pred = noise_pred.get('audio') if isinstance(noise_pred, DTO) else None
         audio_target = noise_pred.get('audio_target') if isinstance(noise_pred, DTO) else None
         audio_sigma = noise_pred.get('audio_sigma') if isinstance(noise_pred, DTO) else None
+
+        if is_audio_only_batch(batch):
+            return self._loss_for_audio_only_batch(
+                audio_pred=audio_pred,
+                audio_target=audio_target,
+                audio_sigma=audio_sigma,
+                noisy_latents=noisy_latents,
+                timesteps=timesteps,
+                batch=batch,
+                additional_loss=additional_loss,
+            )
+
 
         has_mask = batch.mask_tensor is not None
 
