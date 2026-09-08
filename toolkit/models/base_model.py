@@ -401,8 +401,51 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
+    def _enter_generate_adapters(self):
+        if self.model_config.assistant_lora_path is not None:
+            print_acc("Unloading assistant lora")
+            if self.invert_assistant_lora:
+                self.assistant_lora.is_active = True
+                self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+            else:
+                self.assistant_lora.is_active = False
+
+        if self.model_config.inference_lora_path is not None:
+            print_acc("Loading inference lora")
+            self.assistant_lora.is_active = True
+            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+
+    def _exit_generate_adapters(self):
+        if self.model_config.assistant_lora_path is not None:
+            print_acc("Loading assistant lora")
+            if self.invert_assistant_lora:
+                self.assistant_lora.is_active = False
+                self.assistant_lora.force_to('cpu', self.torch_dtype)
+            else:
+                self.assistant_lora.is_active = True
+
+        if self.model_config.inference_lora_path is not None:
+            print_acc("Unloading inference lora")
+            self.assistant_lora.is_active = False
+            self.assistant_lora.force_to('cpu', self.torch_dtype)
+
     @torch.no_grad()
     def generate_images(
+            self,
+            image_configs: List[GenerateImageConfig],
+            sampler=None,
+            pipeline: Union[None, StableDiffusionPipeline,
+                            StableDiffusionXLPipeline] = None,
+    ):
+        try:
+            self._enter_generate_adapters()
+            return self._generate_images_body(image_configs, sampler, pipeline)
+        finally:
+            self._exit_generate_adapters()
+            flush()
+
+    @torch.no_grad()
+    def _generate_images_body(
             self,
             image_configs: List[GenerateImageConfig],
             sampler=None,
@@ -412,22 +455,6 @@ class BaseModel:
         network = self.network
         merge_multiplier = 1.0
         flush()
-        # if using assistant, unfuse it
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Unloading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = True
-                # move weights on to the device
-                self.assistant_lora.force_to(
-                    self.device_torch, self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = False
-
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Loading inference lora")
-            self.assistant_lora.is_active = True
-            # move weights on to the device
-            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
 
         if network is not None:
             network = unwrap_model(self.network)
@@ -744,21 +771,6 @@ class BaseModel:
             network.merge_out(merge_multiplier)
         # self.tokenizer.to(original_device_dict['tokenizer'])
 
-        # refuse loras
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Loading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = False
-                # move weights off the device
-                self.assistant_lora.force_to('cpu', self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = True
-
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Unloading inference lora")
-            self.assistant_lora.is_active = False
-            # move weights off the device
-            self.assistant_lora.force_to('cpu', self.torch_dtype)
         flush()
 
     def get_latent_noise(

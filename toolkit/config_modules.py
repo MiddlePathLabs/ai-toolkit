@@ -735,6 +735,10 @@ class ModelConfig:
         # a lora that stays inactive except during the unconditional (negative)
         # CFG pass -- used to learn the unconditional branch without a second model
         self.unconditional_lora_path = kwargs.get('unconditional_lora_path', None)
+        # H3 sampling-only Turbo LoRA. Default-off; never trained or saved.
+        self.preview_lora_path = kwargs.get('preview_lora_path', None)
+        self.preview_lora_strength = float(kwargs.get('preview_lora_strength', 1.0))
+
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
         # only for SDXL models for now
@@ -912,6 +916,27 @@ class ModelConfig:
                 self.arch = 'ssd'
             else:
                 self.arch = 'sd1'
+        if self.preview_lora_path is not None:
+            if self.arch != "minimax_h3":
+                raise ValueError(
+                    "preview_lora_path is MiniMax-H3 only (model.arch=minimax_h3); "
+                    f"got arch={self.arch!r}."
+                )
+            if self.inference_lora_path is not None:
+                raise ValueError(
+                    "preview_lora_path and inference_lora_path cannot both be set. "
+                    "Use preview_lora_path for H3 Turbo previews."
+                )
+            strength = self.preview_lora_strength
+            if strength != strength or abs(strength) == float("inf"):
+                raise ValueError(
+                    f"preview_lora_strength must be a finite number, got {strength}"
+                )
+        elif self.arch == "minimax_h3" and self.inference_lora_path is not None:
+            raise ValueError(
+                "Use preview_lora_path for H3 Turbo previews, not inference_lora_path."
+            )
+
         
 
 

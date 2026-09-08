@@ -215,6 +215,7 @@ class MinimaxH3Model(BaseModel):
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 512)
         )
+        self.preview_turbo = None
 
     @staticmethod
     def get_train_scheduler():
@@ -375,6 +376,24 @@ class MinimaxH3Model(BaseModel):
         self.assistant_lora.is_active = True
         self.invert_assistant_lora = False
 
+    def load_preview_turbo(self, transformer: MiniMaxH3Transformer):
+        """Frozen sampling-only Turbo LoRA. Inactive and CPU-parked until previews."""
+        from .src.turbo import load_preview_turbo, resolve_preview_lora_path
+
+        self.print_and_status_update("Loading preview Turbo LoRA")
+        lora_path = resolve_preview_lora_path(
+            self.model_config.preview_lora_path, MODELS_PATH
+        )
+        self.model_config.preview_lora_path = lora_path
+        turbo = load_preview_turbo(
+            transformer,
+            lora_path,
+            self.model_config.preview_lora_strength,
+            target_lin_modules=self.target_lora_modules,
+        )
+        self.print_and_status_update(turbo.report.summary())
+        self.preview_turbo = turbo
+
     def _load_transformer(self) -> MiniMaxH3Transformer:
         dit_path = self._resolve_comfy_file(self._dit_component())
         self.print_and_status_update(f"Loading transformer from {dit_path}")
@@ -499,6 +518,9 @@ class MinimaxH3Model(BaseModel):
         # load assistant lora if specified (merged into the quantized weights)
         if self.model_config.assistant_lora_path is not None:
             self.load_training_adapter(transformer)
+        if self.model_config.preview_lora_path is not None:
+            self.load_preview_turbo(transformer)
+
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
@@ -523,6 +545,20 @@ class MinimaxH3Model(BaseModel):
         self.model = transformer
         self.pipeline = MiniMaxH3Pipeline(self)
         self.print_and_status_update("Model Loaded")
+
+    def _enter_generate_adapters(self):
+        super()._enter_generate_adapters()
+        if self.preview_turbo is not None:
+            self.print_and_status_update("Loading preview Turbo LoRA")
+            self.preview_turbo.activate(
+                self.model, self.device_torch, self.torch_dtype
+            )
+
+    def _exit_generate_adapters(self):
+        if self.preview_turbo is not None:
+            self.print_and_status_update("Unloading preview Turbo LoRA")
+            self.preview_turbo.deactivate()
+        super()._exit_generate_adapters()
 
     # ------------------------------------------------------------------
     # Text conditioning
