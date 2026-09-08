@@ -1,6 +1,6 @@
 from typing import List
 import torch
-from toolkit.optimizers.optimizer_utils import runtime_step_scale
+from toolkit.optimizers.optimizer_utils import runtime_param_is_active, runtime_step_scale
 
 
 
@@ -95,7 +95,11 @@ class Automagic2(torch.optim.Optimizer):
 
     def _make_backward_hook(self, group):
         def _hook(p: torch.Tensor):
+            if not runtime_param_is_active(self, p):
+                p.grad = None
+                return
             self._update_param(p, group)
+
 
         return _hook
 

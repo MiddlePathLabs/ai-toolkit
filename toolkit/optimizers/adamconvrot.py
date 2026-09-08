@@ -62,6 +62,7 @@ import torch
 
 from toolkit.optimizers.optimizer_utils import (
     copy_stochastic,
+    runtime_param_is_active,
     runtime_step_scale,
     stochastic_grad_accummulation,
 )
@@ -422,6 +423,9 @@ class AdamConvRot(torch.optim.Optimizer):
 
     @torch.no_grad()
     def _fused_hook(self, p):
+        if not runtime_param_is_active(self, p):
+            p.grad = None
+            return
         gi = self._param_group_index.get(p)
         if gi is None:
             self._rebuild_group_index()
@@ -429,6 +433,7 @@ class AdamConvRot(torch.optim.Optimizer):
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         self._update_param(p, self.param_groups[gi], seed, sanitize=True)
         p.grad = None
+
 
     @property
     def qmax(self) -> int:

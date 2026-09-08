@@ -122,5 +122,7 @@ def get_optimizer(
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     # New factory branches must be classified in toolkit/optimizer_runtime.py
-    # (supports_step_scale / update_phase) before per_image_adaptive_lr_mode: lr.
+    # (supports_step_scale / supports_active_param_mask / update_phase)
+    # before per_image_adaptive_lr_mode: lr or modality_block_routing.
+
     return optimizer

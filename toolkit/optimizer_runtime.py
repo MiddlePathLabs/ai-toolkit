@@ -1,4 +1,4 @@
-"""Transient optimizer runtime windows for step-scale (and later, active-param masks).
+"""Transient optimizer runtime windows for step-scale and active-param masks.
 
 Owns no optimizer state. Window context is never written into ``state_dict``.
 """
@@ -11,10 +11,21 @@ from typing import Any, Iterable, Literal, Optional
 import torch
 
 from toolkit.accelerator import unwrap_model
+from toolkit.h3_modality_routing import uses_modality_block_routing
+
 UpdatePhase = Literal["step", "backward"]
 StepScaleStrategy = Literal["group_lr", "native", "unsupported"]
+MaskStrategy = Literal["grad_none", "native", "unsupported"]
 
 _NATIVE_ATTR = "_runtime_step_scale"
+_NATIVE_MASK_ATTR = "_runtime_active_params"
+
+_AUTOMAGIC_GROUP_VOTE_REASON = (
+    "pools one group-lr vote across every parameter; masking a subset either "
+    "mutates inactive internal LR state or desynchronises the controller. "
+    "Use rose, adamw, automagic, automagic2, or adamconvrot for modality routing."
+)
+
 
 
 def unwrap_optimizer(optimizer: Any) -> Any:
@@ -110,7 +121,9 @@ class OptimizerCapabilities:
     supports_active_param_mask: bool
     update_phase: UpdatePhase
     step_scale_strategy: StepScaleStrategy
+    mask_strategy: MaskStrategy
     unsupported_reason: Optional[str]
+    mask_unsupported_reason: Optional[str]
     optimizer_label: str
 
 
@@ -124,35 +137,58 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
     name = _class_name(opt)
     module = _module_name(opt)
     label = f"{module}.{name}" if module else name
-    no_mask = False
 
     def group_lr(phase: UpdatePhase = "step") -> OptimizerCapabilities:
         return OptimizerCapabilities(
             supports_step_scale=True,
-            supports_active_param_mask=no_mask,
+            supports_active_param_mask=True,
             update_phase=phase,
             step_scale_strategy="group_lr",
+            mask_strategy="grad_none",
             unsupported_reason=None,
+            mask_unsupported_reason=None,
             optimizer_label=label,
         )
 
     def native(phase: UpdatePhase) -> OptimizerCapabilities:
         return OptimizerCapabilities(
             supports_step_scale=True,
-            supports_active_param_mask=no_mask,
+            supports_active_param_mask=True,
             update_phase=phase,
             step_scale_strategy="native",
+            mask_strategy="native" if phase == "backward" else "grad_none",
             unsupported_reason=None,
+            mask_unsupported_reason=None,
             optimizer_label=label,
         )
 
-    def unsupported(reason: str, phase: UpdatePhase = "step") -> OptimizerCapabilities:
+    def unsupported(
+        reason: str,
+        phase: UpdatePhase = "step",
+        *,
+        mask: bool = False,
+        mask_reason: Optional[str] = None,
+    ) -> OptimizerCapabilities:
         return OptimizerCapabilities(
             supports_step_scale=False,
-            supports_active_param_mask=no_mask,
+            supports_active_param_mask=mask,
             update_phase=phase,
             step_scale_strategy="unsupported",
+            mask_strategy="grad_none" if mask else "unsupported",
             unsupported_reason=reason,
+            mask_unsupported_reason=None if mask else (mask_reason or reason),
+            optimizer_label=label,
+        )
+
+    def native_no_mask(phase: UpdatePhase, mask_reason: str) -> OptimizerCapabilities:
+        return OptimizerCapabilities(
+            supports_step_scale=True,
+            supports_active_param_mask=False,
+            update_phase=phase,
+            step_scale_strategy="native",
+            mask_strategy="unsupported",
+            unsupported_reason=None,
+            mask_unsupported_reason=f"{label} {mask_reason}",
             optimizer_label=label,
         )
 
@@ -174,14 +210,16 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
             return unsupported(
                 "Adafactor relative_step=True ignores group lr (_get_lr); "
                 "a group-LR scale would be a silent no-op. Set relative_step: false "
-                "or disable per_image_adaptive_lr_mode: lr."
+                "or disable per_image_adaptive_lr_mode: lr.",
+                mask=True,
             )
         if _group_flag(opt, "scale_parameter", False):
             return unsupported(
                 "Adafactor scale_parameter=True makes its per-parameter LR a function "
                 "of post-update weights (state['RMS']); a one-window step scale would "
                 "permanently perturb it. Set scale_parameter: false or use "
-                "per_image_adaptive_lr_mode: loss."
+                "per_image_adaptive_lr_mode: loss.",
+                mask=True,
             )
         if _group_flag(opt, "beta1", None) is not None:
             return native("step")
@@ -192,9 +230,15 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
     if name == "Automagic2":
         return native("backward")
     if name == "Automagic3":
-        return native("backward" if _is_fused_backward(opt) else "step")
+        return native_no_mask(
+            "backward" if _is_fused_backward(opt) else "step",
+            _AUTOMAGIC_GROUP_VOTE_REASON,
+        )
     if name == "AutomagicEXPERIMENT":
-        return native("backward" if _is_fused_backward(opt) else "step")
+        return native_no_mask(
+            "backward" if _is_fused_backward(opt) else "step",
+            _AUTOMAGIC_GROUP_VOTE_REASON,
+        )
     if name == "AdamConvRot":
         return native("backward" if _is_fused_backward(opt) else "step")
 
@@ -207,28 +251,43 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
             "(numerator and s memory); a temporary group-LR mutation corrupts d. "
             "A copied-step subclass is not a small reviewable patch. Use "
             "per_image_adaptive_lr_mode: loss, disable the feature, or switch to "
-            "prodigy8bit (native final-update scale)."
+            "prodigy8bit (native final-update scale).",
+            mask=True,
         )
 
     if name.startswith("DAdapt"):
         return unsupported(
             "D-Adaptation uses group lr inside its adaptation equations; "
             "a temporary group-LR mutation is not a faithful final-update scale. "
-            "Use per_image_adaptive_lr_mode: loss or disable the feature."
+            "Use per_image_adaptive_lr_mode: loss or disable the feature.",
+            mask_reason=(
+                f"{label} is not classified for active-parameter masks "
+                "(dadaptation is not a maintained factory target)."
+            ),
         )
 
     if name == "Lion" and "lion_pytorch" in module:
         return unsupported(
             f"{label} is not classified for step scaling in this fork "
             "(lion_pytorch is not a maintained factory target). "
-            "Use per_image_adaptive_lr_mode: loss or disable the feature."
+            "Use per_image_adaptive_lr_mode: loss or disable the feature.",
+            mask_reason=(
+                f"{label} is not classified for active-parameter masks "
+                "(lion_pytorch is not a maintained factory target)."
+            ),
         )
 
     return unsupported(
         f"{label} has not declared supports_step_scale. "
         "Declare a faithful group-LR or native strategy before using "
-        "per_image_adaptive_lr_mode: lr."
+        "per_image_adaptive_lr_mode: lr.",
+        mask_reason=(
+            f"{label} has not declared supports_active_param_mask. "
+            "Declare a faithful grad-none or native mask before using "
+            "modality_block_routing."
+        ),
     )
+
 
 
 class OptimizerRuntimeAdapter:
@@ -243,7 +302,9 @@ class OptimizerRuntimeAdapter:
         self.supports_active_param_mask = caps.supports_active_param_mask
         self.update_phase: UpdatePhase = caps.update_phase
         self.step_scale_strategy: StepScaleStrategy = caps.step_scale_strategy
+        self.mask_strategy: MaskStrategy = caps.mask_strategy
         self.unsupported_reason = caps.unsupported_reason
+        self.mask_unsupported_reason = caps.mask_unsupported_reason
         self.optimizer_label = caps.optimizer_label
         self.last_step_scale = 1.0
         self._snapshot_lrs: Optional[list[tuple[dict, Any]]] = None
@@ -258,16 +319,34 @@ class OptimizerRuntimeAdapter:
         return cls(caps)
 
     def validate_for_train_config(self, train_config: Any) -> None:
-        if not uses_adaptive_lr_step_scale(train_config):
-            return
-        if not self.supports_step_scale:
-            reason = self.unsupported_reason or "supports_step_scale is false"
-            raise ValueError(
-                f"per_image_adaptive_lr_mode='lr' requires optimizer step scaling, but "
-                f"{self.optimizer_label} does not support it: {reason}"
-            )
-        if self.update_phase == "backward":
-            self._reject_fused_incompatibilities(train_config)
+        if uses_adaptive_lr_step_scale(train_config):
+            if not self.supports_step_scale:
+                reason = self.unsupported_reason or "supports_step_scale is false"
+                raise ValueError(
+                    f"per_image_adaptive_lr_mode='lr' requires optimizer step scaling, but "
+                    f"{self.optimizer_label} does not support it: {reason}"
+                )
+            if self.update_phase == "backward":
+                self._reject_fused_incompatibilities(train_config)
+        if uses_modality_block_routing(train_config):
+            if not self.supports_active_param_mask:
+                reason = (
+                    self.mask_unsupported_reason
+                    or self.unsupported_reason
+                    or "supports_active_param_mask is false"
+                )
+                raise ValueError(
+                    f"modality_block_routing requires an active-parameter mask, but "
+                    f"{self.optimizer_label} does not support it: {reason}"
+                )
+            if self.update_phase == "backward":
+                loss_type = getattr(train_config, "loss_type", "mse")
+                if loss_type == "mean_flow":
+                    raise ValueError(
+                        f"modality_block_routing with fused-backward optimizer "
+                        f"{self.optimizer_label} cannot wrap the mean_flow second "
+                        f"backward. Disable routing or use a step-time optimizer."
+                    )
 
     def _reject_fused_incompatibilities(self, train_config: Any) -> None:
         grad_accum = int(getattr(train_config, "gradient_accumulation", 1) or 1)
@@ -311,13 +390,30 @@ class OptimizerRuntimeAdapter:
                 f"step_scale must be a finite number >= 0, got {step_scale!r}"
             )
         if active_params is not None and not self.supports_active_param_mask:
+            reason = self.mask_unsupported_reason or "supports_active_param_mask is false"
             raise RuntimeError(
                 f"{self.optimizer_label} does not support an active-parameter mask "
-                f"(supports_active_param_mask is false)."
+                f"({reason})."
             )
         self._window_open = True
         self.last_step_scale = scale
         opt = unwrap_optimizer(optimizer)
+        if active_params is not None:
+            active_ids = frozenset(id(p) for p in active_params)
+            if self.mask_strategy == "native":
+                setattr(opt, _NATIVE_MASK_ATTR, active_ids)
+                self._native_opt = opt
+            elif self.mask_strategy == "grad_none":
+                for group in opt.param_groups:
+                    for param in group["params"]:
+                        if id(param) not in active_ids:
+                            param.grad = None
+                            if hasattr(param, "_accum_grad"):
+                                del param._accum_grad
+            else:
+                raise RuntimeError(
+                    f"{self.optimizer_label} has no implementable active-parameter mask"
+                )
         if scale == 1.0:
             return
         if not self.supports_step_scale:
@@ -355,6 +451,10 @@ class OptimizerRuntimeAdapter:
         self._native_opt = None
         if native_opt is None and optimizer is not None:
             native_opt = unwrap_optimizer(optimizer)
-        if native_opt is not None and hasattr(native_opt, _NATIVE_ATTR):
-            setattr(native_opt, _NATIVE_ATTR, 1.0)
+        if native_opt is not None:
+            if hasattr(native_opt, _NATIVE_ATTR):
+                setattr(native_opt, _NATIVE_ATTR, 1.0)
+            if hasattr(native_opt, _NATIVE_MASK_ATTR):
+                setattr(native_opt, _NATIVE_MASK_ATTR, None)
         self._window_open = False
+

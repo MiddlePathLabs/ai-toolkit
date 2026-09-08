@@ -395,6 +395,33 @@ class GradientNoiseConfig:
             raise ValueError(f'Invalid gradient noise mode: {self.mode}')
 
 
+
+class ModalityBlockRoutingConfig:
+    """Default-off H3 trunk-block routing. None/blank per key = that modality
+    is unrestricted. A non-empty spec is parsed at bind time against
+    ``len(transformer.blocks)``.
+    """
+
+    def __init__(self, **kwargs):
+        def _spec(key: str) -> Optional[str]:
+            value = kwargs.get(key, None)
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        self.photo_blocks: Optional[str] = _spec("photo_blocks")
+        self.clip_blocks: Optional[str] = _spec("clip_blocks")
+        self.voice_blocks: Optional[str] = _spec("voice_blocks")
+
+    @property
+    def enabled(self) -> bool:
+        return any(
+            spec is not None
+            for spec in (self.photo_blocks, self.clip_blocks, self.voice_blocks)
+        )
+
+
 class TrainConfig:
     def __init__(self, **kwargs):
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
@@ -602,6 +629,12 @@ class TrainConfig:
                 f"per_image_adaptive_lr_mode must be 'loss' or 'lr', got {mode!r}"
             )
         self.per_image_adaptive_lr_mode = mode
+        routing_raw = kwargs.get("modality_block_routing", None) or {}
+        if isinstance(routing_raw, ModalityBlockRoutingConfig):
+            self.modality_block_routing = routing_raw
+        else:
+            self.modality_block_routing = ModalityBlockRoutingConfig(**routing_raw)
+
 
         
         # do the loss on a timestep to 0 prediction

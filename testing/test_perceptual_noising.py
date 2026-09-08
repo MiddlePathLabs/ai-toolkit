@@ -308,9 +308,10 @@ def make_hook_trainer(*, accumulating=False):
     trainer.timer = lambda _name: nullcontext()
     trainer.end_of_training_loop = lambda: None
 
-    def train_single_accumulation(_batch):
+    def train_single_accumulation(_batch, accum_scale=1.0):
         parameter.grad = torch.ones_like(parameter)
         return torch.tensor(1.25)
+
 
     trainer.train_single_accumulation = train_single_accumulation
     return trainer, parameter

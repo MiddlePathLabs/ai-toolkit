@@ -25,6 +25,8 @@ from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
 from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
 
+
+
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
@@ -4319,18 +4321,15 @@ class SDTrainer(BaseSDTrainProcess):
                     # loss.backward()
                     # else:
                     runtime = getattr(self, 'optimizer_runtime', None)
-                    use_fused_scale = (
-                        runtime is not None
-                        and uses_adaptive_lr_step_scale(self.train_config)
-                        and runtime.update_phase == 'backward'
+                    opened_fused_window = self._open_optimizer_runtime_window(
+                        phase="backward", batch=batch
                     )
-                    if use_fused_scale:
-                        runtime.begin_window(self.optimizer, self._batch_adaptive_lr_scale(batch))
                     try:
                         self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
                     finally:
-                        if use_fused_scale:
+                        if opened_fused_window and runtime is not None:
                             runtime.end_window(self.optimizer)
+
                     self._mem_diag('after_backward')
 
         return loss.detach()
@@ -4423,9 +4422,13 @@ class SDTrainer(BaseSDTrainProcess):
         should_log = config.log_every > 0 and step % config.log_every == 0
         noise_sq = 0.0
         weight_sq = 0.0
+        active_ids = getattr(self, "_post_step_active_ids", None)
         for parameter in iterable:
             if not getattr(parameter, '_is_lora', False):
                 continue
+            if active_ids is not None and id(parameter) not in active_ids:
+                continue
+
             weight = parameter.data
             if should_log:
                 weight_sq += float(weight.detach().pow(2).sum())
@@ -4464,6 +4467,10 @@ class SDTrainer(BaseSDTrainProcess):
             n_accum *= self.train_config.gradient_accumulation_steps
         accum_scale = 1.0 / n_accum
         for batch in batch_list:
+            router = getattr(self, "modality_router", None)
+            runtime = getattr(self, "optimizer_runtime", None)
+            if router is not None and (runtime is None or runtime.update_phase == "step"):
+                router.observe_batch(batch)
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
@@ -4477,6 +4484,7 @@ class SDTrainer(BaseSDTrainProcess):
                             # if this boundary is trainable, we can stop looking
                             break
             loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
+
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -4490,43 +4498,40 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
-            # fix this for multi params
-            if self.train_config.optimizer != 'adafactor':
-                if isinstance(self.params[0], dict):
-                    for i in range(len(self.params)):
-                        self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
-                else:
-                    self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
-            self._inject_gradient_noise()
-            # only step if we are not accumulating
-            with self.timer('optimizer_step'):
-                runtime = getattr(self, 'optimizer_runtime', None)
-                use_step_scale = (
-                    runtime is not None
-                    and uses_adaptive_lr_step_scale(self.train_config)
-                    and runtime.update_phase == 'step'
-                )
-                try:
-                    if use_step_scale:
-                        runtime.begin_window(
-                            self.optimizer,
-                            self._consume_adaptive_lr_window_scale(),
-                        )
+            runtime = getattr(self, 'optimizer_runtime', None)
+            opened_step_window = False
+            try:
+                opened_step_window = self._open_optimizer_runtime_window(phase="step")
+                # fix this for multi params
+                if self.train_config.optimizer != 'adafactor':
+                    if isinstance(self.params[0], dict):
+                        for i in range(len(self.params)):
+                            self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
+                    else:
+                        self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                self._inject_gradient_noise()
+                # only step if we are not accumulating
+                with self.timer('optimizer_step'):
                     self.optimizer.step()
 
                     self.optimizer.zero_grad(set_to_none=True)
                     if self.adapter and isinstance(self.adapter, CustomAdapter):
                         self.adapter.post_weight_update()
-                finally:
-                    if use_step_scale:
-                        runtime.end_window(self.optimizer)
-                if uses_adaptive_lr_step_scale(self.train_config):
-                    self._record_adaptive_lr_log_metrics()
-            if self.ema is not None:
-                with self.timer('ema_update'):
-                    self.ema.update()
-            self._record_fisher_trace()
-            self._inject_weight_noise()
+                if self.ema is not None:
+                    with self.timer('ema_update'):
+                        self.ema.update()
+                self._record_fisher_trace()
+                self._inject_weight_noise()
+            finally:
+                if opened_step_window and runtime is not None:
+                    runtime.end_window(self.optimizer)
+                self._reset_routing_window()
+            if uses_adaptive_lr_step_scale(self.train_config):
+                self._record_adaptive_lr_log_metrics()
+
+
+
+
         else:
             # gradient accumulation. Just a place for breakpoint
             pass

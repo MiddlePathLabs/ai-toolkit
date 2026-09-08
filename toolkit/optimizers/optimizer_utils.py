@@ -12,6 +12,15 @@ def runtime_step_scale(optimizer, default=1.0):
     return scale
 
 
+def runtime_param_is_active(optimizer, param) -> bool:
+    """Transient active-parameter mask. None means unrestricted. Never persisted."""
+    active = getattr(optimizer, "_runtime_active_params", None)
+    if active is None:
+        return True
+    return id(param) in active
+
+
+
 def compute_scale_for_dtype(tensor, dtype):
     """
     Compute appropriate scale for the given tensor and target dtype.

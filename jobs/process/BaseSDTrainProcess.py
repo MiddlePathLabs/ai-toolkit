@@ -47,6 +47,9 @@ from toolkit.optimizer_runtime import (
     unwrap_optimizer as unwrap_runtime_optimizer,
     uses_adaptive_lr_step_scale,
 )
+from toolkit.h3_modality_routing import bind_modality_router
+
+
 
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
@@ -114,6 +117,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._adaptive_lr_members = {}
         self._last_lr_window_scale = None
         self._last_lr_window_members = None
+        self.modality_router = None
+        self._post_step_active_ids = None
+        self._post_step_active_resolved = False
+
 
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
@@ -856,6 +863,53 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._last_lr_window_members = list(members.values())
         self._last_lr_window_scale = scale
         return scale
+
+    def _remember_routing_active_params(self, active) -> None:
+        if active is None:
+            self._post_step_active_ids = None
+            self._post_step_active_resolved = True
+            return
+        ids = frozenset(id(p) for p in active)
+        if not self._post_step_active_resolved:
+            self._post_step_active_ids = ids
+            self._post_step_active_resolved = True
+            return
+        if self._post_step_active_ids is None:
+            return
+        self._post_step_active_ids = self._post_step_active_ids | ids
+
+    def _reset_routing_window(self) -> None:
+        self._post_step_active_ids = None
+        self._post_step_active_resolved = False
+        router = getattr(self, "modality_router", None)
+        if router is not None:
+            router.reset_window()
+
+    def _open_optimizer_runtime_window(self, *, phase: str, batch=None) -> bool:
+        runtime = getattr(self, "optimizer_runtime", None)
+        if runtime is None or runtime.update_phase != phase:
+            return False
+        apply_scale = 1.0
+        if uses_adaptive_lr_step_scale(self.train_config):
+            if phase == "backward":
+                apply_scale = self._batch_adaptive_lr_scale(batch)
+            else:
+                apply_scale = self._consume_adaptive_lr_window_scale()
+        active = None
+        router = getattr(self, "modality_router", None)
+        if router is not None:
+            if phase == "backward":
+                active = router.active_params_for_batch(batch)
+            else:
+                active = router.consume_window()
+        if apply_scale == 1.0 and active is None:
+            if router is not None:
+                self._remember_routing_active_params(None)
+            return False
+        runtime.begin_window(self.optimizer, apply_scale, active)
+        self._remember_routing_active_params(active)
+        return True
+
 
     def _record_adaptive_lr_log_metrics(self):
         if not uses_adaptive_lr_step_scale(self.train_config):
@@ -2260,6 +2314,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"strategy={self.optimizer_runtime.step_scale_strategy} "
                 f"update_phase={self.optimizer_runtime.update_phase}"
             )
+        self.modality_router = bind_modality_router(
+            self.train_config,
+            self.sd,
+            getattr(self, "network", None) or getattr(self.sd, "network", None),
+        )
+        if self.modality_router is not None:
+            print_acc(
+                f"[modality-routing] {self.optimizer_runtime.optimizer_label} "
+                f"mask={self.optimizer_runtime.mask_strategy} "
+                f"update_phase={self.optimizer_runtime.update_phase}"
+            )
+
 
         
         # set it to do paramiter swapping
@@ -2766,6 +2832,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self._adaptive_lr_members = {}
                 if self.optimizer_runtime is not None:
                     self.optimizer_runtime.end_window(self.optimizer)
+                self._reset_routing_window()
+
 
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
