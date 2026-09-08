@@ -314,6 +314,6 @@ def bind_modality_router(
     if voice is not None:
         parts.append(f"voice -> blocks {format_block_spec(voice)}")
     else:
-        parts.append("voice -> unrestricted (no standalone voice items until WS5)")
+        parts.append("voice -> unrestricted")
     print_acc("[modality-routing] " + "; ".join(parts))
     return router
