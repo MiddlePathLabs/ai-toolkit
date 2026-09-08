@@ -4,6 +4,14 @@ from typing import Optional
 from optimum.quanto import QBytesTensor
 
 
+def runtime_step_scale(optimizer, default=1.0):
+    """Transient per-window final-update scale. Never persisted in state_dict."""
+    scale = getattr(optimizer, "_runtime_step_scale", default)
+    if scale is None:
+        return default
+    return scale
+
+
 def compute_scale_for_dtype(tensor, dtype):
     """
     Compute appropriate scale for the given tensor and target dtype.

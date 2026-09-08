@@ -2,7 +2,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
-from toolkit.optimizers.optimizer_utils import copy_stochastic, Auto8bitTensor, stochastic_grad_accummulation
+from toolkit.optimizers.optimizer_utils import copy_stochastic, Auto8bitTensor, stochastic_grad_accummulation, runtime_step_scale
 
 
 class Prodigy8bit(Optimizer):
@@ -273,11 +273,12 @@ class Prodigy8bit(Optimizer):
                 denom = exp_avg_sq.sqrt().add_(d * eps)
 
                 # Apply weight decay (decoupled variant)
+                dlr_apply = dlr * runtime_step_scale(self)
                 if decay != 0 and decouple:
-                    p_fp32.data.add_(p_fp32.data, alpha=-decay * dlr)
+                    p_fp32.data.add_(p_fp32.data, alpha=-decay * dlr_apply)
 
                 # Take step
-                p_fp32.data.addcdiv_(exp_avg, denom, value=-dlr)
+                p_fp32.data.addcdiv_(exp_avg, denom, value=-dlr_apply)
                 # apply stochastic rounding
                 copy_stochastic(p.data, p_fp32.data)
 

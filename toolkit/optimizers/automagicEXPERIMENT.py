@@ -4,6 +4,7 @@ import torch
 from optimum.quanto import QBytesTensor
 from toolkit.optimizers.optimizer_utils import (
     copy_stochastic,
+    runtime_step_scale,
     stochastic_grad_accummulation,
 )
 from toolkit.util.convrot_quant import (
@@ -451,7 +452,9 @@ class AutomagicEXPERIMENT(torch.optim.Optimizer):
             # p -= lr * (update + weight_decay * p)
             update.add_(p_data_fp32, alpha=group["weight_decay"])
 
-        p_data_fp32.addcmul_(update, lr_t, value=-1.0)
+        scale = runtime_step_scale(self)
+        apply_lr = lr_t if scale == 1.0 else lr_t * scale
+        p_data_fp32.addcmul_(update, apply_lr, value=-1.0)
 
         if p.dtype != torch.float32:
             # apply stochastic rounding

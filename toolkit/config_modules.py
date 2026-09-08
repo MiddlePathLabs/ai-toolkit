@@ -583,6 +583,26 @@ class TrainConfig:
         # effect) unless per_image_adaptive_lr is False — if both are set, the stats-only intent
         # wins and multipliers are still not applied.
         self.per_image_adaptive_lr_stats_only = kwargs.get('per_image_adaptive_lr_stats_only', False)
+        # How watcher multipliers are applied. 'loss' (default) multiplies only
+        # the per-sample visual diffusion loss before backward — prior, audio,
+        # adapter, preservation, and anchor terms stay at full LR. 'lr' leaves
+        # every loss component unscaled and multiplies the optimizer's final
+        # applied update for the whole window, so those auxiliary objectives
+        # ride the same mean-multiplier as the diffusion step. That is the
+        # point of lr mode (visual/audio relative weighting stays 1:1), not a
+        # reason to refuse the mode when anchors/priors are on.
+        # Requires supports_step_scale; fail-closed at startup otherwise.
+        # Discrete watcher state multipliers are NOT min/max LR bounds.
+        mode = kwargs.get('per_image_adaptive_lr_mode', 'loss')
+        if mode is None:
+            mode = 'loss'
+        mode = str(mode).lower()
+        if mode not in ('loss', 'lr'):
+            raise ValueError(
+                f"per_image_adaptive_lr_mode must be 'loss' or 'lr', got {mode!r}"
+            )
+        self.per_image_adaptive_lr_mode = mode
+
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)

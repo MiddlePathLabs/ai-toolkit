@@ -1,6 +1,6 @@
 from typing import List
 import torch
-from toolkit.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
+from toolkit.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation, runtime_step_scale
 from optimum.quanto import QBytesTensor
 import random
 
@@ -271,11 +271,15 @@ class Automagic(torch.optim.Optimizer):
                 state['lr_mask'] = Auto8bitTensor(new_lr)
                 state['avg_lr'] = torch.mean(new_lr)
 
+                scale = runtime_step_scale(self)
+                if scale != 1.0:
+                    update.mul_(scale)
+
                 if group["weight_decay"] != 0:
                     # Apply weight decay with per-parameter learning rates
                     # Instead of using add_ with a tensor alpha (which isn't supported),
                     # we'll use element-wise multiplication to apply the weight decay
-                    weight_decay_update = p_data_fp32 * (-group["weight_decay"]) * new_lr
+                    weight_decay_update = p_data_fp32 * (-group["weight_decay"]) * new_lr * scale
                     p_data_fp32.add_(weight_decay_update)
 
                 p_data_fp32.add_(-update)

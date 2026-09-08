@@ -1,7 +1,7 @@
 import math
 from typing import List
 import torch
-from toolkit.optimizers.optimizer_utils import copy_stochastic, stochastic_grad_accummulation
+from toolkit.optimizers.optimizer_utils import copy_stochastic, stochastic_grad_accummulation, runtime_step_scale
 from optimum.quanto import QBytesTensor
 import random
 
@@ -350,9 +350,14 @@ class Adafactor(torch.optim.Optimizer):
                         update, alpha=(1 - group["beta1"]))
                     update = exp_avg
 
+                scale = runtime_step_scale(self)
+                if scale != 1.0:
+                    # Copy when update aliases exp_avg so the moment stays unscaled.
+                    update = update * scale
+
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(
-                        p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                        p_data_fp32, alpha=(-group["weight_decay"] * lr * scale))
 
                 p_data_fp32.add_(-update)
 

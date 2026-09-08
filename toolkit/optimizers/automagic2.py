@@ -1,5 +1,7 @@
 from typing import List
 import torch
+from toolkit.optimizers.optimizer_utils import runtime_step_scale
+
 
 
 class Automagic2(torch.optim.Optimizer):
@@ -160,14 +162,16 @@ class Automagic2(torch.optim.Optimizer):
             )
         state["step"] += 1
 
-        update.mul_(lr_t)
+        scale = runtime_step_scale(self)
+        apply_lr = lr_t if scale == 1.0 else lr_t * scale
+        update.mul_(apply_lr)
         wd = group["weight_decay"]
 
         if p.dtype == torch.bfloat16:
             # Single bf16 -> fp32 conversion shared by weight decay and SR.
             new_p_fp32 = p.to(torch.float32)
             if wd != 0.0:
-                update.addcmul_(new_p_fp32, lr_t, value=wd)
+                update.addcmul_(new_p_fp32, apply_lr, value=wd)
             new_p_fp32.sub_(update)
             # Stochastic rounding fp32 -> bf16: add random noise into the lower
             # 16 mantissa bits, then truncate. Done in place on new_p_fp32 so
@@ -178,7 +182,7 @@ class Automagic2(torch.optim.Optimizer):
         else:
             if wd != 0.0:
                 p_fp32 = p if p.dtype == torch.float32 else p.to(torch.float32)
-                update.addcmul_(p_fp32, lr_t, value=wd)
+                update.addcmul_(p_fp32, apply_lr, value=wd)
             p.add_(update.to(p.dtype), alpha=-1.0)
 
         p.grad = None

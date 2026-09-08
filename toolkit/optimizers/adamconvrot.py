@@ -62,6 +62,7 @@ import torch
 
 from toolkit.optimizers.optimizer_utils import (
     copy_stochastic,
+    runtime_step_scale,
     stochastic_grad_accummulation,
 )
 from toolkit.util.convrot_quant import (
@@ -540,7 +541,7 @@ class AdamConvRot(torch.optim.Optimizer):
 
     def _step_fp32(self, p, state, group, bc1, bc2, sanitize=False):
         beta1, beta2 = group["betas"]
-        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
+        lr, wd, eps = group["lr"] * runtime_step_scale(self), group["weight_decay"], group["eps"]
         g = p.grad.to(torch.float32)
         if sanitize:
             g = g.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
@@ -594,7 +595,7 @@ class AdamConvRot(torch.optim.Optimizer):
             _h16(p.device),
             p.numel(),
             n_blocks,
-            float(group["lr"]),
+            float(group["lr"]) * float(runtime_step_scale(self)),
             float(group["weight_decay"]),
             float(beta1),
             float(beta2),
@@ -640,7 +641,7 @@ class AdamConvRot(torch.optim.Optimizer):
 
     def _step_quant_torch(self, p, state, group, bc1, bc2, sanitize=False):
         beta1, beta2 = group["betas"]
-        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
+        lr, wd, eps = group["lr"] * runtime_step_scale(self), group["weight_decay"], group["eps"]
         numel = p.numel()
         n_blocks = state["exp_avg"].shape[0]
         n_pad = n_blocks * BLOCK

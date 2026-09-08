@@ -121,4 +121,6 @@ def get_optimizer(
         optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
+    # New factory branches must be classified in toolkit/optimizer_runtime.py
+    # (supports_step_scale / update_phase) before per_image_adaptive_lr_mode: lr.
     return optimizer

@@ -4,6 +4,8 @@ NOTE: This is experimental and under active development; expect breaking changes
 
 from typing import List
 import torch
+from toolkit.optimizers.optimizer_utils import runtime_step_scale
+
 
 
 class Automagic3(torch.optim.Optimizer):
@@ -543,13 +545,15 @@ class Automagic3(torch.optim.Optimizer):
         state["step"] += 1
 
         wd = group["weight_decay"]
+        scale = runtime_step_scale(self)
+        apply_lr = lr_t if scale == 1.0 else lr_t * scale
 
         if p.dtype == torch.float32:
             # Decoupled weight decay folded in (update += wd*p), then a single
             # fused p -= lr * update (lr is a scalar, broadcasts).
             if wd != 0.0:
                 update.add_(p, alpha=wd)
-            p.addcmul_(update, lr_t, value=-1.0)
+            p.addcmul_(update, apply_lr, value=-1.0)
         else:
             # Low precision: apply the update in fp32 then stochastically round
             # back, so tiny updates aren't lost to round-to-nearest. Single
@@ -557,7 +561,7 @@ class Automagic3(torch.optim.Optimizer):
             new_p_fp32 = p.to(torch.float32)
             if wd != 0.0:
                 update.add_(new_p_fp32, alpha=wd)
-            new_p_fp32.addcmul_(update, lr_t, value=-1.0)
+            new_p_fp32.addcmul_(update, apply_lr, value=-1.0)
             self._stochastic_copy_(p, new_p_fp32)
 
         p.grad = None

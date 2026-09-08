@@ -41,6 +41,13 @@ from toolkit.lycoris_special import LycorisSpecialNetwork
 from toolkit.models.decorator import Decorator
 from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
+from toolkit.optimizer_runtime import (
+    OptimizerRuntimeAdapter,
+    mean_window_scale,
+    unwrap_optimizer as unwrap_runtime_optimizer,
+    uses_adaptive_lr_step_scale,
+)
+
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
 from toolkit.prompt_utils import concat_prompt_embeds
@@ -103,6 +110,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.epoch_num = 0
         self.last_save_step = 0
         self.loss_watch = None
+        self.optimizer_runtime = None
+        self._adaptive_lr_members = {}
+        self._last_lr_window_scale = None
+        self._last_lr_window_members = None
+
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -804,6 +816,64 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # if self.data_loader_reg is not None:
         #     self.data_loader_reg = self.accelerator.prepare(self.data_loader_reg)
             
+
+    def _record_adaptive_lr_members(self, batch):
+        if not uses_adaptive_lr_step_scale(self.train_config):
+            return
+        runtime = self.optimizer_runtime
+        if runtime is None or runtime.update_phase != "step":
+            return
+        file_items = getattr(batch, "file_items", None)
+        multipliers = getattr(batch, "loss_multiplier_list", None)
+        if not file_items or multipliers is None:
+            return
+        members = self._adaptive_lr_members
+        for item, mult in zip(file_items, multipliers):
+            path = getattr(item, "path", None)
+            if path is None:
+                continue
+            # Last occurrence wins; unique paths, not per-sample weights.
+            members[path] = float(mult)
+
+    def _consume_adaptive_lr_window_scale(self) -> float:
+        members = self._adaptive_lr_members
+        scale = mean_window_scale(members)
+        self._last_lr_window_members = list(members.values())
+        self._last_lr_window_scale = scale
+        self._adaptive_lr_members = {}
+        return scale
+
+    def _batch_adaptive_lr_scale(self, batch) -> float:
+        members = {}
+        file_items = getattr(batch, "file_items", None) or []
+        multipliers = getattr(batch, "loss_multiplier_list", None) or []
+        for item, mult in zip(file_items, multipliers):
+            path = getattr(item, "path", None)
+            if path is None:
+                continue
+            members[path] = float(mult)
+        scale = mean_window_scale(members)
+        self._last_lr_window_members = list(members.values())
+        self._last_lr_window_scale = scale
+        return scale
+
+    def _record_adaptive_lr_log_metrics(self):
+        if not uses_adaptive_lr_step_scale(self.train_config):
+            return
+        opt = unwrap_runtime_optimizer(self.optimizer) if self.optimizer is not None else None
+        scheduled = 0.0
+        if opt is not None and getattr(opt, "param_groups", None):
+            lr = opt.param_groups[0].get("lr", 0.0)
+            try:
+                scheduled = float(lr.item() if torch.is_tensor(lr) else lr)
+            except Exception:
+                scheduled = 0.0
+        scale = float(self._last_lr_window_scale if self._last_lr_window_scale is not None else 1.0)
+        members = self._last_lr_window_members or []
+        self._last_lr_scheduled = scheduled
+        self._last_lr_window_scale = scale
+        self._last_lr_effective = scheduled * scale
+        self._last_lr_member_count = float(len(members))
 
     def ensure_params_requires_grad(self, force=False):
         if self.train_config.do_paramiter_swapping and not force:
@@ -2180,6 +2250,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=self.train_config.optimizer_params)
         self.optimizer = optimizer
+        self.optimizer_runtime = OptimizerRuntimeAdapter.inspect(
+            optimizer, optimizer_type=optimizer_type
+        )
+        self.optimizer_runtime.validate_for_train_config(self.train_config)
+        if uses_adaptive_lr_step_scale(self.train_config):
+            print_acc(
+                f"[adaptive-lr] lr mode: {self.optimizer_runtime.optimizer_label} "
+                f"strategy={self.optimizer_runtime.step_scale_strategy} "
+                f"update_phase={self.optimizer_runtime.update_phase}"
+            )
+
         
         # set it to do paramiter swapping
         if self.train_config.do_paramiter_swapping:
@@ -2682,6 +2763,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
+                self._adaptive_lr_members = {}
+                if self.optimizer_runtime is not None:
+                    self.optimizer_runtime.end_window(self.optimizer)
+
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
@@ -2808,7 +2893,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             if loss_dict is not None:
                                 for key, value in loss_dict.items():
                                     self.logger.log({
-                                        f'loss/{key}': value,
+                                        key if key.startswith('lr_') else f'loss/{key}': value,
                                     })
                             if self.additional_logs is not None:
                                 for key, value in self.additional_logs.items():
@@ -2824,7 +2909,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             })
                             for key, value in loss_dict.items():
                                 self.logger.log({
-                                    f'loss/{key}': value,
+                                    key if key.startswith('lr_') else f'loss/{key}': value,
                                 })
                             if self.additional_logs is not None:
                                 for key, value in self.additional_logs.items():

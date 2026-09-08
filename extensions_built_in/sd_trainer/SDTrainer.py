@@ -23,6 +23,8 @@ from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
+from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
+
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
@@ -2982,8 +2984,10 @@ class SDTrainer(BaseSDTrainProcess):
 
         # apply loss multiplier before prior loss
         # multiply by our mask
+        # lr mode applies the watcher multiplier to the optimizer update instead.
         try:
-            loss = loss * loss_multiplier
+            if not uses_adaptive_lr_step_scale(self.train_config):
+                loss = loss * loss_multiplier
         except:
             # todo handle mask with video models
             pass
@@ -3514,6 +3518,8 @@ class SDTrainer(BaseSDTrainProcess):
                     ) < self.train_config.match_adapter_chance
 
             self.timer.stop('preprocess_batch')
+            self._record_adaptive_lr_members(batch)
+
 
             is_reg = False
             loss_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
@@ -4312,7 +4318,19 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
-                    self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
+                    runtime = getattr(self, 'optimizer_runtime', None)
+                    use_fused_scale = (
+                        runtime is not None
+                        and uses_adaptive_lr_step_scale(self.train_config)
+                        and runtime.update_phase == 'backward'
+                    )
+                    if use_fused_scale:
+                        runtime.begin_window(self.optimizer, self._batch_adaptive_lr_scale(batch))
+                    try:
+                        self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
+                    finally:
+                        if use_fused_scale:
+                            runtime.end_window(self.optimizer)
                     self._mem_diag('after_backward')
 
         return loss.detach()
@@ -4482,11 +4500,28 @@ class SDTrainer(BaseSDTrainProcess):
             self._inject_gradient_noise()
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
-                self.optimizer.step()
+                runtime = getattr(self, 'optimizer_runtime', None)
+                use_step_scale = (
+                    runtime is not None
+                    and uses_adaptive_lr_step_scale(self.train_config)
+                    and runtime.update_phase == 'step'
+                )
+                try:
+                    if use_step_scale:
+                        runtime.begin_window(
+                            self.optimizer,
+                            self._consume_adaptive_lr_window_scale(),
+                        )
+                    self.optimizer.step()
 
-                self.optimizer.zero_grad(set_to_none=True)
-                if self.adapter and isinstance(self.adapter, CustomAdapter):
-                    self.adapter.post_weight_update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.adapter and isinstance(self.adapter, CustomAdapter):
+                        self.adapter.post_weight_update()
+                finally:
+                    if use_step_scale:
+                        runtime.end_window(self.optimizer)
+                if uses_adaptive_lr_step_scale(self.train_config):
+                    self._record_adaptive_lr_log_metrics()
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
@@ -4532,6 +4567,10 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_body_shape_cos',
             '_last_vae_anchor_loss',
             '_last_vae_anchor_loss_applied',
+            '_last_lr_scheduled',
+            '_last_lr_window_scale',
+            '_last_lr_effective',
+            '_last_lr_member_count',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:
