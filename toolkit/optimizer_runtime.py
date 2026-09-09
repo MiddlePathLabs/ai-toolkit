@@ -395,51 +395,55 @@ class OptimizerRuntimeAdapter:
                 f"{self.optimizer_label} does not support an active-parameter mask "
                 f"({reason})."
             )
-        self._window_open = True
-        self.last_step_scale = scale
-        opt = unwrap_optimizer(optimizer)
-        if active_params is not None:
-            active_ids = frozenset(id(p) for p in active_params)
-            if self.mask_strategy == "native":
-                setattr(opt, _NATIVE_MASK_ATTR, active_ids)
-                self._native_opt = opt
-            elif self.mask_strategy == "grad_none":
-                for group in opt.param_groups:
-                    for param in group["params"]:
-                        if id(param) not in active_ids:
-                            param.grad = None
-                            if hasattr(param, "_accum_grad"):
-                                del param._accum_grad
-            else:
+        try:
+            self._window_open = True
+            self.last_step_scale = scale
+            opt = unwrap_optimizer(optimizer)
+            if active_params is not None:
+                active_ids = frozenset(id(p) for p in active_params)
+                if self.mask_strategy == "native":
+                    setattr(opt, _NATIVE_MASK_ATTR, active_ids)
+                    self._native_opt = opt
+                elif self.mask_strategy == "grad_none":
+                    for group in opt.param_groups:
+                        for param in group["params"]:
+                            if id(param) not in active_ids:
+                                param.grad = None
+                                if hasattr(param, "_accum_grad"):
+                                    del param._accum_grad
+                else:
+                    raise RuntimeError(
+                        f"{self.optimizer_label} has no implementable active-parameter mask"
+                    )
+            if scale == 1.0:
+                return
+            if not self.supports_step_scale:
+                reason = self.unsupported_reason or "supports_step_scale is false"
                 raise RuntimeError(
-                    f"{self.optimizer_label} has no implementable active-parameter mask"
+                    f"Cannot apply step_scale={scale} on {self.optimizer_label}: {reason}"
                 )
-        if scale == 1.0:
-            return
-        if not self.supports_step_scale:
-            reason = self.unsupported_reason or "supports_step_scale is false"
+            if self.step_scale_strategy == "group_lr":
+                snapshot: list[tuple[dict, Any]] = []
+                self._snapshot_lrs = snapshot
+                for group in opt.param_groups:
+                    # Stamp before the first scaled window so Rose wd_schedule does
+                    # not capture a scaled lr via setdefault("initial_lr", lr).
+                    if "initial_lr" not in group:
+                        group["initial_lr"] = _snapshot_lr(group["lr"])
+                    lr = group["lr"]
+                    snapshot.append((group, _snapshot_lr(lr)))
+                    group["lr"] = _scaled_lr(lr, scale)
+                return
+            if self.step_scale_strategy == "native":
+                setattr(opt, _NATIVE_ATTR, scale)
+                self._native_opt = opt
+                return
             raise RuntimeError(
-                f"Cannot apply step_scale={scale} on {self.optimizer_label}: {reason}"
+                f"{self.optimizer_label} has no implementable step-scale strategy"
             )
-        if self.step_scale_strategy == "group_lr":
-            snapshot: list[tuple[dict, Any]] = []
-            for group in opt.param_groups:
-                # Stamp before the first scaled window so Rose wd_schedule does
-                # not capture a scaled lr via setdefault("initial_lr", lr).
-                if "initial_lr" not in group:
-                    group["initial_lr"] = _snapshot_lr(group["lr"])
-                lr = group["lr"]
-                snapshot.append((group, _snapshot_lr(lr)))
-                group["lr"] = _scaled_lr(lr, scale)
-            self._snapshot_lrs = snapshot
-            return
-        if self.step_scale_strategy == "native":
-            setattr(opt, _NATIVE_ATTR, scale)
-            self._native_opt = opt
-            return
-        raise RuntimeError(
-            f"{self.optimizer_label} has no implementable step-scale strategy"
-        )
+        except Exception:
+            self.end_window(optimizer)
+            raise
 
     def end_window(self, optimizer: Any = None) -> None:
         snapshot = self._snapshot_lrs

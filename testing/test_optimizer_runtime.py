@@ -211,6 +211,32 @@ def test_group_lr_scale_restored_after_step_and_exception():
     assert opt.param_groups[0]["lr"] == pytest.approx(base)
 
 
+def test_begin_window_restores_lr_if_scale_raises_mid_flight(monkeypatch):
+    import toolkit.optimizer_runtime as runtime
+
+    p1 = torch.nn.Parameter(torch.ones(2))
+    p2 = torch.nn.Parameter(torch.ones(2))
+    opt = torch.optim.Adam(
+        [{"params": [p1], "lr": 1e-3}, {"params": [p2], "lr": 2e-3}]
+    )
+    adapter = runtime.OptimizerRuntimeAdapter.inspect(opt)
+    orig = runtime._scaled_lr
+    calls = {"n": 0}
+
+    def boom(lr, scale):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("mid-scale")
+        return orig(lr, scale)
+
+    monkeypatch.setattr(runtime, "_scaled_lr", boom)
+    with pytest.raises(RuntimeError, match="mid-scale"):
+        adapter.begin_window(opt, 0.5)
+    assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)
+    assert opt.param_groups[1]["lr"] == pytest.approx(2e-3)
+    assert adapter._window_open is False
+
+
 
 def test_rose_scale_one_matches_disabled_and_scales_delta():
     def make_opt(params):
