@@ -2969,7 +2969,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
-                        self.sample(self.step_num)
+                        try:
+                            self.sample(self.step_num)
+                        except Exception as e:
+                            print_acc(f"[sample] preview failed at step {self.step_num}, continuing: {e}")
+                            traceback.print_exc()
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
                             self.sd.text_encoder_to('cpu')
@@ -3069,7 +3073,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
-            self.sample(self.step_num)
+            try:
+                self.sample(self.step_num)
+            except Exception as e:
+                print_acc(f"[sample] preview failed at step {self.step_num}, continuing: {e}")
+                traceback.print_exc()
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:

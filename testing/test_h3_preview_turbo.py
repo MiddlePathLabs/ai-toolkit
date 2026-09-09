@@ -229,6 +229,36 @@ def test_generate_images_restores_adapters_if_enter_raises():
     assert calls == ["enter", "exit"]
 
 
+def test_generate_images_body_restores_rng_on_exception():
+    model = object.__new__(BaseModel)
+    model.network = None
+    model.adapter = None
+    model.save_device_state = lambda: None
+    model.set_device_state_preset = lambda *_a, **_k: None
+    model.restore_device_state = lambda: None
+    model.device_torch = torch.device("cpu")
+    model.torch_dtype = torch.float32
+
+    class _UNet:
+        def to(self, *args, **kwargs):
+            return self
+
+    model.unet = _UNet()
+
+    def boom():
+        torch.manual_seed(999)
+        raise RuntimeError("pipeline failed")
+
+    model.get_generation_pipeline = boom
+    torch.manual_seed(123)
+    expected = torch.randint(0, 1000, (1,))
+    torch.manual_seed(123)
+    with pytest.raises(RuntimeError, match="pipeline failed"):
+        BaseModel._generate_images_body(model, [])
+    after = torch.randint(0, 1000, (1,))
+    assert torch.equal(after, expected)
+
+
 def test_row_count_mismatch_fails_closed():
     dit = PreviewTurboDit(table_rows=3)
     proj = dit.adaln_proj
