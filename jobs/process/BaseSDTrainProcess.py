@@ -49,9 +49,11 @@ from toolkit.optimizer_runtime import (
 )
 from toolkit.h3_modality_routing import bind_modality_router
 from toolkit.h3_tread import bind_tread
-
-
-
+from toolkit.h3_dopsd import (
+    bind_dopsd,
+    identity_first_step_scale,
+    identity_first_teacher_active,
+)
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
 from toolkit.prompt_utils import concat_prompt_embeds
@@ -896,6 +898,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 apply_scale = self._batch_adaptive_lr_scale(batch)
             else:
                 apply_scale = self._consume_adaptive_lr_window_scale()
+        settings = getattr(self.sd, "dopsd_settings", None)
+        if settings is not None and settings.identity_first:
+            teacher = identity_first_teacher_active(
+                self.step_num,
+                settings.identity_first_steps,
+                identity_first=True,
+                dopsd_enabled=True,
+            )
+            apply_scale *= identity_first_step_scale(
+                teacher,
+                identity_first=True,
+                lr_scale=settings.identity_first_lr_scale,
+            )
+            if (
+                not teacher
+                and not getattr(self, "_dopsd_phase2_logged", False)
+                and settings.identity_first_steps > 0
+            ):
+                self._dopsd_phase2_logged = True
+                print_acc(
+                    f"[dopsd] identity-first phase 1 complete after "
+                    f"{settings.identity_first_steps} optimizer update(s) — "
+                    f"dropping the teacher; photos train at full LR, one forward, "
+                    f"no reference cache."
+                )
         active = None
         router = getattr(self, "modality_router", None)
         if router is not None:
@@ -2327,6 +2354,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"update_phase={self.optimizer_runtime.update_phase}"
             )
         bind_tread(self.train_config, self.sd)
+        bind_dopsd(self.sd, self.optimizer_runtime, self.train_config)
 
 
 

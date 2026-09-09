@@ -400,8 +400,8 @@ class CaptionProcessingDTOMixin:
                 self.caption_dop = self.caption.replace(
                     self.trigger_word, self.dataset_config.diff_output_preservation_class
                 )
-        if getattr(self, 'dopsd_self_ref', False):
-            # trigger word -> the self-reference token, or the token prepended
+        if getattr(self, 'dopsd_self_ref', False) or getattr(self, 'dopsd_other_ref', False):
+            # trigger word -> the reference token, or the token prepended
             # when there is no trigger word
             if self.trigger_word is not None:
                 self.caption_dopsd = self.caption.replace(
@@ -411,7 +411,7 @@ class CaptionProcessingDTOMixin:
                 self.caption_dopsd = f"{self.get_dopsd_ref_token()} {self.caption}".strip()
 
     def get_dopsd_ref_token(self: 'FileItemDTO') -> str:
-        # the item is always the only reference in D-OPSD mode
+        # Picture 1 for stills (self-ref or other-photo); Video 1 for clip self-ref
         return "<Video 1>" if self.is_video else "<Picture 1>"
 
     def get_caption(
@@ -463,14 +463,14 @@ class CaptionProcessingDTOMixin:
                         new_token_list.append(token)
             token_list = new_token_list
 
-        if self.dataset_config.shuffle_tokens:
+        if self.dataset_config.shuffle_tokens and not self.dataset_config.cache_text_embeddings:
             random.shuffle(token_list)
 
         # join back together
         caption = ', '.join(token_list)
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
-        if self.dataset_config.random_triggers:
+        if self.dataset_config.random_triggers and not self.dataset_config.cache_text_embeddings:
             num_triggers = self.dataset_config.random_triggers_max
             if num_triggers > 1:
                 num_triggers = random.randint(0, num_triggers)
@@ -484,7 +484,7 @@ class CaptionProcessingDTOMixin:
                 #     trigger = self.dataset_config.random_triggers[int(random.random() * (len(self.dataset_config.random_triggers)))]
                 #     caption = caption + ', ' + trigger
 
-        if self.dataset_config.shuffle_tokens:
+        if self.dataset_config.shuffle_tokens and not self.dataset_config.cache_text_embeddings:
             # shuffle again
             token_list = caption.split(',')
             random.shuffle(token_list)
@@ -2530,7 +2530,7 @@ class TextEmbeddingFileItemDTOMixin:
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False, dopsd_other_ref_key=None):
         # make sure the caption is loaded here
         # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
@@ -2540,6 +2540,9 @@ class TextEmbeddingFileItemDTOMixin:
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
         ])
+        if dopsd_other_ref_key:
+            item["dopsd_other_ref"] = str(dopsd_other_ref_key)
+            return item
         if dopsd_self_ref:
             # teacher embeds carry the item's own media as the vision reference
             item["dopsd_self_ref"] = True
@@ -2567,11 +2570,16 @@ class TextEmbeddingFileItemDTOMixin:
             item["first_frame_in_te"] = True
         return item
 
-    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
+    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False, dopsd_other_ref_key=None):
         # we store text embeddings in a folder in same path as image called _text_embedding_cache
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
-        hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override, text_only=text_only, dopsd_self_ref=dopsd_self_ref)
+        hash_dict = self.get_text_embedding_info_dict(
+            caption_override=caption_override,
+            text_only=text_only,
+            dopsd_self_ref=dopsd_self_ref,
+            dopsd_other_ref_key=dopsd_other_ref_key,
+        )
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
         hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
@@ -2642,6 +2650,14 @@ class TextEmbeddingFileItemDTOMixin:
             caption_override=self.caption_dopsd, dopsd_self_ref=True
         )
         return self._dopsd_text_embedding_path
+
+    def get_dopsd_other_text_embedding_path(self: 'FileItemDTO', ref_key: str):
+        if self.caption is None:
+            self.load_caption()
+        return self._build_text_embedding_path(
+            caption_override=self.caption_dopsd,
+            dopsd_other_ref_key=ref_key,
+        )
 
     def get_dopsd_dropout_caption(self: 'FileItemDTO'):
         # dropout caption with the trigger word swapped for the self-reference token
@@ -2899,6 +2915,54 @@ class TextEmbeddingCachingMixin:
                         for path, caption in dopsd_targets:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
                             prompt_embeds.save(path)
+                            del prompt_embeds
+                if getattr(file_item, 'dopsd_other_ref', False):
+                    from toolkit.h3_dopsd import pair_key, save_other_photo_teacher_cache, source_path
+                    control_video_paths = getattr(file_item, 'control_video_paths', None) or []
+                    if file_item.control_path is not None or len(control_video_paths) > 0:
+                        raise ValueError(
+                            "D-OPSD other-photo training cannot be combined with "
+                            "control images/videos: the other still must be the only "
+                            f"reference. Offending item: {file_item.path}"
+                        )
+                    slots = list(getattr(file_item, 'dopsd_ref_slots', None) or [])
+                    if slots:
+                        by_key = {pair_key(x): x for x in self.file_list}
+                        if file_item.caption_dopsd is None:
+                            file_item.load_caption()
+                        for slot in slots:
+                            cache_path = file_item.get_dopsd_other_text_embedding_path(slot["pair_key"])
+                            slot["embed_path"] = cache_path
+                            if os.path.exists(cache_path):
+                                continue
+                            partner = by_key.get(slot["pair_key"])
+                            if partner is None:
+                                raise ValueError(
+                                    "D-OPSD other-photo partner missing from dataset: "
+                                    f"{slot['pair_key']} for {file_item.path}"
+                                )
+                            if source_path(partner) == source_path(file_item):
+                                raise ValueError(
+                                    "D-OPSD other-photo refused to encode an item as its "
+                                    f"own reference or flip: {file_item.path}"
+                                )
+                            if not did_move:
+                                self.sd.set_device_state_preset('cache_text_encoder')
+                                did_move = True
+                            partner.load_and_process_image(self.transform, only_load_latents=True)
+                            img = partner.tensor
+                            ctrl_img = [
+                                ((img + 1.0) / 2.0)
+                                .clamp(0, 1)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            ]
+                            partner.cleanup()
+                            encode_ctrl = ctrl_img if self.sd.has_multiple_control_images else ctrl_img[0]
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                file_item.caption_dopsd, control_images=encode_ctrl
+                            )
+                            save_other_photo_teacher_cache(cache_path, prompt_embeds, ctrl_img[0])
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1

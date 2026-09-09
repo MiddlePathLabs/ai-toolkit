@@ -25,10 +25,11 @@ from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
 from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
 from toolkit.h3_audio_only import compute_audio_only_objective, is_audio_only_batch
-
-
-
-
+from toolkit.h3_dopsd import (
+    dopsd_teacher_wanted,
+    load_chosen_other_photo,
+    unweighted_errors,
+)
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
@@ -2182,7 +2183,13 @@ class SDTrainer(BaseSDTrainProcess):
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
-        if getattr(self.sd, 'dopsd_self_ref', False):
+        settings = getattr(self.sd, "dopsd_settings", None)
+        if (
+            getattr(self.sd, "dopsd_enabled", False)
+            and settings is not None
+            and settings.self_ref
+            and not settings.identity_first
+        ):
             # D-OPSD: the teacher (prior) prediction is the training target
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents
@@ -2631,21 +2638,27 @@ class SDTrainer(BaseSDTrainProcess):
             assert not self.train_config.train_turbo
             # matching adapter prediction
             target = prior_pred
-            if getattr(self.sd, 'dopsd_self_ref', False):
+            if dopsd_teacher_wanted(
+                getattr(self.sd, "dopsd_settings", None),
+                step_num=self.step_num,
+                batch=batch,
+            ):
                 if isinstance(prior_pred, DTO) and prior_pred.get('audio') is not None:
                     # the teacher's audio prediction is the audio target too
                     audio_target = prior_pred.get('audio').detach()
-                # D-OPSD bleed: also train against the normal (non-teacher) target
-                if hasattr(self.sd, 'get_loss_target'):
-                    dopsd_normal_target = self.sd.get_loss_target(
-                        noise=noise,
-                        batch=batch,
-                        timesteps=timesteps,
-                    ).detach()
-                elif self.sd.is_flow_matching:
-                    dopsd_normal_target = (noise - batch.latents).detach()
-                else:
-                    dopsd_normal_target = noise
+                settings = getattr(self.sd, "dopsd_settings", None)
+                # Identity-first phase 1 is teacher-only; bleed is the blended path.
+                if settings is None or not settings.identity_first:
+                    if hasattr(self.sd, 'get_loss_target'):
+                        dopsd_normal_target = self.sd.get_loss_target(
+                            noise=noise,
+                            batch=batch,
+                            timesteps=timesteps,
+                        ).detach()
+                    elif self.sd.is_flow_matching:
+                        dopsd_normal_target = (noise - batch.latents).detach()
+                    else:
+                        dopsd_normal_target = noise
         elif self.sd.prediction_type == 'v_prediction':
             # v-parameterization training
             target = self.sd.noise_scheduler.get_velocity(batch.tensor, noise, timesteps)
@@ -2969,16 +2982,39 @@ class SDTrainer(BaseSDTrainProcess):
                     timestep_weight = timestep_weight.view(-1, 1, 1, 1, 1).detach()
                 loss = loss * timestep_weight
 
-        if dopsd_normal_target is not None:
+        if dopsd_teacher_wanted(
+            getattr(self.sd, "dopsd_settings", None),
+            step_num=self.step_num,
+            batch=batch,
+        ):
             if self.train_config.loss_type == "mae":
-                bleed_loss = torch.nn.functional.l1_loss(pred.float(), dopsd_normal_target.float(), reduction="none")
+                teacher_err = torch.nn.functional.l1_loss(
+                    pred.float(), target.float(), reduction="none"
+                )
             else:
-                bleed_loss = torch.nn.functional.mse_loss(pred.float(), dopsd_normal_target.float(), reduction="none")
-            # scale normal loss to the dopsd loss magnitude, then apply bleed strength
-            with torch.no_grad():
-                bleed_scale = loss.detach().mean() / bleed_loss.detach().mean().clamp(min=1e-8)
-            bleed_strength = float(getattr(self.sd, 'dopsd_bleed_strength', 1.0))
-            loss = loss + bleed_loss * bleed_scale * bleed_strength
+                teacher_err = torch.nn.functional.mse_loss(
+                    pred.float(), target.float(), reduction="none"
+                )
+            teacher_mean = float(teacher_err.detach().mean().item())
+            photo_mean = None
+            if dopsd_normal_target is not None:
+                if self.train_config.loss_type == "mae":
+                    bleed_loss = torch.nn.functional.l1_loss(
+                        pred.float(), dopsd_normal_target.float(), reduction="none"
+                    )
+                else:
+                    bleed_loss = torch.nn.functional.mse_loss(
+                        pred.float(), dopsd_normal_target.float(), reduction="none"
+                    )
+                photo_mean = float(bleed_loss.detach().mean().item())
+                with torch.no_grad():
+                    bleed_scale = loss.detach().mean() / bleed_loss.detach().mean().clamp(min=1e-8)
+                bleed_strength = float(getattr(self.sd, 'dopsd_bleed_strength', 1.0))
+                loss = loss + bleed_loss * bleed_scale * bleed_strength
+            parts = unweighted_errors(teacher_mean, photo_mean)
+            self._last_dopsd_teacher_err = parts["teacher"]
+            self._last_dopsd_photo_err = parts["photo"]
+
 
         if self.train_config.do_prior_divergence and prior_pred is not None:
             loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
@@ -4106,7 +4142,6 @@ class SDTrainer(BaseSDTrainProcess):
 
                 if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
                     batch_size = noisy_latents.shape[0]
-                    # update the guidance value, random float between guidance_loss_target[0] and guidance_loss_target[1]
                     # sample before the prior prediction so the prior, main, uncond, and
                     # preservation passes all run at the same guidance values
                     self._guidance_loss_target_batch = [
@@ -4122,8 +4157,6 @@ class SDTrainer(BaseSDTrainProcess):
                 if self.train_config.inverted_mask_prior and batch.mask_tensor is not None:
                     do_inverted_masked_prior = True
 
-                do_correct_pred_norm_prior = self.train_config.correct_pred_norm
-
                 do_guidance_prior = False
 
                 if batch.unconditional_latents is not None:
@@ -4132,8 +4165,15 @@ class SDTrainer(BaseSDTrainProcess):
                     if guidance_type == 'tnt':
                         do_guidance_prior = True
 
+                dopsd_teacher_now = dopsd_teacher_wanted(
+                    getattr(self.sd, "dopsd_settings", None),
+                    step_num=self.step_num,
+                    batch=batch,
+                )
+                saved_control_tensor_list = None
+                settings = getattr(self.sd, "dopsd_settings", None)
                 if ((
-                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm):
+                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm or dopsd_teacher_now):
                     with self.timer('prior predict'):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
@@ -4148,9 +4188,27 @@ class SDTrainer(BaseSDTrainProcess):
                                 [blank_embeds] * noisy_latents.shape[0]
                             )
                         
-                        is_dopsd = getattr(self.sd, 'dopsd_self_ref', False)
-                        if is_dopsd:
-                            # teacher embeds: caption + vision block naming the item as its own reference
+                        if dopsd_teacher_now:
+                            if settings is not None and settings.other_ref:
+                                embeds_list = []
+                                ref_tensors = []
+                                for item in batch.file_items:
+                                    embeds, ref_t, _slot = load_chosen_other_photo(
+                                        item,
+                                        epoch=self.epoch_num,
+                                        seed=settings.pair_seed,
+                                    )
+                                    embeds_list.append(embeds)
+                                    ref = ref_t
+                                    if ref.ndim == 4 and ref.shape[0] == 1:
+                                        ref = ref[0]
+                                    ref_tensors.append(ref.to(self.device_torch, dtype=dtype))
+                                padding_side = batch.file_items[0].te_padding_side
+                                batch.dopsd_prompt_embeds = concat_prompt_embeds(
+                                    embeds_list, padding_side=padding_side
+                                )
+                                saved_control_tensor_list = batch.control_tensor_list
+                                batch.control_tensor_list = [[t] for t in ref_tensors]
                             if batch.dopsd_prompt_embeds is None:
                                 raise ValueError(
                                     "D-OPSD requires cached text embeddings; enable "
@@ -4159,7 +4217,10 @@ class SDTrainer(BaseSDTrainProcess):
                             prior_embeds_to_use = batch.dopsd_prompt_embeds.clone().detach().to(
                                 self.device_torch, dtype=dtype
                             )
-                            batch.dopsd_teacher_pass = True
+                            # Self-ref uses the target pixels; other-photo uses control_tensor_list.
+                            batch.dopsd_teacher_pass = not (
+                                settings is not None and settings.other_ref
+                            )
 
                         prior_pred = self.get_prior_prediction(
                             noisy_latents=noisy_latents,
@@ -4173,8 +4234,10 @@ class SDTrainer(BaseSDTrainProcess):
                             unconditional_embeds=unconditional_embeds,
                             conditioned_prompts=conditioned_prompts
                         )
-                        if is_dopsd:
+                        if dopsd_teacher_now:
                             batch.dopsd_teacher_pass = False
+                            if settings is not None and settings.other_ref:
+                                batch.control_tensor_list = saved_control_tensor_list
                         if prior_pred is not None:
                             # a DTO prior pred keeps its audio extras through detach
                             prior_pred = prior_pred.detach()
@@ -4657,6 +4720,8 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_lr_window_scale',
             '_last_lr_effective',
             '_last_lr_member_count',
+            '_last_dopsd_teacher_err',
+            '_last_dopsd_photo_err',
         ):
             metric_value = getattr(self, metric_name, None)
             if metric_value is not None:

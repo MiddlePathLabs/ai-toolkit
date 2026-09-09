@@ -184,7 +184,11 @@ class BaseModel:
         # the batch as control_video_latents_list); see minimax_h3 ref2va
         self.supports_video_control_images = False
         # D-OPSD: cache per-item teacher text embeds (item's own media as reference 1)
+        self.dopsd = False
+        self.dopsd_enabled = False
         self.dopsd_self_ref = False
+        self.dopsd_other_ref = False
+        self.dopsd_settings = None
         # weight of the normal-target loss added alongside the D-OPSD teacher loss
         self.dopsd_bleed_strength = 1.0
         # forces cache_tensors_to_disk on latent-caching datasets (BaseSDTrainProcess)

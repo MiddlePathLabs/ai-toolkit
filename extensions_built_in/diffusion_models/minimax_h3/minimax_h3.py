@@ -51,6 +51,8 @@ from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.dto import DTO
 from toolkit.metadata import get_meta_for_safetensors
+from toolkit.h3_dopsd import apply_settings_to_model, parse_dopsd_settings
+
 from toolkit.models.base_model import BaseModel
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
 from toolkit.models.v2.resolver import (
@@ -1184,15 +1186,9 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # control VIDEOS are cached like dataset items and consumed as
         # multi-frame reference blocks
         self.supports_video_control_images = True
-        # D-OPSD: a no-grad teacher pass with the target as its own reference
-        # becomes the training target for the reference-free student pass
-        self.dopsd = bool(self.model_config.model_kwargs.get("dopsd", False))
-        if self.dopsd:
-            self.dopsd_self_ref = True
-            self.require_pixel_tensor_cache = True
-            self.dopsd_bleed_strength = float(
-                self.model_config.model_kwargs.get("dopsd_bleed_strength", 1.0)
-            )
+        # D-OPSD: one ref2va DiT, two forwards. Self-reference is the default
+        # when dopsd is on; other-photo / identity-first are default-off.
+        apply_settings_to_model(self, parse_dopsd_settings(self.model_config))
 
     def _dit_component(self) -> str:
         partition = str(

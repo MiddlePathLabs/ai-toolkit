@@ -23,7 +23,7 @@ from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingM
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.h3_audio_only import uses_h3_standalone_audio
-
+from toolkit.h3_dopsd import assign_other_photo_pairs
 from toolkit.accelerator import get_accelerator
 
 import platform
@@ -549,6 +549,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
                     encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
                     dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
+                    dopsd_other_ref=getattr(self.sd, 'dopsd_other_ref', False) if self.sd else False,
                     text_embedding_space_version=self.sd.text_embedding_space_version if self.sd else "sd1",
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
@@ -625,6 +626,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
             else:
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
+        settings = getattr(self.sd, "dopsd_settings", None) if self.sd else None
+        if settings is not None and getattr(settings, "other_ref", False):
+            assign_other_photo_pairs(self.file_list, settings)
 
         self.setup_epoch()
 
