@@ -169,8 +169,10 @@ def test_validate_span_allows_fizgig_prior_rejects_short_tail():
 def test_bind_off_clears_and_returns_none():
     dit = _tiny_dit()
     dit._tread = (0.5, TREAD_START, TREAD_END)
+    dit._tread_generator = torch.Generator()
     assert bind_tread(TrainConfig(), _H3(dit)) is None
     assert dit._tread is None
+    assert dit._tread_generator is None
 
 
 def test_bind_installs_and_rejects_non_h3_and_vsa():
@@ -178,6 +180,7 @@ def test_bind_installs_and_rejects_non_h3_and_vsa():
     cfg = TrainConfig(tread_ratio=0.5, tread_start=TREAD_START, tread_end=TREAD_END)
     assert bind_tread(cfg, _H3(dit)) == (0.5, TREAD_START, TREAD_END)
     assert dit._tread == (0.5, TREAD_START, TREAD_END)
+    assert isinstance(dit._tread_generator, torch.Generator)
 
     class Other:
         arch = "flux"
@@ -240,6 +243,46 @@ def test_same_seed_selects_same_positions():
     assert a is not None and b is not None and c is not None
     assert torch.equal(a, b)
     assert not torch.equal(a, c)
+
+
+def test_keep_idx_from_identical_generators_matches():
+    pack, meta = _pack(t_lat=2)
+    kwargs = dict(
+        seq_len=meta["seq_len"],
+        batch_size=1,
+        video_indices=pack["video_indices"],
+        target_video_grid=pack["vsa_video_grid"],
+        ratio=0.5,
+        start=TREAD_START,
+        end=TREAD_END,
+        n_blocks=N_LAYERS,
+        device=torch.device("cpu"),
+    )
+    a = plan_tread_keep_idx(**kwargs, generator=torch.Generator().manual_seed(7))
+    b = plan_tread_keep_idx(**kwargs, generator=torch.Generator().manual_seed(7))
+    assert a is not None and b is not None
+    assert torch.equal(a, b)
+
+
+def test_tread_forward_does_not_consume_global_rng():
+    dit = _tiny_dit()
+    bind_tread(
+        TrainConfig(tread_ratio=0.5, tread_start=TREAD_START, tread_end=TREAD_END),
+        _H3(dit),
+    )
+    pack, _ = _pack(t_lat=2)
+
+    torch.manual_seed(123)
+    with torch.enable_grad():
+        dit(**_clone_pack(pack))
+    after_on = torch.randint(0, 1000, (1,))
+
+    dit._tread = None
+    torch.manual_seed(123)
+    with torch.enable_grad():
+        dit(**_clone_pack(pack))
+    after_off = torch.randint(0, 1000, (1,))
+    assert torch.equal(after_on, after_off)
 
 
 def test_keep_idx_keeps_text_condition_audio_drops_half_target():

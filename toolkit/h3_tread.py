@@ -73,7 +73,9 @@ def bind_tread(train_config: Any, model: Any) -> Optional[Tuple[float, int, int]
     if not uses_tread(train_config):
         if is_h3_arch(arch):
             try:
-                resolve_h3_transformer(model)._tread = None
+                transformer = resolve_h3_transformer(model)
+                transformer._tread = None
+                transformer._tread_generator = None
             except ValueError:
                 pass
         return None
@@ -111,6 +113,12 @@ def bind_tread(train_config: Any, model: Any) -> Optional[Tuple[float, int, int]
     n_blocks = len(transformer.blocks)
     validate_tread_span(start, end, n_blocks)
     transformer._tread = (ratio, start, end)
+    seed = getattr(train_config, "seed", None)
+    if seed is None:
+        seed = torch.initial_seed()
+    transformer._tread_generator = torch.Generator(device="cpu").manual_seed(
+        int(seed) & 0xFFFFFFFF
+    )
     print_acc(
         f"[tread] token routing ON — {ratio:.0%} of target video tokens skip "
         f"blocks {start}-{end - 1} on CLIP steps (rejoin in block-{start} "
@@ -160,7 +168,12 @@ def plan_tread_keep_idx(
         )
     target = video_indices[-n_target:]
     n_keep = max(1, int(round(n_target * (1.0 - float(ratio)))))
-    perm = torch.randperm(n_target, device=device, generator=generator)
+    if generator is None:
+        perm = torch.randperm(n_target, device=device)
+    else:
+        perm = torch.randperm(
+            n_target, generator=generator, device=generator.device
+        ).to(device)
     keep_vid = target[perm[:n_keep].sort().values]
     live = torch.ones(seq_len, dtype=torch.bool, device=device)
     live[target] = False

@@ -597,6 +597,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 end=route_end,
                 n_blocks=len(self.blocks),
                 device=x.device,
+                generator=getattr(self, "_tread_generator", None),
             )
 
         full_state = None
