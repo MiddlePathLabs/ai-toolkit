@@ -31,6 +31,7 @@ from toolkit.dataloader_mixins import (
     AudioProcessingDTOMixin,
 )
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
+from toolkit.h3_audio_only import uses_h3_standalone_audio
 
 if TYPE_CHECKING:
     from toolkit.config_modules import DatasetConfig
@@ -79,17 +80,12 @@ class FileItemDTO(
         self.is_video = dataset_is_video and os.path.splitext(self.path)[1].lower() in video_extensions
         self.is_audio_model = kwargs.get("is_audio_model", False)
         # H3 standalone voice file — not ACE-Step `is_audio_model`
-        self.is_audio_only = False
         _sd = kwargs.get("sd", None)
-        if (
+        self.is_audio_only = (
             not self.is_audio_model
-            and self.dataset_config is not None
-            and bool(getattr(self.dataset_config, "do_audio", False))
+            and uses_h3_standalone_audio(_sd, self.dataset_config)
             and os.path.splitext(self.path)[1].lower() in audio_extensions
-        ):
-            arch = getattr(getattr(_sd, "model_config", None), "arch", None)
-            if str(arch or "").startswith("minimax_h3"):
-                self.is_audio_only = True
+        )
         self.sample_rate = kwargs.get("sample_rate", 48000)
         if self.is_audio_only:
             from toolkit.h3_audio_only import AUDIO_SAMPLE_RATE
