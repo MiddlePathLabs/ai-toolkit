@@ -35,6 +35,7 @@ from toolkit.h3_tread import (
     gather_tread_state,
     plan_tread_keep_idx,
     scatter_tread_hidden,
+    tread_generator_for_step,
 )
 
 
@@ -587,6 +588,13 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 int(tread[1]),
                 int(tread[2]),
             )
+            seed = getattr(self, "_tread_seed", None)
+            if seed is not None:
+                generator = tread_generator_for_step(
+                    seed, int(getattr(self, "_tread_step", 0))
+                )
+            else:
+                generator = getattr(self, "_tread_generator", None)
             keep_idx = plan_tread_keep_idx(
                 seq_len=seq_len,
                 batch_size=batch_size,
@@ -597,7 +605,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 end=route_end,
                 n_blocks=len(self.blocks),
                 device=x.device,
-                generator=getattr(self, "_tread_generator", None),
+                generator=generator,
             )
 
         full_state = None

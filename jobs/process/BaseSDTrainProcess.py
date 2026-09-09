@@ -48,7 +48,7 @@ from toolkit.optimizer_runtime import (
     uses_adaptive_lr_step_scale,
 )
 from toolkit.h3_modality_routing import bind_modality_router
-from toolkit.h3_tread import bind_tread
+from toolkit.h3_tread import bind_tread, read_tread_seed, set_tread_step
 from toolkit.h3_dopsd import (
     bind_dopsd,
     identity_first_step_scale,
@@ -453,6 +453,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'step': self.step_num,
             'epoch': self.epoch_num,
         })
+        tread_seed = read_tread_seed(self.sd)
+        if tread_seed is not None:
+            info['tread_seed'] = tread_seed
         return info
 
     def clean_up_saves(self):
@@ -1064,6 +1067,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
             self.start_step = self.step_num
+            if 'tread_seed' in meta['training_info']:
+                self._resume_tread_seed = int(meta['training_info']['tread_seed'])
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
     def load_weights(self, path):
@@ -1103,6 +1108,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if 'epoch' in meta['training_info']:
                     self.epoch_num = meta['training_info']['epoch']
                 self.start_step = self.step_num
+                if 'tread_seed' in meta['training_info']:
+                    self._resume_tread_seed = int(meta['training_info']['tread_seed'])
                 print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
     # def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
@@ -2353,7 +2360,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"mask={self.optimizer_runtime.mask_strategy} "
                 f"update_phase={self.optimizer_runtime.update_phase}"
             )
-        bind_tread(self.train_config, self.sd)
+        bind_tread(
+            self.train_config,
+            self.sd,
+            step_num=self.step_num,
+            seed=getattr(self, "_resume_tread_seed", None),
+        )
         bind_dopsd(self.sd, self.optimizer_runtime, self.train_config)
 
 
@@ -2770,6 +2782,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
             self.step_num = step
+            set_tread_step(self.sd, self.step_num)
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:

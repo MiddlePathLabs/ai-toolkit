@@ -67,7 +67,13 @@ def _arch_of(model: Any) -> Any:
     return arch
 
 
-def bind_tread(train_config: Any, model: Any) -> Optional[Tuple[float, int, int]]:
+def bind_tread(
+    train_config: Any,
+    model: Any,
+    *,
+    step_num: int = 0,
+    seed: Optional[int] = None,
+) -> Optional[Tuple[float, int, int]]:
     """Install ``transformer._tread`` or clear it. Fail closed before the first batch."""
     arch = _arch_of(model)
     if not uses_tread(train_config):
@@ -76,6 +82,8 @@ def bind_tread(train_config: Any, model: Any) -> Optional[Tuple[float, int, int]
                 transformer = resolve_h3_transformer(model)
                 transformer._tread = None
                 transformer._tread_generator = None
+                transformer._tread_seed = None
+                transformer._tread_step = 0
             except ValueError:
                 pass
         return None
@@ -113,12 +121,13 @@ def bind_tread(train_config: Any, model: Any) -> Optional[Tuple[float, int, int]
     n_blocks = len(transformer.blocks)
     validate_tread_span(start, end, n_blocks)
     transformer._tread = (ratio, start, end)
-    seed = getattr(train_config, "seed", None)
+    if seed is None:
+        seed = getattr(train_config, "seed", None)
     if seed is None:
         seed = torch.initial_seed()
-    transformer._tread_generator = torch.Generator(device="cpu").manual_seed(
-        int(seed) & 0xFFFFFFFF
-    )
+    transformer._tread_seed = int(seed) & 0xFFFFFFFF
+    transformer._tread_step = int(step_num)
+    transformer._tread_generator = None
     print_acc(
         f"[tread] token routing ON — {ratio:.0%} of target video tokens skip "
         f"blocks {start}-{end - 1} on CLIP steps (rejoin in block-{start} "
@@ -179,6 +188,31 @@ def plan_tread_keep_idx(
     live[target] = False
     live[keep_vid] = True
     return live.nonzero(as_tuple=False).reshape(-1)
+
+
+def tread_generator_for_step(seed: int, step: int) -> torch.Generator:
+    """CPU generator for one TREAD draw. Resume-stable from (seed, step_num)."""
+    mixed = (int(seed) ^ ((int(step) + 1) * 0x9E3779B9)) & 0xFFFFFFFF
+    return torch.Generator(device="cpu").manual_seed(mixed)
+
+
+def set_tread_step(model: Any, step_num: int) -> None:
+    try:
+        transformer = resolve_h3_transformer(model)
+    except ValueError:
+        return
+    if getattr(transformer, "_tread", None) is None:
+        return
+    transformer._tread_step = int(step_num)
+
+
+def read_tread_seed(model: Any) -> Optional[int]:
+    try:
+        transformer = resolve_h3_transformer(model)
+    except ValueError:
+        return None
+    seed = getattr(transformer, "_tread_seed", None)
+    return None if seed is None else int(seed)
 
 
 def gather_tread_state(

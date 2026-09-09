@@ -15,6 +15,8 @@ from toolkit.h3_tread import (
     gather_tread_state,
     plan_tread_keep_idx,
     scatter_tread_hidden,
+    set_tread_step,
+    tread_generator_for_step,
     uses_tread,
     validate_tread_span,
 )
@@ -170,9 +172,11 @@ def test_bind_off_clears_and_returns_none():
     dit = _tiny_dit()
     dit._tread = (0.5, TREAD_START, TREAD_END)
     dit._tread_generator = torch.Generator()
+    dit._tread_seed = 1
     assert bind_tread(TrainConfig(), _H3(dit)) is None
     assert dit._tread is None
     assert dit._tread_generator is None
+    assert dit._tread_seed is None
 
 
 def test_bind_installs_and_rejects_non_h3_and_vsa():
@@ -180,7 +184,8 @@ def test_bind_installs_and_rejects_non_h3_and_vsa():
     cfg = TrainConfig(tread_ratio=0.5, tread_start=TREAD_START, tread_end=TREAD_END)
     assert bind_tread(cfg, _H3(dit)) == (0.5, TREAD_START, TREAD_END)
     assert dit._tread == (0.5, TREAD_START, TREAD_END)
-    assert isinstance(dit._tread_generator, torch.Generator)
+    assert dit._tread_seed is not None
+    assert dit._tread_generator is None
 
     class Other:
         arch = "flux"
@@ -283,6 +288,60 @@ def test_tread_forward_does_not_consume_global_rng():
         dit(**_clone_pack(pack))
     after_off = torch.randint(0, 1000, (1,))
     assert torch.equal(after_on, after_off)
+
+
+
+def test_tread_step_seed_is_deterministic_and_step_dependent():
+    pack, meta = _pack(t_lat=2)
+    kwargs = dict(
+        seq_len=meta["seq_len"],
+        batch_size=1,
+        video_indices=pack["video_indices"],
+        target_video_grid=pack["vsa_video_grid"],
+        ratio=0.5,
+        start=TREAD_START,
+        end=TREAD_END,
+        n_blocks=N_LAYERS,
+        device=torch.device("cpu"),
+    )
+    a = plan_tread_keep_idx(**kwargs, generator=tread_generator_for_step(7, 5))
+    b = plan_tread_keep_idx(**kwargs, generator=tread_generator_for_step(7, 5))
+    c = plan_tread_keep_idx(**kwargs, generator=tread_generator_for_step(7, 0))
+    assert a is not None and b is not None and c is not None
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_tread_rebind_at_step_continues_not_restarts():
+    pack, meta = _pack(t_lat=2)
+    kwargs = dict(
+        seq_len=meta["seq_len"],
+        batch_size=1,
+        video_indices=pack["video_indices"],
+        target_video_grid=pack["vsa_video_grid"],
+        ratio=0.5,
+        start=TREAD_START,
+        end=TREAD_END,
+        n_blocks=N_LAYERS,
+        device=torch.device("cpu"),
+    )
+    cfg = TrainConfig(tread_ratio=0.5, tread_start=TREAD_START, tread_end=TREAD_END)
+    cfg.seed = 99
+    live = _tiny_dit()
+    bind_tread(cfg, _H3(live), step_num=0)
+    seed = live._tread_seed
+    at_five = plan_tread_keep_idx(
+        **kwargs, generator=tread_generator_for_step(seed, 5)
+    )
+    resumed = _tiny_dit()
+    bind_tread(cfg, _H3(resumed), step_num=5, seed=seed)
+    set_tread_step(_H3(resumed), 5)
+    got = plan_tread_keep_idx(
+        **kwargs,
+        generator=tread_generator_for_step(resumed._tread_seed, resumed._tread_step),
+    )
+    assert resumed._tread_step == 5
+    assert torch.equal(at_five, got)
 
 
 def test_keep_idx_keeps_text_condition_audio_drops_half_target():
