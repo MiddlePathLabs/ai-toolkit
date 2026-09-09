@@ -3400,102 +3400,101 @@ class SDTrainer(BaseSDTrainProcess):
             was_adapter_active = self.adapter.is_active
             self.adapter.is_active = False
 
-        if self.train_config.unload_text_encoder and self.adapter is not None and not isinstance(self.adapter, CustomAdapter):
-            raise ValueError("Prior predictions currently do not support unloading text encoder with adapter")
-        # do a prediction here so we can match its output with network multiplier set to 0.0
-        with torch.no_grad():
-            dtype = get_torch_dtype(self.train_config.dtype)
+        try:
+            if self.train_config.unload_text_encoder and self.adapter is not None and not isinstance(self.adapter, CustomAdapter):
+                raise ValueError("Prior predictions currently do not support unloading text encoder with adapter")
+            # do a prediction here so we can match its output with network multiplier set to 0.0
+            with torch.no_grad():
+                dtype = get_torch_dtype(self.train_config.dtype)
 
-            embeds_to_use = conditional_embeds.clone().detach()
-            # handle clip vision adapter by removing triggers from prompt and replacing with the class name
-            if (self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter)) or self.embedding is not None:
-                prompt_list = batch.get_caption_list()
-                class_name = ''
+                embeds_to_use = conditional_embeds.clone().detach()
+                # handle clip vision adapter by removing triggers from prompt and replacing with the class name
+                if (self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter)) or self.embedding is not None:
+                    prompt_list = batch.get_caption_list()
+                    class_name = ''
 
-                triggers = ['[trigger]', '[name]']
-                remove_tokens = []
+                    triggers = ['[trigger]', '[name]']
+                    remove_tokens = []
 
-                if self.embed_config is not None:
-                    triggers.append(self.embed_config.trigger)
-                    for i in range(1, self.embed_config.tokens):
-                        remove_tokens.append(f"{self.embed_config.trigger}_{i}")
-                    if self.embed_config.trigger_class_name is not None:
-                        class_name = self.embed_config.trigger_class_name
+                    if self.embed_config is not None:
+                        triggers.append(self.embed_config.trigger)
+                        for i in range(1, self.embed_config.tokens):
+                            remove_tokens.append(f"{self.embed_config.trigger}_{i}")
+                        if self.embed_config.trigger_class_name is not None:
+                            class_name = self.embed_config.trigger_class_name
 
-                if self.adapter is not None:
-                    triggers.append(self.adapter_config.trigger)
-                    for i in range(1, self.adapter_config.num_tokens):
-                        remove_tokens.append(f"{self.adapter_config.trigger}_{i}")
-                    if self.adapter_config.trigger_class_name is not None:
-                        class_name = self.adapter_config.trigger_class_name
+                    if self.adapter is not None:
+                        triggers.append(self.adapter_config.trigger)
+                        for i in range(1, self.adapter_config.num_tokens):
+                            remove_tokens.append(f"{self.adapter_config.trigger}_{i}")
+                        if self.adapter_config.trigger_class_name is not None:
+                            class_name = self.adapter_config.trigger_class_name
 
-                for idx, prompt in enumerate(prompt_list):
-                    for remove_token in remove_tokens:
-                        prompt = prompt.replace(remove_token, '')
-                    for trigger in triggers:
-                        prompt = prompt.replace(trigger, class_name)
-                    prompt_list[idx] = prompt
+                    for idx, prompt in enumerate(prompt_list):
+                        for remove_token in remove_tokens:
+                            prompt = prompt.replace(remove_token, '')
+                        for trigger in triggers:
+                            prompt = prompt.replace(trigger, class_name)
+                        prompt_list[idx] = prompt
 
-                if batch.prompt_embeds is not None:
-                    embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
-                else:
-                    prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                    embeds_to_use = self.sd.encode_prompt(
-                        prompt_list,
-                        long_prompts=self.do_long_prompts).to(
-                        self.device_torch,
-                        dtype=dtype,
-                        **prompt_kwargs
-                    ).detach()
+                    if batch.prompt_embeds is not None:
+                        embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
+                    else:
+                        prompt_kwargs = {}
+                        if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
+                            prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        embeds_to_use = self.sd.encode_prompt(
+                            prompt_list,
+                            long_prompts=self.do_long_prompts).to(
+                            self.device_torch,
+                            dtype=dtype,
+                            **prompt_kwargs
+                        ).detach()
 
-            # dont use network on this
-            # self.network.multiplier = 0.0
-            self.sd.unet.eval()
+                # dont use network on this
+                # self.network.multiplier = 0.0
+                self.sd.unet.eval()
 
-            if self.adapter is not None and isinstance(self.adapter, IPAdapter) and not self.sd.is_flux and not self.sd.is_lumina2:
-                # we need to remove the image embeds from the prompt except for flux
-                embeds_to_use: PromptEmbeds = embeds_to_use.clone().detach()
-                end_pos = embeds_to_use.text_embeds.shape[1] - self.adapter_config.num_tokens
-                embeds_to_use.text_embeds = embeds_to_use.text_embeds[:, :end_pos, :]
+                if self.adapter is not None and isinstance(self.adapter, IPAdapter) and not self.sd.is_flux and not self.sd.is_lumina2:
+                    # we need to remove the image embeds from the prompt except for flux
+                    embeds_to_use: PromptEmbeds = embeds_to_use.clone().detach()
+                    end_pos = embeds_to_use.text_embeds.shape[1] - self.adapter_config.num_tokens
+                    embeds_to_use.text_embeds = embeds_to_use.text_embeds[:, :end_pos, :]
+                    if unconditional_embeds is not None:
+                        unconditional_embeds = unconditional_embeds.clone().detach()
+                        unconditional_embeds.text_embeds = unconditional_embeds.text_embeds[:, :end_pos]
+
                 if unconditional_embeds is not None:
-                    unconditional_embeds = unconditional_embeds.clone().detach()
-                    unconditional_embeds.text_embeds = unconditional_embeds.text_embeds[:, :end_pos]
+                    unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=dtype).detach()
 
-            if unconditional_embeds is not None:
-                unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=dtype).detach()
-            
-            guidance_embedding_scale = self.train_config.cfg_scale
-            if self.train_config.do_guidance_loss:
-                guidance_embedding_scale = self._guidance_loss_target_batch
+                guidance_embedding_scale = self.train_config.cfg_scale
+                if self.train_config.do_guidance_loss:
+                    guidance_embedding_scale = self._guidance_loss_target_batch
 
-            prior_pred = self.sd.predict_noise(
-                latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
-                conditional_embeddings=embeds_to_use.to(self.device_torch, dtype=dtype).detach(),
-                unconditional_embeddings=unconditional_embeds,
-                timestep=timesteps,
-                guidance_scale=self.train_config.cfg_scale,
-                guidance_embedding_scale=guidance_embedding_scale,
-                rescale_cfg=self.train_config.cfg_rescale,
-                batch=batch,
-                **pred_kwargs  # adapter residuals in here
-            )
+                prior_pred = self.sd.predict_noise(
+                    latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
+                    conditional_embeddings=embeds_to_use.to(self.device_torch, dtype=dtype).detach(),
+                    unconditional_embeddings=unconditional_embeds,
+                    timestep=timesteps,
+                    guidance_scale=self.train_config.cfg_scale,
+                    guidance_embedding_scale=guidance_embedding_scale,
+                    rescale_cfg=self.train_config.cfg_rescale,
+                    batch=batch,
+                    **pred_kwargs  # adapter residuals in here
+                )
+                prior_pred = prior_pred.detach()
+                # remove the residuals as we wont use them on prediction when matching control
+                if match_adapter_assist and 'down_intrablock_additional_residuals' in pred_kwargs:
+                    del pred_kwargs['down_intrablock_additional_residuals']
+                if match_adapter_assist and 'down_block_additional_residuals' in pred_kwargs:
+                    del pred_kwargs['down_block_additional_residuals']
+                if match_adapter_assist and 'mid_block_additional_residual' in pred_kwargs:
+                    del pred_kwargs['mid_block_additional_residual']
+        finally:
             if was_unet_training:
                 self.sd.unet.train()
-            prior_pred = prior_pred.detach()
-            # remove the residuals as we wont use them on prediction when matching control
-            if match_adapter_assist and 'down_intrablock_additional_residuals' in pred_kwargs:
-                del pred_kwargs['down_intrablock_additional_residuals']
-            if match_adapter_assist and 'down_block_additional_residuals' in pred_kwargs:
-                del pred_kwargs['down_block_additional_residuals']
-            if match_adapter_assist and 'mid_block_additional_residual' in pred_kwargs:
-                del pred_kwargs['mid_block_additional_residual']
-
-            if can_disable_adapter:
+            if can_disable_adapter and self.adapter is not None:
                 self.adapter.is_active = was_adapter_active
-            # restore network
-            # self.network.multiplier = network_weight_list
             if self.network is not None:
                 self.network.is_active = was_network_active
         return prior_pred

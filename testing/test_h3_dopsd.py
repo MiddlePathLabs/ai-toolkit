@@ -305,3 +305,86 @@ def test_other_photo_cache_rebuilds_embeds_from_one_read(tmp_path):
     assert tuple(embeds.text_embeds.shape) == (2, 4)
     assert tuple(ref.shape) == (1, 3, 8, 8)
 
+
+
+def _prior_trainer(*, unload_text_encoder=False, predict_error=None):
+    from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+
+    class _UNet:
+        def __init__(self):
+            self.training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self):
+            self.training = True
+
+    def _predict_noise(**kwargs):
+        if predict_error is not None:
+            raise predict_error
+        return torch.zeros(1, 4, 8, 8)
+
+    trainer = SDTrainer.__new__(SDTrainer)
+    trainer.network = SimpleNamespace(is_active=True)
+    trainer.adapter = None
+    trainer.embedding = None
+    trainer.train_config = SimpleNamespace(
+        unload_text_encoder=unload_text_encoder,
+        dtype="fp32",
+        cfg_scale=1.0,
+        do_guidance_loss=False,
+        cfg_rescale=1.0,
+    )
+    trainer.sd = SimpleNamespace(
+        unet=_UNet(),
+        device_torch=torch.device("cpu"),
+        torch_dtype=torch.float32,
+        encode_control_in_text_embeddings=False,
+        is_flux=False,
+        is_lumina2=False,
+        predict_noise=_predict_noise,
+    )
+    trainer.device_torch = torch.device("cpu")
+    return trainer
+
+
+def _call_prior(trainer):
+    from toolkit.prompt_utils import PromptEmbeds
+
+    noisy = torch.zeros(1, 4, 8, 8)
+    return trainer.get_prior_prediction(
+        noisy,
+        PromptEmbeds(torch.zeros(1, 4, 8)),
+        False,
+        [1.0],
+        torch.zeros(1),
+        {},
+        SimpleNamespace(),
+        noisy,
+    )
+
+
+def test_prior_prediction_restores_network_after_oom():
+    trainer = _prior_trainer(predict_error=torch.cuda.OutOfMemoryError("cuda OOM"))
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        _call_prior(trainer)
+    assert trainer.network.is_active is True
+    assert trainer.sd.unet.training is True
+
+
+def test_prior_prediction_restores_network_after_unload_text_encoder():
+    trainer = _prior_trainer(unload_text_encoder=True)
+    trainer.adapter = SimpleNamespace(is_active=True)
+    with pytest.raises(ValueError, match="unloading text encoder"):
+        _call_prior(trainer)
+    assert trainer.network.is_active is True
+    assert trainer.sd.unet.training is True
+
+
+def test_prior_prediction_restores_network_on_success():
+    trainer = _prior_trainer()
+    out = _call_prior(trainer)
+    assert tuple(out.shape) == (1, 4, 8, 8)
+    assert trainer.network.is_active is True
+    assert trainer.sd.unet.training is True

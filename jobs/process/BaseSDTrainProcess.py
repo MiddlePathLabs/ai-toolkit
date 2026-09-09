@@ -2864,6 +2864,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.optimizer_runtime is not None:
                     self.optimizer_runtime.end_window(self.optimizer)
                 self._reset_routing_window()
+                # a raise inside a teacher/prior pass can leave the trainable network
+                # parked; without this the run continues with a no-op LoRA forever.
+                if self.network is not None and not self.network.is_active:
+                    print_acc("[oom-recovery] re-enabling trainable network")
+                    self.network.is_active = True
 
 
                 self.num_consecutive_oom += 1
