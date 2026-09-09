@@ -49,6 +49,18 @@ def uses_h3_standalone_audio(sd: Any, dataset_config: Any) -> bool:
     return str(arch or "").startswith("minimax_h3")
 
 
+def validate_audio_only_caption_dropout(dataset_config: Any, *, has_audio_only: bool) -> None:
+    """Empty-prompt dropout on a voice-only set trains empty-prompt → that voice."""
+    if not has_audio_only:
+        return
+    rate = float(getattr(dataset_config, "caption_dropout_rate", 0.0) or 0.0)
+    if rate > 0:
+        raise ValueError(
+            "caption_dropout_rate > 0 on an H3 audio-only dataset trains "
+            "empty-prompt → that voice. Set caption_dropout_rate: 0."
+        )
+
+
 def is_audio_path(path: str, audio_extensions: Iterable[str]) -> bool:
     return os.path.splitext(path)[1].lower() in set(audio_extensions)
 

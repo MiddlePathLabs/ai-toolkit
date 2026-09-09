@@ -23,6 +23,7 @@ from toolkit.h3_audio_only import (
     make_placeholder_latents,
     trim_to_grid,
     uses_h3_standalone_audio,
+    validate_audio_only_caption_dropout,
     valid_durations_text,
     video_latent_num_frames,
 )
@@ -109,6 +110,16 @@ def test_uses_h3_standalone_audio_not_ace_step():
     assert uses_h3_standalone_audio(ace, ds_on) is False
     assert uses_h3_standalone_audio(flux, ds_on) is False
     assert uses_h3_standalone_audio(None, ds_on) is False
+
+
+
+def test_audio_only_rejects_caption_dropout():
+    validate_audio_only_caption_dropout(SimpleNamespace(caption_dropout_rate=0.0), has_audio_only=True)
+    validate_audio_only_caption_dropout(SimpleNamespace(caption_dropout_rate=0.05), has_audio_only=False)
+    with pytest.raises(ValueError, match="empty-prompt"):
+        validate_audio_only_caption_dropout(
+            SimpleNamespace(caption_dropout_rate=0.05), has_audio_only=True
+        )
 
 
 def test_is_audio_only_batch_mixed_fails_closed():

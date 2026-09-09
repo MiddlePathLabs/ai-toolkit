@@ -22,7 +22,7 @@ from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
-from toolkit.h3_audio_only import uses_h3_standalone_audio
+from toolkit.h3_audio_only import uses_h3_standalone_audio, validate_audio_only_caption_dropout
 from toolkit.h3_dopsd import assign_other_photo_pairs
 from toolkit.accelerator import get_accelerator
 
@@ -593,11 +593,15 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
-        if any(getattr(x, "is_audio_only", False) for x in self.file_list) and not self.dataset_config.buckets:
+        has_audio_only = any(getattr(x, "is_audio_only", False) for x in self.file_list)
+        if has_audio_only and not self.dataset_config.buckets:
             raise ValueError(
                 f"H3 standalone voice recordings require buckets: true "
                 f"(dataset {self.dataset_path})"
             )
+        validate_audio_only_caption_dropout(
+            self.dataset_config, has_audio_only=has_audio_only
+        )
 
         # handle x axis flips
         if self.dataset_config.flip_x:
