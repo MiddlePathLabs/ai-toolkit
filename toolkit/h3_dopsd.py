@@ -189,24 +189,6 @@ def group_key(item: Any, group_by: str = "folder") -> str:
 
 
 
-def rotation_partners(keys: Sequence[str], k: int) -> dict[str, list[str]]:
-    """Item i references i+1..i+K (mod N). Self-excluding by construction."""
-    n = len(keys)
-    if n < 2:
-        raise ValueError(
-            "other-photo D-OPSD needs at least 2 photos in a subject group; "
-            f"got {n}"
-        )
-    kk = min(int(k), n - 1)
-    if kk < 1:
-        raise ValueError("dopsd_ref_count must be >= 1")
-    out: dict[str, list[str]] = {}
-    for i, key in enumerate(keys):
-        out[key] = [keys[(i + 1 + slot) % n] for slot in range(kk)]
-        if key in out[key]:
-            raise RuntimeError(f"other-photo pairing included self for {key}")
-    return out
-
 
 def pick_slot(item_path: str, epoch: int, seed: int, k: int) -> int:
     """Deterministic slot in 0..k-1 from item + epoch + seed."""
@@ -222,21 +204,6 @@ def unweighted_errors(teacher_mean: float, photo_mean: Optional[float]) -> dict[
     photo = 0.0 if photo_mean is None else float(photo_mean)
     return {"teacher": float(teacher_mean), "photo": photo}
 
-
-def format_dopsd_error_log(
-    teacher_err: float, photo_err: float, teacher_weight: float
-) -> str:
-    w = float(teacher_weight)
-    photo_w = 1.0 - w
-    wt, wp = w * float(teacher_err), photo_w * float(photo_err)
-    tot = wt + wp
-    share = (100.0 * wp / tot) if tot else 0.0
-    return (
-        f"[dopsd] teacher err {teacher_err:.4f} x{w:.2f} = {wt:.4f} | "
-        f"photo err {photo_err:.4f} x{photo_w:.2f} = {wp:.4f} | "
-        f"real pixels are {share:.0f}% of this step's loss "
-        f"(the weight alone says {100.0 * photo_w:.0f}%)"
-    )
 
 
 def assign_other_photo_pairs(items: Sequence[Any], settings: DopsdSettings) -> None:

@@ -10,13 +10,11 @@ from toolkit.h3_dopsd import (
     IDENTITY_FIRST_LR_SCALE,
     assign_other_photo_pairs,
     dopsd_teacher_wanted,
-    format_dopsd_error_log,
     identity_first_step_scale,
     identity_first_teacher_active,
     parse_dopsd_settings,
     pick_slot,
     resolve_identity_first_steps,
-    rotation_partners,
     source_path,
     unweighted_errors,
     validate_dopsd,
@@ -78,19 +76,6 @@ def test_invalid_ref_mode_fails_closed():
     with pytest.raises(ValueError, match="self' or 'other"):
         parse_dopsd_settings(_model_config(dopsd=True, dopsd_ref_mode="teacher"))
 
-
-def test_rotation_never_includes_self():
-    keys = ["a.jpg", "b.jpg", "c.jpg"]
-    partners = rotation_partners(keys, 2)
-    for key, refs in partners.items():
-        assert key not in refs
-        assert len(refs) == 2
-        assert len(set(refs)) == 2
-
-
-def test_rotation_singleton_fails():
-    with pytest.raises(ValueError, match="at least 2 photos"):
-        rotation_partners(["only.jpg"], 1)
 
 
 def test_folders_never_cross_subjects():
@@ -210,9 +195,6 @@ def test_unweighted_errors_are_raw():
     parts = unweighted_errors(0.08, 0.20)
     assert parts["teacher"] == pytest.approx(0.08)
     assert parts["photo"] == pytest.approx(0.20)
-    text = format_dopsd_error_log(0.08, 0.20, teacher_weight=0.8)
-    assert "teacher err 0.0800" in text
-    assert "photo err 0.2000" in text
 
 
 def test_other_photo_rejects_batch_size_over_one():
