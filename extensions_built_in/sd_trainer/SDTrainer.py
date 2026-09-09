@@ -4645,6 +4645,10 @@ class SDTrainer(BaseSDTrainProcess):
             opened_step_window = False
             try:
                 opened_step_window = self._open_optimizer_runtime_window(phase="step")
+                # Mask must already have nulled inactive grads. clip_grad_norm_
+                # skips p.grad is None, so the norm is the active subset. Clip
+                # before the mask and the full-set norm silently mis-scales
+                # the active gradients.
                 # fix this for multi params
                 if self.train_config.optimizer != 'adafactor':
                     if isinstance(self.params[0], dict):

@@ -400,6 +400,53 @@ def test_adam_mask_leaves_inactive_bit_identical_and_stateless():
     assert inactive.weight not in opt.state or len(opt.state[inactive.weight]) == 0
 
 
+
+def test_rose_mask_leaves_inactive_bit_identical():
+    """Rose is stateless — no optimizer state to assert, only the weight bits."""
+    torch.manual_seed(0)
+    active = torch.nn.Linear(4, 4, bias=False)
+    inactive = torch.nn.Linear(4, 4, bias=False)
+    opt = get_optimizer(
+        list(active.parameters()) + list(inactive.parameters()),
+        "rose",
+        1e-2,
+        {"bf16_sr": False, "compute_dtype": "fp32"},
+    )
+    adapter = OptimizerRuntimeAdapter.inspect(opt, optimizer_type="rose")
+    x = torch.randn(3, 4)
+    y = torch.randn(3, 4)
+    opt.zero_grad(set_to_none=True)
+    ((active(x) + inactive(x) - y) ** 2).mean().backward()
+    before_active = active.weight.detach().clone()
+    before_inactive = inactive.weight.detach().clone()
+    adapter.begin_window(opt, 1.0, list(active.parameters()))
+    assert inactive.weight.grad is None
+    opt.step()
+    adapter.end_window(opt)
+    assert not torch.equal(active.weight, before_active)
+    assert torch.equal(inactive.weight, before_inactive)
+
+
+def test_clip_norm_matches_active_subset_when_mask_open():
+    torch.manual_seed(0)
+    active = torch.nn.Linear(4, 4, bias=False)
+    inactive = torch.nn.Linear(4, 4, bias=False)
+    params = list(active.parameters()) + list(inactive.parameters())
+    for p in params:
+        p.grad = torch.ones_like(p)
+    opt = torch.optim.Adam(params, lr=1e-3)
+    adapter = OptimizerRuntimeAdapter.inspect(opt)
+    adapter.begin_window(opt, 1.0, list(active.parameters()))
+    max_norm = 0.25
+    ref = torch.nn.Parameter(torch.zeros_like(active.weight))
+    ref.grad = active.weight.grad.detach().clone()
+    ref_norm = torch.nn.utils.clip_grad_norm_([ref], max_norm)
+    total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm)
+    assert float(total_norm) == pytest.approx(float(ref_norm))
+    assert torch.allclose(active.weight.grad, ref.grad)
+    assert inactive.weight.grad is None
+
+
 def _restore_accum_grads(opt):
     for group in opt.param_groups:
         for param in group["params"]:

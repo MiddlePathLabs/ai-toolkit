@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -370,3 +371,133 @@ def test_prior_prediction_restores_network_on_success():
     assert tuple(out.shape) == (1, 4, 8, 8)
     assert trainer.network.is_active is True
     assert trainer.sd.unet.training is True
+
+
+def test_prior_prediction_restores_adapter_after_oom():
+    from toolkit.ip_adapter import IPAdapter
+
+    trainer = _prior_trainer()
+    adapter = IPAdapter.__new__(IPAdapter)
+    adapter.is_active = True
+    trainer.adapter = adapter
+    trainer.sd.is_flux = True
+    seen = []
+
+    def _predict_noise(**kwargs):
+        seen.append(adapter.is_active)
+        raise torch.cuda.OutOfMemoryError("cuda OOM")
+
+    trainer.sd.predict_noise = _predict_noise
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        _call_prior(trainer)
+    assert seen == [False]
+    assert adapter.is_active is True
+    assert trainer.network.is_active is True
+
+
+class _NullTimer:
+    def start(self, *args, **kwargs):
+        return None
+
+    def stop(self, *args, **kwargs):
+        return None
+
+    def __call__(self, name):
+        return nullcontext()
+
+
+def test_dopsd_teacher_and_student_see_same_noise_and_timesteps():
+    from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+    from toolkit.prompt_utils import PromptEmbeds
+
+    noisy = torch.zeros(1, 4, 8, 8)
+    noise = torch.zeros_like(noisy)
+    timesteps = torch.zeros(1)
+    embeds = PromptEmbeds(torch.zeros(1, 4, 8))
+    control_sentinel = object()
+    prior_kw = {}
+    student_kw = {}
+
+    def capture_prior(**kwargs):
+        prior_kw.update(kwargs)
+        return torch.zeros_like(noisy)
+
+    def capture_student(**kwargs):
+        student_kw.update(kwargs)
+        return torch.zeros_like(noisy)
+
+    class _Enc:
+        dtype = torch.float32
+
+        def to(self, *args, **kwargs):
+            return self
+
+    class _Vae:
+        dtype = torch.float32
+
+    trainer = SDTrainer.__new__(SDTrainer)
+    trainer.timer = _NullTimer()
+    trainer.adapter = None
+    trainer.assistant_adapter = None
+    trainer.embedding = None
+    trainer.decorator = None
+    trainer.network = None
+    trainer.optimizer_runtime = None
+    trainer.adapter_config = None
+    trainer.do_prior_prediction = True
+    trainer.do_guided_loss = False
+    trainer.do_long_prompts = False
+    trainer.is_caching_text_embeddings = True
+    trainer.device_torch = torch.device("cpu")
+    trainer.step_num = 0
+    trainer.train_config = TrainConfig(dtype="fp32")
+    trainer.sd = SimpleNamespace(
+        vae=_Vae(),
+        vae_torch_dtype=torch.float32,
+        text_encoder=_Enc(),
+        te_torch_dtype=torch.float32,
+        encode_control_in_text_embeddings=False,
+        is_xl=False,
+        do_masked_loss=False,
+        device_torch=torch.device("cpu"),
+        torch_dtype=torch.float32,
+        dopsd_settings=parse_dopsd_settings(_model_config(dopsd=True)),
+        condition_noisy_latents=lambda latents, batch: latents,
+    )
+    trainer.process_general_training_batch = lambda batch: (
+        noisy, noise, timesteps, ["caption"], None
+    )
+    trainer.get_prior_prediction = capture_prior
+    trainer.predict_noise = capture_student
+    trainer.calculate_loss = lambda **kwargs: torch.tensor(1.0, requires_grad=True)
+    trainer.after_unet_predict = lambda: None
+    trainer._record_adaptive_lr_members = lambda batch: None
+    trainer.accelerator = SimpleNamespace(backward=lambda loss: None)
+
+    batch = SimpleNamespace(
+        file_items=[SimpleNamespace(is_reg=False, prior_reg=False)],
+        control_tensor=None,
+        clip_image_tensor=None,
+        clip_image_embeds=None,
+        mask_tensor=None,
+        extra_values=None,
+        unconditional_latents=None,
+        prompt_embeds=embeds,
+        dopsd_prompt_embeds=embeds,
+        dopsd_teacher_pass=False,
+        control_tensor_list=control_sentinel,
+        latents=noisy,
+    )
+    batch.get_network_weight_list = lambda: [1.0]
+
+    pre_embeds = batch.dopsd_prompt_embeds
+    pre_control = batch.control_tensor_list
+    trainer.train_single_accumulation(batch)
+
+    assert prior_kw["noisy_latents"] is noisy
+    assert prior_kw["timesteps"] is timesteps
+    assert student_kw["noisy_latents"] is noisy
+    assert student_kw["timesteps"] is timesteps
+    assert batch.dopsd_teacher_pass is False
+    assert batch.dopsd_prompt_embeds is pre_embeds
+    assert batch.control_tensor_list is pre_control

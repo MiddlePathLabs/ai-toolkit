@@ -454,6 +454,37 @@ def test_gradient_checkpointing_finite_outputs_and_grads():
     assert all(torch.isfinite(g).all() for g in grads)
 
 
+def test_gradient_checkpointing_matches_eager_outputs_and_grads():
+    torch.manual_seed(0)
+    dit_eager = _tiny_dit()
+    dit_ckpt = _tiny_dit()
+    dit_ckpt.load_state_dict(dit_eager.state_dict())
+    dit_ckpt.enable_gradient_checkpointing(True)
+    dit_eager._tread = (0.5, TREAD_START, TREAD_END)
+    dit_ckpt._tread = (0.5, TREAD_START, TREAD_END)
+    dit_eager._tread_generator = torch.Generator().manual_seed(11)
+    dit_ckpt._tread_generator = torch.Generator().manual_seed(11)
+    pack, _ = _pack(t_lat=2)
+    pack_e = _enable_grads(_clone_pack(pack))
+    pack_c = _enable_grads(_clone_pack(pack))
+
+    with torch.enable_grad():
+        ve, ae = dit_eager(**pack_e)
+        loss_e = ve.float().pow(2).mean() + ae.float().pow(2).mean()
+        loss_e.backward()
+        vc, ac = dit_ckpt(**pack_c)
+        loss_c = vc.float().pow(2).mean() + ac.float().pow(2).mean()
+        loss_c.backward()
+
+    assert torch.equal(ve, vc)
+    assert torch.equal(ae, ac)
+    eager_grads = {n: p.grad for n, p in dit_eager.named_parameters() if p.grad is not None}
+    ckpt_grads = {n: p.grad for n, p in dit_ckpt.named_parameters() if p.grad is not None}
+    assert eager_grads.keys() == ckpt_grads.keys()
+    for name in eager_grads:
+        assert torch.equal(eager_grads[name], ckpt_grads[name]), name
+
+
 def _trainable_one(dit: MiniMaxH3Transformer) -> nn.Parameter:
     for p in dit.parameters():
         p.requires_grad_(False)
