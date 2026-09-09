@@ -34,6 +34,11 @@ EGRID_DTYPE = torch.bfloat16
 EGRID_SHA256 = "30eb3c2cc7fb6b470d9717ff840d359313ac27cd64b705e32da1baa10f72d6a8"
 FULL_MODEL_TEMB_WIDTH = 2688
 
+# Snap is expected: base `_time_embedding` lerps adjacent `adaln_t_table` rows.
+# Fail closed when the nearest-row L2 exceeds one grid cell (half the largest
+# adjacent-row distance × margin). Loosen only with evidence.
+ADALN_MATCH_CELL_MARGIN = 1.25
+
 _DOWN_SUFFIXES = (".lora_down.weight", ".lora_A.weight")
 _UP_SUFFIXES = (".lora_up.weight", ".lora_B.weight")
 
@@ -220,9 +225,22 @@ def _adaln_forward(base: MiniMaxH3AdalnProj, updates: Sequence[Tuple[torch.Tenso
         if bias is not None:
             bias = bias.to(device=temb.device, dtype=torch.float32)
         x = F.linear(temb_in.float(), weight, bias)
-        idx = torch.cdist(
-            temb.detach().float(), table.to(device=temb.device, dtype=torch.float32)
-        ).argmin(dim=1)
+        table_f = table.to(device=temb.device, dtype=torch.float32)
+        dist = torch.cdist(temb.detach().float(), table_f)
+        idx = dist.argmin(dim=1)
+        if not getattr(base, "_adaln_egrid_checked", False):
+            worst = dist.gather(1, idx[:, None]).max().item()
+            if table_f.shape[0] >= 2:
+                half_cell = 0.5 * (table_f[1:] - table_f[:-1]).norm(dim=-1).max().item()
+            else:
+                half_cell = 0.0
+            tol = max(half_cell * ADALN_MATCH_CELL_MARGIN, 1e-5)
+            if worst > tol:
+                raise ValueError(
+                    f"H3 Turbo e-grid: timestep embedding is {worst:.4g} from the nearest "
+                    f"adaln_t_table row (tol {tol:.4g}) — schedule does not match the grid."
+                )
+            base._adaln_egrid_checked = True
         standin = egrid.to(device=temb.device, dtype=x.dtype)[idx]
         for down, up in updates:
             a = down.to(device=x.device, dtype=x.dtype)
@@ -275,6 +293,8 @@ def unpatch_adaln(modules: Iterable[MiniMaxH3AdalnProj]) -> None:
     for mod in modules:
         if "forward" in mod.__dict__:
             del mod.forward
+        if hasattr(mod, "_adaln_egrid_checked"):
+            delattr(mod, "_adaln_egrid_checked")
 
 
 @dataclass

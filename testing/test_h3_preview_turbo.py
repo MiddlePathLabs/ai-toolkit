@@ -131,6 +131,7 @@ def test_adaln_updates_on_same_module_add_not_replace():
     egrid = torch.zeros(4, FULL_MODEL_TEMB_WIDTH)
     egrid[0] = 1.0
     dit.adaln_t_table.zero_()
+    temb.zero_()
     rank = 1
     down = torch.ones(rank, FULL_MODEL_TEMB_WIDTH)
     up_a = torch.ones(proj.linear.out_features, rank)
@@ -235,6 +236,35 @@ def test_row_count_mismatch_fails_closed():
     egrid = torch.randn(4, FULL_MODEL_TEMB_WIDTH)
     with pytest.raises(ValueError, match="e-grid rows"):
         patch_adaln(dit, [(proj, down, up)], "cpu", torch.float32, egrid)
+
+
+def _patch_adaln_one(dit):
+    proj = dit.adaln_proj
+    down, up = _pair(FULL_MODEL_TEMB_WIDTH, proj.linear.out_features)
+    egrid = torch.randn(dit.adaln_t_table.shape[0], FULL_MODEL_TEMB_WIDTH)
+    patched = patch_adaln(dit, [(proj, down, up)], "cpu", torch.float32, egrid)
+    return proj, patched
+
+
+def test_adaln_interpolated_temb_is_within_grid_cell():
+    torch.manual_seed(0)
+    dit = PreviewTurboDit(table_rows=4)
+    proj, patched = _patch_adaln_one(dit)
+    temb = 0.5 * (dit.adaln_t_table[0] + dit.adaln_t_table[1]).unsqueeze(0)
+    proj(temb)
+    unpatch_adaln(patched)
+    assert not hasattr(dit.adaln_proj, "_adaln_egrid_checked")
+
+
+def test_adaln_far_temb_fails_closed():
+    torch.manual_seed(0)
+    dit = PreviewTurboDit(table_rows=4)
+    proj, patched = _patch_adaln_one(dit)
+    temb = dit.adaln_t_table[:1].clone() + 50.0
+    with pytest.raises(ValueError, match="does not match the grid"):
+        proj(temb)
+    unpatch_adaln(patched)
+
 
 def test_load_preview_turbo_inactive_until_activate(tmp_path):
     dit = PreviewTurboDit()
