@@ -242,7 +242,7 @@ class MiniMaxH3Pipeline:
                 video_indices=video_indices,
                 audio_indices=audio_indices,
                 text_indices=text_indices,
-                # target-video token grid (patch 1x2x2); consumed only by VSA models
+                # target-video token grid (patch 1x2x2); VSA tiling and TREAD still/clip routing
                 vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
             )
             v_video = video_pred[:, num_cond:].float()

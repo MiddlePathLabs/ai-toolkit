@@ -48,6 +48,7 @@ from toolkit.optimizer_runtime import (
     uses_adaptive_lr_step_scale,
 )
 from toolkit.h3_modality_routing import bind_modality_router
+from toolkit.h3_tread import bind_tread
 
 
 
@@ -2325,6 +2326,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"mask={self.optimizer_runtime.mask_strategy} "
                 f"update_phase={self.optimizer_runtime.update_phase}"
             )
+        bind_tread(self.train_config, self.sd)
+
 
 
         

@@ -55,6 +55,15 @@ Default-off. Fail-closed at startup when the optimizer cannot honor the requeste
 - **MiniMax-H3 Turbo preview LoRA** — `model.preview_lora_path` (default off) and `model.preview_lora_strength` (default `1.0`). Sampling-only; never trained or saved. Path is a local file, a filename under `models/loras`, or `user/repo/file.safetensors`. H3-only (`model.arch: minimax_h3`). Mutually exclusive with `model.inference_lora_path`.
 - **H3 modality block routing** — `train.modality_block_routing` with optional `photo_blocks`, `clip_blocks`, `voice_blocks`. Default off; a blank/omitted key leaves that modality unrestricted. Spec is a range list such as `"3-12, 14-15, 22,27,31-33"`, parsed against `len(transformer.blocks)`. H3 LoRA/LoKr only. Requires an optimizer that `supports_active_param_mask` (Automagic3 is rejected). Mixed-modality windows use the union of those blocks; refiners and non-trunk adapters stay active.
 - **H3 standalone voice recordings** — on MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
+- **H3 TREAD token routing** — training-only clip-step token skip (Krause et al., [arXiv 2501.04765](https://arxiv.org/abs/2501.04765)). H3-only (`model.arch: minimax_h3*`; VSA / `gate_compress` is rejected at bind). Default off. Clip steps with batch size 1 and more than one latent video frame skip a random `tread_ratio` of *target* video tokens around blocks `[tread_start, tread_end)` and keep `1 - tread_ratio`; skipped rows rejoin in their start-block state. Text, condition, and audio rows stay. Stills, inference, and `batch_size != 1` never route. Bind rejects a post-rejoin tail shorter than 3 blocks (`tread_end` 47 on a 50-block trunk is the Fizgig prior). No UI until a config-file experiment passes the speed gate.
+
+```yaml
+train:
+  tread_ratio: 0.0   # 0.0 = off. (0, 1) enables. 0.5 skips half the target video tokens
+  tread_start: 2     # first routed block (inclusive)
+  tread_end: 47      # rejoin block (exclusive); 50-block trunk leaves blocks 47-49
+```
+
 
 ## Supported Models
 

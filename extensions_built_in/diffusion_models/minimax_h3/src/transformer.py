@@ -31,6 +31,12 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+from toolkit.h3_tread import (
+    gather_tread_state,
+    plan_tread_keep_idx,
+    scatter_tread_hidden,
+)
+
 
 import torch
 import torch.nn.functional as F
@@ -567,7 +573,39 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 )
             )
 
-        for block in self.blocks:
+        keep_idx = None
+        route_start = route_end = -1
+        tread = getattr(self, "_tread", None) if torch.is_grad_enabled() else None
+        if tread is not None:
+            if vsa_ctx is not None:
+                raise ValueError(
+                    "TREAD token routing cannot run with a VSA attention "
+                    "context. Disable TREAD or use a dense H3 checkpoint."
+                )
+            ratio, route_start, route_end = (
+                float(tread[0]),
+                int(tread[1]),
+                int(tread[2]),
+            )
+            keep_idx = plan_tread_keep_idx(
+                seq_len=seq_len,
+                batch_size=batch_size,
+                video_indices=video_indices,
+                target_video_grid=vsa_video_grid,
+                ratio=ratio,
+                start=route_start,
+                end=route_end,
+                n_blocks=len(self.blocks),
+                device=x.device,
+            )
+
+        full_state = None
+        for i, block in enumerate(self.blocks):
+            if keep_idx is not None and i == route_start:
+                full_state = (x, rotary_emb, adaln_indices, attn_mask)
+                x, rotary_emb, adaln_indices, attn_mask = gather_tread_state(
+                    x, rotary_emb, adaln_indices, attn_mask, keep_idx
+                )
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = checkpoint(
                     block,
@@ -581,6 +619,11 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 )
             else:
                 x = block(x, temb, adaln_indices, rotary_emb, attn_mask, vsa_ctx)
+            if keep_idx is not None and i + 1 == route_end:
+                x = scatter_tread_hidden(x, full_state[0], keep_idx)
+                rotary_emb, adaln_indices, attn_mask = full_state[1:]
+                full_state = None
+
 
         video_all, audio_all = self.final_layer(x, temb, inverse)
         video_out = video_all.index_select(1, video_indices)

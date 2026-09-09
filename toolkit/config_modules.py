@@ -634,6 +634,44 @@ class TrainConfig:
             self.modality_block_routing = routing_raw
         else:
             self.modality_block_routing = ModalityBlockRoutingConfig(**routing_raw)
+        # H3 TREAD token routing. 0.0 = off (current path). Fizgig priors
+        # 0.5 / 2 / 47 are experiment values, not universal defaults.
+        self.tread_ratio = float(kwargs.get("tread_ratio", 0.0) or 0.0)
+        if self.tread_ratio != self.tread_ratio or abs(self.tread_ratio) == float("inf"):
+            raise ValueError(
+                f"tread_ratio must be a finite number, got {self.tread_ratio}"
+            )
+        if self.tread_ratio < 0.0 or self.tread_ratio >= 1.0:
+            raise ValueError(
+                f"tread_ratio must be in [0, 1), got {self.tread_ratio}"
+            )
+        def _tread_block_index(name: str, default: int) -> int:
+            raw = kwargs.get(name, default)
+            if raw is None:
+                raise ValueError(f"{name} must be an integer, got None")
+            if isinstance(raw, bool):
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+            if isinstance(raw, float) and float(value) != float(raw):
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+            return value
+
+        self.tread_start = _tread_block_index("tread_start", 2)
+        self.tread_end = _tread_block_index("tread_end", 47)
+        if self.tread_ratio > 0.0:
+            if self.tread_start < 0:
+                raise ValueError(
+                    f"tread_start must be >= 0, got {self.tread_start}"
+                )
+            if not (self.tread_start < self.tread_end):
+                raise ValueError(
+                    f"tread_start must be < tread_end, got "
+                    f"[{self.tread_start}, {self.tread_end})"
+                )
+
 
 
         

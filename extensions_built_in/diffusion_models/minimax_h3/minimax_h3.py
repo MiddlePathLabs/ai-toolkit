@@ -985,7 +985,7 @@ class MinimaxH3Model(BaseModel):
             video_indices=video_indices.to(device),
             audio_indices=audio_indices.to(device),
             text_indices=text_indices.to(device),
-            # target-video token grid (patch 1x2x2); consumed only by VSA models
+            # target-video token grid (patch 1x2x2); VSA tiling and TREAD still/clip routing
             vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
         )
 
