@@ -215,10 +215,15 @@ def assign_other_photo_pairs(items: Sequence[Any], settings: DopsdSettings) -> N
     for item in photos:
         groups.setdefault(group_key(item, settings.group_by), []).append(item)
     if not groups:
-        raise ValueError(
-            "dopsd_ref_mode='other' needs at least 2 photos in one folder; "
-            "this dataset has none. Clips and voice sit out of pairing."
+        # a dataset with NO photos (voice-only / clips-only) sits out of pairing
+        # by design — skip it instead of failing mixed stills+voice jobs. The
+        # job-wide no-photos-anywhere case still fails closed later, at
+        # load_chosen_other_photo ("item has no partners") on the first photo.
+        print_acc(
+            "[dopsd] other-photo: no photos in this dataset — pairing skipped "
+            "(voice/clips sit out)"
         )
+        return
     for folder, group in groups.items():
         unique_sources = {source_path(item) for item in group}
         if len(unique_sources) < 2:
@@ -429,15 +434,34 @@ def apply_settings_to_model(model: Any, settings: DopsdSettings) -> None:
 
 def save_other_photo_teacher_cache(path: str, prompt_embeds: Any, ref_tensor) -> None:
     """Teacher embeds plus the other photo's pixels (0-1). Extra key is ignored by PromptEmbeds.load."""
+    from safetensors import safe_open
     from safetensors.torch import load_file, save_file
 
     prompt_embeds.save(path)
+    # preserve class metadata so PromptEmbeds.load keeps dispatching to the
+    # right subclass (the raw re-save below would otherwise strip it)
+    with safe_open(path, framework="pt") as f:
+        meta = f.metadata()
     state = dict(load_file(path))
     state["dopsd_ref_tensor"] = ref_tensor.detach().float().cpu().contiguous()
-    save_file(state, path)
+    save_file(state, path, metadata=meta)
 
 
 def _prompt_embeds_from_state(state: dict) -> Any:
+    if "text_embeds" in state:
+        # H3 caches are AdvancedPromptEmbeds: tensors live under 'text_embeds'
+        # (plural) with parallel 'text_token_tags' — the generic PromptEmbeds
+        # roundtrip keys (text_embed / text_embed_{i}) never appear here, and
+        # token tags must survive (the packed layout consumes them).
+        from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
+
+        pe = AdvancedPromptEmbeds(
+            text_embeds=state["text_embeds"],
+            text_token_tags=state["text_token_tags"],
+        )
+        pe.frozen_dtype_keys = ["text_token_tags"]
+        return pe
+
     from toolkit.prompt_utils import PromptEmbeds
 
     text_embeds = []
