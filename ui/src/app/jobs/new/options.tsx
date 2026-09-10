@@ -750,6 +750,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.cache_text_embeddings': [true, false],
       'config.process[0].train.do_guidance_loss': [true, undefined],
       'config.process[0].train.guidance_loss_target': [3.5, undefined],
+      'config.process[0].train.guidance_loss_sigma_min': [0.15, undefined],
       'config.process[0].model.assistant_lora_path': [
         'ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors',
         undefined,
@@ -817,9 +818,13 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+            if (config?.config?.process?.[0]?.train?.guidance_loss_sigma_min == null) {
+              setJobConfig(0.15, 'config.process[0].train.guidance_loss_sigma_min');
+            }
           } else if (value === 'ta') {
             setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
             setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_sigma_min');
             setJobConfig(
               'ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors',
               'config.process[0].model.assistant_lora_path',
@@ -833,11 +838,16 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+            if (config?.config?.process?.[0]?.train?.guidance_loss_sigma_min == null) {
+              setJobConfig(0.15, 'config.process[0].train.guidance_loss_sigma_min');
+            }
           } else if (value === 'none') {
             setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
             setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_sigma_min');
             setJobConfig(undefined, 'config.process[0].model.assistant_lora_path');
           }
+
         },
         doc: {
           title: 'MiniMax-H3 Distillation Handling',
@@ -907,6 +917,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.cache_text_embeddings': [true, false],
       'config.process[0].train.do_guidance_loss': [true, undefined],
       'config.process[0].train.guidance_loss_target': [3.5, undefined],
+      'config.process[0].train.guidance_loss_sigma_min': [0.15, undefined],
       'config.process[0].model.assistant_lora_path': [
         'ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v1.safetensors',
         undefined,
@@ -986,9 +997,13 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+            if (config?.config?.process?.[0]?.train?.guidance_loss_sigma_min == null) {
+              setJobConfig(0.15, 'config.process[0].train.guidance_loss_sigma_min');
+            }
           } else if (value === 'ta') {
             setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
             setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_sigma_min');
             setJobConfig(
               'ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v1.safetensors',
               'config.process[0].model.assistant_lora_path',
@@ -1002,11 +1017,16 @@ export const modelArchs: ModelArch[] = [
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
               setJobConfig(3.5, 'config.process[0].train.guidance_loss_target');
             }
+            if (config?.config?.process?.[0]?.train?.guidance_loss_sigma_min == null) {
+              setJobConfig(0.15, 'config.process[0].train.guidance_loss_sigma_min');
+            }
           } else if (value === 'dopsd' || value === 'none') {
             setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
             setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+            setJobConfig(undefined, 'config.process[0].train.guidance_loss_sigma_min');
             setJobConfig(undefined, 'config.process[0].model.assistant_lora_path');
           }
+
         },
         doc: {
           title: 'MiniMax-H3 Distillation Handling',

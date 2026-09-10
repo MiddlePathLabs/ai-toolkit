@@ -1003,6 +1003,7 @@ export default function SimpleJob({
                         } else {
                           setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
                           setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+                          setJobConfig(undefined, 'config.process[0].train.guidance_loss_sigma_min');
                         }
                       }}
                     />
@@ -1016,6 +1017,19 @@ export default function SimpleJob({
                           placeholder="eg. 3.0"
                           min={0}
                         />
+                        <NumberInput
+                          label="Guidance Loss Sigma Min"
+                          className="pt-2"
+                          docKey={'train.guidance_loss_sigma_min'}
+                          value={jobConfig.config.process[0].train.guidance_loss_sigma_min ?? 0}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].train.guidance_loss_sigma_min')
+                          }
+                          placeholder="eg. 0.15"
+                          min={0}
+                          max={1}
+                        />
+
                       </>
                     )}
                   </>

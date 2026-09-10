@@ -320,7 +320,9 @@ export interface TrainConfig {
   validation_config?: ValidationConfig;
   do_guidance_loss?: boolean;
   guidance_loss_target?: number;
+  guidance_loss_sigma_min?: number;
 }
+
 
 export interface QuantizeKwargsConfig {
   exclude: string[];

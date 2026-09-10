@@ -887,6 +887,19 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.guidance_loss_sigma_min': {
+    title: 'Guidance Loss Sigma Min',
+    description: (
+      <>
+        Skip the contrastive guidance-loss correction (and its extra unconditional forward) on
+        steps whose pre-shift base sigma (<code>timesteps / 1000</code>, where 1 is pure noise) is
+        below this threshold. Default 0 always applies. For MiniMax-H3, 0.15 skips the clean end of
+        the draw where per-sample label noise dominates the guidance gap — cheaper steps, and the
+        audio stream benefits most. This is <em>not</em> a high-noise skip.
+      </>
+    ),
+  },
+
   'datasets.caption_dropout_rate': {
     title: 'Caption Dropout Rate',
     description: (

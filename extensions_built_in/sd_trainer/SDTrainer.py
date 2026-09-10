@@ -2401,6 +2401,79 @@ class SDTrainer(BaseSDTrainProcess):
 
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
+    def _log_guidance_sigma_gate(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Per-sample gate. Logs batch-mean base_sigma and applied fraction.
+
+        Base sigma = timesteps/1000 (pre-shift, 1 = pure noise). The gate skips
+        the clean end of the draw (label-noisy steps), not high-noise timesteps.
+        Returns a (B,) bool tensor; run the uncond probe when gate.any().
+        """
+        base_sigma = timesteps.flatten().float() / 1000.0
+        gate = base_sigma >= float(self.train_config.guidance_loss_sigma_min)
+        self.additional_logs['guidance/base_sigma'] = float(base_sigma.mean().item())
+        self.additional_logs['guidance/applied'] = float(gate.float().mean().item())
+        return gate
+
+    @staticmethod
+    def _sample_gate_view(gate: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return gate.to(device=ref.device).view(-1, *([1] * (ref.dim() - 1)))
+
+    @staticmethod
+    def _blend_sigma_gate(gate: torch.Tensor, corrected: torch.Tensor, plain: torch.Tensor) -> torch.Tensor:
+        """Keep corrected on gated samples, plain elsewhere. No-op when gate.all()."""
+        if bool(gate.all().item()):
+            return corrected
+        return torch.where(
+            SDTrainer._sample_gate_view(gate, corrected),
+            corrected,
+            plain.to(device=corrected.device, dtype=corrected.dtype),
+        )
+
+    @staticmethod
+    def _prediction_geometry_log(label: str, prediction: torch.Tensor, target: torch.Tensor):
+        """Student-prediction vs target geometry. Keys stay teacher/{label}_* (musubi).
+
+        On the D-OPSD path `target` is the frozen teacher prediction (noiseless
+        regression label). If guidance loss also re-anchored `target` this step
+        (unsupported combo), the reading guide does not apply.
+
+        Reading guide: norm_ratio drifting above ~1.05 = early amplification/burn
+        warning; a shrinking gap that is mostly residual_dc_rms means the model is
+        learning the dataset palette, not content; at the MSE optimum per-sigma-bin
+        cos and norm_ratio converge to a common value — their gap is remaining
+        training distance.
+        """
+        student = prediction.detach()
+        reference = target.detach()
+        student_flat = student.reshape(-1)
+        reference_flat = reference.reshape(-1)
+        student_norm = student_flat.norm()
+        reference_norm = reference_flat.norm()
+        cos = torch.dot(student_flat, reference_flat) / (student_norm * reference_norm + 1e-12)
+        norm_ratio = student_norm / (reference_norm + 1e-12)
+        residual = student - reference
+        dc_dims = tuple(range(2, residual.ndim))
+        residual_dc = residual.mean(dim=dc_dims, keepdim=True) if dc_dims else residual.mean()
+        # mean(ac^2) = mean(r^2) - mean(dc^2); do not materialize residual_ac.
+        n = residual.numel()
+        r2_mean = torch.dot(residual.reshape(-1), residual.reshape(-1)) / n
+        dc2_mean = residual_dc.square().mean()
+        packed = torch.stack((
+            cos.reshape(()),
+            norm_ratio.reshape(()),
+            dc2_mean.sqrt().reshape(()),
+            (r2_mean - dc2_mean).clamp(min=0).sqrt().reshape(()),
+        )).float().cpu()
+        cos_v, nr_v, dc_v, ac_v = packed.tolist()
+        return {
+            f"teacher/{label}_cos": cos_v,
+            f"teacher/{label}_norm_ratio": nr_v,
+            f"teacher/{label}_residual_dc_rms": dc_v,
+            f"teacher/{label}_residual_ac_rms": ac_v,
+        }
+
+
+
     def _loss_for_audio_only_batch(
             self,
             audio_pred,
@@ -2413,50 +2486,61 @@ class SDTrainer(BaseSDTrainProcess):
     ):
         """Joint forward already ran. Omit video MSE; do not multiply it by zero."""
         if self.train_config.do_guidance_loss and audio_target is not None:
-            with torch.no_grad():
-                unconditional_embeds = concat_prompt_embeds(
-                    [self.unconditional_embeds] * noisy_latents.shape[0],
-                )
-                unconditional_target = self.predict_noise(
-                    noisy_latents=noisy_latents,
-                    timesteps=timesteps,
-                    conditional_embeds=unconditional_embeds,
-                    unconditional_embeds=None,
-                    batch=batch,
-                )
-                audio_uncond = (
-                    unconditional_target.get('audio')
-                    if isinstance(unconditional_target, DTO)
-                    else None
-                )
-                if audio_uncond is not None:
-                    a_dtype = audio_target.dtype
-                    a_target = audio_target.float()
-                    audio_uncond = audio_uncond.float()
-                    audio_dims = [1] * (a_target.dim() - 1)
-                    if self.train_config.do_guidance_loss_cfg_zero:
-                        batch_size = a_target.shape[0]
-                        a_pos_flat = a_target.view(batch_size, -1)
-                        a_neg_flat = audio_uncond.view(batch_size, -1)
-                        a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
-                        a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
-                        audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
-                    audio_guidance_scale = self._guidance_loss_target_batch
-                    if isinstance(audio_guidance_scale, list):
-                        audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
-                            a_target.device, dtype=a_target.dtype
-                        ).view(-1, *audio_dims)
-                    if self.train_config.guidance_loss_schedule == 'sigma':
-                        a_sigma = audio_sigma
-                        if a_sigma is None:
-                            a_sigma = timesteps / 1000.0
-                        a_sigma = a_sigma.to(
-                            a_target.device, dtype=a_target.dtype
-                        ).view(-1, *audio_dims)
-                        audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * a_sigma
-                    audio_target = (
-                        audio_uncond + audio_guidance_scale * (a_target - audio_uncond)
-                    ).to(a_dtype).detach()
+            gate = self._log_guidance_sigma_gate(timesteps)
+            if gate.any():
+                with torch.no_grad():
+                    unconditional_embeds = concat_prompt_embeds(
+                        [self.unconditional_embeds] * noisy_latents.shape[0],
+                    )
+                    unconditional_target = self.predict_noise(
+                        noisy_latents=noisy_latents,
+                        timesteps=timesteps,
+                        conditional_embeds=unconditional_embeds,
+                        unconditional_embeds=None,
+                        batch=batch,
+                    )
+                    audio_uncond = (
+                        unconditional_target.get('audio')
+                        if isinstance(unconditional_target, DTO)
+                        else None
+                    )
+                    if audio_uncond is not None:
+                        plain_audio = audio_target
+                        a_dtype = audio_target.dtype
+                        a_target = audio_target.float()
+                        audio_uncond = audio_uncond.float()
+                        audio_gap = a_target - audio_uncond
+                        self.additional_logs['guidance/audio_gap_rms'] = (
+                            audio_gap[gate.to(device=audio_gap.device)].square().mean().sqrt().item()
+                        )
+                        audio_dims = [1] * (a_target.dim() - 1)
+                        if self.train_config.do_guidance_loss_cfg_zero:
+                            batch_size = a_target.shape[0]
+                            a_pos_flat = a_target.view(batch_size, -1)
+                            a_neg_flat = audio_uncond.view(batch_size, -1)
+                            a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
+                            a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
+                            audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+                        audio_guidance_scale = self._guidance_loss_target_batch
+                        if isinstance(audio_guidance_scale, list):
+                            audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
+                                a_target.device, dtype=a_target.dtype
+                            ).view(-1, *audio_dims)
+                        if self.train_config.guidance_loss_schedule == 'sigma':
+                            a_sigma = audio_sigma
+                            if a_sigma is None:
+                                a_sigma = timesteps / 1000.0
+                            a_sigma = a_sigma.to(
+                                a_target.device, dtype=a_target.dtype
+                            ).view(-1, *audio_dims)
+                            audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * a_sigma
+                        audio_target = self._blend_sigma_gate(
+                            gate,
+                            (audio_uncond + audio_guidance_scale * (a_target - audio_uncond)).to(a_dtype).detach(),
+                            plain_audio,
+                        )
+
+
 
         audio_loss = compute_audio_only_objective(
             audio_pred,
@@ -2769,92 +2853,115 @@ class SDTrainer(BaseSDTrainProcess):
                 raise ValueError(f"Unknown diffusion feature extractor version {self.dfe.version}")
         
         if self.train_config.do_guidance_loss:
-            with torch.no_grad():
-                # we make cached blank prompt embeds that match the batch size
-                unconditional_embeds = concat_prompt_embeds(
-                    [self.unconditional_embeds] * noisy_latents.shape[0],
-                )
-                unconditional_target = self.predict_noise(
-                    noisy_latents=noisy_latents,
-                    timesteps=timesteps,
-                    conditional_embeds=unconditional_embeds,
-                    unconditional_embeds=None,
-                    batch=batch,
-                )
-                # joint audio models: this pass's DTO carries its own audio pred
-                audio_uncond = unconditional_target.get('audio') if isinstance(unconditional_target, DTO) else None
-                is_video = len(target.shape) == 5
-                
-                if self.train_config.do_guidance_loss_cfg_zero:
-                    # zero cfg
-                    # ref https://github.com/WeichenFan/CFG-Zero-star/blob/cdac25559e3f16cb95f0016c04c709ea1ab9452b/wan_pipeline.py#L557
-                    batch_size = target.shape[0]
-                    positive_flat = target.view(batch_size, -1)
-                    negative_flat = unconditional_target.view(batch_size, -1)
-                    # Calculate dot production
-                    dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-                    # Squared norm of uncondition
-                    squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
-                    # st_star = v_cond^T * v_uncond / ||v_uncond||^2
-                    st_star = dot_product / squared_norm
+            gate = self._log_guidance_sigma_gate(timesteps)
+            if gate.any():
+                with torch.no_grad():
+                    # we make cached blank prompt embeds that match the batch size
+                    unconditional_embeds = concat_prompt_embeds(
+                        [self.unconditional_embeds] * noisy_latents.shape[0],
+                    )
+                    unconditional_target = self.predict_noise(
+                        noisy_latents=noisy_latents,
+                        timesteps=timesteps,
+                        conditional_embeds=unconditional_embeds,
+                        unconditional_embeds=None,
+                        batch=batch,
+                    )
+                    # joint audio models: this pass's DTO carries its own audio pred
+                    audio_uncond = unconditional_target.get('audio') if isinstance(unconditional_target, DTO) else None
+                    is_video = len(target.shape) == 5
+                    plain_target = target
+                    gate_dev = gate.to(device=target.device)
 
-                    alpha = st_star
-                    
-                    alpha = alpha.view(batch_size, 1, 1, 1) if not is_video else alpha.view(batch_size, 1, 1, 1, 1)
-                else:
-                    alpha = 1.0
+                    video_gap = target.float() - unconditional_target.float()
+                    self.additional_logs['guidance/video_gap_rms'] = (
+                        video_gap[gate_dev].square().mean().sqrt().item()
+                    )
+                    if audio_target is not None and audio_uncond is not None:
+                        audio_gap = audio_target.float() - audio_uncond.float()
+                        self.additional_logs['guidance/audio_gap_rms'] = (
+                            audio_gap[gate_dev].square().mean().sqrt().item()
+                        )
 
-                guidance_scale = self._guidance_loss_target_batch
-                if isinstance(guidance_scale, list):
-                    guidance_scale = torch.tensor(guidance_scale).to(target.device, dtype=target.dtype)
-                    guidance_scale = guidance_scale.view(-1, 1, 1, 1) if not is_video else guidance_scale.view(-1, 1, 1, 1, 1)
-
-                if self.train_config.guidance_loss_schedule == 'sigma':
-                    # the (target - uncond) sample direction carries s * fresh_noise
-                    # that nothing can predict at low sigma, so decay the
-                    # extrapolation toward a plain flow target as sigma falls
-                    sigma = (timesteps.to(target.device) / 1000.0).to(target.dtype)
-                    sigma = sigma.view(-1, 1, 1, 1) if not is_video else sigma.view(-1, 1, 1, 1, 1)
-                    guidance_scale = 1.0 + (guidance_scale - 1.0) * sigma
-
-                unconditional_target = unconditional_target * alpha
-                target = unconditional_target + guidance_scale * (target - unconditional_target)
-
-                # joint audio models carry their audio pred/target on the pred
-                # DTOs. Extrapolate the audio target the same way so the audio
-                # stream trains contrastively as well.
-                if audio_target is not None and audio_uncond is not None:
-                    a_dtype = audio_target.dtype
-                    a_target = audio_target.float()
-                    audio_uncond = audio_uncond.float()
-                    audio_dims = [1] * (a_target.dim() - 1)
                     if self.train_config.do_guidance_loss_cfg_zero:
-                        batch_size = a_target.shape[0]
-                        a_pos_flat = a_target.view(batch_size, -1)
-                        a_neg_flat = audio_uncond.view(batch_size, -1)
-                        a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
-                        a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
-                        audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+                        # zero cfg
+                        # ref https://github.com/WeichenFan/CFG-Zero-star/blob/cdac25559e3f16cb95f0016c04c709ea1ab9452b/wan_pipeline.py#L557
+                        batch_size = target.shape[0]
+                        positive_flat = target.view(batch_size, -1)
+                        negative_flat = unconditional_target.view(batch_size, -1)
+                        # Calculate dot production
+                        dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+                        # Squared norm of uncondition
+                        squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+                        # st_star = v_cond^T * v_uncond / ||v_uncond||^2
+                        st_star = dot_product / squared_norm
 
-                    audio_guidance_scale = self._guidance_loss_target_batch
-                    if isinstance(audio_guidance_scale, list):
-                        audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
-                            a_target.device, dtype=a_target.dtype
-                        ).view(-1, *audio_dims)
+                        alpha = st_star
+
+                        alpha = alpha.view(batch_size, 1, 1, 1) if not is_video else alpha.view(batch_size, 1, 1, 1, 1)
+                    else:
+                        alpha = 1.0
+
+                    guidance_scale = self._guidance_loss_target_batch
+                    if isinstance(guidance_scale, list):
+                        guidance_scale = torch.tensor(guidance_scale).to(target.device, dtype=target.dtype)
+                        guidance_scale = guidance_scale.view(-1, 1, 1, 1) if not is_video else guidance_scale.view(-1, 1, 1, 1, 1)
 
                     if self.train_config.guidance_loss_schedule == 'sigma':
-                        # audio streams can run on their own remapped sigma
-                        a_sigma = audio_sigma
-                        if a_sigma is None:
-                            a_sigma = timesteps / 1000.0
-                        a_sigma = a_sigma.to(
-                            a_target.device, dtype=a_target.dtype
-                        ).view(-1, *audio_dims)
-                        audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * a_sigma
+                        # the (target - uncond) sample direction carries s * fresh_noise
+                        # that nothing can predict at low sigma, so decay the
+                        # extrapolation toward a plain flow target as sigma falls
+                        sigma = (timesteps.to(target.device) / 1000.0).to(target.dtype)
+                        sigma = sigma.view(-1, 1, 1, 1) if not is_video else sigma.view(-1, 1, 1, 1, 1)
+                        guidance_scale = 1.0 + (guidance_scale - 1.0) * sigma
 
-                    audio_target = (
-                        audio_uncond + audio_guidance_scale * (a_target - audio_uncond)
-                    ).to(a_dtype).detach()
+                    unconditional_target = unconditional_target * alpha
+                    target = self._blend_sigma_gate(
+                        gate,
+                        unconditional_target + guidance_scale * (target - unconditional_target),
+                        plain_target,
+                    )
+
+                    # joint audio models carry their audio pred/target on the pred
+                    # DTOs. Extrapolate the audio target the same way so the audio
+                    # stream trains contrastively as well.
+                    if audio_target is not None and audio_uncond is not None:
+                        plain_audio = audio_target
+                        a_dtype = audio_target.dtype
+                        a_target = audio_target.float()
+                        audio_uncond = audio_uncond.float()
+                        audio_dims = [1] * (a_target.dim() - 1)
+                        if self.train_config.do_guidance_loss_cfg_zero:
+                            batch_size = a_target.shape[0]
+                            a_pos_flat = a_target.view(batch_size, -1)
+                            a_neg_flat = audio_uncond.view(batch_size, -1)
+                            a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
+                            a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
+                            audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+
+                        audio_guidance_scale = self._guidance_loss_target_batch
+                        if isinstance(audio_guidance_scale, list):
+                            audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
+                                a_target.device, dtype=a_target.dtype
+                            ).view(-1, *audio_dims)
+
+                        if self.train_config.guidance_loss_schedule == 'sigma':
+                            # audio streams can run on their own remapped sigma
+                            a_sigma = audio_sigma
+                            if a_sigma is None:
+                                a_sigma = timesteps / 1000.0
+                            a_sigma = a_sigma.to(
+                                a_target.device, dtype=a_target.dtype
+                            ).view(-1, *audio_dims)
+                            audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * a_sigma
+
+                        audio_target = self._blend_sigma_gate(
+                            gate,
+                            (audio_uncond + audio_guidance_scale * (a_target - audio_uncond)).to(a_dtype).detach(),
+                            plain_audio,
+                        )
+
+
 
         if target is None:
             target = noise
@@ -3014,6 +3121,15 @@ class SDTrainer(BaseSDTrainProcess):
             parts = unweighted_errors(teacher_mean, photo_mean)
             self._last_dopsd_teacher_err = parts["teacher"]
             self._last_dopsd_photo_err = parts["photo"]
+            self.additional_logs.update(self._prediction_geometry_log('video', pred, target))
+            if audio_pred is not None and audio_target is not None:
+                self.additional_logs.update(
+                    self._prediction_geometry_log('audio', audio_pred, audio_target)
+                )
+            self.additional_logs['teacher/base_sigma'] = float(
+                (timesteps.flatten().float() / 1000.0).mean().item()
+            )
+
 
 
         if self.train_config.do_prior_divergence and prior_pred is not None:

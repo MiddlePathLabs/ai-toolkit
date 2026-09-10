@@ -741,6 +741,10 @@ class TrainConfig:
         # contrastive loss
         self.do_guidance_loss = kwargs.get('do_guidance_loss', False)
         self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
+        # skip guidance-loss correction below this pre-shift base sigma
+        # (timesteps/1000; 1 = pure noise). 0 = always apply. H3 recommended 0.15.
+        self.guidance_loss_sigma_min: float = kwargs.get('guidance_loss_sigma_min', 0.0)
+
         self.do_guidance_loss_cfg_zero: bool = kwargs.get('do_guidance_loss_cfg_zero', False)
         # 'constant' uses guidance_loss_target as is. 'sigma' decays the target
         # toward 1.0 as sigma falls (effective = 1 + (target - 1) * sigma) so the
