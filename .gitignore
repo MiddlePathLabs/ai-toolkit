@@ -198,3 +198,4 @@ original_repo
 test_outputs/
 .next
 testing/.model_test_outputs
+testing/.*
