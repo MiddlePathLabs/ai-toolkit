@@ -96,7 +96,12 @@ from .src.text_encoder import (
     load_video_ref,
     trim_caption_tokens,
 )
-from .src.transformer import MiniMaxH3Transformer, MiniMaxH3TransformerParams
+from .src.transformer import (
+    MiniMaxH3Attention,
+    MiniMaxH3Transformer,
+    MiniMaxH3TransformerParams,
+    _flash_attn_func,
+)
 from .src.vae import MiniMaxH3VideoVAE
 
 if TYPE_CHECKING:
@@ -511,6 +516,30 @@ class MinimaxH3Model(BaseModel):
         flush()
         return MiniMaxH3VaeBundle(video_vae, audio_vae)
 
+    def _apply_flash_attention(self, transformer: MiniMaxH3Transformer) -> None:
+        """``model_kwargs.use_flash_attention``: route dense H3 attention
+        through the flash_attn wheel instead of SDPA. Windows torch ships
+        without the flash SDPA backend, so this is the only way to reach those
+        kernels here. Padded-batch steps (attn_mask present) and fp32 layers
+        always keep SDPA — flash-attn takes neither."""
+        if not self.model_config.model_kwargs.get("use_flash_attention", False):
+            return
+        if _flash_attn_func is None:
+            self.print_and_status_update(
+                "[flash-attn] model_kwargs.use_flash_attention is set but the "
+                "flash_attn wheel is not installed; keeping SDPA"
+            )
+            return
+        enabled = 0
+        for module in transformer.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.use_flash_attention = True
+                enabled += 1
+        self.print_and_status_update(
+            f"[flash-attn] enabled on {enabled} attention layers "
+            "(padded-batch / fp32 steps fall back to SDPA)"
+        )
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading MiniMax-H3 model")
@@ -523,9 +552,9 @@ class MinimaxH3Model(BaseModel):
         if self.model_config.preview_lora_path is not None:
             self.load_preview_turbo(transformer)
 
-
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
+        self._apply_flash_attention(transformer)
         flush()
 
         tokenizer, processor, text_encoder = self._load_text_encoder()

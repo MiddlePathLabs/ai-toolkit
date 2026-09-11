@@ -44,6 +44,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except ImportError:  # wheel absent: use_flash_attention stays a silent no-op
+    _flash_attn_func = None
+
 MODALITY_NUM = 3  # 0 = video, 1 = text, 2 = audio; -1 marks padding rows
 
 
@@ -156,6 +161,10 @@ class MiniMaxH3TimeEmbedder(nn.Module):
 class MiniMaxH3Attention(nn.Module):
     """Fused-QKV self-attention with per-head RMSNorm on q/k and partial RoPE."""
 
+    # flipped per-module by MinimaxH3Model._apply_flash_attention(); never on
+    # by default so checkpoints/loaders that never ask keep exact SDPA numerics
+    use_flash_attention = False
+
     def __init__(
         self,
         hidden: int,
@@ -200,6 +209,17 @@ class MiniMaxH3Attention(nn.Module):
 
             gate = self.to_gate_compress(x).view(b, s, self.heads, self.head_dim)
             out = vsa_attention(q, k, v, gate, vsa)
+            return self.out_proj(out.reshape(b, s, -1))
+
+        if (
+            self.use_flash_attention
+            and _flash_attn_func is not None
+            and attn_mask is None
+            and q.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # flash-attn is a drop-in (B,S,H,D) replacement for the no-padding
+            # half-precision case; padded batches and fp32 layers keep SDPA
+            out = _flash_attn_func(q, k, v)
             return self.out_proj(out.reshape(b, s, -1))
 
         q = q.transpose(1, 2)
