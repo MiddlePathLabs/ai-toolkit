@@ -91,8 +91,11 @@ export interface NetworkConfig {
   conv_alpha: number;
   lokr_full_rank: boolean;
   lokr_factor: number;
+  dropout?: number | null;
+  pretrained_lora_path?: string | null;
   network_kwargs: {
     ignore_if_contains: string[];
+    only_if_contains?: string[];
   };
   transformer_only?: boolean;
 }
@@ -103,6 +106,8 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  hf_repo_id?: string | null;
+  hf_private?: boolean;
 }
 
 export interface DatasetConfig {
@@ -162,6 +167,19 @@ export interface DatasetConfig {
   vae_anchor_loss_weight?: number;
   vae_anchor_loss_min_t?: number;
   vae_anchor_loss_max_t?: number;
+  invert_mask?: boolean;
+  keep_tokens?: number;
+  token_dropout_rate?: number;
+  replacements?: string[];
+  cache_latents?: boolean;
+  num_workers?: number;
+  pin_memory?: boolean;
+  prefetch_factor?: number;
+  buckets?: boolean;
+  bucket_tolerance?: number;
+  random_crop?: boolean;
+  square_crop?: boolean;
+  random_scale?: boolean;
 }
 
 export interface EMAConfig {
@@ -321,6 +339,14 @@ export interface TrainConfig {
   do_guidance_loss?: boolean;
   guidance_loss_target?: number;
   guidance_loss_sigma_min?: number;
+  lr_scheduler?: string;
+  unet_lr?: number | null;
+  text_encoder_lr?: number | null;
+  min_snr_gamma?: number | null;
+  snr_gamma?: number | null;
+  noise_offset?: number;
+  min_denoising_steps?: number;
+  max_denoising_steps?: number;
 }
 
 
@@ -349,6 +375,9 @@ export interface ModelConfig {
   compile_fullgraph?: boolean;
   compile_dynamic?: boolean;
   cache_size_limit?: number;
+  vae_path?: string | null;
+  te_name_or_path?: string | null;
+  extras_name_or_path?: string | null;
 }
 
 export interface SampleItem {
@@ -384,6 +413,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  format?: string;
 }
 
 export interface LoggingConfig {
@@ -487,6 +517,7 @@ export interface CaptionJobConfig {
 export interface ConfigDoc {
   title: string | React.ReactNode;
   description: React.ReactNode;
+  summary?: string;
 }
 
 export interface SelectOption {

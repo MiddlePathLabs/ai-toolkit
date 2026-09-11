@@ -918,6 +918,236 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'network.pretrained_lora_path': {
+    title: 'Resume from LoRA',
+    summary: 'Start from an existing LoRA instead of training from scratch.',
+    description: 'Path to a .safetensors LoRA. Weights load as the starting point for this run.',
+  },
+  'network.dropout': {
+    title: 'Network Dropout',
+    summary: 'Randomly drop LoRA weights during training to reduce overfitting.',
+    description: 'Leave empty for no dropout. Typical values are 0.05–0.1.',
+  },
+  'network.transformer_only': {
+    title: 'Transformer Only',
+    summary: 'Train LoRA only on transformer blocks, not every linear layer.',
+    description: 'On by default for diffusion transformers. Turn off only if you know you need extra modules.',
+  },
+  'network.only_if_contains': {
+    title: 'Train Only Layers',
+    summary: 'Only create LoRA on layers whose names contain these substrings.',
+    description: (
+      <>
+        Comma-separated name fragments. Example: <code>single_transformer_blocks.7.proj_out</code>. Empty means all
+        layers (minus Ignore). Ignore wins when both match.
+      </>
+    ),
+  },
+  'network.ignore_if_contains': {
+    title: 'Ignore Layers',
+    summary: 'Skip LoRA on layers whose names contain these substrings.',
+    description: (
+      <>
+        Comma-separated name fragments. Some architectures pre-fill this (experts, gates). Ignore takes priority over
+        Train Only.
+      </>
+    ),
+  },
+  'datasets.mask_path': {
+    title: 'Mask Dataset',
+    summary: 'Folder of masks matching your images so loss focuses on the subject.',
+    description: 'Same filenames as the target dataset. White/high values are trained more; black is down-weighted.',
+  },
+  'datasets.mask_min_value': {
+    title: 'Mask Min Value',
+    summary: 'Floor for masked-out pixels so they still get a little loss.',
+    description: '0 ignores the background completely. 0.1 is a safe default so the rest of the image does not collapse.',
+  },
+  'datasets.invert_mask': {
+    title: 'Invert Mask',
+    summary: 'Swap subject and background if your masks are the wrong way around.',
+    description: 'Use when white is background instead of the subject.',
+  },
+  'datasets.shuffle_tokens': {
+    title: 'Shuffle Tokens',
+    summary: 'Shuffle caption tokens each step so the model cannot memorize order.',
+    description: 'Keep Tokens (below) stays at the front when shuffling.',
+  },
+  'datasets.keep_tokens': {
+    title: 'Keep Tokens',
+    summary: 'How many leading caption tokens stay fixed when shuffling.',
+    description: 'Use 1 to keep a trigger word first. 0 shuffles everything.',
+  },
+  'datasets.token_dropout_rate': {
+    title: 'Token Dropout',
+    summary: 'Drop individual caption tokens at random.',
+    description: 'Unlike caption dropout (whole caption), this removes pieces of the prompt.',
+  },
+  'datasets.replacements': {
+    title: 'Caption Replacements',
+    summary: 'Rewrite caption text before training. One rule per line: old|new.',
+    description: 'Example: person|woman. Applied to every caption in this dataset.',
+  },
+  'datasets.cache_latents': {
+    title: 'Cache Latents in RAM',
+    summary: 'Keep VAE latents in memory instead of (or as well as) disk.',
+    description: 'Faster than disk cache, uses a lot of RAM. Disk cache is the checkbox above.',
+  },
+  'datasets.num_workers': {
+    title: 'Data Workers',
+    summary: 'Background processes that load images.',
+    description: 'Default is 2. Raise on fast disks if the GPU waits on data.',
+  },
+  'datasets.pin_memory': {
+    title: 'Pin Memory',
+    summary: 'Faster CPU→GPU copies. Uses extra host RAM.',
+    description: 'Usually leave off unless you know the dataloader is the bottleneck.',
+  },
+  'datasets.buckets': {
+    title: 'Buckets',
+    summary: 'Group images by aspect ratio instead of forcing one size.',
+    description: 'On by default. Turn off only for debugging.',
+  },
+  'datasets.bucket_tolerance': {
+    title: 'Bucket Tolerance',
+    summary: 'Pixel step used when grouping aspect ratios.',
+    description: '64 is the usual value. Smaller means more buckets and more VRAM fragmentation.',
+  },
+  'datasets.random_crop': {
+    title: 'Random Crop',
+    summary: 'Crop a random window instead of a center crop.',
+    description: 'Helps when images are larger than the training resolution.',
+  },
+  'datasets.square_crop': {
+    title: 'Square Crop',
+    summary: 'Force a square crop before bucketing.',
+    description: 'Use for models that dislike wide/tall buckets.',
+  },
+  'datasets.random_scale': {
+    title: 'Random Scale',
+    summary: 'Jitter scale slightly before cropping.',
+    description: 'Mild augmentation. Off by default.',
+  },
+  'save.save_format': {
+    title: 'Save Format',
+    summary: 'How checkpoints are written: Diffusers folder or a single safetensors file.',
+    description: 'Diffusers is required for some full models. LoRAs usually use safetensors.',
+  },
+  'save.push_to_hub': {
+    title: 'Push to Hub',
+    summary: 'Upload each save to Hugging Face.',
+    description: 'Needs a token on the Settings page. Set a repo id below.',
+  },
+  'save.hf_repo_id': {
+    title: 'Hub Repo ID',
+    summary: 'username/model-name on Hugging Face.',
+    description: 'Created if it does not exist. Private repos need a write token with repo access.',
+  },
+  'save.hf_private': {
+    title: 'Private Repo',
+    summary: 'Make the Hugging Face repo private.',
+    description: 'Only applies when Push to Hub is on.',
+  },
+  'train.lr_scheduler': {
+    title: 'LR Scheduler',
+    summary: 'How learning rate changes over the run. Constant is the safe default.',
+    description: 'Cosine/linear decay can help long runs. Constant is what most LoRAs should use.',
+  },
+  'train.unet_lr': {
+    title: 'Unet / Transformer LR',
+    summary: 'Override LR for the transformer. Empty uses the main learning rate.',
+    description: 'Leave empty unless you are training multiple parts at different rates.',
+  },
+  'train.text_encoder_lr': {
+    title: 'Text Encoder LR',
+    summary: 'Override LR for the text encoder. Empty uses the main learning rate.',
+    description: 'Only matters if Train Text Encoder is on.',
+  },
+  'train.train_text_encoder': {
+    title: 'Train Text Encoder',
+    summary: 'Also train the text encoder, not just the LoRA on the transformer.',
+    description: 'Usually off for Flux/Qwen/HiDream. Can overfit captions quickly.',
+  },
+  'train.min_snr_gamma': {
+    title: 'Min-SNR Gamma',
+    summary: 'Down-weight very noisy timesteps so they do not dominate loss.',
+    description: '5 is a common value. Empty disables it. Do not combine with SNR Gamma.',
+  },
+  'train.snr_gamma': {
+    title: 'SNR Gamma',
+    summary: 'Fixed SNR weighting. Empty disables it.',
+    description: 'Prefer Min-SNR Gamma unless you have a reason. Do not set both.',
+  },
+  'train.noise_offset': {
+    title: 'Noise Offset',
+    summary: 'Adds a little extra noise so dark/bright scenes train better.',
+    description: '0.05–0.1 is the usual range. 0 is off.',
+  },
+  'train.min_denoising_steps': {
+    title: 'Min Denoising Step',
+    summary: 'Do not train on timesteps below this.',
+    description: 'Leave at 0 unless you are excluding near-clean latents.',
+  },
+  'train.max_denoising_steps': {
+    title: 'Max Denoising Step',
+    summary: 'Do not train on timesteps above this.',
+    description: 'Leave at 999 unless you are excluding near-pure-noise latents.',
+  },
+  'model.compile_mode': {
+    title: 'Compile Mode',
+    summary: 'torch.compile strategy. Default is safest.',
+    description: 'max-autotune is slower to start. reduce-overhead helps small batches.',
+  },
+  'model.compile_fullgraph': {
+    title: 'Compile Fullgraph',
+    summary: 'Require a single compiled graph. Fails if the model breaks the graph.',
+    description: 'Leave off unless you are chasing extra speed and know it compiles cleanly.',
+  },
+  'model.compile_dynamic': {
+    title: 'Compile Dynamic',
+    summary: 'Allow varying shapes (resolutions, batch) in the compiled model.',
+    description: 'On by default so multi-resolution training does not recompile every step.',
+  },
+  'model.cache_size_limit': {
+    title: 'Compile Cache Limit',
+    summary: 'How many compiled graphs to keep. Empty uses PyTorch’s default.',
+    description: 'Raise if you train many resolutions and see constant recompiles.',
+  },
+  'model.quantize_exclude': {
+    title: 'Quantize Exclude',
+    summary: 'Layer-name substrings to leave in full precision.',
+    description: 'Comma-separated. Use if quantizing a layer makes training NaN.',
+  },
+  'model.vae_path': {
+    title: 'VAE Path',
+    summary: 'Optional replacement VAE. Empty uses the model’s default.',
+    description: 'Huggingface id or local path.',
+  },
+  'model.te_name_or_path': {
+    title: 'Text Encoder Path',
+    summary: 'Optional replacement text encoder. Empty uses the model’s default.',
+    description: 'Huggingface id or local path.',
+  },
+  'model.extras_name_or_path': {
+    title: 'Extras Path',
+    summary: 'Optional extra weights (tokenizer, scheduler, etc.). Empty uses the model path.',
+    description: 'Only needed when those files live somewhere other than the base model.',
+  },
+  'sample.neg': {
+    title: 'Negative Prompt',
+    summary: 'Applied to every sample unless a prompt overrides it.',
+    description: 'Often unused on flow-matching models with guidance 1.',
+  },
+  'sample.format': {
+    title: 'Sample Format',
+    summary: 'File format for preview images.',
+    description: 'jpg is smaller. png is lossless. webp is a middle ground.',
+  },
+  'datasets.prefetch_factor': {
+    title: 'Prefetch Factor',
+    summary: 'Batches each worker prepares ahead of the GPU.',
+    description: 'Default is 2. Only matters when Data Workers is above 0.',
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {
