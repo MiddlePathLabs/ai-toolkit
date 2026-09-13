@@ -167,6 +167,9 @@ class BaseModel:
         self.invert_assistant_lora = False
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
+        # inference engine: called as hook(step_index, num_steps, latents)
+        # after every scheduler step while generating samples
+        self.sample_step_hook = None
         self.is_transformer = False
 
         self.sample_prompts_cache = None
@@ -433,6 +436,18 @@ class BaseModel:
             self.assistant_lora.is_active = False
             self.assistant_lora.force_to('cpu', self.torch_dtype)
 
+    def _emit_sample_step(self, latents, step_index=None, num_steps=None):
+        """For holders whose sampling loop bypasses scheduler.step: report one
+        denoised latent to sample_step_hook (no-op when unset)."""
+        from toolkit.sample_step_hook import emit_sample_step
+
+        emit_sample_step(self, latents, step_index, num_steps)
+
+    def _install_sample_step_hooks(self, pipeline):
+        from toolkit.sample_step_hook import install_sample_step_hooks
+
+        return install_sample_step_hooks(self, pipeline)
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -480,6 +495,15 @@ class BaseModel:
         # save current seed state for training
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+        if pipeline is None:
+            pipeline = self.get_generation_pipeline()
+            try:
+                pipeline.set_progress_bar_config(disable=True)
+            except:
+                pass
+
+        unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
 
         start_multiplier = 1.0
         if network is not None:
@@ -549,6 +573,7 @@ class BaseModel:
 
                         if network is not None:
                             network.multiplier = gen_config.network_multiplier
+                        self._sample_step_index = 0
                         torch.manual_seed(gen_config.seed)
                         torch.cuda.manual_seed(gen_config.seed)
 
@@ -761,6 +786,7 @@ class BaseModel:
             del pipeline
             torch.cuda.empty_cache()
         finally:
+            unwrap_step_hooks()
             # restore training state
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
