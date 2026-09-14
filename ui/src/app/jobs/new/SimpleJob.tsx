@@ -949,11 +949,15 @@ export default function SimpleJob({
                 <NumberInput
                   label="Weight Decay"
                   className="pt-2"
-                  value={jobConfig.config.process[0].train.optimizer_params.weight_decay}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.optimizer_params.weight_decay')}
+                  value={jobConfig.config.process[0].train.optimizer_params?.weight_decay ?? null}
+                  onChange={value =>
+                    // cleared = remove the key, not write null (optimizer_params is splatted
+                    // into the optimizer constructor, and null weight_decay crashes it)
+                    setJobConfig(value ?? undefined, 'config.process[0].train.optimizer_params.weight_decay')
+                  }
                   placeholder="eg. 0.0001"
                   min={0}
-                  required
+                  allowEmpty
                 />
                 <Checkbox
                   label="Per-Image Adaptive LR"
@@ -2654,7 +2658,7 @@ export default function SimpleJob({
                         </FormGroup>
                       )}
                     </div>
-                    {!isAudioModel && (
+                    {!isAudioModel && !dataset.do_audio && (
                       <div>
                         <FormGroup label="Resolutions" className="pt-2">
                           <div className="grid grid-cols-2 gap-2">
@@ -2667,11 +2671,13 @@ export default function SimpleJob({
                                   <Checkbox
                                     key={res}
                                     label={res.toString()}
-                                    checked={dataset.resolution.includes(res)}
+                                    checked={(dataset.resolution ?? []).includes(res)}
                                     onChange={value => {
-                                      const resolutions = dataset.resolution.includes(res)
-                                        ? dataset.resolution.filter(r => r !== res)
-                                        : [...dataset.resolution, res];
+                                      // imported datasets may have no resolution key at all
+                                      const currentResolutions = dataset.resolution ?? [];
+                                      const resolutions = currentResolutions.includes(res)
+                                        ? currentResolutions.filter(r => r !== res)
+                                        : [...currentResolutions, res];
                                       setJobConfig(resolutions, `config.process[0].datasets[${i}].resolution`);
                                     }}
                                   />

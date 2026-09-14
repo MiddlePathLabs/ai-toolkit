@@ -2,7 +2,7 @@
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
 import { migrateNoisingConfig } from '@/helpers/noisingConfig';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig, TrainConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -284,6 +284,25 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
 
   const train = jobConfig.config.process[0].train;
   migrateNoisingConfig(train);
+  // Backfill plain train defaults so run.py-style imports (which omit sections the
+  // simple view reads) render and save like UI-created jobs. Values are the
+  // trainer's own defaults, so they never change what a config trains with.
+  // weight_decay is backfilled only for rose (1e-4 is its built-in default);
+  // other optimizers' library defaults differ, so writing 1e-4 would change them.
+  if (train.gradient_accumulation == null) {
+    train.gradient_accumulation = 1;
+  }
+  if (!train.content_or_style) {
+    train.content_or_style = 'balanced';
+  }
+  if (!train.loss_type) {
+    train.loss_type = 'mse';
+  }
+  const optimizerParams: { weight_decay?: number } = train.optimizer_params ?? {};
+  if (train.optimizer === 'rose' && optimizerParams.weight_decay == null) {
+    optimizerParams.weight_decay = 1e-4;
+  }
+  train.optimizer_params = optimizerParams as TrainConfig['optimizer_params'];
   // Merge a complete disabled depth object into any partial saved object.
   // Preserves saved values, fills fields added after the first depth release.
   // Do NOT migrate train.loss_split here: omission IS the Auto state, and
