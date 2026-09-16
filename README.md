@@ -140,6 +140,7 @@ model:
 
 ### Experimental
 - [lodestones/Zeta-Chroma](https://huggingface.co/lodestones/Zeta-Chroma) (Zeta Chroma)
+- [m-a-p/YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B) (YuE2) - audio. The official audio-to-token encoder is unreleased; training uses the community tokenizer by Kytra ([@sin_ceriously](https://x.com/sin_ceriously)), [Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4).
 
 ## Installation
 

@@ -378,13 +378,23 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.model_kwargs.instruction': {
+    title: 'LLM Prompt',
+    description: (
+      <>
+        The instruction the model is asked for every training item, as the user turn of the chat. The item's caption
+        file is the answer it learns to give. Use the same wording when running the trained LoRA, and it is also what
+        samples use when their own prompt is left blank.
+      </>
+    ),
+  },
   'model.model_kwargs.kv_cache': {
     title: 'KV Cache',
     description: (
       <>
-        This will enable KV Cache for control images in a model that supports it. LoRAs trained with this on
-        need to also be inferenced with it, and vice versa. This does not speed up or slow down training, but on inference,
-        the control images only need to be processed once for the entire generation, vs being processed for every step.
+        This will enable KV Cache for control images in a model that supports it. LoRAs trained with this on need to
+        also be inferenced with it, and vice versa. This does not speed up or slow down training, but on inference, the
+        control images only need to be processed once for the entire generation, vs being processed for every step.
         Which leads to a significant speedup on inference.
       </>
     ),
@@ -880,12 +890,7 @@ const docs: { [key: string]: ConfigDoc } = {
 
   'train.guidance_loss_target': {
     title: 'Guidance Loss Target',
-    description: (
-      <>
-        For contrastive guidance loss, this is the target CGF to amplify predictions to. 
-
-      </>
-    ),
+    description: <>For contrastive guidance loss, this is the target CGF to amplify predictions to.</>,
   },
   'train.guidance_loss_sigma_min': {
     title: 'Guidance Loss Sigma Min',
@@ -906,15 +911,15 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         Caption dropout rate is the probability that the caption for an image will be dropped (replaced with a blank
         caption) for any given training step. For example, a value of 0.05 will drop the caption around 5% of the time.
-        Dropping captions helps the model learn the concept being trained without relying entirely on the caption,
-        and helps preserve the model&apos;s ability to generate without a prompt. If a trigger word is set, the trigger
-        word is still used when the caption is dropped, so the model still associates the dropped samples with your
-        trigger word. Regularization images, or images without a trigger word, drop to a fully blank caption.
+        Dropping captions helps the model learn the concept being trained without relying entirely on the caption, and
+        helps preserve the model&apos;s ability to generate without a prompt. If a trigger word is set, the trigger word
+        is still used when the caption is dropped, so the model still associates the dropped samples with your trigger
+        word. Regularization images, or images without a trigger word, drop to a fully blank caption.
         <br />
         <br />
-        Caption dropout also works when caching text embeddings. An additional embedding for the dropout caption
-        (blank, or the trigger word alone) is cached to disk alongside the normal one, and it is randomly swapped in
-        at train time at this rate.
+        Caption dropout also works when caching text embeddings. An additional embedding for the dropout caption (blank,
+        or the trigger word alone) is cached to disk alongside the normal one, and it is randomly swapped in at train
+        time at this rate.
       </>
     ),
   },
