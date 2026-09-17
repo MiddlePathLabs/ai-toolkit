@@ -3095,6 +3095,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
         if self.accelerator.is_main_process:
+            # also write a step-numbered save of the final weights. The no-suffix
+            # file below is the completion marker AND the resume source, so an
+            # extend (raise train.steps, rerun) overwrites it — without this
+            # numbered copy the previous final is unrecoverable.
+            self.save(step=self.train_config.steps)
             self.save()
         if not self.train_config.disable_sampling:
             try:
