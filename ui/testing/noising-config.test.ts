@@ -107,3 +107,7 @@ test('all noising controls survive a SQLite JSON save and reload', async () => {
     await closeDatabase(db);
   }
 });
+
+// Make this file a module so its top-level `require`-bound consts stay file-scoped
+// and do not collide with sibling test scripts under `tsc -p tsconfig.json`.
+export {};

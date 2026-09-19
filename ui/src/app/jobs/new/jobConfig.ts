@@ -347,3 +347,47 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
 
   return jobConfig;
 };
+
+// Outbound counterpart to the migration merges above. The trainer treats a
+// missing loss block as fully disabled (backend defaults are all off and every
+// perceptor downloads lazily), so form-state defaults never need to be
+// persisted. Strip each block that is still deep-equal to its untouched
+// disabled default; a customized block is kept even while disabled so staged
+// settings survive a save/reload round trip.
+const lossBlockDefaults: [string, Record<string, any>][] = [
+  ['depth_consistency', defaultDepthConsistencyConfig],
+  ['normal_id', defaultNormalIDConfig],
+  ['body_proportion', defaultBodyProportionConfig],
+  ['face_id', defaultFaceIDConfig],
+  ['subject_mask', defaultSubjectMaskConfig],
+  ['body_shape', defaultBodyShapeConfig],
+  ['vae_anchor', defaultVAEAnchorConfig],
+];
+
+const deepEqual = (a: any, b: any): boolean => {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every(key => deepEqual(a[key], b[key]));
+};
+
+export const pruneUntouchedLossBlocks = (jobConfig: JobConfig): JobConfig => {
+  const process: any = jobConfig?.config?.process?.[0];
+  if (!process) return jobConfig;
+  const keysToRemove = lossBlockDefaults
+    .filter(([key, defaults]) => process[key] != null && deepEqual(process[key], defaults))
+    .map(([key]) => key);
+  if (keysToRemove.length === 0) return jobConfig;
+  const prunedProcess = { ...process };
+  for (const key of keysToRemove) {
+    delete prunedProcess[key];
+  }
+  return {
+    ...jobConfig,
+    config: {
+      ...jobConfig.config,
+      process: [prunedProcess, ...jobConfig.config.process.slice(1)],
+    },
+  };
+};

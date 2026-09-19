@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
+import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig, pruneUntouchedLossBlocks } from './jobConfig';
 import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
@@ -157,7 +157,9 @@ export default function TrainingForm() {
         id: runId,
         name: jobConfig.config.name,
         gpu_ids: gpuIDs,
-        job_config: jobConfig,
+        // Strip loss blocks the user never enabled; migrateJobConfig re-merges
+        // their disabled defaults when the job is loaded back into the form.
+        job_config: pruneUntouchedLossBlocks(jobConfig),
       })
       .then(res => {
         setStatus('success');
