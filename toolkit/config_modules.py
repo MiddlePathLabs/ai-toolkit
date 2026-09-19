@@ -67,6 +67,10 @@ class SampleItem:
         self.ctrl_img_3: Optional[str] = kwargs.get('ctrl_img_3', None)
         
         self.network_multiplier: float = kwargs.get('network_multiplier', sample_config.network_multiplier)
+        # EMA runs: sample this item with the raw (non-EMA) weights instead of
+        # the shadow weights. Ignored when EMA is disabled. These samples get a
+        # RAW_ filename prefix so they can be told apart and filtered.
+        self.raw_weights: bool = kwargs.get('raw_weights', False)
         # convert to a number if it is a string
         if isinstance(self.network_multiplier, str):
             try:

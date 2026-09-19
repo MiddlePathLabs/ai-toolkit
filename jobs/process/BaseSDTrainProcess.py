@@ -325,6 +325,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
+        raw_gen_img_config_list = []
 
         sample_config = self.first_sample_config if is_first else self.sample_config
         start_seed = sample_config.seed
@@ -341,12 +342,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if sample_config.walk_seed:
                 current_seed = start_seed + i
 
+            sample_item = sample_config.samples[i]
+            if sample_item.seed is not None:
+                current_seed = sample_item.seed
+
             step_num = ''
             if step is not None:
                 # zero-pad 9 digits
                 step_num = f"_{str(step).zfill(9)}"
 
-            filename = f"[time]_{step_num}_[count].{self.sample_config.ext}"
+            # EMA runs can route individual sample items to the raw weights
+            # (sample_item.raw_weights); those generate in a second pass below
+            filename_prefix = ''
+            if self.ema is not None and getattr(sample_item, 'raw_weights', False):
+                filename_prefix = 'RAW_'
+
+            filename = f"{filename_prefix}[time]_{step_num}_[count].{self.sample_config.ext}"
 
             output_path = os.path.join(sample_folder, filename)
 
@@ -371,12 +382,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             extra_args = {}
             if self.adapter_config is not None and self.adapter_config.test_img_path is not None:
                 extra_args['adapter_image_path'] = test_image_paths[i]
-            
-            sample_item = sample_config.samples[i]
-            if sample_item.seed is not None:
-                current_seed = sample_item.seed
 
-            gen_img_config_list.append(GenerateImageConfig(
+            target_list = raw_gen_img_config_list if filename_prefix else gen_img_config_list
+            target_list.append(GenerateImageConfig(
                 prompt=prompt,  # it will autoparse the prompt
                 width=sample_item.width,
                 height=sample_item.height,
@@ -406,6 +414,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        raw_gen_img_config_list = self.post_process_generate_image_config_list(raw_gen_img_config_list)
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:
@@ -414,11 +423,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        # send to be generated
+        if len(gen_img_config_list) > 0:
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+
+        # raw-weight sample pass: items flagged raw_weights are ROUTED here
+        # (not duplicated — the EMA set is the unflagged items only), generated
+        # with the raw training weights. Seeds derive from the same loop state
+        # as the EMA items; filenames carry the RAW_ prefix. For a same-prompt
+        # EMA-vs-raw pair, duplicate the sample row with a pinned seed and
+        # flag one copy. Isolated so a failure here cannot kill the run.
+        if len(raw_gen_img_config_list) > 0 and self.ema is not None:
+            self.ema.train()  # put the raw training weights back
+            try:
+                self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
+            except Exception as e:
+                print_acc(f"[sample] raw-weight sampling failed, continuing: {e}")
+                traceback.print_exc()
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -469,17 +492,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # pattern is {job_name}_{zero_filled_step} for both files and directories
             pattern = f"{self.job.name}_*"
             items = glob.glob(os.path.join(self.save_root, pattern))
+
+            # A file WITHOUT a 9-digit step suffix is a completion marker
+            # (e.g. {name}_ema.safetensors, {trigger}_ema.safetensors, the
+            # diffusers {name}_ema folder), never a step save. Before the
+            # _ema tag the markers did not match the {name}_* pattern at all;
+            # now they do, so they must be excluded here or they burn a
+            # keep slot and can get pruned by a later step save.
+            def is_step_save(path: str) -> bool:
+                stem = os.path.splitext(os.path.basename(path))[0]
+                # step suffix is _{step:0>9} — always at least 9 digits
+                return re.search(r'_\d{9,}$', stem) is not None
+
             # Separate files and directories
-            safetensors_files = [f for f in items if f.endswith('.safetensors')]
-            pt_files = [f for f in items if f.endswith('.pt')]
-            directories = [d for d in items if os.path.isdir(d) and not d.endswith('.safetensors')]
+            safetensors_files = [f for f in items if f.endswith('.safetensors') and is_step_save(f)]
+            pt_files = [f for f in items if f.endswith('.pt') and is_step_save(f)]
+            directories = [d for d in items if os.path.isdir(d) and not d.endswith('.safetensors') and is_step_save(d)]
             embed_files = []
             # do embedding files
             if self.embed_config is not None:
                 embed_pattern = f"{self.embed_config.trigger}_*"
                 embed_items = glob.glob(os.path.join(self.save_root, embed_pattern))
                 # will end in safetensors or pt
-                embed_files = [f for f in embed_items if f.endswith('.safetensors') or f.endswith('.pt')]
+                embed_files = [f for f in embed_items if (f.endswith('.safetensors') or f.endswith('.pt')) and is_step_save(f)]
 
             # check for critic files
             critic_pattern = f"CRITIC_{self.job.name}_*"
@@ -527,9 +562,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # remove duplicates
             items_to_remove = list(dict.fromkeys(items_to_remove))
 
-            # take the RAW_ twin along with its sibling so the pairs stay in sync
+            # take the RAW_ twin along with its sibling so the pairs stay in
+            # sync. EMA siblings carry the _ema tag right before the step
+            # suffix and the raw twin drops it (RAW_<name>_<step> pairs with
+            # <name>_ema_<step>), so strip the LAST _ema occurrence — the tag
+            # is always the last one.
             for item in list(items_to_remove):
-                twin = os.path.join(os.path.dirname(item), 'RAW_' + os.path.basename(item))
+                base = os.path.basename(item)
+                if '_ema' in base:
+                    head, _, tail = base.rpartition('_ema')
+                    base = head + tail
+                twin = os.path.join(os.path.dirname(item), 'RAW_' + base)
                 if twin in raw_items:
                     items_to_remove.append(twin)
 
@@ -565,7 +608,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # weights live and once with the raw training weights live; everything
         # that must happen once per save event (optimizer state, prune, hooks)
         # stays in save().
-        filename = f'{prefix}{self.job.name}{step_num}.safetensors'
+        # EMA-on checkpoints carry an _ema tag before the step suffix (matching
+        # the _LoRA/_refiner/_t2i naming convention) so the weight set is
+        # visible in the filename. The RAW_ dual-save pass is raw by
+        # construction and does not get the tag.
+        ema_tag = '_ema' if (prefix == '' and self.ema is not None) else ''
+        filename = f'{prefix}{self.job.name}{ema_tag}{step_num}.safetensors'
         file_path = os.path.join(self.save_root, filename)
 
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
@@ -575,7 +623,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # add _lora to name
                     lora_name += '_LoRA'
 
-                filename = f'{lora_name}{step_num}.safetensors'
+                filename = f'{lora_name}{ema_tag}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 prev_multiplier = self.network.multiplier
                 self.network.multiplier = 1.0
@@ -593,7 +641,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # even if added to lora, still save the trigger version
             if self.embedding is not None:
-                emb_filename = f'{prefix}{self.embed_config.trigger}{step_num}.safetensors'
+                emb_filename = f'{prefix}{self.embed_config.trigger}{ema_tag}{step_num}.safetensors'
                 emb_file_path = os.path.join(self.save_root, emb_filename)
                 # for combo, above will get it
                 # set current step
@@ -605,7 +653,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.embedding.save(emb_file_path)
 
             if self.decorator is not None:
-                dec_filename = f'{prefix}{self.job.name}{step_num}.safetensors'
+                dec_filename = f'{prefix}{self.job.name}{ema_tag}{step_num}.safetensors'
                 dec_file_path = os.path.join(self.save_root, dec_filename)
                 decorator_state_dict = self.decorator.state_dict()
                 for key, value in decorator_state_dict.items():
@@ -632,7 +680,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         adapter_name += '_adapter'
 
-                filename = f'{adapter_name}{step_num}.safetensors'
+                filename = f'{adapter_name}{ema_tag}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 # save adapter
                 state_dict = self.adapter.state_dict()
@@ -705,7 +753,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.sd.refiner_unet and self.train_config.train_refiner:
                 # save refiner
                 refiner_name = self.job.name + '_refiner'
-                filename = f'{refiner_name}{step_num}.safetensors'
+                filename = f'{refiner_name}{ema_tag}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 self.sd.save_refiner(
                     file_path,
@@ -3272,6 +3320,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         }
                     )
         dtype = "torch.bfloat16" if self.model_config.is_flux else "torch.float16"
+        # the final checkpoint carries the _ema tag when EMA is enabled
+        ema_tag = '_ema' if self.ema is not None else ''
+        final_ckpt_name = f'{self.job.name}{ema_tag}.safetensors'
         # Construct the README content
         readme_content = f"""---
 tags:
@@ -3306,7 +3357,7 @@ from diffusers import AutoPipelineForText2Image
 import torch
 
 pipeline = AutoPipelineForText2Image.from_pretrained('{base_model}', torch_dtype={dtype}).to('cuda')
-pipeline.load_lora_weights('{repo_id}', weight_name='{self.job.name}.safetensors')
+pipeline.load_lora_weights('{repo_id}', weight_name='{final_ckpt_name}')
 image = pipeline('{instance_prompt if not widgets else self.sample_config.prompts[0]}').images[0]
 image.save("my_image.png")
 ```

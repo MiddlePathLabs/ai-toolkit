@@ -3862,6 +3862,27 @@ export default function SimpleJob({
                             }}
                             placeholder={`1.0 (default)`}
                           />
+                          {!isLlmModel && jobConfig.config.process[0].train.ema_config?.use_ema && (
+                            <Checkbox
+                              label={`Raw Weights (no EMA)`}
+                              className="pt-2"
+                              checked={sample.raw_weights || false}
+                              onChange={value => {
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  if (value) {
+                                    newConfig.config.process[0].sample.samples[i].raw_weights = true;
+                                  } else {
+                                    delete newConfig.config.process[0].sample.samples[i].raw_weights;
+                                  }
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              }}
+                            />
+                          )}
                         </div>
                       </div>
                       {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (

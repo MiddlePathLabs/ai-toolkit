@@ -395,6 +395,7 @@ export interface SampleItem {
   ctrl_img?: string | null;
   ctrl_idx?: number;
   network_multiplier?: number;
+  raw_weights?: boolean;
   ctrl_img_1?: string | null;
   ctrl_img_2?: string | null;
   ctrl_img_3?: string | null;
