@@ -54,6 +54,7 @@ from toolkit.metadata import get_meta_for_safetensors
 from toolkit.h3_dopsd import apply_settings_to_model, parse_dopsd_settings
 
 from toolkit.models.base_model import BaseModel
+from toolkit.unloader import FakeTextEncoder
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
 from toolkit.models.v2.resolver import (
     find_file_recursive,
@@ -409,20 +410,41 @@ class MinimaxH3Model(BaseModel):
         # else at its stored precision (the bf16/fp16/fp32 mix is deliberate)
         return MiniMaxH3Transformer.load_model(dit_path, dtype=self.torch_dtype)
 
-    def _load_text_encoder(self):
-        from accelerate import init_empty_weights
-        from transformers import (
-            AutoConfig,
-            AutoProcessor,
-            AutoTokenizer,
-            Qwen3VLForConditionalGeneration,
-        )
+    def _load_tokenizer_processor(self):
+        from transformers import AutoTokenizer, AutoProcessor
 
         tokenizer = AutoTokenizer.from_pretrained(
             ORIGINAL_REPO, subfolder="FL2VA/tokenizer"
         )
         processor = AutoProcessor.from_pretrained(
             ORIGINAL_REPO, subfolder="FL2VA/processor"
+        )
+        return tokenizer, processor
+
+    def _te_source_path(self):
+        """Checkpoint the text-encoder load reads (weights file or folder)."""
+        te_path = self.model_config.te_name_or_path
+        if te_path is not None:
+            return te_path
+        return self._resolve_comfy_file("text_encoder")
+
+    def te_cache_identity(self) -> str:
+        """Stable identity of the text-encoder weights for prompt-embed caches.
+
+        Path + size + mtime catches a TE swap without hashing a 25 GB file.
+        SDTrainer's static-embed disk cache keys on this, so replacing the TE
+        file invalidates every cached embedding."""
+        src = self._te_source_path()
+        if os.path.isdir(src):
+            return f"dir|{src}"
+        st = os.stat(src)
+        return f"file|{src}|{st.st_size}|{int(st.st_mtime)}|{self.te_torch_dtype}"
+
+    def _load_text_encoder_weights(self):
+        from accelerate import init_empty_weights
+        from transformers import (
+            AutoConfig,
+            Qwen3VLForConditionalGeneration,
         )
 
         te_path = self.model_config.te_name_or_path
@@ -437,10 +459,7 @@ class MinimaxH3Model(BaseModel):
                 te_path, config=config, torch_dtype=self.te_torch_dtype
             )
         else:
-            if te_path is not None:
-                te_file = te_path
-            else:
-                te_file = self._resolve_comfy_file("text_encoder")
+            te_file = self._te_source_path()
             self.print_and_status_update(
                 f"Loading Qwen3-VL text encoder from {te_file}"
             )
@@ -506,7 +525,7 @@ class MinimaxH3Model(BaseModel):
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         flush()
-        return tokenizer, processor, text_encoder
+        return text_encoder
 
     def _load_vaes(self) -> MiniMaxH3VaeBundle:
         self.print_and_status_update("Loading video VAE")
@@ -557,12 +576,28 @@ class MinimaxH3Model(BaseModel):
         self._apply_flash_attention(transformer)
         flush()
 
-        tokenizer, processor, text_encoder = self._load_text_encoder()
-        if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
-            # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
-            text_encoder.aitk_is_quantized = True
-        # quantize + offload + placement, all driven by model_config
-        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+        tokenizer, processor = self._load_tokenizer_processor()
+        if getattr(self, "defer_text_encoder", False):
+            # warm-start path: every prompt embedding can come from disk (the
+            # dataset caption caches plus the trainer's static-embed cache).
+            # Install the same stub unload_text_encoder uses; the real weights
+            # materialize lazily inside get_prompt_embeds on the first actual
+            # encode, so any cold item just pays the load at that point.
+            self._te_deferred = True
+            text_encoder = FakeTextEncoder(
+                device=self.device_torch, dtype=self.te_torch_dtype
+            )
+            self.print_and_status_update(
+                "Text encoder deferred (embeddings served from cache; "
+                "weights load on first encode)"
+            )
+        else:
+            text_encoder = self._load_text_encoder_weights()
+            if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
+                # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
+                text_encoder.aitk_is_quantized = True
+            # quantize + offload + placement, all driven by model_config
+            text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
         flush()
 
         vae_bundle = self._load_vaes()
@@ -600,7 +635,25 @@ class MinimaxH3Model(BaseModel):
         static video reference (``image_refs_as_video``)."""
         return image
 
+    def _ensure_text_encoder(self):
+        """Materialize the deferred text encoder (no-op unless load_model
+        deferred it). Safe to call from any encode path — the first real
+        encode pays the weight load."""
+        if not getattr(self, "_te_deferred", False):
+            return
+        self._te_deferred = False
+        self.print_and_status_update("Loading deferred Qwen3-VL text encoder")
+        text_encoder = self._load_text_encoder_weights()
+        if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
+            # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
+            text_encoder.aitk_is_quantized = True
+        # quantize + offload + placement, all driven by model_config
+        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+        self.text_encoder = text_encoder
+        flush()
+
     def get_prompt_embeds(self, prompt, control_images=None) -> AdvancedPromptEmbeds:
+        self._ensure_text_encoder()
         if isinstance(prompt, str):
             prompt = [prompt]
         if self.text_encoder.device == torch.device("cpu"):

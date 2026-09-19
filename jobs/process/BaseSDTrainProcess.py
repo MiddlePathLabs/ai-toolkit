@@ -2054,6 +2054,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
+        # warm-start skip: when every text embedding can come from disk there is
+        # no reason to load the (25 GB) text encoder up front. Models that opt
+        # in (currently MiniMax-H3) install a stub and materialize the real
+        # weights on the first actual encode; other models ignore the attribute.
+        if (
+            self.train_config.cache_text_embeddings
+            and not self.train_config.train_text_encoder
+        ):
+            self.sd.defer_text_encoder = True
         # run base sd process run
         self.sd.load_model()
         

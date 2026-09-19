@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import random
 from collections import OrderedDict
@@ -529,6 +531,60 @@ class SDTrainer(BaseSDTrainProcess):
             return self.sd.encode_prompt(prompt, **kwargs)
         except Exception:
             return self.sd.encode_prompt(prompt, control_images=self.get_blank_control_image(), **kwargs)
+
+    # ------------------------------------------------------------------
+    # Static prompt-embed disk cache (warm-start text-encoder skip)
+    # ------------------------------------------------------------------
+    def _te_cache_identity(self) -> Optional[str]:
+        # models that can pin their TE weights expose te_cache_identity(); without
+        # it we don't cache at all rather than key on a weak identity (a TE swap
+        # would silently serve stale embeddings)
+        fn = getattr(self.sd, 'te_cache_identity', None)
+        if not callable(fn):
+            return None
+        try:
+            return str(fn())
+        except Exception:
+            return None
+
+    def _static_embed_cache_path(self, kind: str, prompt: str, extra: str = "") -> Optional[str]:
+        identity = self._te_cache_identity()
+        if identity is None:
+            return None
+        key_src = json.dumps(
+            {
+                "te": identity,
+                "model": self.model_config.name_or_path,
+                "kind": kind,
+                "prompt": prompt,
+                "extra": extra,
+                "long_prompts": bool(self.do_long_prompts),
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:32]
+        try:
+            cache_dir = os.path.join(self.save_root, 'static_embeds')
+            os.makedirs(cache_dir, exist_ok=True)
+            return os.path.join(cache_dir, f"{digest}.pt")
+        except Exception:
+            return None
+
+    def _load_static_embed(self, path: Optional[str]):
+        if path is None or not os.path.exists(path):
+            return None
+        try:
+            return torch.load(path, map_location='cpu', weights_only=False)
+        except Exception:
+            return None
+
+    def _save_static_embed(self, path: Optional[str], embeds) -> None:
+        if path is None:
+            return
+        try:
+            torch.save(embeds.to('cpu'), path)
+        except Exception:
+            pass  # a failed cache write only costs a re-encode on the next run
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -641,8 +697,23 @@ class SDTrainer(BaseSDTrainProcess):
                         control_images=ctrl_img
                     ).to('cpu')
                 else:
-                    positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
-                    negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
+                    # plain text prompts: serve from the static-embed cache when
+                    # possible so a warm start never needs the text encoder
+                    pos_path = self._static_embed_cache_path(
+                        'sample_pos', gen_img_config.prompt,
+                        extra=str(gen_img_config.negative_prompt),
+                    )
+                    neg_path = self._static_embed_cache_path(
+                        'sample_neg', str(gen_img_config.negative_prompt),
+                    )
+                    positive = self._load_static_embed(pos_path)
+                    if positive is None:
+                        positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
+                        self._save_static_embed(pos_path, positive)
+                    negative = self._load_static_embed(neg_path)
+                    if negative is None:
+                        negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
+                        self._save_static_embed(neg_path, negative)
                 
                 self.sd.sample_prompts_cache.append({
                     'conditional': positive,
@@ -2173,14 +2244,25 @@ class SDTrainer(BaseSDTrainProcess):
         
         # cache unconditional embeds (blank prompt); text-generating models have no text encoder
         if not getattr(self.sd, 'is_llm', False):
-            with torch.no_grad():
-                self.unconditional_embeds = self.encode_static_prompt(
-                    [self.train_config.unconditional_prompt],
-                    long_prompts=self.do_long_prompts,
-                ).to(
+            uncond_path = self._static_embed_cache_path(
+                'uncond', self.train_config.unconditional_prompt or ''
+            )
+            cached_uncond = self._load_static_embed(uncond_path)
+            if cached_uncond is not None:
+                self.unconditional_embeds = cached_uncond.to(
                     self.device_torch,
                     dtype=self.sd.torch_dtype
                 ).detach()
+            else:
+                with torch.no_grad():
+                    self.unconditional_embeds = self.encode_static_prompt(
+                        [self.train_config.unconditional_prompt],
+                        long_prompts=self.do_long_prompts,
+                    ).to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    ).detach()
+                    self._save_static_embed(uncond_path, self.unconditional_embeds)
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
@@ -2241,11 +2323,31 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                self.cached_blank_embeds = self.encode_static_prompt("")
+                blank_path = self._static_embed_cache_path('blank', '')
+                trigger_path = (
+                    self._static_embed_cache_path('trigger', self.trigger_word)
+                    if self.trigger_word is not None else None
+                )
+                dop_path = (
+                    self._static_embed_cache_path(
+                        'dop_class', self.train_config.diff_output_preservation_class
+                    )
+                    if self.train_config.diff_output_preservation else None
+                )
+                self.cached_blank_embeds = self._load_static_embed(blank_path)
+                if self.cached_blank_embeds is None:
+                    self.cached_blank_embeds = self.encode_static_prompt("")
+                    self._save_static_embed(blank_path, self.cached_blank_embeds)
                 if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
+                    self.cached_trigger_embeds = self._load_static_embed(trigger_path)
+                    if self.cached_trigger_embeds is None:
+                        self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
+                        self._save_static_embed(trigger_path, self.cached_trigger_embeds)
                 if self.train_config.diff_output_preservation:
-                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
+                    self.cached_dop_class_embeds = self._load_static_embed(dop_path)
+                    if self.cached_dop_class_embeds is None:
+                        self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
+                        self._save_static_embed(dop_path, self.cached_dop_class_embeds)
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
