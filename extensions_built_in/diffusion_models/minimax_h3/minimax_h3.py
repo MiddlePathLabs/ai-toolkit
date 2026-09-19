@@ -1009,27 +1009,43 @@ class MinimaxH3Model(BaseModel):
         # Training pass (LoRA/adapters): the pruned fp16 checkpoint drives the text
         # rows to inf in the last block. Harmless for the base model, fatal for
         # adapters (NaN grads everywhere) — guard both the LoRA input and the
-        # backward path. Cleared again on no-grad passes (sampling), so inference
-        # always runs the untouched forward. See transformer._zero_nonfinite_grad
-        # and network_mixins.
+        # backward path. A grad pass sets the flags and leaves them set. A no-grad
+        # pass (sampling / guidance-loss probe) runs the untouched forward with the
+        # guards off, then restores what was there before: a gradient-checkpointed
+        # training forward may still be awaiting its backward, and its recompute
+        # has to see the flags the original forward saw or torch.utils.checkpoint
+        # raises CheckpointError. See transformer._zero_nonfinite_grad and
+        # network_mixins.
         training = torch.is_grad_enabled()
-        self.model.sanitize_backward_nonfinite = training
         network = getattr(self, "network", None)
+        prev_transformer_flag = self.model.sanitize_backward_nonfinite
+        prev_network_flag = (
+            getattr(network, "zero_nonfinite_lora_inputs", False)
+            if network is not None
+            else False
+        )
+        self.model.sanitize_backward_nonfinite = training
         if network is not None:
             network.zero_nonfinite_lora_inputs = training
-        video_pred, audio_pred = self.model(
-            hidden_states=video_rows,
-            audio_hidden_states=audio_rows.to(dtype),
-            encoder_hidden_states=text_batch,
-            row_timesteps=row_t.to(device),
-            token_tags=token_tags.to(device),
-            position_ids=position_ids.to(device),
-            video_indices=video_indices.to(device),
-            audio_indices=audio_indices.to(device),
-            text_indices=text_indices.to(device),
-            # target-video token grid (patch 1x2x2); VSA tiling and TREAD still/clip routing
-            vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
-        )
+        try:
+            video_pred, audio_pred = self.model(
+                hidden_states=video_rows,
+                audio_hidden_states=audio_rows.to(dtype),
+                encoder_hidden_states=text_batch,
+                row_timesteps=row_t.to(device),
+                token_tags=token_tags.to(device),
+                position_ids=position_ids.to(device),
+                video_indices=video_indices.to(device),
+                audio_indices=audio_indices.to(device),
+                text_indices=text_indices.to(device),
+                # target-video token grid (patch 1x2x2); VSA tiling and TREAD still/clip routing
+                vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+            )
+        finally:
+            if not training:
+                self.model.sanitize_backward_nonfinite = prev_transformer_flag
+                if network is not None:
+                    network.zero_nonfinite_lora_inputs = prev_network_flag
 
         if num_cond_audio > 0:
             # reference soundtrack rows are conditioning, not targets

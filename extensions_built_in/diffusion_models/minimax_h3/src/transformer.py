@@ -376,19 +376,23 @@ class MiniMaxH3Block(nn.Module):
         rotary_emb,  # (cos, sin)
         attn_mask: Optional[torch.Tensor] = None,
         vsa=None,  # H3VSAContext or None (dense)
+        sanitize: bool = False,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaln_proj(temb)
         )
         dt = x.dtype  # pruned checkpoints store the adaln projections fp16
-        # Training only (set by the parent transformer): with the pruned fp16 checkpoint
+        # Training only (passed in by the parent transformer): with the pruned fp16 checkpoint
         # the modulation rows of the text tokens overflow to inf in the last block. Those
         # rows are never read out, so the base forward is fine, but every op that touches
         # an inf there yields NaN in the BACKWARD (0 * inf), the attention backward spreads
         # it into every row, and every adapter upstream gets NaN gradients. Dead rows are
         # zeroed (value and gradient) at the modulation, the norm output and the residual.
         # A no-op wherever the base forward is finite, so the base model is untouched.
-        san = getattr(self, "sanitize_nonfinite_rows", False)
+        # The flag is a call argument, not an attribute: it rides the torch.utils.checkpoint
+        # args, so a recompute triggered by backward sees the same value the original
+        # forward saw even if a no-grad pass (guidance-loss probe) ran in between.
+        san = sanitize
 
         h = self.norm1(x) * (1.0 + _mod_rows(scale_msa, adaln_indices, dt, san)) + _mod_rows(
             shift_msa, adaln_indices, dt, san
@@ -672,11 +676,12 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 generator=generator,
             )
 
-        # training-only non-finite guards (see MiniMaxH3Block.forward); propagated
-        # here so gradient-checkpointing recomputes see the flag too
-        self.final_layer.sanitize_nonfinite_rows = self.sanitize_backward_nonfinite
-        for block in self.blocks:
-            block.sanitize_nonfinite_rows = self.sanitize_backward_nonfinite
+        # training-only non-finite guards (see MiniMaxH3Block.forward). The block flag
+        # rides the checkpoint args so a recompute sees the original forward's value; the
+        # final layer runs outside the checkpointed regions and keeps reading the
+        # attribute, which each real forward refreshes before use.
+        san = self.sanitize_backward_nonfinite
+        self.final_layer.sanitize_nonfinite_rows = san
 
         full_state = None
         for i, block in enumerate(self.blocks):
@@ -694,10 +699,11 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     rotary_emb,
                     attn_mask,
                     vsa_ctx,
+                    san,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, temb, adaln_indices, rotary_emb, attn_mask, vsa_ctx)
+                x = block(x, temb, adaln_indices, rotary_emb, attn_mask, vsa_ctx, san)
             if keep_idx is not None and i + 1 == route_end:
                 x = scatter_tread_hidden(x, full_state[0], keep_idx)
                 rotary_emb, adaln_indices, attn_mask = full_state[1:]
