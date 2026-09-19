@@ -185,6 +185,7 @@ export interface DatasetConfig {
 export interface EMAConfig {
   use_ema: boolean;
   ema_decay: number;
+  save_raw_weights?: boolean;
 }
 
 export interface WeightNoiseConfig {

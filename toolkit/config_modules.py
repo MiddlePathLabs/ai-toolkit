@@ -1025,6 +1025,10 @@ class EMAConfig:
     def __init__(self, **kwargs):
         self.use_ema: bool = kwargs.get('use_ema', False)
         self.ema_decay: float = kwargs.get('ema_decay', 0.999)
+        # also write the raw (non-EMA) weights next to every EMA checkpoint as
+        # RAW_<name><step>.safetensors, so one run yields both for A/B. The RAW_
+        # prefix keeps them invisible to auto-resume globs and keep-counts.
+        self.save_raw_weights: bool = kwargs.get('save_raw_weights', False)
         # feeds back the decay difference into the parameter
         self.use_feedback: bool = kwargs.get('use_feedback', False)
         # per-step fraction of (shadow - param) pulled back into the param; keep well below 1 - ema_decay

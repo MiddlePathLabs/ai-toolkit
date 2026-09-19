@@ -485,6 +485,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             critic_pattern = f"CRITIC_{self.job.name}_*"
             critic_items = glob.glob(os.path.join(self.save_root, critic_pattern))
 
+            # EMA dual-save twins (RAW_<name>_...). They never match the
+            # {job.name}_* pattern above, so they are not counted toward
+            # max_step_saves_to_keep — they are removed with their sibling below
+            raw_items = glob.glob(os.path.join(self.save_root, "RAW_*"))
+
             # Sort the lists by creation time if they are not empty
             if safetensors_files:
                 safetensors_files.sort(key=os.path.getctime)
@@ -522,6 +527,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # remove duplicates
             items_to_remove = list(dict.fromkeys(items_to_remove))
 
+            # take the RAW_ twin along with its sibling so the pairs stay in sync
+            for item in list(items_to_remove):
+                twin = os.path.join(os.path.dirname(item), 'RAW_' + os.path.basename(item))
+                if twin in raw_items:
+                    items_to_remove.append(twin)
+
             for item in items_to_remove:
                 print_acc(f"Removing old save: {item}")
                 if os.path.isdir(item):
@@ -546,40 +557,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
-    def save(self, step=None):
-        if not self.accelerator.is_main_process:
-            return
-        flush()
-        if self.ema is not None:
-            # always save params as ema
-            self.ema.eval()
-
-        if not os.path.exists(self.save_root):
-            os.makedirs(self.save_root, exist_ok=True)
-
-        step_num = ''
-        if step is not None:
-            self.last_save_step = step
-            # zeropad 9 digits
-            step_num = f"_{str(step).zfill(9)}"
-
-        self.update_training_metadata()
-        filename = f'{self.job.name}{step_num}.safetensors'
+    def _save_live_weights(self, step_num: str, save_meta, prefix: str = '') -> str:
+        # Serialize whichever weights are currently live in the network /
+        # embedding / decorator / adapter (or the full model for fine-tuning and
+        # merge-on-save) as <prefix><name><step_num>.safetensors and return the
+        # primary checkpoint path. EMA dual-save calls this once with the shadow
+        # weights live and once with the raw training weights live; everything
+        # that must happen once per save event (optimizer state, prune, hooks)
+        # stays in save().
+        filename = f'{prefix}{self.job.name}{step_num}.safetensors'
         file_path = os.path.join(self.save_root, filename)
 
-        save_meta = copy.deepcopy(self.meta)
-        # get extra meta
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            additional_save_meta = self.adapter.get_additional_save_metadata()
-            if additional_save_meta is not None:
-                for key, value in additional_save_meta.items():
-                    save_meta[key] = value
-
-        # prepare meta
-        save_meta = get_meta_for_safetensors(save_meta, self.job.name)
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
             if self.network is not None:
-                lora_name = self.job.name
+                lora_name = prefix + self.job.name
                 if self.named_lora:
                     # add _lora to name
                     lora_name += '_LoRA'
@@ -602,7 +593,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # even if added to lora, still save the trigger version
             if self.embedding is not None:
-                emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
+                emb_filename = f'{prefix}{self.embed_config.trigger}{step_num}.safetensors'
                 emb_file_path = os.path.join(self.save_root, emb_filename)
                 # for combo, above will get it
                 # set current step
@@ -612,9 +603,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # replace extension
                     emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
                 self.embedding.save(emb_file_path)
-            
+
             if self.decorator is not None:
-                dec_filename = f'{self.job.name}{step_num}.safetensors'
+                dec_filename = f'{prefix}{self.job.name}{step_num}.safetensors'
                 dec_file_path = os.path.join(self.save_root, dec_filename)
                 decorator_state_dict = self.decorator.state_dict()
                 for key, value in decorator_state_dict.items():
@@ -627,7 +618,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
             if self.adapter is not None and self.adapter_config.train:
-                adapter_name = self.job.name
+                adapter_name = prefix + self.job.name
                 if self.network_config is not None or self.embedding is not None:
                     # add _lora to name
                     if self.adapter_config.type == 't2i':
@@ -702,9 +693,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # reset weights to zero
                 self.network.reset_weights()
                 self.network.is_merged_in = False
-                
+
                 print_acc("Done merging network weights. Saving model...")
-                
+
             if self.save_config.save_format == "diffusers":
                 # saving as a folder path
                 file_path = file_path.replace('.safetensors', '')
@@ -727,6 +718,57 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     save_meta,
                     get_torch_dtype(self.save_config.dtype)
                 )
+        return file_path
+
+    def save(self, step=None):
+        if not self.accelerator.is_main_process:
+            return
+        flush()
+        if self.ema is not None:
+            # always save params as ema
+            self.ema.eval()
+
+        if not os.path.exists(self.save_root):
+            os.makedirs(self.save_root, exist_ok=True)
+
+        step_num = ''
+        if step is not None:
+            self.last_save_step = step
+            # zeropad 9 digits
+            step_num = f"_{str(step).zfill(9)}"
+
+        self.update_training_metadata()
+
+        save_meta = copy.deepcopy(self.meta)
+        # get extra meta
+        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+            additional_save_meta = self.adapter.get_additional_save_metadata()
+            if additional_save_meta is not None:
+                for key, value in additional_save_meta.items():
+                    save_meta[key] = value
+
+        # prepare meta
+        save_meta = get_meta_for_safetensors(save_meta, self.job.name)
+
+        file_path = self._save_live_weights(step_num, save_meta)
+
+        # EMA dual-save: the pass above wrote the shadow weights. Write the raw
+        # training weights alongside them so one run yields both for A/B. The
+        # RAW_ prefix keeps these invisible to get_latest_save_path globs
+        # (auto-resume) and to the keep-count in clean_up_saves; twins are
+        # pruned together with their sibling. Full-model / merged saves skip
+        # the raw pass — doubling a whole unet is not worth it.
+        if (
+            self.ema is not None
+            and self.train_config.ema_config.save_raw_weights
+            and not self.is_fine_tuning
+            and not self.train_config.merge_network_on_save
+        ):
+            self.ema.restore()  # raw training weights back into the live modules
+            raw_path = self._save_live_weights(step_num, save_meta, prefix='RAW_')
+            print_acc(f"Saved raw (non-EMA) checkpoint to {raw_path}")
+            # the ema.train() at the end of save() restores again; collected_params
+            # is never cleared, so that second restore is an idempotent copy
 
         # save learnable params as json if we have thim
         if self.snr_gos:

@@ -1089,14 +1089,24 @@ export default function SimpleJob({
                   />
                 </FormGroup>
                 {jobConfig.config.process[0].train.ema_config?.use_ema && (
-                  <NumberInput
-                    label="EMA Decay"
-                    className="pt-2"
-                    value={jobConfig.config.process[0].train.ema_config?.ema_decay as number}
-                    onChange={value => setJobConfig(value, 'config.process[0].train.ema_config.ema_decay')}
-                    placeholder="eg. 0.99"
-                    min={0}
-                  />
+                  <>
+                    <NumberInput
+                      label="EMA Decay"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.ema_config?.ema_decay as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.ema_config.ema_decay')}
+                      placeholder="eg. 0.99"
+                      min={0}
+                    />
+                    <Checkbox
+                      label="Also save raw (non-EMA) weights"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.ema_config?.save_raw_weights || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.ema_config.save_raw_weights')
+                      }
+                    />
+                  </>
                 )}
 
                 {!isLlmModel && (
