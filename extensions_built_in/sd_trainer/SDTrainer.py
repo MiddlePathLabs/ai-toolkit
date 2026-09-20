@@ -544,7 +544,8 @@ class SDTrainer(BaseSDTrainProcess):
             return None
         try:
             return str(fn())
-        except Exception:
+        except Exception as e:
+            print_acc(f"static-embed cache disabled: te_cache_identity failed: {e}")
             return None
 
     def _static_embed_cache_path(self, kind: str, prompt: str, extra: str = "") -> Optional[str]:
@@ -574,17 +575,26 @@ class SDTrainer(BaseSDTrainProcess):
         if path is None or not os.path.exists(path):
             return None
         try:
-            return torch.load(path, map_location='cpu', weights_only=False)
-        except Exception:
+            # PromptEmbeds.load dispatches on the file's class_name metadata, so
+            # this returns the right container (AdvancedPromptEmbeds, Anima, ...)
+            return PromptEmbeds.load(path)
+        except Exception as e:
+            print_acc(f"static-embed cache miss for {path}: {e}")
             return None
 
     def _save_static_embed(self, path: Optional[str], embeds) -> None:
         if path is None:
             return
         try:
-            torch.save(embeds.to('cpu'), path)
-        except Exception:
-            pass  # a failed cache write only costs a re-encode on the next run
+            # clone + cpu so saving never moves the live tensors: PromptEmbeds.to
+            # mutates in place, and a CUDA-resident embed would otherwise drag
+            # the training copy off the device (AdvancedPromptEmbeds.to copies,
+            # but this must be safe for both). safetensors format, same as the
+            # dataset caption caches.
+            embeds.clone().to('cpu').save(path)
+        except Exception as e:
+            # a failed cache write only costs a re-encode on the next run
+            print_acc(f"static-embed cache write failed for {path}: {e}")
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -698,10 +708,10 @@ class SDTrainer(BaseSDTrainProcess):
                     ).to('cpu')
                 else:
                     # plain text prompts: serve from the static-embed cache when
-                    # possible so a warm start never needs the text encoder
+                    # possible so a warm start never needs the text encoder.
+                    # pos and neg are independent encodes, keyed separately.
                     pos_path = self._static_embed_cache_path(
                         'sample_pos', gen_img_config.prompt,
-                        extra=str(gen_img_config.negative_prompt),
                     )
                     neg_path = self._static_embed_cache_path(
                         'sample_neg', str(gen_img_config.negative_prompt),

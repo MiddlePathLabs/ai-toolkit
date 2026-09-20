@@ -431,12 +431,20 @@ class MinimaxH3Model(BaseModel):
     def te_cache_identity(self) -> str:
         """Stable identity of the text-encoder weights for prompt-embed caches.
 
-        Path + size + mtime catches a TE swap without hashing a 25 GB file.
-        SDTrainer's static-embed disk cache keys on this, so replacing the TE
-        file invalidates every cached embedding."""
+        Path + size + mtime catches a TE swap without hashing a 25 GB file
+        (for a transformers-format folder: aggregate size + newest mtime of the
+        shards). SDTrainer's static-embed disk cache keys on this, so replacing
+        the TE file or folder invalidates every cached embedding."""
         src = self._te_source_path()
         if os.path.isdir(src):
-            return f"dir|{src}"
+            total_size = 0
+            newest = 0
+            for root, _dirs, files in os.walk(src):
+                for name in files:
+                    st = os.stat(os.path.join(root, name))
+                    total_size += st.st_size
+                    newest = max(newest, int(st.st_mtime))
+            return f"dir|{src}|{total_size}|{newest}|{self.te_torch_dtype}"
         st = os.stat(src)
         return f"file|{src}|{st.st_size}|{int(st.st_mtime)}|{self.te_torch_dtype}"
 
@@ -444,7 +452,6 @@ class MinimaxH3Model(BaseModel):
         from accelerate import init_empty_weights
         from transformers import (
             AutoConfig,
-            Qwen3VLForConditionalGeneration,
         )
 
         te_path = self.model_config.te_name_or_path
@@ -592,12 +599,7 @@ class MinimaxH3Model(BaseModel):
                 "weights load on first encode)"
             )
         else:
-            text_encoder = self._load_text_encoder_weights()
-            if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
-                # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
-                text_encoder.aitk_is_quantized = True
-            # quantize + offload + placement, all driven by model_config
-            text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+            text_encoder = self._prepare_te(self._load_text_encoder_weights())
         flush()
 
         vae_bundle = self._load_vaes()
@@ -635,21 +637,28 @@ class MinimaxH3Model(BaseModel):
         static video reference (``image_refs_as_video``)."""
         return image
 
-    def _ensure_text_encoder(self):
-        """Materialize the deferred text encoder (no-op unless load_model
-        deferred it). Safe to call from any encode path — the first real
-        encode pays the weight load."""
-        if not getattr(self, "_te_deferred", False):
-            return
-        self._te_deferred = False
-        self.print_and_status_update("Loading deferred Qwen3-VL text encoder")
-        text_encoder = self._load_text_encoder_weights()
+    def _prepare_te(self, text_encoder):
+        """Quantize-flag + placement a freshly loaded text encoder needs before
+        use (both the eager load path and the deferred materialization)."""
         if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
             # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
             text_encoder.aitk_is_quantized = True
         # quantize + offload + placement, all driven by model_config
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+        return text_encoder
+
+    def _ensure_text_encoder(self):
+        """Materialize the deferred text encoder (no-op unless load_model
+        deferred it). Safe to call from any encode path — the first real
+        encode pays the weight load. The deferred flag only clears once the
+        real encoder is in place, so a failed load is retried (or fails with
+        its actual traceback) instead of leaving a stub that looks loaded."""
+        if not getattr(self, "_te_deferred", False):
+            return
+        self.print_and_status_update("Loading deferred Qwen3-VL text encoder")
+        text_encoder = self._prepare_te(self._load_text_encoder_weights())
         self.text_encoder = text_encoder
+        self._te_deferred = False
         flush()
 
     def get_prompt_embeds(self, prompt, control_images=None) -> AdvancedPromptEmbeds:
