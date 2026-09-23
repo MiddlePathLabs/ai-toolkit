@@ -20,7 +20,6 @@ install. All heavy imports are lazy so selecting Krea never imports them.
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 from typing import List, Optional, Tuple
 
@@ -55,6 +54,22 @@ def _require_face_deps():
             "Then verify: python -c \"import onnxruntime as ort; "
             "print(ort.get_available_providers())\" lists CUDAExecutionProvider."
         ) from e
+
+
+def _onnx_to_torch(onnx_path: str):
+    """ONNX file -> fx.GraphModule without onnx2torch's Windows temp-file leak.
+
+    ``onnx2torch.convert(path)`` always runs ``safe_shape_inference``, which
+    holds a ``NamedTemporaryFile`` open and then writes/reads that same path.
+    Windows raises ``PermissionError: [Errno 13]`` even on a freshly staged
+    copy. There is no ``safe_shape_inference=False`` flag.
+
+    Passing a ``ModelProto`` uses in-memory ``infer_shapes`` for models under
+    2GB (ArcFace ``w600k_r50`` is ~166MB) and never opens that temp file.
+    """
+    import onnx
+    import onnx2torch
+    return onnx2torch.convert(onnx.load(onnx_path))
 
 
 class FaceIDExtractor:
@@ -162,7 +177,6 @@ class DifferentiableFaceEncoder(nn.Module):
     def __init__(self, model_name: str = "buffalo_l", device: Optional[torch.device] = None):
         super().__init__()
         _require_face_deps()
-        import onnx2torch
         onnx_path = os.path.join(
             os.path.expanduser("~"), ".insightface", "models", model_name, "w600k_r50.onnx"
         )
@@ -181,13 +195,7 @@ class DifferentiableFaceEncoder(nn.Module):
                     f"  pip uninstall -y onnxruntime && pip install --no-deps onnxruntime-gpu\n"
                     f"Or manually download the buffalo_l model pack to ~/.insightface/models/"
                 ) from e
-        # onnx2torch.safe_shape_inference writes a temp file next to the source
-        # ONNX -> PermissionError on Windows when the model dir has a live handle.
-        # Staging the ONNX into a temp dir avoids the contention.
-        with tempfile.TemporaryDirectory() as _td:
-            _local_onnx = os.path.join(_td, os.path.basename(onnx_path))
-            shutil.copy2(onnx_path, _local_onnx)
-            self.model = onnx2torch.convert(_local_onnx)
+        self.model = _onnx_to_torch(onnx_path)
         self.model.eval()
         self.model.requires_grad_(False)
         if device is not None:

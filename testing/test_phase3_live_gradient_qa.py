@@ -17,8 +17,8 @@ Tier 2 - real perceptor differentiability (weight-loading bypassed):
     patched out (random init) and its real `forward` is run on synthetic pixels
     with requires_grad=True. Asserts: output finite, input receives non-zero
     grad, all perceptor params remain requires_grad=False and receive no grad.
-    face_id's ArcFace path is exercised via a tiny ONNX converted with the real
-    onnx2torch.convert (the actual deployed conversion path).
+    face_id's ArcFace path is exercised via a tiny ONNX converted with
+    ``toolkit.face_id._onnx_to_torch`` (the deployed conversion path).
 
 These two tiers together prove the only things static inspection cannot: that
 no `.detach()`, `torch.no_grad()`, dtype cast, or PIL/NumPy round-trip silently
@@ -379,26 +379,19 @@ def test_normal_real_forward_is_differentiable():
         assert not p.requires_grad
 
 
-@pytest.mark.xfail(
-    condition=sys.platform == "win32",
-    reason="onnx2torch.safe_shape_inference leaks a file handle on Windows; "
-           "documented Phase 3 finding (face_id conversion path).",
-    strict=True,
-)
 def test_face_id_onnx_conversion_and_forward_is_differentiable():
-    """Build a tiny ONNX, run it through the REAL onnx2torch.convert path the
-    deployed encoder uses, then exercise DifferentiableFaceEncoder.forward."""
-    import onnx2torch
-    from toolkit.face_id import DifferentiableFaceEncoder
+    """Build a tiny ONNX, run it through the deployed _onnx_to_torch path,
+    then exercise DifferentiableFaceEncoder.forward preprocessing."""
+    from toolkit.face_id import _onnx_to_torch
 
-    # Build + export a tiny ArcFace-like model to ONNX.
+    # Linear-only graph: F.normalize exports ONNX Clip with empty min/max
+    # names that onnx2torch cannot convert (independent of the Windows leak).
     class TinyArc(nn.Module):
         def __init__(self):
             super().__init__()
-            self.fc = nn.Linear(3 * 112 * 112, 512, bias=False)
+            self.fc = nn.Linear(3, 512, bias=False)
         def forward(self, x):
-            flat = x.reshape(x.shape[0], -1)
-            return F.normalize(self.fc(flat), p=2, dim=-1)
+            return self.fc(x.mean(dim=(2, 3)))
 
     torch.manual_seed(0)
     arc = TinyArc().eval()
@@ -408,20 +401,13 @@ def test_face_id_onnx_conversion_and_forward_is_differentiable():
         torch.onnx.export(arc, dummy, onnx_path, input_names=["input"], output_names=["out"],
                           opset_version=17, dynamic_axes={"input": {0: "B"}, "out": {0: "B"}},
                           dynamo=False)
-        # Stage into a fresh temp dir (mirrors DifferentiableFaceEncoder's
-        # Windows workaround for onnx2torch.safe_shape_inference contention).
-        with tempfile.TemporaryDirectory() as td2:
-            staged = os.path.join(td2, "tiny.onnx")
-            import shutil
-            shutil.copy2(onnx_path, staged)
-            converted = onnx2torch.convert(staged)
+        converted = _onnx_to_torch(onnx_path)
     converted.eval()
     for p in converted.parameters():
         p.requires_grad_(False)
 
     # Replicate DifferentiableFaceEncoder.forward preprocessing exactly.
     pixels = torch.rand(2, 3, 96, 80, requires_grad=True)
-    bboxes = [None, None]
     crops = F.interpolate(pixels, size=(112, 112), mode="bilinear", align_corners=False)
     crops_bgr = crops.flip(1)
     crops_norm = (crops_bgr * 255.0 - 127.5) / 127.5
