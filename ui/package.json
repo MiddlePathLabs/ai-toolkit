@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "next lint",
     "update_db": "npx prisma generate && npx prisma db push",
-    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,css,scss}\""
+    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,css,scss}\"",
+    "check_extensions": "tsc -p ../tsconfig.json"
   },
   "dependencies": {
     "@headlessui/react": "^2.2.0",

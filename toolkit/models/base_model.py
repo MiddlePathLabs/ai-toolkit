@@ -26,6 +26,7 @@ from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, conca
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
+from toolkit.unloader import FakeTextEncoder
 import torch
 from toolkit.pipelines import CustomStableDiffusionXLPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
@@ -261,6 +262,14 @@ class BaseModel:
         return self.arch == 'ssd'
 
     @property
+    def load_rgba(self) -> bool:
+        """Images keep an alpha channel end to end: the dataloader loads them
+        as RGBA (opaque alpha when the source has none), the VAE encodes four
+        channels, and decoded samples keep the alpha. Only models with an RGBA
+        VAE override this."""
+        return False
+
+    @property
     def is_v3(self):
         return self.arch == 'sd3'
 
@@ -287,6 +296,28 @@ class BaseModel:
     @property
     def text_embedding_space_version(self):
         return self.arch
+
+    def get_latent_space_version(self) -> str:
+        """Latent cache key. Override to invalidate caches when model_kwargs change what gets cached."""
+        if self.model_config.latent_space_version is not None:
+            return self.model_config.latent_space_version
+        if self.latent_space_version is not None:
+            return self.latent_space_version
+        if self.is_xl:
+            return 'sdxl'
+        if self.is_v3:
+            return 'sd3'
+        if self.is_auraflow:
+            return 'sdxl'
+        if self.is_flux:
+            return 'flux1'
+        if self.model_config.is_pixart_sigma:
+            return 'sdxl'
+        return self.model_config.arch
+
+    def get_text_embedding_space_version(self) -> str:
+        """Text embedding cache key. Override like get_latent_space_version."""
+        return self.text_embedding_space_version
 
     def get_bucket_divisibility(self):
         if self.vae is None:
@@ -689,19 +720,21 @@ class BaseModel:
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
                             conditional_embeds = self.encode_prompt(
-                                gen_config.prompt, 
-                                gen_config.prompt_2, 
+                                gen_config.prompt,
+                                gen_config.prompt_2,
                                 force_all=True,
-                                control_images=ctrl_img
+                                control_images=ctrl_img,
+                                target_size=(gen_config.width, gen_config.height),
                             )
 
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = True
                             unconditional_embeds = self.encode_prompt(
-                                gen_config.negative_prompt, 
-                                gen_config.negative_prompt_2, 
+                                gen_config.negative_prompt,
+                                gen_config.negative_prompt_2,
                                 force_all=True,
-                                control_images=ctrl_img
+                                control_images=ctrl_img,
+                                target_size=(gen_config.width, gen_config.height),
                             )
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
@@ -1176,6 +1209,7 @@ class BaseModel:
             max_length=None,
             dropout_prob=0.0,
             control_images=None,
+            target_size=None,
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -1187,7 +1221,11 @@ class BaseModel:
             prompt2 = [prompt2]
         # if control_images in the signature, pass it. This keep from breaking plugins
         if self.encode_control_in_text_embeddings:
-            return self.get_prompt_embeds(prompt, control_images=control_images)
+            kwargs = {"control_images": control_images}
+            # target (width, height) only for models that size references against it
+            if target_size is not None and "target_size" in inspect.signature(self.get_prompt_embeds).parameters:
+                kwargs["target_size"] = target_size
+            return self.get_prompt_embeds(prompt, **kwargs)
 
         return self.get_prompt_embeds(prompt)
 
@@ -1493,8 +1531,10 @@ class BaseModel:
         }
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
+            # unloaded TEs are FakeTextEncoder stubs; arch probes into TE internals would raise
+            any_fake = any(isinstance(e, FakeTextEncoder) for e in self.text_encoder)
             for encoder in self.text_encoder:
-                te_has_grad = self.get_te_has_grad()
+                te_has_grad = False if any_fake else self.get_te_has_grad()
                 self.device_state['text_encoder'].append({
                     'training': encoder.training,
                     'device': encoder.device,
@@ -1502,7 +1542,10 @@ class BaseModel:
                     'requires_grad': te_has_grad
                 })
         elif self.text_encoder is not None:
-            te_has_grad = self.get_te_has_grad()
+            if isinstance(self.text_encoder, FakeTextEncoder):
+                te_has_grad = False
+            else:
+                te_has_grad = self.get_te_has_grad()
 
             self.device_state['text_encoder'] = {
                 'training': self.text_encoder.training,
@@ -1625,6 +1668,8 @@ class BaseModel:
             active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
+        if device_state_preset in ['cache_text_encoder']:
+            active_modules = ['text_encoder']
         if device_state_preset in ['generate']:
             active_modules = ['vae', 'unet',
                               'text_encoder', 'adapter', 'refiner_unet']
