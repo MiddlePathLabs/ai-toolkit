@@ -364,6 +364,12 @@ const docs: { [key: string]: ConfigDoc } = {
         the audio to become distorted. If you are noticing this happen, you can increase the audio loss multiplier to
         give more weight to the audio loss. You could try something like 2.0, 10.0 etc. Warning, setting this too high
         could overfit and damage the model.
+        <br />
+        <br />
+        MiniMax-H3 video-only training: keep <code>Do Audio</code> on and set this to 0. The model then still sees each
+        clip's real soundtrack as context (as it always does at inference) but gets no audio loss. Turning{' '}
+        <code>Do Audio</code> off instead replaces the soundtrack with silence. Either way, H3 is single-stream: a
+        video-only LoRA still changes the weights the audio path uses, so check its audio.
       </>
     ),
   },

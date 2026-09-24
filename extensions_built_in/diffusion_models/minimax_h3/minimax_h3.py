@@ -852,6 +852,29 @@ class MinimaxH3Model(BaseModel):
         ]
         return torch.cat(packed, dim=0).to(self.device_torch, self.torch_dtype)
 
+    @torch.no_grad()
+    def _silence_audio_rows(self, a_lat: int) -> torch.Tensor:
+        """Packed rows (1, 2*a_lat, 32) of the audio VAE's encoding of digital
+        silence, the "no soundtrack" placeholder. The released audio VAE does
+        not map a zero waveform to a zero latent, so zero rows are not what the
+        model sees for silence. Encoded once per length, on whatever device
+        the audio VAE currently sits on (no VAE moves mid-training)."""
+        cache = self.__dict__.setdefault("_silence_rows_cache", {})
+        rows = cache.get(a_lat)
+        if rows is None:
+            vae = self.audio_vae
+            wave = torch.zeros(
+                packing.AUDIO_CHANNELS,
+                1,
+                a_lat * vae.HOP_LENGTH,
+                device=vae.device,
+                dtype=torch.float32,
+            )
+            z = vae.encode(wave)[..., :a_lat]  # (2, 32, a_lat)
+            rows = pack_audio_latents(z.unsqueeze(0)).float().cpu()
+            cache[a_lat] = rows
+        return rows
+
     # ------------------------------------------------------------------
     # Training forward
     # ------------------------------------------------------------------
@@ -991,15 +1014,24 @@ class MinimaxH3Model(BaseModel):
                 # estimate (x0 = noisy - sigma_a * pred); rides the pred DTO
                 noisy_audio_rows = audio_rows
             else:
-                # no soundtrack: silence (zeros) noised at the audio sigma
-                # rides along without contributing to the loss
-                audio_rows = sa * torch.randn(
-                    batch_size,
-                    a_lat * packing.AUDIO_CHANNELS,
-                    32,
-                    device=device,
-                    dtype=torch.float32,
+                # no soundtrack: VAE-encoded silence noised at the audio sigma
+                # rides along without contributing to the loss. Its noise is
+                # shared across passes like a real soundtrack's, so teacher /
+                # guidance probes see the same audio rows as the student.
+                silence = self._silence_audio_rows(a_lat).to(device)
+                silence = silence.expand(batch_size, -1, -1)
+                audio_noise = (
+                    batch.latents.get("audio_noise")
+                    if batch is not None and isinstance(batch.latents, DTO)
+                    else None
                 )
+                if audio_noise is not None and audio_noise.shape == silence.shape:
+                    audio_noise = audio_noise.to(device, torch.float32)
+                else:
+                    audio_noise = torch.randn_like(silence)
+                    if batch is not None and batch.latents is not None:
+                        batch.latents = DTO(batch.latents, audio_noise=audio_noise)
+                audio_rows = (1.0 - sa) * silence + sa * audio_noise
 
             # embeds cached with a longer max_text_length: cap the caption
             # tail (vision blocks are never touched)
