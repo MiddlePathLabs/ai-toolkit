@@ -538,19 +538,14 @@ class BaseModel:
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
-        if pipeline is None:
-            pipeline = self.get_generation_pipeline()
-            try:
-                pipeline.set_progress_bar_config(disable=True)
-            except:
-                pass
-
-        unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
-
         start_multiplier = 1.0
         if network is not None:
             start_multiplier = network.multiplier
 
+        # pipeline creation lives inside the try: if it raises, the finally
+        # still restores the training RNG / device state and merges the
+        # network back out
+        unwrap_step_hooks = lambda: None
         try:
             if pipeline is None:
                 pipeline = self.get_generation_pipeline()
@@ -558,6 +553,8 @@ class BaseModel:
                     pipeline.set_progress_bar_config(disable=True)
                 except:
                     pass
+
+            unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
 
             # pipeline.to(self.device_torch)
 
