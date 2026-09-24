@@ -52,6 +52,7 @@ from toolkit.h3_train_blocks import prepare_train_blocks, verify_train_blocks
 from toolkit.h3_tread import bind_tread, read_tread_seed, set_tread_step
 from toolkit.category_stop import bind_category_stop, category_kinds, window_category_kinds
 from toolkit.low_noise_share import bind_low_noise_share
+from toolkit.timestep_focus import TimestepFocus, validate_timestep_focus
 from toolkit.h3_dopsd import (
     bind_dopsd,
     identity_first_step_scale,
@@ -130,6 +131,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._post_step_active_ids = None
         self._post_step_active_resolved = False
         self._low_noise_shift = None
+        self.timestep_focus = None
         self.category_stop = None
         self._category_window_kinds = set()
 
@@ -1602,6 +1604,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
 
+                if self.timestep_focus is not None and self.timestep_focus.enabled:
+                    timestep_indices = self.timestep_focus(
+                        timestep_indices,
+                        self.sd.noise_scheduler.timesteps,
+                        min_noise_steps,
+                        max_noise_steps,
+                    )
+
                 if self.train_config.first_timestep_chance > 0.0:
                     # index 0 is full noise; per-sample chance to force it
                     force_first = torch.rand((batch_size,), device=timestep_indices.device) < self.train_config.first_timestep_chance
@@ -2519,6 +2529,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         bind_dopsd(self.sd, self.optimizer_runtime, self.train_config)
         self._low_noise_shift = bind_low_noise_share(self.train_config, self.sd)
+        validate_timestep_focus(self.train_config)
+        self.timestep_focus = TimestepFocus(self.train_config, self.sd)
         self.category_stop = bind_category_stop(
             self.train_config,
             self.optimizer_runtime,

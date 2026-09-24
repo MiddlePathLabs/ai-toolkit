@@ -772,6 +772,22 @@ class TrainConfig:
                 )
         self.low_noise_share: Optional[float] = low_noise_share
 
+        # musubi-tuner timestep focus (toolkit/timestep_focus.py): with this
+        # probability a draw lands uniformly in base sigma [min, max) (pre-shift,
+        # 1 = pure noise). 0 = off. musubi: 0.5 with the 0.4-0.8 default band.
+        self.timestep_focus_prob: float = float(kwargs.get("timestep_focus_prob", 0.0) or 0.0)
+        self.timestep_focus_min: float = float(kwargs.get("timestep_focus_min", 0.4))
+        self.timestep_focus_max: float = float(kwargs.get("timestep_focus_max", 0.8))
+        if not (0.0 <= self.timestep_focus_prob <= 1.0):
+            raise ValueError(
+                f"timestep_focus_prob must be in [0, 1], got {self.timestep_focus_prob}"
+            )
+        if not (0.0 <= self.timestep_focus_min < self.timestep_focus_max <= 1.0):
+            raise ValueError(
+                "timestep_focus_min/max must satisfy 0 <= min < max <= 1, got "
+                f"[{self.timestep_focus_min}, {self.timestep_focus_max})"
+            )
+
         category_stop_raw = kwargs.get("category_stop", None) or {}
         if isinstance(category_stop_raw, CategoryStopConfig):
             self.category_stop = category_stop_raw
