@@ -3741,20 +3741,23 @@ class SDTrainer(BaseSDTrainProcess):
                             prompt = prompt.replace(trigger, class_name)
                         prompt_list[idx] = prompt
 
-                if batch.prompt_embeds is not None:
-                    embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
-                else:
-                    prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
-                    embeds_to_use = self.sd.encode_prompt(
-                        prompt_list,
-                        long_prompts=self.do_long_prompts,
-                        **prompt_kwargs).to(
-                        self.device_torch,
-                        dtype=dtype
-                    ).detach()
+                    # only this branch swaps the embeds (trigger-free prompt);
+                    # everyone else keeps the conditional_embeds passed in
+                    # (D-OPSD teacher, DOP / blank preservation, ...)
+                    if batch.prompt_embeds is not None:
+                        embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
+                    else:
+                        prompt_kwargs = {}
+                        if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
+                            prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
+                        embeds_to_use = self.sd.encode_prompt(
+                            prompt_list,
+                            long_prompts=self.do_long_prompts,
+                            **prompt_kwargs).to(
+                            self.device_torch,
+                            dtype=dtype
+                        ).detach()
 
                 # dont use network on this
                 # self.network.multiplier = 0.0
