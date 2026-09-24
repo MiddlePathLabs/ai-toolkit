@@ -71,6 +71,7 @@ from toolkit.print import print_acc
 from diffusers import FluxFillPipeline
 from transformers import AutoModel, AutoTokenizer, Gemma2Model, Qwen2Model, LlamaModel
 from toolkit.basic import flush
+from toolkit.network_mixins import network_base_is_quantized
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -1269,9 +1270,14 @@ class StableDiffusion:
         if network is not None:
             network.eval()
             # check if we have the same network weight for all samples. If we do, we can merge in th
-            # the network to drastically speed up inference
+            # the network to drastically speed up inference (never into a
+            # quantized base, see network_base_is_quantized)
             unique_network_weights = set([x.network_multiplier for x in image_configs])
-            if len(unique_network_weights) == 1 and network.can_merge_in:
+            if (
+                len(unique_network_weights) == 1
+                and network.can_merge_in
+                and not network_base_is_quantized(network)
+            ):
                 # make sure it is on device before merging. 
                 self.unet.to(self.device_torch)
                 can_merge_in = True

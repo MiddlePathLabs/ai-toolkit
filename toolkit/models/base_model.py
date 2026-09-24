@@ -43,6 +43,7 @@ from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
 from toolkit.basic import flush
+from toolkit.network_mixins import network_base_is_quantized
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -513,10 +514,17 @@ class BaseModel:
             network = unwrap_model(self.network)
             network.eval()
             # check if we have the same network weight for all samples. If we do, we can merge in th
-            # the network to drastically speed up inference
+            # the network to drastically speed up inference. Never into a
+            # quantized base: the requantize erases small deltas from the
+            # samples and merge-out drifts the frozen weights every cycle, so
+            # the LoRA stays a live branch there (musubi's runtime attach).
             unique_network_weights = set(
                 [x.network_multiplier for x in image_configs])
-            if len(unique_network_weights) == 1 and network.can_merge_in:
+            if (
+                len(unique_network_weights) == 1
+                and network.can_merge_in
+                and not network_base_is_quantized(network)
+            ):
                 can_merge_in = True
                 merge_multiplier = unique_network_weights.pop()
                 network.merge_in(merge_weight=merge_multiplier)

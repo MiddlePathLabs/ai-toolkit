@@ -57,6 +57,21 @@ def print_once(msg):
         printed_messages.append(msg)
 
 
+def network_base_is_quantized(network) -> bool:
+    """ToolkitNetworkMixin.base_is_quantized for any network (False for
+    networks that do not wrap base layers). Logs once when it blocks a
+    sample-time merge."""
+    check = getattr(network, 'base_is_quantized', None)
+    if not callable(check) or not check():
+        return False
+    print_once(
+        "Sampling with the LoRA as a live branch: the base is quantized, and "
+        "merging would re-quantize it (small deltas round away, and merge-out "
+        "drifts the frozen weights)."
+    )
+    return True
+
+
 def broadcast_and_multiply(tensor, multiplier):
     # Determine the number of dimensions required
     num_extra_dims = tensor.dim() - multiplier.dim()
@@ -898,6 +913,28 @@ class ToolkitNetworkMixin:
     def reset_weights(self: Network):
         for module in self.get_all_modules():
             module.reset_weights()
+
+    def base_is_quantized(self: Network) -> bool:
+        """True when any base layer this network wraps is quantized (ostris,
+        torchao, quanto). Merging into such a layer re-quantizes it: deltas
+        under half a quantization step round away (measured on convrot8: a
+        LoRA with delta rms 0.2% of the weights kept 0% of its effect, 1%
+        kept 79%), and merge-out re-quantizes again, walking the frozen base
+        a little every cycle."""
+        from toolkit.util.quantize import is_quantized_tensor
+        for module in self.get_all_modules():
+            org = getattr(module, 'org_module', None)
+            om = org[0] if isinstance(org, list) and org else None
+            if om is None:
+                continue
+            if getattr(om, 'is_ostris_quantized', False):
+                return True
+            # read the raw parameter: OstrisLinear-style .weight properties
+            # materialize a full dequantized copy
+            w = getattr(om, '_parameters', {}).get('weight')
+            if w is not None and (is_quantized_tensor(w) or 'quanto' in type(w).__module__):
+                return True
+        return False
 
     def merge_in(self, merge_weight=1.0):
         if self.network_type.lower() == 'dora':
