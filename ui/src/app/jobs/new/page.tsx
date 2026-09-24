@@ -294,6 +294,9 @@ export default function TrainingForm() {
           <AdvancedConfigEditor
             config={jobConfig}
             setConfig={setJobConfig}
+            // Show the same config that Create/Update saves: untouched, disabled
+            // loss blocks are hidden here and re-merged into form state on parse.
+            transformForDisplay={pruneUntouchedLossBlocks}
             transformOnParse={(parsed: any) => {
               try {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';

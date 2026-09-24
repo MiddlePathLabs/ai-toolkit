@@ -9,6 +9,9 @@ type Props<T> = {
   config: T;
   setConfig: (value: any, key?: string) => void;
   transformOnParse?: (parsed: any) => any;
+  // Maps form state to what the editor shows (e.g. hiding untouched defaults).
+  // Must be idempotent over transformOnParse output so edits don't round-trip.
+  transformForDisplay?: (config: T) => any;
 };
 
 const yamlConfig: YAML.DocumentOptions &
@@ -35,8 +38,10 @@ function toYaml(obj: any): string {
   return doc.toString(yamlConfig);
 }
 
-export default function AdvancedConfigEditor<T>({ config, setConfig, transformOnParse }: Props<T>) {
+export default function AdvancedConfigEditor<T>({ config, setConfig, transformOnParse, transformForDisplay }: Props<T>) {
   const { theme } = useTheme();
+  const toDisplay = (value: any) => (transformForDisplay ? transformForDisplay(value) : value);
+  const displayConfig = toDisplay(config);
   const [editorValue, setEditorValue] = useState<string>('');
   const [hasError, setHasError] = useState(false);
   const lastConfigUpdateStringRef = useRef('');
@@ -57,9 +62,9 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
 
     // Initial content setup
     try {
-      const yamlContent = toYaml(config);
+      const yamlContent = toYaml(displayConfig);
       setEditorValue(yamlContent);
-      lastConfigUpdateStringRef.current = JSON.stringify(config);
+      lastConfigUpdateStringRef.current = JSON.stringify(displayConfig);
     } catch (e) {
       console.warn(e);
     }
@@ -67,7 +72,7 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
 
   useEffect(() => {
     const lastUpdate = lastConfigUpdateStringRef.current;
-    const currentUpdate = JSON.stringify(config);
+    const currentUpdate = JSON.stringify(displayConfig);
 
     // Skip if no changes or editor not yet mounted
     if (lastUpdate === currentUpdate || !isEditorMounted.current) {
@@ -84,7 +89,7 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
         const scrollTop = editor.getScrollTop();
 
         // Update content
-        const yamlContent = toYaml(config);
+        const yamlContent = toYaml(displayConfig);
 
         // Only update if the content is actually different
         if (yamlContent !== editor.getValue()) {
@@ -133,7 +138,9 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
         if (transformOnParse) {
           parsed = transformOnParse(parsed);
         }
-        lastConfigUpdateStringRef.current = JSON.stringify(parsed);
+        // Store the display form so the config effect sees no change and
+        // doesn't rewrite the text the user is typing.
+        lastConfigUpdateStringRef.current = JSON.stringify(toDisplay(parsed));
         setConfig(parsed);
       }
     } catch (e: any) {
