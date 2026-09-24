@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence, Tuple
 
 from toolkit.h3_modality_routing import classify_file_item, is_h3_arch
@@ -34,6 +34,11 @@ class DopsdSettings:
     identity_first_steps: int = 0
     identity_first_lr_scale: float = IDENTITY_FIRST_LR_SCALE
     bleed_strength: float = 1.0
+    # teacher-loss shape (musubi-tuner): weight of the magnitude term of the
+    # MSE split, and of the video residual's per-channel DC (colour/tone
+    # cast). 1.0 / 1.0 is plain MSE.
+    loss_mag_weight: float = 1.0
+    loss_dc_weight: float = 1.0
 
     @property
     def other_ref(self) -> bool:
@@ -136,7 +141,64 @@ def parse_dopsd_settings(model_config: Any) -> DopsdSettings:
         bleed_strength=_finite_float(
             "dopsd_bleed_strength", kw.get("dopsd_bleed_strength", 1.0), 1.0
         ),
+        loss_mag_weight=_nonneg_float(
+            "dopsd_loss_mag_weight", kw.get("dopsd_loss_mag_weight"), 1.0
+        ),
+        loss_dc_weight=_nonneg_float(
+            "dopsd_loss_dc_weight", kw.get("dopsd_loss_dc_weight"), 1.0
+        ),
     )
+
+
+def _nonneg_float(name: str, raw: Any, default: float) -> float:
+    value = _finite_float(name, raw, default)
+    if value < 0.0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+def decomposed_teacher_loss(pred, target, mag_weight=1.0, dc_weight=1.0):
+    """Per-sample teacher-matching loss, mean-per-element like MSE -> (B,).
+
+    musubi-tuner's exact split of the MSE, ||p - t||^2 =
+    (||p|| - ||t||)^2 + 2 ||p|| ||t|| (1 - cos), with the ||p|| factor of the
+    direction term detached. Plain MSE couples the two: hedging an
+    unpredictable direction pays off by shrinking the norm, so the student
+    converges to the conditional mean's reduced magnitude (delayed
+    commitment, washed-out contrast at inference). Decoupled, the direction
+    gradient is purely rotational and the magnitude optimum is the per-sample
+    teacher norm. At mag_weight = dc_weight = 1 the value equals plain MSE.
+
+    mag_weight scales the magnitude term (0 = pure direction). dc_weight
+    scales the per-channel DC of the residual (mean over every dim after the
+    channel dim: a global colour/tone cast), applied by shrinking the DC of
+    both sides so ||p~ - t~||^2 = ||r_ac||^2 + w ||r_dc||^2. Either may be a
+    float or a (B,) tensor (per-sample weights, e.g. full weights on anchor
+    steps).
+    """
+    import torch
+
+    p = pred.float()
+    t = target.float().detach()
+    b = p.shape[0]
+    bshape = (b,) + (1,) * (p.ndim - 1)
+    dc = torch.as_tensor(dc_weight, dtype=p.dtype, device=p.device)
+    if bool((dc != 1.0).any()):
+        s = dc.sqrt().expand(b).reshape(bshape) if dc.ndim else dc.sqrt()
+        dims = tuple(range(2, p.ndim))
+        p_dc = p.mean(dim=dims, keepdim=True)
+        t_dc = t.mean(dim=dims, keepdim=True)
+        p = p + (s - 1.0) * p_dc
+        t = t + (s - 1.0) * t_dc
+    pf = p.reshape(b, -1)
+    tf = t.reshape(b, -1)
+    p_norm = pf.norm(dim=1)
+    t_norm = tf.norm(dim=1)
+    cos = (pf * tf).sum(dim=1) / (p_norm * t_norm).clamp(min=1e-12)
+    magnitude = (p_norm - t_norm).square()
+    direction = 2.0 * p_norm.detach() * t_norm * (1.0 - cos)
+    mag = torch.as_tensor(mag_weight, dtype=p.dtype, device=p.device)
+    return (mag * magnitude + direction) / pf.shape[1]
 
 
 def resolve_identity_first_steps(raw_steps: int, train_steps: int) -> int:
@@ -341,6 +403,15 @@ def validate_dopsd(
             "model_kwargs.dopsd requires MiniMax-H3 ref2va (one DiT, two forwards). "
             "Do not load a second teacher model. Set model.arch / partition to ref2va."
         )
+    if (
+        (settings.loss_mag_weight != 1.0 or settings.loss_dc_weight != 1.0)
+        and train_config is not None
+        and str(getattr(train_config, "loss_type", "mse")) != "mse"
+    ):
+        raise ValueError(
+            "dopsd_loss_mag_weight / dopsd_loss_dc_weight split the MSE; they need "
+            f"train.loss_type: mse (got {train_config.loss_type!r})."
+        )
     if settings.other_ref and train_config is not None:
         batch_size = int(getattr(train_config, "batch_size", 1) or 1)
         if batch_size != 1:
@@ -379,19 +450,12 @@ def bind_dopsd(
     model_config = getattr(model, "model_config", None)
     settings = parse_dopsd_settings(model_config)
     if train_config is not None and settings.identity_first:
-        settings = DopsdSettings(
-            enabled=settings.enabled,
-            ref_mode=settings.ref_mode,
-            ref_count=settings.ref_count,
-            group_by=settings.group_by,
-            pair_seed=settings.pair_seed,
-            identity_first=settings.identity_first,
+        settings = replace(
+            settings,
             identity_first_steps=resolve_identity_first_steps(
                 settings.identity_first_steps,
                 int(getattr(train_config, "steps", 0) or 0),
             ),
-            identity_first_lr_scale=settings.identity_first_lr_scale,
-            bleed_strength=settings.bleed_strength,
         )
     validate_dopsd(
         settings,
@@ -405,7 +469,8 @@ def bind_dopsd(
         return None
     print_acc(
         f"[dopsd] enabled ref_mode={settings.ref_mode} "
-        f"bleed={settings.bleed_strength:g}"
+        f"bleed={settings.bleed_strength:g} "
+        f"loss mag={settings.loss_mag_weight:g} dc={settings.loss_dc_weight:g}"
         + (
             f" identity_first={settings.identity_first_steps} steps "
             f"@ {settings.identity_first_lr_scale:g}x LR"

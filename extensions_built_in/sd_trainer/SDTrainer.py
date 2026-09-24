@@ -28,6 +28,7 @@ from toolkit.print import print_acc
 from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
 from toolkit.h3_audio_only import compute_audio_only_objective, is_audio_only_batch
 from toolkit.h3_dopsd import (
+    decomposed_teacher_loss,
     dopsd_teacher_wanted,
     load_chosen_other_photo,
     unweighted_errors,
@@ -2618,6 +2619,25 @@ class SDTrainer(BaseSDTrainProcess):
 
 
 
+    @staticmethod
+    def _decomposed_teacher_loss(loss, pred, target, settings, mag_weight=None, dc_weight=None):
+        """Swap the elementwise teacher MSE for the magnitude/direction split
+        (toolkit.h3_dopsd.decomposed_teacher_loss). Any per-sample weighting
+        already on `loss` (scale_loss, timestep weights) is carried over as
+        the ratio to the plain MSE, and the result is broadcast back to the
+        elementwise shape so the rest of the pipeline is unchanged."""
+        mag = settings.loss_mag_weight if mag_weight is None else mag_weight
+        dc = settings.loss_dc_weight if dc_weight is None else dc_weight
+        per_sample = decomposed_teacher_loss(pred, target, mag, dc)
+        b = loss.shape[0]
+        with torch.no_grad():
+            plain = torch.nn.functional.mse_loss(
+                pred.float(), target.float(), reduction="none"
+            ).reshape(b, -1).mean(dim=1)
+            ratio = loss.detach().float().reshape(b, -1).mean(dim=1) / plain.clamp(min=1e-12)
+        per_sample = per_sample * ratio
+        return per_sample.view(b, *([1] * (loss.ndim - 1))).expand_as(loss)
+
     def _loss_for_audio_only_batch(
             self,
             audio_pred,
@@ -3239,6 +3259,11 @@ class SDTrainer(BaseSDTrainProcess):
             step_num=self.step_num,
             batch=batch,
         ):
+            settings = getattr(self.sd, "dopsd_settings", None)
+            if settings is not None and (
+                settings.loss_mag_weight != 1.0 or settings.loss_dc_weight != 1.0
+            ):
+                loss = self._decomposed_teacher_loss(loss, pred, target, settings)
             if self.train_config.loss_type == "mae":
                 teacher_err = torch.nn.functional.l1_loss(
                     pred.float(), target.float(), reduction="none"
