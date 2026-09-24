@@ -418,6 +418,14 @@ class CaptionProcessingDTOMixin:
                 self.caption_dopsd = wrap_ref_teacher_caption(
                     self.caption_dopsd, with_audio=self._dopsd_teacher_has_audio()
                 )
+            elif (
+                getattr(self, 'dopsd_other_ref', False)
+                and getattr(self, 'dopsd_subject_declaration', False)
+            ):
+                from toolkit.h3_dopsd import wrap_subject_reference_caption
+                self.caption_dopsd = wrap_subject_reference_caption(
+                    self.caption_dopsd, still_image=not self.is_video
+                )
 
     def _dopsd_teacher_has_audio(self: 'FileItemDTO') -> bool:
         """The self-ref teacher's <Audio 1> exists only when the clip's
@@ -432,7 +440,12 @@ class CaptionProcessingDTOMixin:
             return False
 
     def get_dopsd_ref_token(self: 'FileItemDTO') -> str:
-        # Picture 1 for stills (self-ref or other-photo); Video 1 for clip self-ref
+        # Picture 1 for stills (self-ref or other-photo); Video 1 for clip self-ref.
+        # With the subject declaration, the other-photo token is <Subject 1>,
+        # which the wrapper defines as the subject shown in <Picture 1>.
+        if getattr(self, 'dopsd_other_ref', False) and getattr(self, 'dopsd_subject_declaration', False):
+            from toolkit.h3_dopsd import SUBJECT_REF_TOKEN
+            return SUBJECT_REF_TOKEN
         return "<Video 1>" if self.is_video else "<Picture 1>"
 
     def get_caption(

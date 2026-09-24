@@ -49,6 +49,10 @@ class DopsdSettings:
     # wrap self-ref video teacher captions in the official copy declaration
     # (`<Video 1>` fully_preserved, `<Audio 1>` fully_copy)
     copy_declaration: bool = False
+    # wrap other-photo teacher captions in the official subject-reference
+    # declaration; the reference token becomes <Subject 1>
+    subject_declaration: bool = False
+    musubi_recipe: bool = False
 
     @property
     def teacher_gated(self) -> bool:
@@ -100,6 +104,34 @@ def _int_field(name: str, raw: Any, default: int, *, minimum: Optional[int] = No
     return value
 
 
+# musubi-tuner's validated starting recipes, filled in by
+# `dopsd_musubi_recipe: true` for any key the config leaves unset.
+# self  = their `ref` teacher (the training item is its own reference);
+# other = their `subject_ref` teacher (other pictures of the subject).
+# Train-config parts of the recipes are only logged (see bind_dopsd).
+MUSUBI_RECIPES = {
+    "self": {
+        "dopsd_teacher_sigma_max": 0.75,
+        "dopsd_loss_dc_weight": 0.3,
+        "dopsd_copy_declaration": True,
+    },
+    "other": {
+        # identity is decided at base 0.92-1.0: never anchor the top
+        "dopsd_teacher_sigma_max": 1.0,
+        "dopsd_teacher_sigma_min": 0.15,
+        "dopsd_loss_mag_weight": 0.5,
+        "dopsd_loss_dc_weight": 0.3,
+        "dopsd_subject_declaration": True,
+    },
+}
+MUSUBI_RECIPE_TRAIN_HINTS = {
+    "self": "timestep_focus_prob 0.5; watch for a plateau around ~300 steps "
+            "and keep the checkpoints at or just after it",
+    "other": "lr 3e-4 with 50 warmup steps, ~500 steps, no timestep focus "
+             "(1e-3 random-walks away from the teacher, 1e-4 stays weak)",
+}
+
+
 def parse_dopsd_settings(model_config: Any) -> DopsdSettings:
     """Parse `model_kwargs` D-OPSD flags. Default-off."""
     kw = _kwargs_of(model_config)
@@ -109,6 +141,8 @@ def parse_dopsd_settings(model_config: Any) -> DopsdSettings:
         raise ValueError(
             f"dopsd_ref_mode must be 'self' or 'other', got {kw.get('dopsd_ref_mode')!r}"
         )
+    if enabled and bool(kw.get("dopsd_musubi_recipe", False)):
+        kw = {**MUSUBI_RECIPES[mode], **kw}
     group_by = str(kw.get("dopsd_group_by", "folder") or "folder").strip().lower()
     if group_by not in GROUP_BY_MODES:
         raise ValueError(
@@ -171,6 +205,8 @@ def parse_dopsd_settings(model_config: Any) -> DopsdSettings:
             "dopsd_preservation_weight", kw.get("dopsd_preservation_weight"), 1.0
         ),
         copy_declaration=bool(kw.get("dopsd_copy_declaration", False)),
+        subject_declaration=bool(kw.get("dopsd_subject_declaration", False)),
+        musubi_recipe=bool(kw.get("dopsd_musubi_recipe", False)),
     )
 
 
@@ -219,6 +255,58 @@ def wrap_ref_teacher_caption(caption: str, with_audio: bool) -> str:
         ),
     )
     return header + caption
+
+
+# musubi-tuner's subject-reference teacher wrap (same file, Apache-2.0): the
+# official full-reference declaration that makes the base read the picture as
+# a *subject* reference (identity/appearance) rather than a frame of the
+# target. `attribute_transfer` is their validated marker, and the "pose,
+# framing, outfit and setting follow the description" clause keeps the
+# picture from acting as a copy source. One picture: D-OPSD's other-photo
+# teacher shows one partner photo per step.
+SUBJECT_REF_TOKEN = "<Subject 1>"
+
+
+def wrap_subject_reference_caption(caption: str, *, still_image: bool) -> str:
+    summary = (
+        f"The target is a single still image with no motion, a static shot of "
+        f"{SUBJECT_REF_TOKEN} as described below."
+        if still_image
+        else f"The target video shows {SUBJECT_REF_TOKEN} as described below."
+    )
+    return (
+        "subject_definitions:\n"
+        f"{SUBJECT_REF_TOKEN} is the subject whose appearance comes from <Picture 1> "
+        "(face and hair style).\n\n"
+        f"summary:\n[reference generation] {summary}\n\n"
+        "retention_analysis:\n"
+        f"{SUBJECT_REF_TOKEN} (appears in [Shot 1]): attribute_transfer - the appearance "
+        f"of {SUBJECT_REF_TOKEN} in <Picture 1> is referenced; pose, framing, outfit and "
+        "setting follow the description.\n\n"
+        f"detailed_description:\n{caption}"
+    )
+
+
+def recipe_warnings(settings: "DopsdSettings") -> list:
+    """musubi warns when a teacher band contradicts the mode's validated recipe."""
+    warnings = []
+    if not settings.enabled:
+        return warnings
+    if settings.other_ref and settings.teacher_sigma_max < 1.0:
+        warnings.append(
+            f"dopsd_teacher_sigma_max={settings.teacher_sigma_max:g} with ref_mode "
+            "'other': identity is decided at base sigma 0.92-1.0, so the anchor band "
+            "pulls exactly those decisions back to the base (musubi: the student "
+            "learns composition but never identity). The recipe keeps 1.0."
+        )
+    if settings.self_ref and settings.teacher_sigma_max > 0.85:
+        warnings.append(
+            f"dopsd_teacher_sigma_max={settings.teacher_sigma_max:g} with ref_mode "
+            "'self': above base sigma ~0.85 the weights cannot align a self-reference "
+            "against a noise-dominated input, and unrestricted teaching there "
+            "overwrites the base's composition prior (musubi recipe: 0.75)."
+        )
+    return warnings
 
 
 def teacher_step_conditioned(settings: "DopsdSettings", base_sigma: float) -> bool:
@@ -577,7 +665,15 @@ def bind_dopsd(
             if settings.other_ref
             else " self-reference"
         )
+        + (" subject_declaration" if settings.other_ref and settings.subject_declaration else "")
     )
+    for warning in recipe_warnings(settings):
+        print_acc(f"[dopsd] WARNING: {warning}")
+    if settings.musubi_recipe:
+        print_acc(
+            f"[dopsd] musubi recipe ({settings.ref_mode}); train-side settings it "
+            f"was validated with: {MUSUBI_RECIPE_TRAIN_HINTS[settings.ref_mode]}"
+        )
     return settings
 
 
@@ -588,6 +684,7 @@ def apply_settings_to_model(model: Any, settings: DopsdSettings) -> None:
     model.dopsd_other_ref = settings.other_ref
     model.dopsd_bleed_strength = settings.bleed_strength
     model.dopsd_copy_declaration = settings.self_ref and settings.copy_declaration
+    model.dopsd_subject_declaration = settings.other_ref and settings.subject_declaration
     model.dopsd_settings = settings
     if settings.enabled:
         model.require_pixel_tensor_cache = True

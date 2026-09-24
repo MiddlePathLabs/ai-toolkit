@@ -114,6 +114,7 @@ class FileItemDTO(
         self.dopsd_self_ref = kwargs.get("dopsd_self_ref", False)
         self.dopsd_other_ref = kwargs.get("dopsd_other_ref", False)
         self.dopsd_copy_declaration = kwargs.get("dopsd_copy_declaration", False)
+        self.dopsd_subject_declaration = kwargs.get("dopsd_subject_declaration", False)
         self.dopsd_ref_slots = []
         self.te_padding_side = kwargs.get("te_padding_side", "right")
         self.latent_space_version = kwargs.get("latent_space_version", "sd1")
