@@ -897,10 +897,11 @@ const docs: { [key: string]: ConfigDoc } = {
     description: (
       <>
         Skip the contrastive guidance-loss correction (and its extra unconditional forward) on
-        steps whose pre-shift base sigma (<code>timesteps / 1000</code>, where 1 is pure noise) is
-        below this threshold. Default 0 always applies. For MiniMax-H3, 0.15 skips the clean end of
-        the draw where per-sample label noise dominates the guidance gap — cheaper steps, and the
-        audio stream benefits most. This is <em>not</em> a high-noise skip.
+        steps whose pre-shift base sigma (1 is pure noise) is below this threshold. Default 0
+        always applies. MiniMax-H3 undoes its shift-12 first, so 0.15 means video sigma ~0.68 and
+        skips the cleanest ~15% of the draw, where per-sample label noise dominates the guidance
+        gap — cheaper steps, and the audio stream benefits most. Other models compare against{' '}
+        <code>timesteps / 1000</code>. This is <em>not</em> a high-noise skip.
       </>
     ),
   },

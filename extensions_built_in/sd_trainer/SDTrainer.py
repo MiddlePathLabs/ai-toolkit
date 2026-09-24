@@ -2532,14 +2532,27 @@ class SDTrainer(BaseSDTrainProcess):
 
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
+    def _base_sigma(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Pre-shift base sigma per sample (1 = pure noise).
+
+        timesteps/1000 is the post-shift sigma the latents were noised at.
+        Models with a fixed training shift (MiniMax-H3: 12) expose
+        timestep_to_base_sigma to undo it; others keep timesteps/1000.
+        """
+        sigma = timesteps.flatten().float() / 1000.0
+        to_base = getattr(self.sd, 'timestep_to_base_sigma', None)
+        if callable(to_base):
+            return to_base(sigma)
+        return sigma
+
     def _log_guidance_sigma_gate(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Per-sample gate. Logs batch-mean base_sigma and applied fraction.
 
-        Base sigma = timesteps/1000 (pre-shift, 1 = pure noise). The gate skips
-        the clean end of the draw (label-noisy steps), not high-noise timesteps.
+        Base sigma is pre-shift (see _base_sigma). The gate skips the clean
+        end of the draw (label-noisy steps), not high-noise timesteps.
         Returns a (B,) bool tensor; run the uncond probe when gate.any().
         """
-        base_sigma = timesteps.flatten().float() / 1000.0
+        base_sigma = self._base_sigma(timesteps)
         gate = base_sigma >= float(self.train_config.guidance_loss_sigma_min)
         self.additional_logs['guidance/base_sigma'] = float(base_sigma.mean().item())
         self.additional_logs['guidance/applied'] = float(gate.float().mean().item())
@@ -3259,7 +3272,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self._prediction_geometry_log('audio', audio_pred, audio_target)
                 )
             self.additional_logs['teacher/base_sigma'] = float(
-                (timesteps.flatten().float() / 1000.0).mean().item()
+                self._base_sigma(timesteps).mean().item()
             )
 
 

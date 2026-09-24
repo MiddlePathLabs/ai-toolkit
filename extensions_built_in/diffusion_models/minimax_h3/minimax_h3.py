@@ -1132,6 +1132,13 @@ class MinimaxH3Model(BaseModel):
         batch = kwargs.get("batch")
         return (noise - batch.latents).detach()
 
+    def timestep_to_base_sigma(self, sigma_v: torch.Tensor) -> torch.Tensor:
+        """Video sigma (timesteps / 1000, post shift-12) -> the shared base
+        sigma both streams are derived from. Sigma thresholds (guidance-loss
+        gate, teacher gates, logs) are defined in this base space, as in
+        musubi-tuner: base 0.15 is video sigma ~0.68, not 0.15."""
+        return packing.shift_sigma(sigma_v, 1.0 / packing.VIDEO_SIGMA_SHIFT)
+
     # ------------------------------------------------------------------
     # Sampling (training previews)
     # ------------------------------------------------------------------

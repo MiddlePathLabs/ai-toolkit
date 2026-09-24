@@ -851,7 +851,8 @@ class TrainConfig:
         self.do_guidance_loss = kwargs.get('do_guidance_loss', False)
         self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
         # skip guidance-loss correction below this pre-shift base sigma
-        # (timesteps/1000; 1 = pure noise). 0 = always apply. H3 recommended 0.15.
+        # (1 = pure noise; H3 undoes its shift-12 so base 0.15 = video sigma
+        # ~0.68, other models use timesteps/1000). 0 = always apply. H3: 0.15.
         self.guidance_loss_sigma_min: float = kwargs.get('guidance_loss_sigma_min', 0.0)
 
         self.do_guidance_loss_cfg_zero: bool = kwargs.get('do_guidance_loss_cfg_zero', False)
