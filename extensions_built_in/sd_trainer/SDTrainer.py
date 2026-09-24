@@ -375,6 +375,9 @@ def preflight_vae_anchor(
 
 
 class SDTrainer(BaseSDTrainProcess):
+    # hook_train_loop opens the optimizer runtime window, which is where the
+    # category_stop anchor scale is applied
+    supports_category_anchor = True
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)

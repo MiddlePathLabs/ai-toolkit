@@ -39,6 +39,14 @@ Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.
 
 Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other optimizer in the config.
 
+### MiniMax-H3 Turbo preview LoRA
+
+`model.preview_lora_path` (default off) and `model.preview_lora_strength` (default `1.0`). Sampling-only; never trained or saved. Path is a local file, a filename under `models/loras`, or `user/repo/file.safetensors`. H3-only (`model.arch: minimax_h3`). Mutually exclusive with `model.inference_lora_path`.
+
+### H3 standalone voice (audio-only) datasets
+
+On MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
+
 ### Other additions
 
 - `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples.
@@ -52,12 +60,14 @@ Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other
 
 Default-off. Fail-closed at startup when the optimizer cannot honor the requested mode.
 
-- **Per-image adaptive LR `lr` mode** — `train.per_image_adaptive_lr_mode: lr` (default `loss`). Requires `train.per_image_adaptive_lr: true`. `loss` multiplies only the per-sample visual diffusion loss before backward; prior, audio, adapter, preservation, and anchor terms stay at full LR. `lr` leaves every loss component unscaled and multiplies the optimizer's applied update for the whole window. Requires an optimizer that `supports_step_scale`. Discrete watcher multipliers are not min/max LR bounds. On optimizers that normalise by a gradient-range statistic (Rose), a uniform loss scale cancels, so `loss` mode mainly shifts visual-vs-audio balance on AV steps and does nothing on photo-only steps.
-- **MiniMax-H3 Turbo preview LoRA** — `model.preview_lora_path` (default off) and `model.preview_lora_strength` (default `1.0`). Sampling-only; never trained or saved. Path is a local file, a filename under `models/loras`, or `user/repo/file.safetensors`. H3-only (`model.arch: minimax_h3`). Mutually exclusive with `model.inference_lora_path`.
-- **H3 modality block routing** — `train.modality_block_routing` with optional `photo_blocks`, `clip_blocks`, `voice_blocks`. Default off; a blank/omitted key leaves that modality unrestricted. Spec is a range list such as `"3-12, 14-15, 22,27,31-33"`, parsed against `len(transformer.blocks)`. H3 LoRA/LoKr only. Requires an optimizer that `supports_active_param_mask` (Automagic3 is rejected). Mixed-modality windows are left unrestricted (every block trains); refiners and non-trunk adapters stay active.
-- **H3 standalone voice recordings** — on MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
+- **Per-image adaptive LR `lr` mode** — `train.per_image_adaptive_lr_mode: lr` (default `loss`). Requires `train.per_image_adaptive_lr: true`. `loss` multiplies only the per-sample visual diffusion loss before backward; prior, audio, adapter, preservation, and anchor terms stay at full LR. `lr` leaves every loss component unscaled and multiplies the optimizer's applied update for the whole window. Requires an optimizer that `supports_step_scale`. Discrete watcher multipliers are not min/max LR bounds. On optimizers that normalise by a gradient-range statistic (Rose), a uniform loss scale cancels, so `loss` mode mainly shifts visual-vs-audio balance on AV steps and does nothing on photo-only steps. Measured A/B at character-LoRA scale: `lr` mode was on par with base (with transient mid-run destabilization) and slightly below the plain champion optimizer when stacked on it — not adopted for that recipe. The default `loss` mode was not part of the controlled A/B series.
+- **H3 modality block routing** — `train.modality_block_routing` with optional `photo_blocks`, `clip_blocks`, `voice_blocks`. Default off; a blank/omitted key leaves that modality unrestricted. Spec is a range list such as `"3-12, 14-15, 22,27,31-33"`, parsed against `len(transformer.blocks)`. H3 LoRA/LoKr only. Requires an optimizer that `supports_active_param_mask` (Automagic3 is rejected). Mixed-modality windows are left unrestricted (every block trains); refiners and non-trunk adapters stay active. Measured A/B at rank-16 / 2000-step character-LoRA scale: no measurable quality benefit (interference protection only, no speed gain) — keep off for that recipe. That A/B measured the mask as built: the full backward still runs (masked gradients are computed, then dropped) and the token refiner keeps training. It is not a test of a block window with the refiner frozen; for that, see `network.train_blocks` below.
+- **H3 block window (`network.train_blocks`)** — LoRA on a range of trunk blocks and nothing else, e.g. `"20-49"`. The token refiner, `final_layer`, and blocks outside the range get no adapter, so nothing before the first selected block is trainable and autograd stops there (Fizgig measured ~23% faster steps on int8 for its 20-49 recipe). Applies to every item type (photos, clips, voice). H3 LoRA/LoKr only; mutually exclusive with `network_kwargs.only_if_contains`; `ignore_if_contains` still applies. Verified at network build by module ownership (fails if any adapter sits outside the window or a selected block got none). Refused while the text encoder or an embedding trains (text rows pass through every block). Uncompiled runs also check on the first training forward that the block before the window needs no grad; compiled runs skip that runtime check. After Fizgig's "Default" training mode.
+- **Low-noise share (`train.low_noise_share`)** — fraction of training draws below sigma 0.5, e.g. `0.6`. Solves the static shift that puts exactly that share of the training grid below 0.5 and uses it for the training draw only; the model's configured shift (12 on H3), sampling and previews are unchanged. H3's own draw puts ~6.6% of steps below 0.5 (and never goes below sigma ~0.126); `0.6` is Fizgig's "Likeness and Style". On H3 the share is the *video* share: audio rows keep the model's fixed video→audio pairing (`remap_sigma` from shift 12, the pairing inference uses at every step), so audio lands cleaner — `0.6` puts ~86% of audio draws below 0.5 (default ~24%). Remapping from the training shift instead would pair clean video with noisy audio, a combination inference never produces; Fizgig trains the same way. Both shares are logged at startup. Requires `noise_scheduler: flowmatch`, `timestep_type: shift`, a static-shift scheduler, `content_or_style: balanced`, full denoising range, and `first_timestep_chance: 0`; anything else fails at startup. The startup log prints the solved shift and sigma range.
+- **Category stop (`train.category_stop`)** — `photo_step` / `clip_step` / `voice_step` retire that category once the training step reaches it; blank = never. `mode: anchor` (default) keeps training it at 0.1× the optimizer's applied update (requires `supports_step_scale`); `mode: stop` skips its batches before the forward pass. Requires `batch_size: 1` (train-level and any `datasets[].batch_size`, which overrides it when buckets are on) and no gradient accumulation (one category per update). `mode` must be a string: an unquoted YAML `off` loads as a boolean and is refused, not read as anchor. Regularisation items (`is_reg`) never count toward a category, so they are neither scaled nor skipped. Anchor mode needs a trainer that opens the optimizer runtime window (`diffusion_trainer` does) and is refused otherwise. Step-based, so it holds across resume. After Fizgig's per-category stop epoch.
+- **EMA warmup (`train.ema_config.warmup`)** — ramps the EMA decay in as `min(ema_decay, (1+n)/(10+n))` so early checkpoints and samples track the weights instead of the zero-init adapter. Default off (constant decay, as before). The update count isn't saved, so on resume it restarts at the resumed step (the ramp is already saturated past ~440 steps) rather than at 0. Fizgig's measured default is `ema_decay: 0.98` with this ramp.
 - **H3 TREAD token routing** — training-only clip-step token skip (Krause et al., [arXiv 2501.04765](https://arxiv.org/abs/2501.04765)). H3-only (`model.arch: minimax_h3*`; VSA / `gate_compress` is rejected at bind). Default off. Clip steps with batch size 1 and more than one latent video frame skip a random `tread_ratio` of *target* video tokens around blocks `[tread_start, tread_end)` and keep `1 - tread_ratio`; skipped rows rejoin in their start-block state. Text, condition, and audio rows stay. Stills, inference, and `batch_size != 1` never route. Bind rejects a post-rejoin tail shorter than 3 blocks (`tread_end` 47 on a 50-block trunk is the Fizgig prior). No UI until a config-file experiment passes the speed gate.
-- **H3 D-OPSD other-photo / identity-first** — extends existing `model.model_kwargs.dopsd` (self-reference: one ref2va DiT, two forwards). Default-off. `dopsd_ref_mode: other` pairs each still with a different photo in the same folder (never itself, never its own flip, never another folder); clips and voice sit out. `dopsd_identity_first` is teacher-only at 1/3 LR for `dopsd_identity_first_steps` optimizer updates (`-1` → 650), then drops the teacher (one forward, full LR). Other-photo requires `train.batch_size: 1`. Identity-first requires an optimizer that `supports_step_scale`. No second teacher model. No UI until a config-file experiment.
+- **H3 D-OPSD other-photo / identity-first** — extends existing `model.model_kwargs.dopsd` (self-reference: one ref2va DiT, two forwards). Default-off. `dopsd_ref_mode: other` pairs each still with a different photo in the same folder (never itself, never its own flip, never another folder); clips and voice sit out. `dopsd_identity_first` is teacher-only at 1/3 LR for `dopsd_identity_first_steps` optimizer updates (`-1` → 650), then drops the teacher (one forward, full LR). Other-photo requires `train.batch_size: 1`. Identity-first requires an optimizer that `supports_step_scale`. No second teacher model. A/B tested and not adopted for the character-LoRA recipe; kept for further experimentation. No UI until a config-file experiment.
 
 
 ```yaml
@@ -75,6 +85,21 @@ model:
     dopsd_ref_count: 1
     dopsd_identity_first: false
     dopsd_identity_first_steps: -1  # -1 = 650 optimizer updates
+```
+
+```yaml
+network:
+  train_blocks: "20-49"     # H3 trunk blocks only; backward stops at block 20
+train:
+  timestep_type: shift
+  low_noise_share: 0.6      # 60% of training draws below sigma 0.5
+  category_stop:
+    voice_step: 1500        # null = never; also photo_step, clip_step
+    mode: anchor            # anchor (0.1x update) | stop (skip batches)
+  ema_config:
+    use_ema: true
+    ema_decay: 0.98
+    warmup: true
 ```
 
 

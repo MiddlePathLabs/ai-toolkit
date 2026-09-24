@@ -111,8 +111,15 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         device,
         timestep_type='linear',
         latents=None,
-        patch_size=1
+        patch_size=1,
+        shift_override=None,
     ):
+        # shift_override replaces self.shift for this training grid only (see
+        # toolkit/low_noise_share.py). The scheduler's own shift is untouched.
+        if shift_override is not None and timestep_type not in ['flux_shift', 'lumina2_shift', 'shift']:
+            raise ValueError(
+                f"shift_override needs a shift timestep type, got {timestep_type!r}"
+            )
         self.timestep_type = timestep_type
         if timestep_type == 'linear' or timestep_type == 'weighted':
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
@@ -142,6 +149,11 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             sigmas = timesteps / self.config.num_train_timesteps
 
             if self.config.use_dynamic_shifting:
+                if shift_override is not None:
+                    raise ValueError(
+                        "shift_override is for static-shift schedulers; this one "
+                        "uses dynamic shifting"
+                    )
                 if latents is None:
                     raise ValueError('latents is None')
 
@@ -159,7 +171,8 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 )
                 sigmas = self.time_shift(mu, 1.0, sigmas)
             else:
-                sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+                shift = self.shift if shift_override is None else float(shift_override)
+                sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
             if self.config.shift_terminal:
                 sigmas = self.stretch_shift_to_terminal(sigmas)

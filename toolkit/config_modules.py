@@ -230,8 +230,16 @@ class NetworkConfig:
         self.pretrained_lora_path = kwargs.get('pretrained_lora_path', None)
         
         # will create diffirential full weight modules for layers not conv/linear
-        # only useful in very special cases. 
+        # only useful in very special cases.
         self.all_layers = kwargs.get('all_layers', False)
+
+        # H3 only: LoRA on these trunk blocks and nothing else ("20-49"). Nothing
+        # before the first block is trainable, so autograd stops there. Parsed and
+        # verified at network build (toolkit/h3_train_blocks.py). None = off.
+        train_blocks = kwargs.get('train_blocks', None)
+        if train_blocks is not None:
+            train_blocks = str(train_blocks).strip() or None
+        self.train_blocks: Optional[str] = train_blocks
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -427,6 +435,69 @@ class ModalityBlockRoutingConfig:
             spec is not None
             for spec in (self.photo_blocks, self.clip_blocks, self.voice_blocks)
         )
+
+
+class CategoryStopConfig:
+    """Default-off per-category retirement (photo / clip / voice). A category
+    whose ``<kind>_step`` is set retires once the training step reaches it:
+    ``anchor`` keeps training it at a small fixed update scale, ``stop`` skips
+    its batches. None per key = that category never retires. Bound in
+    toolkit/category_stop.py.
+    """
+
+    MODES = ("anchor", "stop")
+
+    def __init__(self, **kwargs):
+        def _step(key: str) -> Optional[int]:
+            raw = kwargs.get(key, None)
+            if raw is None:
+                return None
+            if isinstance(raw, bool):
+                raise ValueError(f"category_stop.{key} must be an integer step, got {raw!r}")
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"category_stop.{key} must be an integer step, got {raw!r}"
+                ) from None
+            if isinstance(raw, float) and float(value) != float(raw):
+                raise ValueError(f"category_stop.{key} must be an integer step, got {raw!r}")
+            if value < 1:
+                raise ValueError(f"category_stop.{key} must be >= 1, got {value}")
+            return value
+
+        self.photo_step: Optional[int] = _step("photo_step")
+        self.clip_step: Optional[int] = _step("clip_step")
+        self.voice_step: Optional[int] = _step("voice_step")
+        mode = kwargs.get("mode", None)
+        if mode is None:
+            mode = "anchor"
+        if not isinstance(mode, str):
+            # YAML reads unquoted off / no / false as a bool; never guess a mode
+            raise ValueError(
+                f"category_stop.mode must be one of {self.MODES} as a string, got "
+                f"{mode!r} (an unquoted YAML off/no/false is a bool; to disable, "
+                f"remove the category_stop block)"
+            )
+        mode = mode.strip().lower()
+        if mode not in self.MODES:
+            raise ValueError(
+                f"category_stop.mode must be one of {self.MODES}, got {mode!r}"
+            )
+        self.mode: str = mode
+
+    @property
+    def steps(self) -> Dict[str, int]:
+        out = {
+            "photo": self.photo_step,
+            "clip": self.clip_step,
+            "voice": self.voice_step,
+        }
+        return {kind: step for kind, step in out.items() if step is not None}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.steps)
 
 
 class TrainConfig:
@@ -678,6 +749,34 @@ class TrainConfig:
                     f"tread_start must be < tread_end, got "
                     f"[{self.tread_start}, {self.tread_end})"
                 )
+
+        # Share of training draws below sigma 0.5, on the 'shift' timestep type
+        # with a static-shift scheduler. None = the model's own shift (unchanged).
+        # Training draw only: sampling and the scheduler config keep their shift.
+        # Checked against the scheduler at bind (toolkit/low_noise_share.py).
+        low_noise_share = kwargs.get("low_noise_share", None)
+        if low_noise_share is not None:
+            if isinstance(low_noise_share, bool):
+                raise ValueError(
+                    f"low_noise_share must be a number in (0, 1), got {low_noise_share!r}"
+                )
+            try:
+                low_noise_share = float(low_noise_share)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"low_noise_share must be a number in (0, 1), got {low_noise_share!r}"
+                ) from None
+            if not (0.0 < low_noise_share < 1.0):
+                raise ValueError(
+                    f"low_noise_share must be in (0, 1), got {low_noise_share}"
+                )
+        self.low_noise_share: Optional[float] = low_noise_share
+
+        category_stop_raw = kwargs.get("category_stop", None) or {}
+        if isinstance(category_stop_raw, CategoryStopConfig):
+            self.category_stop = category_stop_raw
+        else:
+            self.category_stop = CategoryStopConfig(**category_stop_raw)
 
 
 
@@ -1029,6 +1128,15 @@ class EMAConfig:
     def __init__(self, **kwargs):
         self.use_ema: bool = kwargs.get('use_ema', False)
         self.ema_decay: float = kwargs.get('ema_decay', 0.999)
+        # ramp the decay in as min(ema_decay, (1 + n) / (10 + n)) so early updates
+        # track the weights instead of the zero-init adapter. Off = constant decay.
+        warmup = kwargs.get('warmup', False)
+        if warmup is None:
+            warmup = False
+        if not isinstance(warmup, bool):
+            # bool("false") is True; refuse anything but a real boolean
+            raise ValueError(f"ema_config.warmup must be true or false, got {warmup!r}")
+        self.warmup: bool = warmup
         # also write the raw (non-EMA) weights next to every EMA checkpoint as
         # RAW_<name><step>.safetensors, so one run yields both for A/B. The RAW_
         # prefix keeps them invisible to auto-resume globs and keep-counts.

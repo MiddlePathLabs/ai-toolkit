@@ -48,7 +48,10 @@ from toolkit.optimizer_runtime import (
     uses_adaptive_lr_step_scale,
 )
 from toolkit.h3_modality_routing import bind_modality_router
+from toolkit.h3_train_blocks import prepare_train_blocks, verify_train_blocks
 from toolkit.h3_tread import bind_tread, read_tread_seed, set_tread_step
+from toolkit.category_stop import bind_category_stop, category_kinds, window_category_kinds
+from toolkit.low_noise_share import bind_low_noise_share
 from toolkit.h3_dopsd import (
     bind_dopsd,
     identity_first_step_scale,
@@ -96,6 +99,9 @@ def _use_block_compile(block_compile: bool, gradient_checkpointing: bool) -> boo
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
+    # True on trainers whose hook_train_loop opens the optimizer runtime window
+    # (see _open_optimizer_runtime_window); category_stop anchor mode needs it
+    supports_category_anchor = False
 
     def __init__(self, process_id: int, job, config: OrderedDict, custom_pipeline=None):
         super().__init__(process_id, job, config)
@@ -123,6 +129,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.modality_router = None
         self._post_step_active_ids = None
         self._post_step_active_resolved = False
+        self._low_noise_shift = None
+        self.category_stop = None
+        self._category_window_kinds = set()
 
 
         # start at 1 so we can do a sample at the start
@@ -979,6 +988,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def _reset_routing_window(self) -> None:
         self._post_step_active_ids = None
         self._post_step_active_resolved = False
+        self._category_window_kinds = set()
         router = getattr(self, "modality_router", None)
         if router is not None:
             router.reset_window()
@@ -1018,6 +1028,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"dropping the teacher; photos train at full LR, one forward, "
                     f"no reference cache."
                 )
+        category_stop = getattr(self, "category_stop", None)
+        if category_stop is not None:
+            kinds = (
+                category_kinds(batch)
+                if phase == "backward"
+                else self._category_window_kinds
+            )
+            apply_scale *= category_stop.step_scale(kinds, self.step_num)
         active = None
         router = getattr(self, "modality_router", None)
         if router is not None:
@@ -1071,10 +1089,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.ema = ExponentialMovingAverage(
                 params,
                 decay=self.train_config.ema_config.ema_decay,
+                use_num_updates=self.train_config.ema_config.warmup,
                 use_feedback=self.train_config.ema_config.use_feedback,
                 feedback_rate=self.train_config.ema_config.feedback_rate,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
             )
+            if self.train_config.ema_config.warmup and self.step_num > 0:
+                # the update count is not saved; on resume the adapter is not
+                # zero-init, so start the ramp where the step count says it is
+                self.ema.num_updates = int(self.step_num)
             # expose to the model: models that run an EMA-teacher forward during training
             # (e.g. wan21_pixel self_flow) read it from here
             self.sd.ema = self.ema
@@ -1472,12 +1495,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     elif hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'patch_size'):
                         patch_size = self.sd.unet.config.patch_size
                     
+                    shift_kwargs = {}
+                    if self._low_noise_shift is not None:
+                        shift_kwargs['shift_override'] = self._low_noise_shift
                     self.sd.noise_scheduler.set_train_timesteps(
                         num_train_timesteps,
                         device=self.device_torch,
                         timestep_type=timestep_type,
                         latents=latents,
                         patch_size=patch_size,
+                        **shift_kwargs,
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(
@@ -2215,6 +2242,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(self.sd, 'target_lora_modules'):
                     network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
 
+                network_kwargs, train_block_indices = prepare_train_blocks(
+                    self.network_config,
+                    self.sd,
+                    network_kwargs,
+                    train_text_encoder=self.train_config.train_text_encoder,
+                    train_embedding=self.embed_config is not None,
+                )
+
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
                     unet=self.sd.get_model_to_train(),
@@ -2288,6 +2323,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
 
                 self.network.prepare_grad_etc(text_encoder, unet)
+                verify_train_blocks(
+                    self.sd,
+                    self.network,
+                    train_block_indices,
+                    arm_runtime_check=not getattr(self.model_config, 'compile', False),
+                )
                 flush()
 
                 # LyCORIS doesnt have default_lr
@@ -2477,6 +2518,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             seed=getattr(self, "_resume_tread_seed", None),
         )
         bind_dopsd(self.sd, self.optimizer_runtime, self.train_config)
+        self._low_noise_shift = bind_low_noise_share(self.train_config, self.sd)
+        self.category_stop = bind_category_stop(
+            self.train_config,
+            self.optimizer_runtime,
+            supports_anchor=self.supports_category_anchor,
+            datasets=self.datasets,
+        )
 
 
 
@@ -2932,25 +2980,47 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator_reg)
                         is_reg_step = True
                     elif dataloader is not None:
-                        try:
-                            with self.timer('get_batch'):
-                                batch = next(dataloader_iterator)
-                        except StopIteration:
-                            with self.timer('reset_batch'):
-                                # hit the end of an epoch, reset
-                                dataloader_iterator = iter(dataloader)
-                                trigger_dataloader_setup_epoch(dataloader)
-                                self.epoch_num += 1
-                                if self.train_config.gradient_accumulation_steps == -1:
-                                    # if we are accumulating for an entire epoch, trigger a step
-                                    self.is_grad_accumulation_step = False
-                                    self.grad_accumulation_step = 0
-                            with self.timer('get_batch'):
-                                batch = next(dataloader_iterator)
+                        # category_stop mode 'stop': retired categories never reach the
+                        # forward pass. Bounded so a dataset with nothing left fails loudly.
+                        skipped_here = 0
+                        while True:
+                            try:
+                                with self.timer('get_batch'):
+                                    batch = next(dataloader_iterator)
+                            except StopIteration:
+                                with self.timer('reset_batch'):
+                                    # hit the end of an epoch, reset
+                                    dataloader_iterator = iter(dataloader)
+                                    trigger_dataloader_setup_epoch(dataloader)
+                                    self.epoch_num += 1
+                                    if self.train_config.gradient_accumulation_steps == -1:
+                                        # if we are accumulating for an entire epoch, trigger a step
+                                        self.is_grad_accumulation_step = False
+                                        self.grad_accumulation_step = 0
+                                with self.timer('get_batch'):
+                                    batch = next(dataloader_iterator)
+                            if self.category_stop is None or not self.category_stop.should_skip(batch, step):
+                                break
+                            skipped_here += 1
+                            self.category_stop.skipped += 1
+                            try:
+                                skip_cap = 2 * len(dataloader) + 1
+                            except TypeError:
+                                skip_cap = 100000
+                            if skipped_here > skip_cap:
+                                raise RuntimeError(
+                                    f"train.category_stop: every category in the dataset is "
+                                    f"retired at step {step} (mode 'stop'); nothing left to train"
+                                )
                     else:
                         batch = None
                     batch_list.append(batch)
                     batch_step += 1
+
+                if self.category_stop is not None:
+                    # recorded here, not in a trainer hook, so every trainer's step
+                    # window sees it; reset in _reset_routing_window after the step
+                    self._category_window_kinds = window_category_kinds(batch_list)
 
                 # setup accumulation
                 if self.train_config.gradient_accumulation_steps == -1:
