@@ -39,6 +39,20 @@ class DopsdSettings:
     # cast). 1.0 / 1.0 is plain MSE.
     loss_mag_weight: float = 1.0
     loss_dc_weight: float = 1.0
+    # self-ref teacher recipe (musubi-tuner's `ref` teacher). Base sigma
+    # (pre-shift, 1 = pure noise) band where the teacher sees the reference;
+    # outside it the step is a base-preservation anchor (teacher runs on the
+    # student's own text, no reference). Defaults = always conditioned.
+    teacher_sigma_max: float = 1.0
+    teacher_sigma_min: float = 0.0
+    preservation_weight: float = 1.0
+    # wrap self-ref video teacher captions in the official copy declaration
+    # (`<Video 1>` fully_preserved, `<Audio 1>` fully_copy)
+    copy_declaration: bool = False
+
+    @property
+    def teacher_gated(self) -> bool:
+        return self.teacher_sigma_max < 1.0 or self.teacher_sigma_min > 0.0
 
     @property
     def other_ref(self) -> bool:
@@ -147,7 +161,69 @@ def parse_dopsd_settings(model_config: Any) -> DopsdSettings:
         loss_dc_weight=_nonneg_float(
             "dopsd_loss_dc_weight", kw.get("dopsd_loss_dc_weight"), 1.0
         ),
+        teacher_sigma_max=_unit_float(
+            "dopsd_teacher_sigma_max", kw.get("dopsd_teacher_sigma_max"), 1.0
+        ),
+        teacher_sigma_min=_unit_float(
+            "dopsd_teacher_sigma_min", kw.get("dopsd_teacher_sigma_min"), 0.0
+        ),
+        preservation_weight=_nonneg_float(
+            "dopsd_preservation_weight", kw.get("dopsd_preservation_weight"), 1.0
+        ),
+        copy_declaration=bool(kw.get("dopsd_copy_declaration", False)),
     )
+
+
+def _unit_float(name: str, raw: Any, default: float) -> float:
+    value = _finite_float(name, raw, default)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+    return value
+
+
+# musubi-tuner's ref-teacher caption header (src/musubi_tuner/minimax_h3/
+# text_encoder.py, Apache-2.0): the official editing-prompt declaration that
+# makes the base treat the reference as a 1:1 copy source. musubi measured
+# that video copying saturates without it, but the <Audio 1> fully_copy line
+# is what opens audio teaching across the whole band.
+_REF_TEACHER_HEADER_VIDEO = (
+    "subject_definitions:\n"
+    "<Video 1> is the source video for the target video edit.\n"
+    "{audio_definition}"
+    "\n"
+    "summary:\n"
+    "[video editing{audio_tag}] The target video is an edited version of <Video 1> "
+    "with no changes; all shots, subjects, camera movement, and sound are preserved "
+    "as they are.\n"
+    "\n"
+    "retention_analysis:\n"
+    "<Video 1> (all shots): fully_preserved - every shot, subject, action, and camera "
+    "movement of the source video is retained without modification.\n"
+    "{audio_retention}"
+    "\n"
+    "detailed_description:\n"
+)
+
+
+def wrap_ref_teacher_caption(caption: str, with_audio: bool) -> str:
+    """Self-ref video teacher caption: copy declaration + the caption."""
+    header = _REF_TEACHER_HEADER_VIDEO.format(
+        audio_definition=(
+            "<Audio 1> is the synchronized audio track of <Video 1> and is reused "
+            "in the target video.\n" if with_audio else ""
+        ),
+        audio_tag=" + audio reuse" if with_audio else "",
+        audio_retention=(
+            "<Audio 1>: fully_copy - <Audio 1> is reused 1:1 as the target video's "
+            "complete final audio track.\n" if with_audio else ""
+        ),
+    )
+    return header + caption
+
+
+def teacher_step_conditioned(settings: "DopsdSettings", base_sigma: float) -> bool:
+    """True when the teacher sees the reference this step; False = anchor."""
+    return settings.teacher_sigma_min <= base_sigma <= settings.teacher_sigma_max
 
 
 def _nonneg_float(name: str, raw: Any, default: float) -> float:
@@ -412,6 +488,18 @@ def validate_dopsd(
             "dopsd_loss_mag_weight / dopsd_loss_dc_weight split the MSE; they need "
             f"train.loss_type: mse (got {train_config.loss_type!r})."
         )
+    if settings.teacher_sigma_min >= settings.teacher_sigma_max:
+        raise ValueError(
+            "dopsd_teacher_sigma_min must be below dopsd_teacher_sigma_max, got "
+            f"{settings.teacher_sigma_min} / {settings.teacher_sigma_max}"
+        )
+    if settings.teacher_gated and train_config is not None:
+        batch_size = int(getattr(train_config, "batch_size", 1) or 1)
+        if batch_size != 1:
+            raise ValueError(
+                "dopsd_teacher_sigma_min/max gate the teacher per step and need "
+                f"train.batch_size: 1 (got {batch_size})."
+            )
     if settings.other_ref and train_config is not None:
         batch_size = int(getattr(train_config, "batch_size", 1) or 1)
         if batch_size != 1:
@@ -472,6 +560,13 @@ def bind_dopsd(
         f"bleed={settings.bleed_strength:g} "
         f"loss mag={settings.loss_mag_weight:g} dc={settings.loss_dc_weight:g}"
         + (
+            f" teacher base-sigma band [{settings.teacher_sigma_min:g}, "
+            f"{settings.teacher_sigma_max:g}] anchor weight {settings.preservation_weight:g}"
+            if settings.teacher_gated
+            else ""
+        )
+        + (" copy_declaration" if settings.self_ref and settings.copy_declaration else "")
+        + (
             f" identity_first={settings.identity_first_steps} steps "
             f"@ {settings.identity_first_lr_scale:g}x LR"
             if settings.identity_first
@@ -492,6 +587,7 @@ def apply_settings_to_model(model: Any, settings: DopsdSettings) -> None:
     model.dopsd_self_ref = settings.self_ref
     model.dopsd_other_ref = settings.other_ref
     model.dopsd_bleed_strength = settings.bleed_strength
+    model.dopsd_copy_declaration = settings.self_ref and settings.copy_declaration
     model.dopsd_settings = settings
     if settings.enabled:
         model.require_pixel_tensor_cache = True

@@ -409,6 +409,27 @@ class CaptionProcessingDTOMixin:
                 )
             else:
                 self.caption_dopsd = f"{self.get_dopsd_ref_token()} {self.caption}".strip()
+            if (
+                getattr(self, 'dopsd_self_ref', False)
+                and getattr(self, 'dopsd_copy_declaration', False)
+                and self.is_video
+            ):
+                from toolkit.h3_dopsd import wrap_ref_teacher_caption
+                self.caption_dopsd = wrap_ref_teacher_caption(
+                    self.caption_dopsd, with_audio=self._dopsd_teacher_has_audio()
+                )
+
+    def _dopsd_teacher_has_audio(self: 'FileItemDTO') -> bool:
+        """The self-ref teacher's <Audio 1> exists only when the clip's
+        soundtrack rides along (do_audio) and the file has an audio stream."""
+        if not getattr(self.dataset_config, 'do_audio', False):
+            return False
+        try:
+            import av
+            with av.open(self.path) as container:
+                return len(container.streams.audio) > 0
+        except Exception:
+            return False
 
     def get_dopsd_ref_token(self: 'FileItemDTO') -> str:
         # Picture 1 for stills (self-ref or other-photo); Video 1 for clip self-ref

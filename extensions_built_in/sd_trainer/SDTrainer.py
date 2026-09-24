@@ -30,6 +30,7 @@ from toolkit.h3_audio_only import compute_audio_only_objective, is_audio_only_ba
 from toolkit.h3_dopsd import (
     decomposed_teacher_loss,
     dopsd_teacher_wanted,
+    teacher_step_conditioned,
     load_chosen_other_photo,
     unweighted_errors,
 )
@@ -2896,7 +2897,10 @@ class SDTrainer(BaseSDTrainProcess):
                     audio_target = prior_pred.get('audio').detach()
                 settings = getattr(self.sd, "dopsd_settings", None)
                 # Identity-first phase 1 is teacher-only; bleed is the blended path.
-                if settings is None or not settings.identity_first:
+                # Anchor steps are pure base preservation: no photo bleed.
+                if (settings is None or not settings.identity_first) and not getattr(
+                    batch, "dopsd_anchor", False
+                ):
                     if hasattr(self.sd, 'get_loss_target'):
                         dopsd_normal_target = self.sd.get_loss_target(
                             noise=noise,
@@ -3260,10 +3264,20 @@ class SDTrainer(BaseSDTrainProcess):
             batch=batch,
         ):
             settings = getattr(self.sd, "dopsd_settings", None)
-            if settings is not None and (
+            dopsd_anchor = bool(getattr(batch, "dopsd_anchor", False))
+            if dopsd_anchor:
+                # anchor steps keep the full magnitude and DC penalty (restoring
+                # the base's output norm and palette is the anchor's job)
+                loss = loss * settings.preservation_weight
+            elif settings is not None and (
                 settings.loss_mag_weight != 1.0 or settings.loss_dc_weight != 1.0
             ):
                 loss = self._decomposed_teacher_loss(loss, pred, target, settings)
+            if settings is not None and settings.teacher_gated:
+                self.additional_logs['teacher/conditioned'] = 0.0 if dopsd_anchor else 1.0
+                self.additional_logs[
+                    'loss/anchor' if dopsd_anchor else 'loss/teaching'
+                ] = float(loss.detach().mean().item())
             if self.train_config.loss_type == "mae":
                 teacher_err = torch.nn.functional.l1_loss(
                     pred.float(), target.float(), reduction="none"
@@ -3423,6 +3437,8 @@ class SDTrainer(BaseSDTrainProcess):
         if audio_pred is not None and audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(audio_pred.float(), audio_target.float(), reduction="mean")
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            if getattr(batch, "dopsd_anchor", False):
+                audio_loss = audio_loss * self.sd.dopsd_settings.preservation_weight
             self.additional_logs['loss/img'] = loss.item()
             self.additional_logs['loss/audio'] = audio_loss.item()
             loss = loss + audio_loss
@@ -4501,7 +4517,18 @@ class SDTrainer(BaseSDTrainProcess):
                                 [blank_embeds] * noisy_latents.shape[0]
                             )
                         
-                        if dopsd_teacher_now:
+                        batch.dopsd_anchor = False
+                        if dopsd_teacher_now and settings is not None and settings.teacher_gated:
+                            # outside the teacher band the teacher drops the
+                            # reference and runs on the student's own text: a
+                            # base-preservation anchor (musubi-tuner)
+                            batch.dopsd_anchor = not teacher_step_conditioned(
+                                settings, float(self._base_sigma(timesteps)[0].item())
+                            )
+                        if dopsd_teacher_now and batch.dopsd_anchor:
+                            prior_embeds_to_use = conditional_embeds
+                            batch.dopsd_teacher_pass = False
+                        elif dopsd_teacher_now:
                             if settings is not None and settings.other_ref:
                                 embeds_list = []
                                 ref_tensors = []
@@ -4549,7 +4576,7 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                         if dopsd_teacher_now:
                             batch.dopsd_teacher_pass = False
-                            if settings is not None and settings.other_ref:
+                            if settings is not None and settings.other_ref and not batch.dopsd_anchor:
                                 batch.control_tensor_list = saved_control_tensor_list
                         if prior_pred is not None:
                             # a DTO prior pred keeps its audio extras through detach

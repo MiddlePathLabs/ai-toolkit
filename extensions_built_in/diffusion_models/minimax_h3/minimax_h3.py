@@ -1357,18 +1357,30 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # when dopsd is on; other-photo / identity-first are default-off.
         apply_settings_to_model(self, parse_dopsd_settings(self.model_config))
 
-    def _dit_component(self) -> str:
-        partition = str(
+    def _partition(self) -> str:
+        return str(
             self.model_config.model_kwargs.get("partition", "ref2va_pruned")
         ).lower()
-        if partition not in ("ref2va", "ref2va_pruned"):
+
+    def _dit_component(self) -> str:
+        partition = self._partition()
+        allowed = ("ref2va", "ref2va_pruned")
+        if self.model_config.model_kwargs.get("dopsd", False):
+            # musubi-tuner: the FL2VA weights copy a self-reference far more
+            # literally than the Ref2VA weights (their condition semantics is
+            # "exact frames of this video"), so they make the better D-OPSD
+            # teacher. The student then trains on the FL2VA base too.
+            allowed = allowed + ("fl2va", "fl2va_pruned")
+        if partition not in allowed:
             raise ValueError(
-                f"model_kwargs.partition must be ref2va or ref2va_pruned for "
+                f"model_kwargs.partition must be one of {', '.join(allowed)} for "
                 f"{self.arch}, got {partition}"
             )
         return f"dit_{partition}"
 
     def get_base_model_version(self):
+        if self._partition().startswith("fl2va"):
+            return "minimax_h3_fl2va"
         return "minimax_h3_ref2va"
 
     def _build_condition(

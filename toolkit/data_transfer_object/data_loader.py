@@ -113,6 +113,7 @@ class FileItemDTO(
         # D-OPSD: also cache teacher embeds with the item's own media as reference 1
         self.dopsd_self_ref = kwargs.get("dopsd_self_ref", False)
         self.dopsd_other_ref = kwargs.get("dopsd_other_ref", False)
+        self.dopsd_copy_declaration = kwargs.get("dopsd_copy_declaration", False)
         self.dopsd_ref_slots = []
         self.te_padding_side = kwargs.get("te_padding_side", "right")
         self.latent_space_version = kwargs.get("latent_space_version", "sd1")
@@ -344,6 +345,8 @@ class DataLoaderBatchDTO:
 
             # set by the trainer around the D-OPSD teacher pass
             self.dopsd_teacher_pass: bool = False
+            # D-OPSD teacher gated off this step: base-preservation anchor
+            self.dopsd_anchor: bool = False
 
             self.num_frames: int = self.file_items[0].num_frames
             audio_only_batch = all(
