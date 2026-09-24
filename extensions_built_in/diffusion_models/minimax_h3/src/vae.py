@@ -19,7 +19,7 @@ the token embedder, output projection, and every norm kept in fp32.
 """
 
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -761,24 +761,46 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
 
     # -- public interface ----------------------------------------------------
 
-    def encode(self, pixels, sample=True, generator=None, fp16_round=False):
+    @contextmanager
+    def _encoder_in_fp32(self):
+        """Run the encoder half at the released fp32 precision. The Comfy
+        repack stores this VAE in fp16, and fp16 encoder activations leave
+        outliers in cached training targets. Only the encoder and quant_conv
+        are upcast (and cast back after, losslessly); the ~5 GB decoder is
+        untouched."""
+        modules = (self.encoder, self.quant_conv)
+        prev = next(self.encoder.parameters()).dtype
+        if prev == torch.float32:
+            yield
+            return
+        for m in modules:
+            m.float()
+        try:
+            yield
+        finally:
+            for m in modules:
+                m.to(prev)
+
+    def encode(self, pixels, sample=True, generator=None, fp16_round=False, fp32=False):
         """pixels (B, 3, T, H, W) in [-1, 1], T == 17n + 5, or T == 1 (single
         keyframe: spatial encode only, no temporal chunking). Returns
         normalized latents (B, latent_channels, t, h, w): posterior sampled
         (or the mean when sample=False), optionally rounded through fp16
         BEFORE the (z - latents_mean) / latents_std normalization
-        (fp16_round=True is the released first-frame-conditioning recipe)."""
+        (fp16_round=True is the released first-frame-conditioning recipe).
+        fp32=True runs the encoder upcast to fp32 (see _encoder_in_fp32)."""
         x = pixels
         if x.ndim == 4:
             x = x.unsqueeze(2)
         x = (x.float() + 1.0) * 0.5
         x = (x - self.pixel_mean) / self.pixel_std
-        x = x.to(self.dtype)
 
-        if x.shape[2] == 1:
-            moments = self._encode_clip(x)[:, :, -1:]
-        else:
-            moments = self._encode_video(x)
+        with self._encoder_in_fp32() if fp32 else nullcontext():
+            x = x.to(next(self.encoder.parameters()).dtype)
+            if x.shape[2] == 1:
+                moments = self._encode_clip(x)[:, :, -1:]
+            else:
+                moments = self._encode_video(x)
 
         mean, logvar = moments.float().chunk(2, dim=1)
         if sample:

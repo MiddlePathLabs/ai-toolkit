@@ -217,7 +217,16 @@ class MinimaxH3Model(BaseModel):
         # embeds; the sample's frame cap while encoding sample prompts
         self._ref_video_dataset_config = None
         self._sample_ref_max_frames = None
-        self.latent_space_version = "minimax_h3_v1"
+        # target / condition encodes run the video VAE encoder in fp32 (the
+        # released precision; the fp16 repack leaves outliers up to ~0.4 in
+        # the latents). v2 caches hold fp32-encoded latents; opting out keeps
+        # the v1 key so existing fp16-encoded caches stay valid.
+        self.vae_encode_fp32 = bool(
+            self.model_config.model_kwargs.get("vae_encode_fp32", True)
+        )
+        self.latent_space_version = (
+            "minimax_h3_v2" if self.vae_encode_fp32 else "minimax_h3_v1"
+        )
         # caption token cap (vision blocks are never truncated); the released
         # stack has no limit — set 0 to disable
         self.max_text_length = int(
@@ -766,7 +775,7 @@ class MinimaxH3Model(BaseModel):
             items = [it[:, :aligned] for it in items]
 
         batch = torch.stack(items).to(self.vae_device_torch, self.video_vae.dtype)
-        latents = self.video_vae.encode(batch, sample=True)
+        latents = self.video_vae.encode(batch, sample=True, fp32=self.vae_encode_fp32)
         return latents.to(device, dtype=dtype)
 
     @torch.no_grad()
@@ -783,6 +792,7 @@ class MinimaxH3Model(BaseModel):
             sample=True,
             generator=generator,
             fp16_round=True,
+            fp32=self.vae_encode_fp32,
         )
         return latents.float()
 
@@ -1548,6 +1558,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             sample=True,
             generator=generator,
             fp16_round=True,
+            fp32=self.vae_encode_fp32,
         )
         # soundtrack rides clean when the clip has one (same test as the TE label)
         audio_rows = None
