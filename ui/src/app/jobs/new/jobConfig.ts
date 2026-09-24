@@ -1,7 +1,7 @@
 'use client';
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
-import { migrateNoisingConfig } from '@/helpers/noisingConfig';
+import { defaultGradientNoiseConfig, defaultWeightNoiseConfig, migrateNoisingConfig } from '@/helpers/noisingConfig';
 import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig, TrainConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
@@ -188,21 +188,8 @@ export const defaultJobConfig: JobConfig = {
             use_ema: false,
             ema_decay: 0.99,
           },
-          weight_noise: {
-            enabled: false,
-            mode: 'relative',
-            sigma: 0.00125,
-            bound_norm: false,
-            log_every: 50,
-          },
-          gradient_noise: {
-            enabled: false,
-            mode: 'neelakantan',
-            sigma: 0.001,
-            eta: 0.01,
-            gamma: 0.55,
-            log_every: 50,
-          },
+          weight_noise: { ...defaultWeightNoiseConfig },
+          gradient_noise: { ...defaultGradientNoiseConfig },
           skip_first_sample: false,
           force_first_sample: false,
           disable_sampling: false,
@@ -364,6 +351,13 @@ const lossBlockDefaults: [string, Record<string, any>][] = [
   ['vae_anchor', defaultVAEAnchorConfig],
 ];
 
+// Same idea for the train-level noising blocks migrateNoisingConfig backfills;
+// their defaults mirror the backend's, so omitting them trains identically.
+const trainBlockDefaults: [string, Record<string, any>][] = [
+  ['weight_noise', defaultWeightNoiseConfig],
+  ['gradient_noise', defaultGradientNoiseConfig],
+];
+
 const deepEqual = (a: any, b: any): boolean => {
   if (a === b) return true;
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
@@ -375,13 +369,20 @@ const deepEqual = (a: any, b: any): boolean => {
 export const pruneUntouchedLossBlocks = (jobConfig: JobConfig): JobConfig => {
   const process: any = jobConfig?.config?.process?.[0];
   if (!process) return jobConfig;
-  const keysToRemove = lossBlockDefaults
-    .filter(([key, defaults]) => process[key] != null && deepEqual(process[key], defaults))
-    .map(([key]) => key);
-  if (keysToRemove.length === 0) return jobConfig;
+  const untouchedKeys = (obj: any, blockDefaults: [string, Record<string, any>][]) =>
+    blockDefaults.filter(([key, defaults]) => obj?.[key] != null && deepEqual(obj[key], defaults)).map(([key]) => key);
+  const keysToRemove = untouchedKeys(process, lossBlockDefaults);
+  const trainKeysToRemove = untouchedKeys(process.train, trainBlockDefaults);
+  if (keysToRemove.length === 0 && trainKeysToRemove.length === 0) return jobConfig;
   const prunedProcess = { ...process };
   for (const key of keysToRemove) {
     delete prunedProcess[key];
+  }
+  if (trainKeysToRemove.length > 0) {
+    prunedProcess.train = { ...process.train };
+    for (const key of trainKeysToRemove) {
+      delete prunedProcess.train[key];
+    }
   }
   return {
     ...jobConfig,

@@ -5,22 +5,31 @@ type NoisingTrainConfig = {
   gradient_noise?: Partial<GradientNoiseConfig>;
 };
 
+// Mirrors WeightNoiseConfig / GradientNoiseConfig defaults in toolkit/config_modules.py.
+export const defaultWeightNoiseConfig: WeightNoiseConfig = {
+  enabled: false,
+  mode: 'relative',
+  sigma: 0.00125,
+  bound_norm: false,
+  log_every: 50,
+};
+
+export const defaultGradientNoiseConfig: GradientNoiseConfig = {
+  enabled: false,
+  mode: 'neelakantan',
+  sigma: 0.001,
+  eta: 0.01,
+  gamma: 0.55,
+  log_every: 50,
+};
+
 export const migrateNoisingConfig = <T extends NoisingTrainConfig>(train: T): T => {
   train.weight_noise = {
-    enabled: false,
-    mode: 'relative',
-    sigma: 0.00125,
-    bound_norm: false,
-    log_every: 50,
+    ...defaultWeightNoiseConfig,
     ...(train.weight_noise ?? {}),
   };
   train.gradient_noise = {
-    enabled: false,
-    mode: 'neelakantan',
-    sigma: 0.001,
-    eta: 0.01,
-    gamma: 0.55,
-    log_every: 50,
+    ...defaultGradientNoiseConfig,
     ...(train.gradient_noise ?? {}),
   };
   return train;

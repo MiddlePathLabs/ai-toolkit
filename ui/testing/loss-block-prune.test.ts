@@ -85,6 +85,24 @@ test('round trip: a pruned config inflates back into full form state', () => {
   assert.deepEqual(reloaded.config.process[0].depth_consistency, defaultDepthConsistencyConfig);
 });
 
+test('untouched train noising blocks are stripped, enabled ones survive', () => {
+  const pruned = pruneUntouchedLossBlocks(formState());
+  assert.equal('weight_noise' in pruned.config.process[0].train, false);
+  assert.equal('gradient_noise' in pruned.config.process[0].train, false);
+  assert.equal(pruned.config.process[0].train.optimizer, defaultJobConfig.config.process[0].train.optimizer);
+
+  const job = formState();
+  job.config.process[0].train.weight_noise.enabled = true;
+  const kept = pruneUntouchedLossBlocks(job);
+  assert.equal(kept.config.process[0].train.weight_noise.enabled, true);
+  assert.equal('gradient_noise' in kept.config.process[0].train, false);
+  // live form state keeps both blocks
+  assert.ok(job.config.process[0].train.gradient_noise);
+
+  const reloaded = migrateJobConfig(objectCopy(pruned));
+  assert.equal(reloaded.config.process[0].train.gradient_noise.mode, 'neelakantan');
+});
+
 // Make this file a module so its top-level `require`-bound consts stay file-scoped
 // and do not collide with sibling test scripts under `tsc -p tsconfig.json`.
 export {};
