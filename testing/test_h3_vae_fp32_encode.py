@@ -45,3 +45,20 @@ def test_fp32_storage_is_left_alone():
     with vae._encoder_in_fp32():
         pass
     assert vae.encoder.weight.dtype == torch.float32
+
+
+def test_failed_upcast_is_rolled_back():
+    vae = _stub()
+
+    class _Boom(torch.nn.Module):
+        def float(self):
+            raise torch.cuda.OutOfMemoryError("upcast OOM")
+
+    vae.quant_conv = _Boom()
+    try:
+        with vae._encoder_in_fp32():
+            pass
+    except torch.cuda.OutOfMemoryError:
+        pass
+    # the encoder had already been upcast when quant_conv failed
+    assert vae.encoder.weight.dtype == torch.float16

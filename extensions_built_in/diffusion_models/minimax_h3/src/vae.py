@@ -773,9 +773,11 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
         if prev == torch.float32:
             yield
             return
-        for m in modules:
-            m.float()
         try:
+            # inside the try: a failure mid-upcast (e.g. OOM on the second
+            # module) still casts everything back
+            for m in modules:
+                m.float()
             yield
         finally:
             for m in modules:
