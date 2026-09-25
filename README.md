@@ -47,6 +47,15 @@ Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other
 
 On MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
 
+### MiniMax-H3 findings ported from musubi-tuner
+
+Measured behaviour from [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner)'s H3 docs (`minimax_h3*.md`), checked against this fork. These change default behaviour on every H3 run:
+
+- **Base-sigma thresholds** — H3 sigma thresholds are in the pre-shift *base* space (1 = pure noise), as in musubi. `timesteps / 1000` is the post-shift-12 video sigma, so `train.guidance_loss_sigma_min: 0.15` used to gate base ~0.0145 (~1.5% of steps); it now gates base 0.15 (= video sigma ~0.68, the intended ~15%). The `guidance/base_sigma` and `teacher/base_sigma` logs are base sigma too. Other models keep `timesteps / 1000`.
+- **Encoded silence** — clips without a soundtrack, `do_audio: false` datasets and image items ride with the audio VAE's encoding of silence instead of zero latents (a zero latent decodes to broadband noise at ~-26 dBFS). Its noise is shared across passes, so guidance/teacher probes see the student's audio rows. Video-only training that keeps real audio as context: `do_audio: true` + `train.audio_loss_multiplier: 0`.
+- **fp32 VAE encoding** — training targets, keyframes and references encode with the video VAE encoder upcast to fp32 (the fp16 Comfy repack left outliers up to ~0.4 on a latent std of ~1). `latent_space_version` is now `minimax_h3_v2`, so H3 latent and reference-video caches rebuild once; `model.model_kwargs.vae_encode_fp32: false` keeps fp16 encodes and the existing v1 caches.
+- **Samples keep the LoRA live on quantized bases** — training samples used to merge the LoRA into the base for speed. On a quantized base (H3's ConvRot int8, any ostris / torchao / quanto layer) that re-quantizes: measured on convrot8, a LoRA with delta rms 0.2% of the weights kept 0% of its effect in samples (1% kept 79%), and merge-out walked the frozen base 0.02–0.3% per sample cycle. Samples now run the LoRA as a live branch there (musubi's `--lora_runtime_attach`); plain bases still merge.
+
 ### Other additions
 
 - `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples.
@@ -54,6 +63,8 @@ On MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3`
 - Env-gated CUDA memory diagnostics (`KREA2_MEM_DIAG`) in the SD trainer.
 - Fix: timer no longer divides by zero on empty buckets after OOM recovery.
 - Fix: a sampling exception no longer leaves `assistant_lora` / `inference_lora` permanently disabled — restore runs in `finally`. Affects Flux, Krea2, z_image, wan22, and H3.
+- Fix: prior predictions no longer replace the embeds they are given with the batch's cached caption embeds (a re-indent had pulled that block out of the ClipVision/embedding branch). From 2026-09-09 until this fix the H3 D-OPSD teacher ran on the student's plain caption embeds, and DOP / blank-prompt preservation priors used the training caption.
+- Fix: a failure while building the sample pipeline now still restores the training RNG and device state and merges the network back out.
 - Test infrastructure: unit tests in `testing/` plus a real-data integration harness in `testing/integration/` (perceptual noising QA, depth consistency, gradient-contract probes).
 
 ### Experimental
@@ -67,7 +78,16 @@ Default-off. Fail-closed at startup when the optimizer cannot honor the requeste
 - **Category stop (`train.category_stop`)** — `photo_step` / `clip_step` / `voice_step` retire that category once the training step reaches it; blank = never. `mode: anchor` (default) keeps training it at 0.1× the optimizer's applied update (requires `supports_step_scale`); `mode: stop` skips its batches before the forward pass. Requires `batch_size: 1` (train-level and any `datasets[].batch_size`, which overrides it when buckets are on) and no gradient accumulation (one category per update). `mode` must be a string: an unquoted YAML `off` loads as a boolean and is refused, not read as anchor. Regularisation items (`is_reg`) never count toward a category, so they are neither scaled nor skipped. Anchor mode needs a trainer that opens the optimizer runtime window (`diffusion_trainer` does) and is refused otherwise. Step-based, so it holds across resume. After Fizgig's per-category stop epoch.
 - **EMA warmup (`train.ema_config.warmup`)** — ramps the EMA decay in as `min(ema_decay, (1+n)/(10+n))` so early checkpoints and samples track the weights instead of the zero-init adapter. Default off (constant decay, as before). The update count isn't saved, so on resume it restarts at the resumed step (the ramp is already saturated past ~440 steps) rather than at 0. Fizgig's measured default is `ema_decay: 0.98` with this ramp.
 - **H3 TREAD token routing** — training-only clip-step token skip (Krause et al., [arXiv 2501.04765](https://arxiv.org/abs/2501.04765)). H3-only (`model.arch: minimax_h3*`; VSA / `gate_compress` is rejected at bind). Default off. Clip steps with batch size 1 and more than one latent video frame skip a random `tread_ratio` of *target* video tokens around blocks `[tread_start, tread_end)` and keep `1 - tread_ratio`; skipped rows rejoin in their start-block state. Text, condition, and audio rows stay. Stills, inference, and `batch_size != 1` never route. Bind rejects a post-rejoin tail shorter than 3 blocks (`tread_end` 47 on a 50-block trunk is the Fizgig prior). No UI until a config-file experiment passes the speed gate.
-- **H3 D-OPSD other-photo / identity-first** — extends existing `model.model_kwargs.dopsd` (self-reference: one ref2va DiT, two forwards). Default-off. `dopsd_ref_mode: other` pairs each still with a different photo in the same folder (never itself, never its own flip, never another folder); clips and voice sit out. `dopsd_identity_first` is teacher-only at 1/3 LR for `dopsd_identity_first_steps` optimizer updates (`-1` → 650), then drops the teacher (one forward, full LR). Other-photo requires `train.batch_size: 1`. Identity-first requires an optimizer that `supports_step_scale`. No second teacher model. A/B tested and not adopted for the character-LoRA recipe; kept for further experimentation. No UI until a config-file experiment.
+- **H3 D-OPSD other-photo / identity-first** — extends existing `model.model_kwargs.dopsd` (self-reference: one ref2va DiT, two forwards). Default-off. `dopsd_ref_mode: other` pairs each still with a different photo in the same folder (never itself, never its own flip, never another folder); clips and voice sit out. `dopsd_identity_first` is teacher-only at 1/3 LR for `dopsd_identity_first_steps` optimizer updates (`-1` → 650), then drops the teacher (one forward, full LR). Other-photo requires `train.batch_size: 1`. Identity-first requires an optimizer that `supports_step_scale`. No second teacher model. A/B tested and not adopted for the character-LoRA recipe; kept for further experimentation. No UI until a config-file experiment. (Those A/Bs predate the prior-embeds fix above: the teacher saw the plain caption, so they are worth re-running.)
+- **Timestep focus (`train.timestep_focus_prob`)** — musubi's H3 timestep focus. With probability P a draw lands uniformly in base sigma `[timestep_focus_min, timestep_focus_max)` (default `0.4`–`0.8`, video sigma ~0.89–0.98 on H3, where content is decided); otherwise it stays as drawn. Band density becomes `P + (1-P)·band_share`; musubi measured ~2x faster convergence of that band at `0.5`. The band is on the model's own schedule, so it composes with `low_noise_share` (band points are weighted to stay uniform in base sigma on a re-bent grid) and is intersected with the denoising range. Fails closed with the cubic `content_or_style` bias and the fixed-step timestep types. Default off.
+- **H3 D-OPSD teacher recipes (musubi `ref` / `subject_ref`)** — all `model.model_kwargs`, default off (D-OPSD unchanged):
+  - `dopsd_loss_mag_weight` / `dopsd_loss_dc_weight` (default `1.0` = plain MSE): the teacher loss as musubi's exact magnitude/direction split of the MSE with the student-norm factor detached, so the student commits to the teacher's norm instead of the conditional mean's shrunken one (washed-out output). The DC weight scales the residual's per-channel mean, a global colour/tone cast (`0.3` keeps the dataset palette from being learned as style; keep `1.0` for style LoRAs). Needs `loss_type: mse`.
+  - `dopsd_teacher_sigma_max` / `dopsd_teacher_sigma_min` (base sigma; default `1.0` / `0`): outside the band the teacher drops the reference and runs on the student's own text, a base-preservation anchor (full loss weights, no photo bleed, scaled by `dopsd_preservation_weight`). Logs `teacher/conditioned`, `loss/teaching`, `loss/anchor`. Needs `train.batch_size: 1`.
+  - `dopsd_copy_declaration`: self-reference video teacher captions get the official copy declaration (`<Video 1>` fully_preserved, `<Audio 1>` fully_copy when the soundtrack rides along), which opens audio teaching.
+  - `dopsd_subject_declaration`: other-photo teacher captions get the official subject-reference declaration; the reference token becomes `<Subject 1>` (defined as the subject of `<Picture 1>`), which doubles as the student's trigger.
+  - `dopsd_musubi_recipe: true` fills musubi's validated values for unset keys — self: `sigma_max 0.75`, `dc 0.3`, copy declaration; other: `sigma_max 1.0`, `sigma_min 0.15`, `mag 0.5`, `dc 0.3`, subject declaration. The train-side parts are only logged: self → `timestep_focus_prob: 0.5`, keep checkpoints at or just after the ~300-step plateau; other → `lr: 3e-4`, 50 warmup steps, ~500 steps. Startup warns when a band contradicts the mode (other-photo with `sigma_max < 1` anchors the band where identity is decided).
+  - `partition: fl2va` / `fl2va_pruned` is accepted with `dopsd: true` (musubi: the FL2VA weights copy a self-reference far more literally than Ref2VA); the student then trains on the FL2VA base and the LoRA records `minimax_h3_fl2va`.
+  - musubi's caveat: a teacher that sees the target itself (self-reference) loses the distilled guidance amplification on image targets; for stills they use the other-photo teacher only.
 
 
 ```yaml
@@ -85,6 +105,12 @@ model:
     dopsd_ref_count: 1
     dopsd_identity_first: false
     dopsd_identity_first_steps: -1  # -1 = 650 optimizer updates
+    dopsd_musubi_recipe: true       # musubi's per-mode teacher recipe for unset keys
+    # dopsd_teacher_sigma_max: 0.75 # base sigma; above it the step is a base anchor
+    # dopsd_loss_dc_weight: 0.3     # 1.0 = plain MSE
+    # vae_encode_fp32: false        # keep fp16 encodes and the v1 latent caches
+train:
+  timestep_focus_prob: 0.5          # 0 = off; band [timestep_focus_min, timestep_focus_max)
 ```
 
 ```yaml
