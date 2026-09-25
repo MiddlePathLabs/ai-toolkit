@@ -2621,15 +2621,15 @@ class SDTrainer(BaseSDTrainProcess):
 
 
     @staticmethod
-    def _decomposed_teacher_loss(loss, pred, target, settings, mag_weight=None, dc_weight=None):
+    def _decomposed_teacher_loss(loss, pred, target, settings):
         """Swap the elementwise teacher MSE for the magnitude/direction split
         (toolkit.h3_dopsd.decomposed_teacher_loss). Any per-sample weighting
         already on `loss` (scale_loss, timestep weights) is carried over as
         the ratio to the plain MSE, and the result is broadcast back to the
         elementwise shape so the rest of the pipeline is unchanged."""
-        mag = settings.loss_mag_weight if mag_weight is None else mag_weight
-        dc = settings.loss_dc_weight if dc_weight is None else dc_weight
-        per_sample = decomposed_teacher_loss(pred, target, mag, dc)
+        per_sample = decomposed_teacher_loss(
+            pred, target, settings.loss_mag_weight, settings.loss_dc_weight
+        )
         b = loss.shape[0]
         with torch.no_grad():
             plain = torch.nn.functional.mse_loss(

@@ -81,3 +81,26 @@ def test_fl2va_base_is_allowed_only_for_dopsd():
     assert m.get_base_model_version() == "minimax_h3_fl2va"
     # D-OPSD validation accepts the FL2VA base in the Ref2VA model class
     validate_dopsd(parse_dopsd_settings(_cfg(dopsd=True)), arch="minimax_h3_ref2va", model=m)
+
+
+def test_teacher_audio_probe_runs_once_per_file(monkeypatch):
+    import av
+    from toolkit.dataloader_mixins import CaptionProcessingDTOMixin
+
+    calls = []
+
+    class _Container:
+        streams = SimpleNamespace(audio=[object()])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(av, "open", lambda path: calls.append(path) or _Container())
+    item = SimpleNamespace(path="clip.mp4", dataset_config=SimpleNamespace(do_audio=True))
+    probe = CaptionProcessingDTOMixin._dopsd_teacher_has_audio
+    assert probe(item) is True
+    assert probe(item) is True
+    assert calls == ["clip.mp4"]

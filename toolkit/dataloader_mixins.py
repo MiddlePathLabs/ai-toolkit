@@ -432,12 +432,18 @@ class CaptionProcessingDTOMixin:
         soundtrack rides along (do_audio) and the file has an audio stream."""
         if not getattr(self.dataset_config, 'do_audio', False):
             return False
+        # constant per file; load_caption re-runs on fetches, so probe once
+        cached = getattr(self, '_dopsd_has_audio_stream', None)
+        if cached is not None:
+            return cached
         try:
             import av
             with av.open(self.path) as container:
-                return len(container.streams.audio) > 0
+                has_audio = len(container.streams.audio) > 0
         except Exception:
-            return False
+            has_audio = False
+        self._dopsd_has_audio_stream = has_audio
+        return has_audio
 
     def get_dopsd_ref_token(self: 'FileItemDTO') -> str:
         # Picture 1 for stills (self-ref or other-photo); Video 1 for clip self-ref.
