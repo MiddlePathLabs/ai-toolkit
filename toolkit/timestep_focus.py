@@ -12,7 +12,10 @@ at prob 0.5.
 Base sigma is pre-shift (1 = pure noise): models with a fixed training shift
 expose ``timestep_to_base_sigma`` (MiniMax-H3 undoes its shift 12), others use
 timesteps / 1000. The band is intersected with min/max_denoising_steps, so a
-narrowed range keeps the focused draws inside it.
+narrowed range keeps the focused draws inside it. With train.low_noise_share
+the band still means the same sigmas of the model's own schedule; the grid
+is unevenly spaced there, so band points are weighted by the base-sigma
+width they cover to keep the focused draws uniform in base sigma.
 """
 from __future__ import annotations
 
@@ -62,20 +65,45 @@ def focus_band_indices(
     return band
 
 
+def band_base_weights(base_sigmas: torch.Tensor, band: torch.Tensor) -> Optional[torch.Tensor]:
+    """Base-sigma width each band grid point stands for, or None when the
+    grid is evenly spaced in base sigma (the model's own shift). A grid
+    re-bent by train.low_noise_share still hits the same base band, but its
+    points are unevenly spaced there (3.4x at low_noise_share 0.6), so an
+    index-uniform pick would bunch at one end of the band."""
+    n = base_sigmas.shape[0]
+    if n < 2:
+        return None
+    b = base_sigmas.double()
+    lo = (band - 1).clamp(min=0)
+    hi = (band + 1).clamp(max=n - 1)
+    width = (b[lo] - b[hi]).abs() / (hi - lo).clamp(min=1).double()
+    if float(width.max() / width.min().clamp(min=1e-30)) < 1.01:
+        return None
+    return width.float()
+
+
 def apply_timestep_focus(
     timestep_indices: torch.Tensor,
     band: torch.Tensor,
     prob: float,
     generator: Optional[torch.Generator] = None,
+    weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Replace each index with a uniform band index with probability ``prob``."""
+    """Replace each index with a band index with probability ``prob``: uniform
+    over the band's grid points, or proportional to ``weights``."""
     if prob <= 0.0:
         return timestep_indices
     n = timestep_indices.shape[0]
     device = timestep_indices.device
-    hit = torch.rand(n, generator=generator, device="cpu").to(device) < prob
-    pick = torch.randint(band.numel(), (n,), generator=generator, device="cpu").to(device)
-    focused = band.to(device)[pick].to(timestep_indices.dtype)
+    # draw on the generator's own device (torch refuses a mismatch)
+    gen_device = generator.device if generator is not None else torch.device("cpu")
+    hit = torch.rand(n, generator=generator, device=gen_device).to(device) < prob
+    if weights is None:
+        pick = torch.randint(band.numel(), (n,), generator=generator, device=gen_device)
+    else:
+        pick = torch.multinomial(weights.to(gen_device), n, replacement=True, generator=generator)
+    focused = band.to(device)[pick.to(device)].to(timestep_indices.dtype)
     return torch.where(hit, focused, timestep_indices)
 
 
@@ -89,6 +117,7 @@ class TimestepFocus:
         self.sd = sd
         self._key = None
         self._band = None
+        self._weights = None
         self._logged = False
 
     @property
@@ -103,14 +132,22 @@ class TimestepFocus:
         if key != self._key:
             base = base_sigma_of_grid(grid_timesteps, self.sd)
             self._band = focus_band_indices(base, self.lo, self.hi, min_idx, max_idx)
+            self._weights = band_base_weights(base, self._band)
             self._key = key
             if not self._logged:
                 share = self._band.numel() / float(max_idx - min_idx + 1)
+                sig = grid_timesteps[self._band].float() / 1000.0
                 print_acc(
                     f"[timestep-focus] {self.prob:.0%} of draws land in base sigma "
-                    f"[{self.lo:g}, {self.hi:g}) ({self._band.numel()} grid points); "
-                    f"band density {self.prob + (1 - self.prob) * share:.0%} "
+                    f"[{self.lo:g}, {self.hi:g}) of the model's own schedule (sigma "
+                    f"{float(sig.min()):.3f}-{float(sig.max()):.3f}; "
+                    f"{self._band.numel()} grid points"
+                    + (", weighted to stay uniform in base sigma on this grid"
+                       if self._weights is not None else "")
+                    + f"); band density {self.prob + (1 - self.prob) * share:.0%} "
                     f"(uniform draw: {share:.0%})."
                 )
                 self._logged = True
-        return apply_timestep_focus(timestep_indices, self._band, self.prob)
+        return apply_timestep_focus(
+            timestep_indices, self._band, self.prob, weights=self._weights
+        )

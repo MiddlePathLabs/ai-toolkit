@@ -9,6 +9,7 @@ from toolkit.config_modules import TrainConfig
 from toolkit.timestep_focus import (
     TimestepFocus,
     apply_timestep_focus,
+    band_base_weights,
     focus_band_indices,
     validate_timestep_focus,
 )
@@ -87,3 +88,53 @@ def test_real_h3_training_grid():
     expected = 0.4 / (1.0 - float(scheduler.sigma_min)) * 1000
     assert band.numel() == pytest.approx(expected, abs=2)
     assert int(band.max() - band.min()) + 1 == band.numel()
+
+
+def _real_grid(shift_override=None):
+    from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
+
+    scheduler = CustomFlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=1000, shift=12.0, use_dynamic_shifting=False
+    )
+    kw = {} if shift_override is None else {"shift_override": shift_override}
+    scheduler.set_train_timesteps(1000, device="cpu", timestep_type="shift", **kw)
+    return scheduler
+
+
+def test_default_grid_needs_no_weights():
+    scheduler = _real_grid()
+    base = _H3().timestep_to_base_sigma(scheduler.timesteps.float() / 1000.0)
+    band = focus_band_indices(base, 0.4, 0.8, 0, 999)
+    assert band_base_weights(base, band) is None
+
+
+def test_low_noise_share_grid_keeps_the_band_and_stays_uniform_in_base():
+    from toolkit.low_noise_share import shift_for_low_noise_share
+
+    probe = _real_grid()
+    shift = shift_for_low_noise_share(0.6, float(probe.sigma_min), float(probe.sigma_max))
+    scheduler = _real_grid(shift)
+    grid = scheduler.timesteps
+    base = _H3().timestep_to_base_sigma(grid.float() / 1000.0)
+    focus = TimestepFocus(SimpleNamespace(timestep_focus_prob=1.0), _H3())
+    torch.manual_seed(0)
+    out = focus(torch.zeros(200_000, dtype=torch.long), grid, 0, 999)
+    picked = base[out]
+    # same band of the model's schedule as without low_noise_share
+    assert picked.min() >= 0.4 - 0.01 and picked.max() < 0.8
+    assert focus._weights is not None
+    # uniform in base sigma: each half of the band gets ~half the draws
+    lower_half = ((picked >= 0.4) & (picked < 0.6)).float().mean().item()
+    assert lower_half == pytest.approx(0.5, abs=0.03)
+
+
+def test_generator_on_its_own_device():
+    band = torch.arange(10, 20)
+    g = torch.Generator(device="cpu").manual_seed(0)
+    out = apply_timestep_focus(torch.zeros(8, dtype=torch.long), band, 1.0, generator=g)
+    assert out.min() >= 10 and out.max() < 20
+    if torch.cuda.is_available():
+        g = torch.Generator(device="cuda").manual_seed(0)
+        out = apply_timestep_focus(torch.zeros(8, dtype=torch.long), band, 1.0, generator=g,
+                                   weights=torch.ones(10))
+        assert out.device.type == "cpu" and out.min() >= 10
