@@ -629,7 +629,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       // the ComfyUI repack (local copies in the comfy models folder win over
       // the download); the vendor repo or a fine-tune here loads as named
       "config.process[0].model.name_or_path": [
-        "Kijai/Ming-Image-ComfyUI",
+        "Comfy-Org/Ming-Image",
         defaultNameOrPath,
       ],
       "config.process[0].model.quantize": [true, false],
@@ -973,11 +973,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].train.cache_text_embeddings": [true, false],
-      "config.process[0].train.do_guidance_loss": [true, undefined],
-      "config.process[0].train.guidance_loss_target": [3.5, undefined],
-      "config.process[0].train.guidance_loss_sigma_min": [0.15, undefined],
       "config.process[0].model.assistant_lora_path": [
-        "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors",
+        "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v3.safetensors",
         undefined,
       ],
       "config.process[0].network.linear": [16, defaultLinearRank],
@@ -1020,10 +1017,10 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
         label: "Distillation Handling Method",
         options: [
           { value: "cg", label: "Contrastive Guidance" },
-          { value: "ta", label: "Training Adapter" },
+          { value: "ta", label: "Training Adapter (default)" },
           {
             value: "both",
-            label: "Contrastive Guidance + Training Adapter (default)",
+            label: "Contrastive Guidance + Training Adapter",
           },
           { value: "none", label: "None" },
         ],
@@ -1073,13 +1070,13 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
               "config.process[0].train.guidance_loss_sigma_min",
             );
             setJobConfig(
-              "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors",
+              "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v3.safetensors",
               "config.process[0].model.assistant_lora_path",
             );
           } else if (value === "both") {
             setJobConfig(true, "config.process[0].train.do_guidance_loss");
             setJobConfig(
-              "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors",
+              "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v3.safetensors",
               "config.process[0].model.assistant_lora_path",
             );
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
@@ -1180,11 +1177,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].train.cache_text_embeddings": [true, false],
-      "config.process[0].train.do_guidance_loss": [true, undefined],
-      "config.process[0].train.guidance_loss_target": [3.5, undefined],
-      "config.process[0].train.guidance_loss_sigma_min": [0.15, undefined],
       "config.process[0].model.assistant_lora_path": [
-        "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v1.safetensors",
+        "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v2.safetensors",
         undefined,
       ],
       "config.process[0].network.linear": [16, defaultLinearRank],
@@ -1226,10 +1220,10 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
         label: "Distillation Handling Method",
         options: [
           { value: "cg", label: "Contrastive Guidance" },
-          { value: "ta", label: "Training Adapter" },
+          { value: "ta", label: "Training Adapter (default)" },
           {
             value: "both",
-            label: "Contrastive Guidance + Training Adapter (default)",
+            label: "Contrastive Guidance + Training Adapter",
           },
           { value: "dopsd", label: "D-OPSD" },
           { value: "none", label: "None" },
@@ -1294,13 +1288,13 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
               "config.process[0].train.guidance_loss_sigma_min",
             );
             setJobConfig(
-              "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v1.safetensors",
+              "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v2.safetensors",
               "config.process[0].model.assistant_lora_path",
             );
           } else if (value === "both") {
             setJobConfig(true, "config.process[0].train.do_guidance_loss");
             setJobConfig(
-              "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v1.safetensors",
+              "ostris/minimax_h3_training_adapter/minimax_h3_ref2va_training_adapter_v2.safetensors",
               "config.process[0].model.assistant_lora_path",
             );
             if (!config?.config?.process?.[0]?.train?.guidance_loss_target) {
@@ -1433,6 +1427,135 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           shared with the fl2va arch. Everything else (pre-quantized load, 24
           fps, 17n+5 frame grid, guidance scale 1, single-image mode) matches
           MiniMax-H3.
+        </p>
+      </div>
+    ),
+  },
+  {
+    name: "minimax_h3_vsa",
+    label: "FastH3 8-Step V2",
+    group: "video",
+    isVideoModel: true,
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.process[0].model.name_or_path": [
+        "FastVideo/FastVideo-FastH3-Comfy",
+        defaultNameOrPath,
+      ],
+      // pre-quantized weights: matching qtypes keep the load unchanged
+      "config.process[0].model.quantize": [true, false],
+      "config.process[0].model.qtype": ["convrot8", "qfloat8"],
+      "config.process[0].model.quantize_te": [true, false],
+      "config.process[0].model.qtype_te": ["nvfp4", "qfloat8"],
+      "config.process[0].model.low_vram": [true, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].model.assistant_lora_path": [
+        "ostris/minimax_h3_training_adapter/fastvideo_fasth3_8step_v2_training_adapter_v1.safetensors",
+        undefined,
+      ],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.network_kwargs.ignore_if_contains": [
+        ["adaln_proj"],
+        [],
+      ],
+      "config.process[0].sample.num_frames": [107, 1],
+      "config.process[0].sample.fps": [24, 1],
+      "config.process[0].sample.width": [768, 1024],
+      "config.process[0].sample.height": [768, 1024],
+      "config.process[0].sample.guidance_scale": [1, 4],
+      "config.process[0].sample.sample_steps": [8, 25],
+      "config.process[0].train.audio_loss_multiplier": [1.0, undefined],
+      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].datasets[x].do_audio": [true, undefined],
+      "config.process[0].datasets[x].cache_latents_to_disk": [true, false],
+      "config.process[0].datasets[x].fps": [24, undefined],
+      "config.process[0].datasets[x].num_frames": [39, undefined],
+      "config.process[0].datasets[x].auto_frame_count": [true, undefined],
+    },
+    disableSections: ["network.conv"],
+    additionalSections: [
+      "datasets.num_frames",
+      "model.layer_offloading",
+      "model.low_vram",
+      "datasets.do_audio",
+      "datasets.audio_normalize",
+      "datasets.audio_preserve_pitch",
+      "train.audio_loss_multiplier",
+      "datasets.auto_frame_count",
+      "model.assistant_lora_path",
+    ],
+    customModelSelectOptions: [
+      {
+        label: "Distillation Handling Method",
+        options: [
+          { value: "ta", label: "Training Adapter (default)" },
+          { value: "none", label: "None" },
+        ],
+        getValue: (config: JobConfig) => {
+          const assistantLoraPath =
+            config?.config?.process?.[0]?.model?.assistant_lora_path;
+          return assistantLoraPath && assistantLoraPath.trim() !== ""
+            ? "ta"
+            : "none";
+        },
+        onChange: (
+          value: string,
+          config: JobConfig,
+          setJobConfig: (value: any, key: string) => void,
+        ) => {
+          setJobConfig(
+            value === "ta"
+              ? "ostris/minimax_h3_training_adapter/fastvideo_fasth3_8step_v2_training_adapter_v1.safetensors"
+              : undefined,
+            "config.process[0].model.assistant_lora_path",
+          );
+        },
+        doc: {
+          title: "FastH3 Distillation Handling",
+          description: (
+            <div>
+              FastH3 is a step-distilled model, so training on it directly will
+              make the distillation break down. The Training Adapter (the
+              MiniMax-H3 adapter) absorbs that drift during training and is
+              removed at inference, but can still break down over a long run.
+            </div>
+          ),
+        },
+      },
+    ],
+    modelNotes: (
+      <div className="space-y-2">
+        <p>
+          FastVideo's FastH3 8-Step V2: MiniMax-H3 DMD2-distilled to 8 steps
+          with Video Sparse Attention (80% sparsity). Text-to-video with joint
+          audio only — no first-frame or reference conditioning.
+        </p>
+        <p>
+          Weights load from the{" "}
+          <Link href="/settings" className="text-blue-400 hover:underline">
+            Models Folder Path
+          </Link>{" "}
+          set in settings. Anything missing is downloaded there from{" "}
+          <code>FastVideo/FastVideo-FastH3-Comfy</code> on first load. The text
+          encoder and VAEs are the same files MiniMax-H3 uses, so an existing
+          MiniMax-H3 setup only needs the new DiT. Files used:
+        </p>
+        <pre className="bg-gray-900 border border-gray-700 rounded-lg p-3 text-xs overflow-x-auto">
+          <code>{`<MODELS_PATH>/
+├── diffusion_models/
+│   └── fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors
+├── text_encoders/
+│   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+└── vae/
+    ├── minimax_h3_video_vae_fp16.safetensors
+    └── minimax_h3_audio_vae_fp32.safetensors`}</code>
+        </pre>
+        <p>
+          Sample with 8 steps and guidance scale 1 (the trained schedule). Video
+          is fixed 24 fps and frame counts snap down to the 17n+5 grid.
         </p>
       </div>
     ),
