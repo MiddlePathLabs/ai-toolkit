@@ -2014,12 +2014,12 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           edit: true,
           match_target_res: true,
           kv_cache: true,
-          "config.process[0].depth_consistency.model_id": [
+        },
+        {},
+      ],
+      "config.process[0].depth_consistency.model_id": [
         "depth-anything/Depth-Anything-V2-Large-hf",
         "depth-anything/Depth-Anything-V2-Small-hf",
-      ],
-    },
-        {},
       ],
     },
     disableSections: ["network.conv", "train.unload_text_encoder"],
@@ -2068,12 +2068,12 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           edit: true,
           match_target_res: true,
           kv_cache: true,
-          "config.process[0].depth_consistency.model_id": [
+        },
+        {},
+      ],
+      "config.process[0].depth_consistency.model_id": [
         "depth-anything/Depth-Anything-V2-Large-hf",
         "depth-anything/Depth-Anything-V2-Small-hf",
-      ],
-    },
-        {},
       ],
     },
     disableSections: ["network.conv", "train.unload_text_encoder"],
