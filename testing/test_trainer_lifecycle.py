@@ -357,3 +357,208 @@ def test_completed_update_snapshot_exposes_boundary_clock():
         "epoch": 3,
         "completed_update_id": 5,
     }
+
+
+# ---------------------------------------------------------------------------
+# F10 / F13 / F14 acceptance oracles (independent arithmetic, no self-compare)
+# ---------------------------------------------------------------------------
+
+class _LossConfig:
+    """Train config whose unset gates are inert (falsy) instead of crashing."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def __getattr__(self, name):
+        return False
+
+
+def _loss_trainer(config_overrides=None, sd=None):
+    trainer = object.__new__(SDTrainer)
+    trainer.device_torch = torch.device("cpu")
+    trainer.train_config = _LossConfig(
+        loss_type="mse",
+        loss_target="noise",
+        inverted_mask_prior_multiplier=0.5,
+        audio_loss_multiplier=1.0,
+        max_loss=None,
+        **(config_overrides or {}),
+    )
+    # get_loss_target keeps the main target arithmetic out of scope here.
+    trainer.sd = sd if sd is not None else SimpleNamespace(
+        is_flow_matching=True,
+        get_loss_target=lambda noise, batch, timesteps: noise,
+        scale_loss=lambda loss: loss,
+    )
+    trainer.loss_watch = None
+    trainer.additional_logs = {}
+    trainer.adapter = None
+    trainer.embedding = None
+    trainer.ema = None
+    trainer.step_num = 0
+    trainer._adaptive_lr_window_steps = 1
+    for attr in (
+        "depth_consistency_config", "normal_config", "body_proportion_config",
+        "face_id_config", "body_shape_config", "vae_anchor_config",
+        "subject_mask_config", "adapter_config", "network_config", "dfe",
+    ):
+        setattr(trainer, attr, None)
+    return trainer
+
+
+def test_f10_prior_masks_use_each_samples_own_region_not_row_zero():
+    """F10: disjoint per-item prior masks select their own complement; a
+    fully-masked (zero-complement) item contributes exactly zero instead of
+    inheriting sample 0's region."""
+    H = W = 8
+    # protected regions: sample 0 top half, sample 1 EVERYWHERE (empty complement)
+    mask = torch.zeros(2, 1, H, W)
+    mask[0, :, :4, :] = 1.0
+    mask[1, :, :, :] = 1.0
+    trainer = _loss_trainer({"inverted_mask_prior": True})
+    batch = SimpleNamespace(
+        get_is_reg_list=lambda: [False, False],
+        loss_multiplier_list=[1.0, 1.0],
+        mask_tensor=mask,
+        latents=torch.zeros(2, 1, H, W),
+    )
+    noise_pred = torch.zeros(2, 1, H, W, requires_grad=True)
+    prior_pred = torch.full((2, 1, H, W), 2.0, requires_grad=True)
+    noise = torch.zeros(2, 1, H, W)
+    loss = trainer.calculate_loss(
+        noise_pred,
+        noise,
+        torch.zeros(2, 1, H, W),
+        torch.tensor([500.0, 500.0]),
+        batch,
+        prior_pred=prior_pred,
+    )
+    # independent expectation: visual target == noise -> 0 everywhere.
+    # prior term = 0.5 * mean over own complement of (pred - prior)^2
+    #   sample 0 complement = rows 4:8 -> 0.5 * 4.0 = 2.0
+    #   sample 1 complement empty   -> 0.0
+    # batch mean -> (2.0 + 0.0) / 2 = 1.0
+    # a row-0 broadcast would give sample 1 sample 0's region -> 2.0.
+    assert float(loss.detach()) == pytest.approx(1.0, abs=1e-6)
+    loss.backward()
+    assert prior_pred.grad is not None
+    assert prior_pred.grad[0, :, :4, :].abs().sum().item() == pytest.approx(0.0, abs=1e-7)
+    assert prior_pred.grad[0, :, 4:, :].abs().sum().item() > 0.0
+    assert prior_pred.grad[1].abs().sum().item() == pytest.approx(0.0, abs=1e-7)
+
+
+def _audio_guidance_trainer(uncond_audio, guidance_scale=2.0):
+    from toolkit.dto import DTO
+    from toolkit.prompt_utils import PromptEmbeds
+
+    trainer = _loss_trainer(
+        {
+            "do_guidance_loss": True,
+            "do_guidance_loss_cfg_zero": True,
+            "guidance_loss_sigma_min": 0.0,
+            "guidance_loss_schedule": None,
+        }
+    )
+    trainer._guidance_loss_target_batch = guidance_scale
+    trainer.unconditional_embeds = PromptEmbeds(torch.zeros(1, 2, 3))
+
+    def fake_predict_noise(**_kwargs):
+        return DTO(torch.zeros(1), audio=uncond_audio.clone())
+
+    trainer.predict_noise = fake_predict_noise
+    return trainer
+
+
+def _expected_cfg_zero_audio_loss(pred, a_target, uncond, scale, multiplier, dtype_bits):
+    """Independent FP64 oracle for the CFG-Zero guided audio objective."""
+    import torch as _t
+
+    total = 0.0
+    B = a_target.shape[0]
+    for i in range(B):
+        a = a_target[i].double().reshape(-1)
+        u = uncond[i].double().reshape(-1)
+        p = pred[i].double().reshape(-1)
+        s = float((a * u).sum()) / max(float((u * u).sum()), 1e-8)
+        u_prime = u * s
+        blended = u_prime + scale * (a - u_prime)
+        total += float(((p - blended) ** 2).mean()) * float(multiplier[i])
+    return total / B
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("normal", torch.float16),
+        ("zero_uncond", torch.float16),
+        ("tiny_uncond", torch.float32),
+        ("large_uncond", torch.float16),
+    ],
+)
+def test_f13_cfg_zero_ratio_matches_fp64_oracle_and_stays_finite(case):
+    """F13: the CFG-Zero dot/norm ratio is computed in FP32 and matches an
+    independent FP64 oracle for zero/tiny/large unconditionals without any
+    disconnected-zero substitution."""
+    name, dtype = case
+    torch.manual_seed(7)
+    B, C, T = 2, 4, 16
+    pred = torch.randn(B, C, T, dtype=dtype)
+    a_target = torch.randn(B, C, T, dtype=dtype)
+    uncond = torch.randn(B, C, T, dtype=dtype)
+    if name == "zero_uncond":
+        uncond = torch.zeros_like(uncond)
+    elif name == "tiny_uncond":
+        uncond = uncond * 1e-20
+    elif name == "large_uncond":
+        uncond = uncond * 1e4
+    trainer = _audio_guidance_trainer(uncond)
+    loss = trainer._loss_for_audio_only_batch(
+        audio_pred=pred,
+        audio_target=a_target.clone(),
+        audio_mask=torch.ones(B, dtype=torch.bool),
+        audio_sigma=None,
+        noisy_latents=torch.zeros(B, 1, 2, 2),
+        timesteps=torch.full((B,), 500.0),
+        batch=SimpleNamespace(),
+        additional_loss=0.0,
+        loss_multiplier=torch.ones(B),
+    )
+    assert torch.isfinite(loss)
+    expected = _expected_cfg_zero_audio_loss(
+        pred.float(), a_target.float(), uncond.float(), 2.0, torch.ones(B), dtype
+    )
+    assert float(loss.detach()) == pytest.approx(expected, rel=3e-2, abs=3e-3)
+
+
+def test_f14_base_sigma_is_exact_across_grids_and_boundaries():
+    """F14: base sigma resolution is exact FP32 for any timestep grid (no
+    stale lookup state across grid changes) and delegates to the model's
+    active-shift inversion."""
+    trainer = object.__new__(SDTrainer)
+    trainer.sd = SimpleNamespace()  # no timestep_to_base_sigma -> t/1000
+    linear = torch.tensor([0.0, 250.0, 500.0, 1000.0])
+    assert SDTrainer._base_sigma(trainer, linear).tolist() == [0.0, 0.25, 0.5, 1.0]
+    # a different grid (sigmoid-distributed timesteps) resolves on the same
+    # call path with no cross-grid staleness
+    sig = torch.tensor([0.001, 0.02, 0.5, 0.98, 0.999])
+    assert SDTrainer._base_sigma(trainer, sig * 1000.0).tolist() == pytest.approx(sig.tolist(), abs=1e-7)
+    # fp16 timesteps are resolved in FP32 (values fp16 would destroy)
+    ts16 = torch.tensor([0.1, 333.3], dtype=torch.float16)
+    out = SDTrainer._base_sigma(trainer, ts16)
+    assert out.dtype == torch.float32
+    # expected from the fp16-quantized timestep, resolved in FP32
+    assert out.tolist() == pytest.approx([float(ts16[0].item()) / 1000.0, float(ts16[1].item()) / 1000.0], abs=1e-7)
+    # boundaries
+    assert SDTrainer._base_sigma(trainer, torch.tensor([0.0, 1000.0])).tolist() == [0.0, 1.0]
+
+    # the real H3 inversion uses the ACTIVE model shift (Fast ships 10, not 12)
+    from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
+        MinimaxH3Model,
+    )
+
+    for shift in (12.0, 10.0):
+        holder = SimpleNamespace(video_sigma_shift=shift)
+        sig_v = torch.tensor([0.126, 0.5, 0.68, 1.0])
+        base = MinimaxH3Model.timestep_to_base_sigma(holder, sig_v.clone())
+        expect = [float(s / (shift - (shift - 1.0) * s)) for s in sig_v.tolist()]
+        assert base.tolist() == pytest.approx(expect, rel=1e-6)

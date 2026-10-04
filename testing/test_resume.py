@@ -194,3 +194,155 @@ def test_interrupted_resume_matches_uninterrupted_cpu_oracle(tmp_path):
     )
     assert host_resume.completed_update_id == total_updates
     assert host_resume.ema.num_updates is None
+
+
+# ---------------------------------------------------------------------------
+# Atomic raw-state write + resume-mode gate semantics oracles
+# ---------------------------------------------------------------------------
+
+def _raw_state(**overrides):
+    state = {
+        "kind": "ai_toolkit.raw_training_state",
+        "schema": 1,
+        "recipe_identity": "RID",
+        "determinism": {"supported": True, "reasons": []},
+        "snapshot": {"step": 3, "epoch": 0, "completed_update_id": 3},
+        "params": [torch.zeros(1)],
+        "optimizer": {"state": {}, "param_groups": []},
+        "scheduler": {"last_epoch": 3},
+        "ema": None,
+        "rng": None,
+        "data": {"train": None, "reg": None},
+    }
+    state.update(overrides)
+    return state
+
+
+def test_atomic_training_state_write_is_all_or_nothing(tmp_path, monkeypatch):
+    target = tmp_path / "training_state.pt"
+    holder = SimpleNamespace(save_root=str(tmp_path), _resume_state_path=str(target))
+
+    # clean save lands only at the final path, no temp litter
+    BaseSDTrainProcess._atomic_save_training_state(holder, _raw_state())
+    assert target.exists()
+    assert torch.load(str(target), weights_only=False)["kind"] == "ai_toolkit.raw_training_state"
+    assert list(tmp_path.glob(".training_state_*")) == []
+    good_bytes = target.read_bytes()
+
+    # interrupted write (partial bytes then raise) leaves the previous
+    # complete file untouched and no partial replacement behind
+    real_save = torch.save
+
+    def crashing_save(obj, path, *args, **kwargs):
+        with open(path, "wb") as fh:
+            fh.write(b"PK\x03\x04partial")
+        raise RuntimeError("simulated crash mid-save")
+
+    monkeypatch.setattr(torch, "save", crashing_save)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        BaseSDTrainProcess._atomic_save_training_state(holder, _raw_state())
+    monkeypatch.setattr(torch, "save", real_save)
+    assert target.read_bytes() == good_bytes
+    assert list(tmp_path.glob(".training_state_*")) == []
+
+    # a corrupted/partial file on disk is rejected fail-closed, never resumed
+    corrupt = tmp_path / "corrupt_state.pt"
+    corrupt.write_bytes(b"PK\x03\x04truncated")
+    loader = SimpleNamespace(resume_mode="auto", _resume_state_path=str(corrupt), _resume_state=None)
+    with pytest.raises(ValueError, match="weights_only"):
+        BaseSDTrainProcess._load_resume_state_if_present(loader)
+
+
+def _gate_holder(tmp_path, resume_mode, *, state=None, supported=True):
+    if supported:
+        dataset_configs = [SimpleNamespace(num_workers=0, buckets=False)]
+        device_torch = torch.device("cpu")
+    else:
+        dataset_configs = [
+            SimpleNamespace(num_workers=2, buckets=True),
+            SimpleNamespace(num_workers=2, buckets=True),
+        ]
+        device_torch = torch.device("cuda")
+    holder = SimpleNamespace(
+        resume_mode=resume_mode,
+        _resume_state_path=str(tmp_path / "training_state.pt"),
+        _resume_state=state,
+        accelerator=SimpleNamespace(num_processes=1),
+        device_torch=device_torch,
+        model_config=SimpleNamespace(compile=False, block_compile=False),
+        train_config=SimpleNamespace(gradient_accumulation=1, gradient_accumulation_steps=1),
+        dataset_configs=dataset_configs,
+        _resume_recipe_identity=lambda: "RID",
+        optimizer=None,
+        lr_scheduler=None,
+        step_num=0,
+        start_step=0,
+        epoch_num=0,
+        completed_update_id=0,
+    )
+    holder._deterministic_resume_supported = (
+        lambda: BaseSDTrainProcess._deterministic_resume_supported(holder)
+    )
+    return holder
+
+
+def test_resume_mode_gate_semantics(tmp_path):
+    # fresh run: auto with no state file loads nothing and validates clean
+    fresh = _gate_holder(tmp_path, "auto", supported=True)
+    BaseSDTrainProcess._load_resume_state_if_present(fresh)
+    assert fresh._resume_state is None
+    BaseSDTrainProcess._validate_resume_runtime_support(fresh)  # no raise
+
+    # auto/exact with a complete state on an unsupported (GPU/worker/bucket)
+    # environment refuse rather than silently approximating a resume
+    state = _raw_state()
+    strict = _gate_holder(tmp_path, "auto", state=state, supported=False)
+    with pytest.raises(ValueError, match="exact replay is unsupported"):
+        BaseSDTrainProcess._validate_resume_runtime_support(strict)
+
+    exact_unsupported = _gate_holder(tmp_path, "exact", state=state, supported=False)
+    with pytest.raises(ValueError, match="single-process CPU"):
+        BaseSDTrainProcess._validate_resume_runtime_support(exact_unsupported)
+
+    # exact on the supported deterministic scope with matching identity admits
+    exact_ok = _gate_holder(tmp_path, "exact", state=state, supported=True)
+    BaseSDTrainProcess._validate_resume_runtime_support(exact_ok)  # no raise
+
+    # identity mismatch is refused even in the supported scope
+    other = _gate_holder(tmp_path, "exact", state=_raw_state(recipe_identity="OTHER"), supported=True)
+    with pytest.raises(ValueError, match="recipe/config identity differs"):
+        BaseSDTrainProcess._validate_resume_runtime_support(other)
+
+    # weights_only never loads raw state and never gates on determinism
+    warm = _gate_holder(tmp_path, "weights_only", supported=False)
+    warm._resume_state_path = str(tmp_path / "absent.pt")  # also nothing on disk
+    BaseSDTrainProcess._load_resume_state_if_present(warm)
+    assert warm._resume_state is None
+    BaseSDTrainProcess._validate_resume_runtime_support(warm)  # no raise
+
+    # a saved-but-unsupported state is equally ignored under weights_only
+    warm_state = _gate_holder(tmp_path, "weights_only", supported=False)
+    p = tmp_path / "training_state.pt"
+    torch.save(_raw_state(), str(p))
+    warm_state._resume_state_path = str(p)
+    BaseSDTrainProcess._load_resume_state_if_present(warm_state)
+    assert warm_state._resume_state is None
+    # and restoration is a no-op: counters/optimizer stay untouched (a warm
+    # start, never a resume)
+    BaseSDTrainProcess._restore_resume_optimizer_state(warm_state)
+    assert warm_state.step_num == 0 and warm_state.completed_update_id == 0
+
+    # incomplete and unknown-schema states are explicit errors, not resumes
+    p2 = tmp_path / "incomplete.pt"
+    torch.save({"kind": "ai_toolkit.raw_training_state", "schema": 1}, str(p2))
+    broken = _gate_holder(tmp_path, "auto")
+    broken._resume_state_path = str(p2)
+    with pytest.raises(ValueError, match="incomplete"):
+        BaseSDTrainProcess._load_resume_state_if_present(broken)
+
+    p3 = tmp_path / "badschema.pt"
+    torch.save(_raw_state(schema=99), str(p3))
+    bad = _gate_holder(tmp_path, "auto")
+    bad._resume_state_path = str(p3)
+    with pytest.raises(ValueError, match="schema"):
+        BaseSDTrainProcess._load_resume_state_if_present(bad)
