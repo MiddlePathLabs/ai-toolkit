@@ -91,6 +91,7 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
     DecoratorConfig
 from toolkit.admission import raise_for_process_admission
+from toolkit import force_hf_hub_progress_bars
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -115,6 +116,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     supports_category_anchor = False
 
     def __init__(self, process_id: int, job, config: OrderedDict, custom_pipeline=None):
+        # Admission can import the package without Hugging Face. Enable the
+        # progress policy only for the actual training runtime.
+        force_hf_hub_progress_bars()
         super().__init__(process_id, job, config)
         self.accelerator: Accelerator = get_accelerator()
         if self.accelerator.is_local_main_process:
@@ -1461,6 +1465,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # you can extend this in subclass to get params
         # otherwise params will be gathered through normal means
         return None
+
+    def _repair_pending_text_embeddings(self, batch, dataloader):
+        pending = getattr(batch, "pending_text_embedding_items", None)
+        if not pending:
+            return
+        for dataset in get_dataloader_datasets(dataloader):
+            repair = getattr(dataset, "repair_pending_text_embeddings", None)
+            if repair is not None:
+                repair(batch)
+        remaining = [
+            item.path for item in getattr(batch, "file_items", [])
+            if getattr(item, "pending_text_embedding", False)
+        ]
+        if remaining:
+            raise RuntimeError(
+                f"Caption cache regeneration did not complete before training: {remaining}"
+            )
+        batch.rebuild_prompt_embeddings()
 
     def hook_train_loop(self, batch):
         # return loss
@@ -3322,6 +3344,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 for b in range(self.train_config.gradient_accumulation):
                     # keep track to alternate on an accumulation step for reg   
                     batch_step = step
+                    batch_dataloader = None
                     # don't do a reg step on sample or save steps as we dont want to normalize on those
                     if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
                         try:
@@ -3335,8 +3358,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
+                        batch_dataloader = dataloader_reg
                         is_reg_step = True
                     elif dataloader is not None:
+                        batch_dataloader = dataloader
                         # category_stop mode 'stop': retired categories never reach the
                         # forward pass. Bounded so a dataset with nothing left fails loudly.
                         skipped_here = 0
@@ -3371,6 +3396,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 )
                     else:
                         batch = None
+                    if batch is not None and batch_dataloader is not None:
+                        self._repair_pending_text_embeddings(batch, batch_dataloader)
                     batch_list.append(batch)
                     batch_step += 1
 

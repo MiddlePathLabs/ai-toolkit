@@ -8,6 +8,7 @@ import os
 import random
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
 
@@ -29,6 +30,27 @@ from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt
 from torchvision import transforms
+
+_CAPTION_SOURCE_MEMO = {}
+_CAPTION_SOURCE_MEMO_KEY_BY_PATH = {}
+
+
+def _load_caption_source_memo(source_path: str):
+    source_path = os.path.abspath(source_path)
+    with open(source_path, "rb") as source:
+        payload = source.read()
+    digest = hashlib.sha256(payload).digest()
+    key = (source_path, digest)
+    caption_dict = _CAPTION_SOURCE_MEMO.get(key)
+    if caption_dict is None:
+        caption_dict = json.loads(payload.decode("utf-8"))
+        previous_key = _CAPTION_SOURCE_MEMO_KEY_BY_PATH.get(source_path)
+        if previous_key is not None and previous_key != key:
+            _CAPTION_SOURCE_MEMO.pop(previous_key, None)
+        _CAPTION_SOURCE_MEMO[key] = caption_dict
+        _CAPTION_SOURCE_MEMO_KEY_BY_PATH[source_path] = key
+    return caption_dict
+
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
 import albumentations as A
@@ -75,12 +97,23 @@ def _memoized_fingerprint(cache: dict, path: str) -> str:
     return cache[key]
 
 
+def _model_fingerprint_cache(model) -> dict:
+    cache = getattr(model, "_aitk_cache_fingerprint_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(model, "_aitk_cache_fingerprint_cache", cache)
+        except Exception:
+            pass
+    return cache
+
+
 def _cache_model_identity(model) -> str:
     """Serialize representation-changing model/encoder provenance.
 
-    In particular, include both the resolved encoder source and the explicit
-    ``model_kwargs.text_encoder_path`` override.  The latter is intentionally
-    included even when a model exposes a legacy ``te_cache_identity`` helper.
+    Identity preparation is model-scoped. FileItemDTO instances share the
+    prepared identity and the underlying source fingerprints, so a dataset
+    with repeated paths does not reread a checkpoint for every item.
     """
     if model is None:
         return "model:none"
@@ -96,16 +129,19 @@ def _cache_model_identity(model) -> str:
         te_name = getattr(config, "te_name_or_path", None)
     te_override = kwargs.get("text_encoder_path")
     source = te_override or te_name
+    fingerprints = _model_fingerprint_cache(model)
     encoder = ""
     if source and isinstance(source, (str, bytes, os.PathLike)) and os.path.isdir(source):
         parts = []
         for root, _dirs, names in os.walk(source):
             for name in sorted(names):
                 item = os.path.join(root, name)
-                parts.append((os.path.relpath(item, source), _fingerprint_optional(item)))
+                parts.append((os.path.relpath(item, source), _memoized_fingerprint(
+                    fingerprints, item
+                )))
         encoder = json.dumps(parts, sort_keys=True, separators=(",", ":"))
     elif source:
-        encoder = _fingerprint_optional(source)
+        encoder = _memoized_fingerprint(fingerprints, source)
     legacy = getattr(model, "te_cache_identity", None)
     try:
         legacy_identity = legacy() if callable(legacy) else legacy
@@ -138,17 +174,21 @@ def _latent_cache_model_identity(model) -> str:
     """Identity for target latent encoding, including resolved VAE sources."""
     if model is None:
         return "model:none"
+    cached = getattr(model, "_aitk_latent_cache_model_identity", None)
+    if cached is not None:
+        return cached
     config = getattr(model, "model_config", None)
     kwargs = (
         config.get("model_kwargs", {}) if isinstance(config, dict)
         else getattr(config, "model_kwargs", {})
     ) or {}
+    fingerprints = _model_fingerprint_cache(model)
 
     def _path_identity(value):
         entry = {"value": str(value)}
         try:
             if os.path.isfile(value):
-                entry["fingerprint"] = content_fingerprint(value)
+                entry["fingerprint"] = _memoized_fingerprint(fingerprints, value)
         except (OSError, IOError, TypeError):
             pass
         return entry
@@ -198,7 +238,14 @@ def _latent_cache_model_identity(model) -> str:
         fields["condition_encoder_recipe"] = str(
             getattr(model, "condition_encoder_recipe", "")
         )
-    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    identity = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    try:
+        setattr(model, "_aitk_latent_cache_model_identity", identity)
+    except Exception:
+        pass
+    return identity
+
+
 
 
 if TYPE_CHECKING:
@@ -518,6 +565,7 @@ class CaptionProcessingDTOMixin:
         self: 'FileItemDTO',
         caption_dict: Union[dict, None] = None,
         force: bool = False,
+        refresh_source: bool = True,
     ):
         if force:
             # Dataset JSON is authoritative when present. Reset every derived
@@ -540,6 +588,9 @@ class CaptionProcessingDTOMixin:
                     setattr(self, attr, None)
             self._loaded_text_embedding_path = None
             self._caption_was_dropped = False
+            source_path = getattr(self, "caption_source_path", None)
+            if refresh_source and source_path and os.path.isfile(source_path):
+                caption_dict = _load_caption_source_memo(source_path)
         if self.raw_caption is not None:
             # we already loaded it
             pass
@@ -2157,13 +2208,22 @@ class LatentCachingFileItemDTOMixin:
         self.source_content_fingerprint = (
             content_fingerprint(path) if path and os.path.isfile(path) else str(path or "")
         )
+        dataset_config = kwargs.get("dataset_config")
         cache_text = bool(
-            getattr(kwargs.get("dataset_config"), "cache_text_embeddings", False)
+            getattr(dataset_config, "cache_text_embeddings", False)
+        )
+        cache_latents = bool(
+            getattr(dataset_config, "cache_latents", False)
+            or getattr(dataset_config, "cache_latents_to_disk", False)
         )
         self._cache_model_identity = (
-            _cache_model_identity(kwargs.get("sd")) if cache_text else "text-cache-disabled"
+            _cache_model_identity(kwargs.get("sd"))
+            if cache_text else "text-cache-disabled"
         )
-        self._latent_model_identity = _latent_cache_model_identity(kwargs.get("sd"))
+        self._latent_model_identity = (
+            _latent_cache_model_identity(kwargs.get("sd"))
+            if cache_latents else "latent-cache-disabled"
+        )
         # v2 changes the cache namespace: source content and transform/control
         # provenance are now part of the latent identity.
         self.latent_version = 2
@@ -2895,6 +2955,8 @@ class TextEmbeddingFileItemDTOMixin:
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
+        self.pending_text_embedding = False
+        self.pending_text_embedding_paths = []
 
     def get_text_embedding_info_dict(
         self: 'FileItemDTO',
@@ -3134,37 +3196,45 @@ class TextEmbeddingFileItemDTOMixin:
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
             return
+        self.pending_text_embedding = False
+        self.pending_text_embedding_paths = []
+
+        def load(path):
+            try:
+                return PromptEmbeds.load(path)
+            except FileNotFoundError:
+                self.pending_text_embedding = True
+                self.pending_text_embedding_paths.append(path)
+                return None
+
         if self.prompt_embeds is None:
             te_path = self.get_text_embedding_path()
             self._caption_was_dropped = False
             if self.dataset_config.caption_dropout_rate > 0:
-                # get a random float form 0 to 1
-                rand = random.random()
-                if rand < self.dataset_config.caption_dropout_rate:
-                    # drop the caption by using the cached blank embedding
+                if random.random() < self.dataset_config.caption_dropout_rate:
                     te_path = self.get_blank_text_embedding_path()
                     self._caption_was_dropped = True
-            # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(te_path)
+            self.prompt_embeds = load(te_path)
+            if self.prompt_embeds is None:
+                return
             self._loaded_text_embedding_path = te_path
         if self.dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
             if self._caption_was_dropped:
-                # match live encoding, which builds the DOP caption from the
-                # dropped caption (trigger word replaced with the class)
                 dop_path = self.get_dop_blank_text_embedding_path()
             else:
                 dop_path = self.get_dop_text_embedding_path()
             if dop_path == self._loaded_text_embedding_path:
-                # no trigger word in caption, same embedding
                 self.dop_prompt_embeds = self.prompt_embeds
             else:
-                self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
+                self.dop_prompt_embeds = load(dop_path)
+                if self.dop_prompt_embeds is None:
+                    return
         if getattr(self, 'dopsd_self_ref', False) and self.dopsd_prompt_embeds is None:
             if self._caption_was_dropped:
                 dopsd_path = self.get_dopsd_blank_text_embedding_path()
             else:
                 dopsd_path = self.get_dopsd_text_embedding_path()
-            self.dopsd_prompt_embeds = PromptEmbeds.load(dopsd_path)
+            self.dopsd_prompt_embeds = load(dopsd_path)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -3173,21 +3243,32 @@ class TextEmbeddingCachingMixin:
             super().__init__(**kwargs)
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
-    def cache_text_embeddings(self: 'AiToolkitDataset'):
-        with accelerator.main_process_first():
+    def cache_text_embeddings(
+        self: 'AiToolkitDataset',
+        file_items=None,
+    ):
+        cache_context = (
+            accelerator.main_process_first()
+            if file_items is None
+            else nullcontext()
+        )
+        with cache_context:
+            items = self.file_list if file_items is None else file_items
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
             
             did_move = False
 
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
-                # JSON/short-caption authority is resolved before any path is
-                # computed. This also lets a changed caption re-key without
-                # deleting the previous orphan cache file.
+            # Resolve JSON/short-caption authority before any text key is
+            # computed. This also lets a changed caption re-key without
+            # deleting the previous orphan cache file.
+            for file_item in tqdm(items):
                 file_item.refresh_source_cache_provenance()
-                file_item.load_caption(getattr(self, "caption_dict", None), force=True)
+                file_item.load_caption(
+                    getattr(self, "caption_dict", None),
+                    force=True,
+                    refresh_source=False,
+                )
                 file_item.latent_load_device = self.sd.device
 
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
@@ -3395,7 +3476,8 @@ class TextEmbeddingCachingMixin:
                             save_other_photo_teacher_cache(cache_path, prompt_embeds, ctrl_img[0])
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True
-                i += 1
+                file_item.pending_text_embedding = False
+                file_item.pending_text_embedding_paths = []
             # restore device state
             # if did_move:
             #     self.sd.restore_device_state()

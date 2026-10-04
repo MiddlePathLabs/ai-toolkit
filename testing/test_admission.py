@@ -261,6 +261,49 @@ def test_dormant_audio_files_do_not_activate_standalone_voice_rules(tmp_path):
     assert result["resolved"][0]["dataset_audio_indices"] == []
     assert RULE_H3_AUDIO not in _ids(result)
 
+def test_nested_standalone_audio_activates_voice_policy(tmp_path):
+    nested = tmp_path / "clips"
+    nested.mkdir()
+    (nested / "voice.wav").write_bytes(b"audio marker")
+
+    process = _process(
+        datasets=[
+            {
+                "dataset_path": str(tmp_path),
+                "do_audio": True,
+                "buckets": False,
+            }
+        ]
+    )
+    result = collect_admission_diagnostics({"process": [process]})
+
+    assert RULE_H3_AUDIO in _ids(result)
+    assert result["resolved"][0]["dataset_audio_indices"] == [0]
+
+def test_large_audio_dataset_defers_unresolved_presence(tmp_path):
+    import toolkit.admission as admission
+
+    for index in range(admission._AUDIO_SCAN_MAX_ENTRIES + 1):
+        (tmp_path / f"caption-{index}.txt").write_text("caption")
+    voices = tmp_path / "voices"
+    voices.mkdir()
+    (voices / "voice.wav").write_bytes(b"audio marker")
+    process = _process(
+        datasets=[{
+            "dataset_path": str(tmp_path),
+            "do_audio": True,
+            "buckets": False,
+        }]
+    )
+    result = collect_admission_diagnostics({"process": [process]})
+
+    assert result["resolved"][0]["dataset_audio_indices"] == []
+    assert RULE_H3_AUDIO not in _ids(result)
+    assert admission.RULE_H3_AUDIO_DURATION in {
+        diagnostic["rule_id"] for diagnostic in result["deferred"]
+    }
+
+
 
 def test_edit_cfg_checks_each_effective_preview_item_and_legacy_prompts():
     per_item = _process(

@@ -461,15 +461,18 @@ def _apply_dataloader_transform(
     img,  # PIL.Image.Image in RGB
     file_item: 'FileItemDTO',
 ):
-    """Mirror of dataloader_mixins.load_and_process_image lines 774-793.
+    """Mirror the image geometry used by ``load_and_process_image``.
 
-    Applies deterministic flips + bucket resize + crop. Falls back to the
-    input image unchanged if bucket params aren't attached (non-bucketing
-    datasets or pre-setup_buckets invocations).
+    Subject extraction runs before workers fetch samples, so this helper must
+    apply both bucket and nonbucket geometry before the mask is resized. The
+    nonbucket path intentionally uses center geometry; random crops cannot be
+    represented by one static per-file mask and should use bucketed datasets.
     """
     from PIL import Image as _Image
+    from torchvision import transforms
 
-    # Per-file deterministic flips (if configured via dataset augments).
+    config = getattr(file_item, "dataset_config", None)
+    is_bucketed = bool(getattr(config, "buckets", False))
     if getattr(file_item, 'flip_x', False):
         img = img.transpose(_Image.FLIP_LEFT_RIGHT)
     if getattr(file_item, 'flip_y', False):
@@ -481,24 +484,30 @@ def _apply_dataloader_transform(
     cy = getattr(file_item, 'crop_y', None)
     cw = getattr(file_item, 'crop_width', None)
     ch = getattr(file_item, 'crop_height', None)
+    if is_bucketed and None not in (stw, sth, cx, cy, cw, ch):
+        img = img.resize((int(stw), int(sth)), _Image.BICUBIC)
+        return img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
 
-    if None in (stw, sth, cx, cy, cw, ch):
-        # No bucket params — use raw. Caller will downsample to a square.
+    if config is None:
         return img
-
-    img = img.resize((int(stw), int(sth)), _Image.BICUBIC)
-    img = img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
-    return img
+    scale = float(getattr(config, "scale", 1.0) or 1.0)
+    img = img.resize(
+        (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+        _Image.BICUBIC,
+    )
+    crop_size = min(img.size)
+    if getattr(config, "random_crop", False):
+        crop_size = min(crop_size, int(getattr(config, "resolution", crop_size)))
+    img = transforms.CenterCrop(crop_size)(img)
+    resolution = int(getattr(config, "resolution", crop_size))
+    return img.resize((resolution, resolution), _Image.BICUBIC)
 
 
 def _mask_output_hw(file_item: 'FileItemDTO', fallback_hw: int) -> tuple:
-    """Preferred output (H, W) for the cached mask.
-
-    If bucket crop dims are known, cache at (crop_h, crop_w) so the mask
-    matches the training-tensor aspect ratio and F.interpolate to the latent
-    grid at training time is a straight resize. Falls back to a square
-    (fallback_hw, fallback_hw) when bucket params are absent.
-    """
+    """Return mask geometry matching the effective training representation."""
+    config = getattr(file_item, "dataset_config", None)
+    if not bool(getattr(config, "buckets", False)):
+        return int(fallback_hw), int(fallback_hw)
     cw = getattr(file_item, 'crop_width', None)
     ch = getattr(file_item, 'crop_height', None)
     if cw is not None and ch is not None:
@@ -534,6 +543,21 @@ def _mask_cache_identity(file_item: 'FileItemDTO', config, out_h: int, out_w: in
         ],
         "output": [int(out_h), int(out_w)],
         "config": {
+            "buckets": bool(
+                getattr(getattr(file_item, "dataset_config", None), "buckets", False)
+            ),
+            "scale": float(
+                getattr(getattr(file_item, "dataset_config", None), "scale", 1.0)
+            ),
+            "random_crop": bool(
+                getattr(getattr(file_item, "dataset_config", None), "random_crop", False)
+            ),
+            "random_scale": bool(
+                getattr(getattr(file_item, "dataset_config", None), "random_scale", False)
+            ),
+            "resolution": int(
+                getattr(getattr(file_item, "dataset_config", None), "resolution", 0)
+            ),
             "cache_resolution": int(getattr(config, "cache_resolution", 0)),
             "body_close_radius": int(getattr(config, "body_close_radius", 0)),
             "mask_dilate_radius": int(getattr(config, "mask_dilate_radius", 0)),
@@ -581,6 +605,17 @@ def cache_subject_masks(
     from PIL import Image
     from PIL.ImageOps import exif_transpose
 
+    for file_item in file_items:
+        dataset_config = getattr(file_item, "dataset_config", None)
+        if (
+            not bool(getattr(dataset_config, "buckets", False))
+            and bool(getattr(dataset_config, "random_crop", False))
+        ):
+            raise ValueError(
+                "Subject-mask caching with nonbucket random crops/scales is "
+                "unsupported because one static mask cannot follow each "
+                f"per-sample transform: {file_item.path}"
+            )
     target_hw = int(config.cache_resolution)
 
     # Determine whether we can skip loading the extractor altogether (all cached).

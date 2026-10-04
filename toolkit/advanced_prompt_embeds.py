@@ -136,6 +136,8 @@ class AdvancedPromptEmbeds:
         return new_pe
 
     def save(self, path):
+        from toolkit.prompt_utils import _atomic_save_safetensors
+
         data = {}
         metadata = {"class_name": self.__class__.__name__}
         if self._frozen_dtype_keys:
@@ -146,8 +148,7 @@ class AdvancedPromptEmbeds:
                     f"Cannot save key {key!r}: expected list of length 1, got {len(value)}"
                 )
             data[key] = value[0]
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(data, path, metadata=metadata)
+        _atomic_save_safetensors(data, path, metadata=metadata)
 
     @classmethod
     def load(cls, path=None):

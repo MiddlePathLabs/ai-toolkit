@@ -73,8 +73,9 @@ class FileItemDTO(
 ):
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
+        self.caption_source_path = kwargs.get("caption_source_path")
+        self.cache_owner_token = kwargs.get("cache_owner_token")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
-        # a video dataset can contain both videos and images. Images are
         # treated as single-frame items and bucketed separately from videos
         dataset_is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
         self.is_video = dataset_is_video and os.path.splitext(self.path)[1].lower() in video_extensions
@@ -781,67 +782,12 @@ class DataLoaderBatchDTO:
                             "clip_image_embeds_unconditional is None for some file items"
                         )
 
-            if any([x.prompt_embeds is not None for x in self.file_items]):
-                # find one to use as a base
-                base_prompt_embeds = None
-                for x in self.file_items:
-                    if x.prompt_embeds is not None:
-                        base_prompt_embeds = x.prompt_embeds
-                        break
-                prompt_embeds_list = []
-                for x in self.file_items:
-                    if x.prompt_embeds is None:
-                        y = base_prompt_embeds
-                    else:
-                        y = x.prompt_embeds
-                    if x.text_embedding_space_version == "zimage":
-                        # z image needs to be a list if it is not already
-                        if not isinstance(y.text_embeds, list):
-                            y.text_embeds = [y.text_embeds]
-                    prompt_embeds_list.append(y)
-                padding_side = self.file_items[0].te_padding_side
-
-                self.prompt_embeds = concat_prompt_embeds(prompt_embeds_list, padding_side=padding_side)
-
-            if any([x.dop_prompt_embeds is not None for x in self.file_items]):
-                # find one to use as a base
-                base_dop_prompt_embeds = None
-                for x in self.file_items:
-                    if x.dop_prompt_embeds is not None:
-                        base_dop_prompt_embeds = x.dop_prompt_embeds
-                        break
-                dop_prompt_embeds_list = []
-                for x in self.file_items:
-                    if x.dop_prompt_embeds is None:
-                        y = base_dop_prompt_embeds
-                    else:
-                        y = x.dop_prompt_embeds
-                    if x.text_embedding_space_version == "zimage":
-                        # z image needs to be a list if it is not already
-                        if not isinstance(y.text_embeds, list):
-                            y.text_embeds = [y.text_embeds]
-                    dop_prompt_embeds_list.append(y)
-                padding_side = self.file_items[0].te_padding_side
-
-                self.dop_prompt_embeds = concat_prompt_embeds(dop_prompt_embeds_list, padding_side=padding_side)
-
-            if any([getattr(x, 'dopsd_prompt_embeds', None) is not None for x in self.file_items]):
-                # find one to use as a base
-                base_dopsd_prompt_embeds = None
-                for x in self.file_items:
-                    if x.dopsd_prompt_embeds is not None:
-                        base_dopsd_prompt_embeds = x.dopsd_prompt_embeds
-                        break
-                dopsd_prompt_embeds_list = []
-                for x in self.file_items:
-                    if x.dopsd_prompt_embeds is None:
-                        y = base_dopsd_prompt_embeds
-                    else:
-                        y = x.dopsd_prompt_embeds
-                    dopsd_prompt_embeds_list.append(y)
-                padding_side = self.file_items[0].te_padding_side
-
-                self.dopsd_prompt_embeds = concat_prompt_embeds(dopsd_prompt_embeds_list, padding_side=padding_side)
+            self.pending_text_embedding_items = [
+                x for x in self.file_items
+                if getattr(x, "pending_text_embedding", False)
+            ]
+            if not self.pending_text_embedding_items:
+                self._aggregate_prompt_embeddings()
 
             if any([x.audio_tensor is not None for x in self.file_items]):
                 # find one to use as a base
@@ -861,6 +807,70 @@ class DataLoaderBatchDTO:
         except Exception as e:
             print(e)
             raise e
+    def _aggregate_prompt_embeddings(self):
+        if any(x.prompt_embeds is not None for x in self.file_items):
+            base_prompt_embeds = next(
+                x.prompt_embeds for x in self.file_items if x.prompt_embeds is not None
+            )
+            prompt_embeds_list = []
+            for x in self.file_items:
+                y = x.prompt_embeds if x.prompt_embeds is not None else base_prompt_embeds
+                if x.text_embedding_space_version == "zimage":
+                    if not isinstance(y.text_embeds, list):
+                        y.text_embeds = [y.text_embeds]
+                prompt_embeds_list.append(y)
+            self.prompt_embeds = concat_prompt_embeds(
+                prompt_embeds_list, padding_side=self.file_items[0].te_padding_side
+            )
+
+        if any(x.dop_prompt_embeds is not None for x in self.file_items):
+            base_dop = next(
+                x.dop_prompt_embeds
+                for x in self.file_items
+                if x.dop_prompt_embeds is not None
+            )
+            dop_list = []
+            for x in self.file_items:
+                y = x.dop_prompt_embeds if x.dop_prompt_embeds is not None else base_dop
+                if x.text_embedding_space_version == "zimage":
+                    if not isinstance(y.text_embeds, list):
+                        y.text_embeds = [y.text_embeds]
+                dop_list.append(y)
+            self.dop_prompt_embeds = concat_prompt_embeds(
+                dop_list, padding_side=self.file_items[0].te_padding_side
+            )
+
+        if any(getattr(x, "dopsd_prompt_embeds", None) is not None for x in self.file_items):
+            base_dopsd = next(
+                x.dopsd_prompt_embeds
+                for x in self.file_items
+                if x.dopsd_prompt_embeds is not None
+            )
+            dopsd_list = [
+                x.dopsd_prompt_embeds
+                if x.dopsd_prompt_embeds is not None else base_dopsd
+                for x in self.file_items
+            ]
+            self.dopsd_prompt_embeds = concat_prompt_embeds(
+                dopsd_list, padding_side=self.file_items[0].te_padding_side
+            )
+
+    def rebuild_prompt_embeddings(self):
+        pending = [
+            x for x in self.file_items
+            if getattr(x, "pending_text_embedding", False)
+        ]
+        if pending:
+            raise RuntimeError(
+                "Cannot rebuild batch prompt embeddings while caption caches "
+                f"remain missing: {[x.path for x in pending]}"
+            )
+        self.prompt_embeds = None
+        self.dop_prompt_embeds = None
+        self.dopsd_prompt_embeds = None
+        self.pending_text_embedding_items = []
+        self._aggregate_prompt_embeddings()
+
 
     def get_is_reg_list(self):
         return [x.is_reg for x in self.file_items]

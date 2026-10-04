@@ -1,12 +1,18 @@
+"""Lightweight toolkit package namespace.
+
+Admission is imported by ``python -m toolkit.admission`` before any training
+dependencies are needed. Keep this module free of third-party imports; the
+Hugging Face progress hook is exposed lazily for the real training bootstrap.
+"""
 import importlib
 import logging
 
 
-def force_hf_hub_progress_bars():
-    hf_tqdm = importlib.import_module('huggingface_hub.utils.tqdm')
-
+def force_hf_hub_progress_bars() -> None:
+    """Keep Hub download bars visible when training logs are not a TTY."""
+    hf_tqdm = importlib.import_module("huggingface_hub.utils.tqdm")
     original_is_tqdm_disabled = hf_tqdm.is_tqdm_disabled
-    if getattr(original_is_tqdm_disabled, '_aitk_forced_progress', False):
+    if getattr(original_is_tqdm_disabled, "_aitk_forced_progress", False):
         return
 
     def is_tqdm_disabled(log_level):
@@ -19,6 +25,3 @@ def force_hf_hub_progress_bars():
 
     is_tqdm_disabled._aitk_forced_progress = True
     hf_tqdm.is_tqdm_disabled = is_tqdm_disabled
-
-
-force_hf_hub_progress_bars()

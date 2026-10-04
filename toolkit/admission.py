@@ -67,6 +67,8 @@ _AUDIO_EXTENSIONS = {
 _H3_FRAME_CHUNK = 17
 _H3_FRAME_REMAINDER = 5
 _H3_FPS = 24
+_AUDIO_SCAN_MAX_ENTRIES = 256
+_AUDIO_SCAN_MAX_DEPTH = 2
 
 
 class AdmissionError(ValueError):
@@ -272,22 +274,37 @@ def _has_multi_backward(train: Mapping[str, Any]) -> bool:
     return modern > 1 or legacy != 1 or _bool(train.get("single_item_batching")) or str(train.get("loss_type", "mse")) == "mean_flow"
 
 
-def _dataset_audio_files(dataset: Mapping[str, Any]) -> Optional[list[str]]:
-    """Return known audio paths without decoding or writing; None means unknown."""
+def _dataset_has_audio(dataset: Mapping[str, Any]) -> Optional[bool]:
+    """Find one audio file with a bounded, non-materializing directory scan.
+
+    Admission only needs to know whether a dataset can contain standalone
+    audio. Decoding, duration checks, and complete dataset enumeration remain
+    deferred to the runtime loader.
+    """
     raw = dataset.get("dataset_path", dataset.get("folder_path"))
     if not _nonempty(raw):
         return None
     path = Path(str(raw)).expanduser()
     try:
-        if path.is_file() and path.suffix.lower() in _AUDIO_EXTENSIONS:
-            return [str(path)]
+        if path.is_file():
+            return path.suffix.lower() in _AUDIO_EXTENSIONS
         if not path.is_dir():
             return None
-        found: list[str] = []
-        for entry in path.rglob("*"):
-            if entry.is_file() and entry.suffix.lower() in _AUDIO_EXTENSIONS:
-                found.append(str(entry))
-        return found
+        pending: list[tuple[Path, int]] = [(path, 0)]
+        scanned = 0
+        while pending:
+            current, depth = pending.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > _AUDIO_SCAN_MAX_ENTRIES:
+                        return None
+                    if entry.is_file(follow_symlinks=False):
+                        if Path(entry.name).suffix.lower() in _AUDIO_EXTENSIONS:
+                            return True
+                    elif depth < _AUDIO_SCAN_MAX_DEPTH and entry.is_dir(follow_symlinks=False):
+                        pending.append((Path(entry.path), depth + 1))
+        return False
     except OSError:
         return None
 
@@ -703,11 +720,11 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                     "Explicit H3 video frame counts must fit the packed 17n+5 frame grid.",
                     "Use 17n+5 frames (5, 22, 39, ...) or enable auto_frame_count so the model snapper trims to the grid.",
                 )
-            # H3 enumerates standalone audio only when this dataset's effective
+            # Probe standalone audio only when this dataset's effective
             # do_audio policy is enabled. Dormant media in an image/video folder
             # must not activate standalone-voice restrictions.
-            known_audio = _dataset_audio_files(ds) if _bool(ds.get("do_audio")) else None
-            if known_audio:
+            known_audio = _dataset_has_audio(ds) if _bool(ds.get("do_audio")) else None
+            if known_audio is True:
                 actual_audio_datasets.append(index)
                 if not _bool(ds.get("buckets", True)):
                     collector.add(

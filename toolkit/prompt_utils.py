@@ -1,4 +1,5 @@
 import os
+import tempfile
 from typing import Optional, TYPE_CHECKING, List, Union, Tuple
 
 import torch
@@ -18,6 +19,27 @@ if TYPE_CHECKING:
 class ACTION_TYPES_SLIDER:
     ERASE_NEGATIVE = 0
     ENHANCE_NEGATIVE = 1
+def _atomic_save_safetensors(state_dict, path, metadata=None):
+    cache_dir = os.path.dirname(path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".tmp_", suffix=".safetensors", dir=cache_dir
+    )
+    os.close(fd)
+    try:
+        if metadata is None:
+            save_file(state_dict, temp_path)
+        else:
+            save_file(state_dict, temp_path, metadata=metadata)
+        os.replace(temp_path, path)
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
 
 
 class PromptEmbeds:
@@ -137,8 +159,7 @@ class PromptEmbeds:
                     state_dict[f"attention_mask_{i}"] = attn.cpu()
             else:
                 state_dict["attention_mask"] = pe.attention_mask.cpu()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(state_dict, path)
+        _atomic_save_safetensors(state_dict, path)
     
     @classmethod
     def load(cls, path: str) -> 'PromptEmbeds':
@@ -148,8 +169,8 @@ class PromptEmbeds:
         :return: An instance of PromptEmbeds.
         """
         # first check if it is advanced prompt embed file
-        f = safe_open(path, framework='pt')
-        metadata = f.metadata()
+        with safe_open(path, framework='pt') as f:
+            metadata = f.metadata()
         if metadata is not None and metadata.get("class_name", "") == "AdvancedPromptEmbeds":
             return AdvancedPromptEmbeds.load(path=path)
         if metadata is not None and metadata.get("class_name", "") == "AnimaPromptEmbeds":

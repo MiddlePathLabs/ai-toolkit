@@ -3,6 +3,7 @@ import json
 import os
 import random
 import traceback
+import uuid
 from functools import lru_cache
 from typing import List, TYPE_CHECKING, Iterable
 
@@ -559,6 +560,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_caching_clip_vision_to_disk = dataset_config.cache_clip_vision_to_disk
         self.is_generating_controls = len(dataset_config.controls) > 0
         self.epoch_num = 0
+        # Stable across worker copies and deep-copied item fetches; distinct
+        # dataset instances may legitimately share the same media path.
+        self.cache_owner_token = uuid.uuid4().hex
 
         self.sd = sd
 
@@ -574,6 +578,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.random_crop = self.random_scale if self.random_scale else dataset_config.random_crop
         self.resolution = dataset_config.resolution
         self.caption_dict = None
+        self.caption_source_path = None
         self.file_list: List['FileItemDTO'] = []
 
         # check if dataset_path is a folder or json
@@ -600,6 +605,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 file_list.extend(os.path.join(root, file) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.'))
         else:
             # assume json
+            self.caption_source_path = self.dataset_path
             with open(self.dataset_path, 'r') as f:
                 self.caption_dict = json.load(f)
                 # keys are file paths
@@ -676,11 +682,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         for file in tqdm(file_list):
             try:
                 file_item = FileItemDTO(
+                    dataset_config=dataset_config,
+                    is_audio_model=self.is_audio_model,
                     sd=self.sd,
                     path=file,
-                    is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file.lower().endswith(tuple(audio_extensions))),
-                    dataset_config=dataset_config,
-                    dataloader_transforms=self.transform,
+                    caption_source_path=self.caption_source_path,
+                    cache_owner_token=self.cache_owner_token,
                     size_database=self.size_database,
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
@@ -699,7 +706,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 if self.is_caching_text_embeddings:
                     # Resolve JSON/short-caption authority before any text
                     # cache key is built; sidecars are only the fallback.
-                    file_item.load_caption(self.caption_dict, force=True)
+                    file_item.load_caption(
+                        self.caption_dict,
+                        force=True,
+                        refresh_source=False,
+                    )
                 self.file_list.append(file_item)
             except Exception as e:
                 print_acc(traceback.format_exc())
@@ -797,6 +808,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # always do this last
                 self.setup_controls()
         self.epoch_num += 1
+    def _refresh_caption_source_for_workers(self) -> None:
+        if self.caption_source_path is None:
+            return
+        with open(self.caption_source_path, 'r') as source:
+            self.caption_dict = json.load(source)
+
 
     def __getstate__(self):
         # on Windows/macOS dataloader workers are spawned, which pickles the dataset.
@@ -811,23 +828,102 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             return len(self.batch_indices)
         return len(self.file_list)
 
-    def _get_replacement_index(self, index) -> int:
-        # when an image fails to load we have to swap in a different one. With buckets the
-        # replacement must come from the same bucket so the collated shapes still match.
+    def _missing_text_embedding_paths(self, file_item: 'FileItemDTO') -> list:
+        if not getattr(file_item, "is_text_embedding_cached", False):
+            return []
+        paths = [file_item.get_text_embedding_path(recalculate=True)]
+        config = self.dataset_config
+        if config.diff_output_preservation:
+            paths.append(file_item.get_dop_text_embedding_path(recalculate=True))
+        if config.caption_dropout_rate > 0:
+            paths.append(file_item.get_blank_text_embedding_path(recalculate=True))
+            if config.diff_output_preservation:
+                paths.append(file_item.get_dop_blank_text_embedding_path(recalculate=True))
+        if getattr(file_item, "dopsd_self_ref", False):
+            paths.append(file_item.get_dopsd_text_embedding_path(recalculate=True))
+            if config.caption_dropout_rate > 0:
+                paths.append(file_item.get_dopsd_blank_text_embedding_path(recalculate=True))
+        if getattr(file_item, "dopsd_other_ref", False):
+            for slot in getattr(file_item, "dopsd_ref_slots", None) or []:
+                paths.append(file_item.get_dopsd_other_text_embedding_path(slot["pair_key"]))
+        return [path for path in paths if not os.path.exists(path)]
+
+    def _regenerate_text_embeddings(self, file_items) -> None:
+        """Regenerate embeddings without leaking the cache preset into training."""
+        save_state = getattr(self.sd, "save_device_state", None)
+        restore_state = getattr(self.sd, "restore_device_state", None)
+        state_saved = False
+        try:
+            if callable(save_state) and callable(restore_state):
+                save_state()
+                state_saved = True
+            self.cache_text_embeddings(file_items=file_items)
+        finally:
+            if state_saved:
+                restore_state()
+
+    def _ensure_text_embedding(self, file_item: 'FileItemDTO') -> None:
+        missing = self._missing_text_embedding_paths(file_item)
+        if not missing:
+            return
+        if self.sd is None:
+            file_item.pending_text_embedding = True
+            file_item.pending_text_embedding_paths = missing
+            return
+        self._refresh_caption_source_for_workers()
+        self._regenerate_text_embeddings([file_item])
+        remaining = self._missing_text_embedding_paths(file_item)
+        if remaining:
+            raise FileNotFoundError(
+                f"Caption cache regeneration did not write {remaining[0]} "
+                f"for {file_item.path}"
+            )
+
+    def repair_pending_text_embeddings(self, batch) -> None:
+        pending = list(getattr(batch, "pending_text_embedding_items", None) or [])
+        if not pending:
+            return
+        if self.sd is None:
+            raise RuntimeError("Caption cache repair requires the parent model")
+        owner_token = getattr(self, "cache_owner_token", None)
+        if not owner_token:
+            return
+        owned = [
+            item for item in pending
+            if getattr(item, "cache_owner_token", None) == owner_token
+        ]
+        if not owned:
+            return
+        self._refresh_caption_source_for_workers()
+        self._regenerate_text_embeddings(owned)
+        for item in owned:
+            item.load_prompt_embedding()
+        unresolved = [item.path for item in owned if item.pending_text_embedding]
+        if unresolved:
+            raise RuntimeError(
+                f"Caption cache repair left items unresolved: {unresolved}"
+            )
+
+    def _get_replacement_index(self, index):
         if self.dataset_config.buckets:
             for bucket in self.buckets.values():
                 if index in bucket.file_list_idx:
-                    candidates = [i for i in bucket.file_list_idx if i != index]
-                    if candidates:
-                        return random.choice(candidates)
-                    break
-        return random.randint(0, len(self.file_list) - 1)
+                    return random.choice(bucket.file_list_idx)
+        return random.randrange(len(self.file_list))
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
         # Refresh JSON/sidecar authority before cached prompt lookup so a
         # caption edit re-keys the copied item during a running job.
-        file_item.load_caption(self.caption_dict, force=True)
+        file_item.load_caption(
+            self.caption_dict,
+            force=True,
+            refresh_source=True,
+        )
+        # A changed caption must regenerate this same item's complete cache
+        # family before load_prompt_embedding can run. It must never be hidden
+        # by the corrupt-file replacement path below.
+        self._ensure_text_embedding(file_item)
         try:
             file_item.load_and_process_image(self.transform)
         except Exception as e:
@@ -912,10 +1008,8 @@ def get_dataloader_from_datasets(
     if dataloader_kwargs['num_workers'] > 0:
         dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
         # keep workers alive across epochs. Without this, spawn platforms (Windows/macOS)
-        # boot new worker processes every epoch, which can take longer than the epoch
-        # itself on small datasets. The dataset is static after epoch 0 (setup_epoch only
-        # does work on the first call) and per-epoch shuffling happens in the main process
-        # sampler, so workers never hold stale state.
+        # would repeatedly recreate workers; the dataset is static after epoch 0
+        # and per-epoch shuffling happens in the main process.
         dataloader_kwargs['persistent_workers'] = True
         # spawned workers re-import the full stack at boot and would repeat every
         # import-time warning the parent already printed. Children inherit these env

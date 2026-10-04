@@ -293,7 +293,7 @@ def load_ref_video_latent(
     )
     source_audio_present = bool(source["audio_present"])
     hash_dict = {
-        "recipe_namespace": "h3_ref_video_condition_v3",
+        "recipe_namespace": "h3_ref_video_condition_v4",
         "source_content_fingerprint": source["source_content_fingerprint"],
         "source_geometry": [src_w, src_h, total, float(src_fps)],
         "ref_sizing": "match_target_area",
@@ -353,7 +353,7 @@ def load_ref_video_latent(
         frames.append(frame)
 
     pixels = torch.from_numpy(np.stack(frames)).float() / 255.0 * 2.0 - 1.0
-    pixels = pixels.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W), [-1, 1]
+    pixels = pixels.permute(3, 0, 1, 2).unsqueeze(0)  # (1, C, T, H, W), [-1, 1]
     # H3's condition-specific API owns seed-42 posterior sampling and the
     # fp16-round-before-normalization rule. Do not substitute encode_images.
     latent = model.encode_condition_images(pixels)[0].to("cpu", torch.float16)

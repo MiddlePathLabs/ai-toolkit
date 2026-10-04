@@ -269,6 +269,42 @@ def test_loss_missing_penalty_is_reported_and_trainable_with_confidence():
     assert float(confidence.grad.abs().sum().item()) > 0.0
 
 
+def test_missing_body_shortfall_descends_through_live_heatmap_confidence():
+    ref_visibility = torch.ones(1, 8)
+    generated_visibility = torch.zeros(1, 8)
+    ratios = torch.zeros(1, 8)
+    heatmaps = torch.full((1, 8, 1, 1), -0.25, requires_grad=True)
+
+    confidence = DifferentiableBodyProportionEncoder._heatmaps_to_confidence(
+        heatmaps
+    ).flatten(2).amax(dim=2)
+    loss, _ = compute_body_proportion_loss(
+        ratios,
+        generated_visibility,
+        ratios,
+        ref_visibility,
+        gen_confidence=confidence,
+    )
+    before = float(loss.item())
+    initial_confidence = float(confidence.mean().item())
+    loss.backward()
+    with torch.no_grad():
+        heatmaps -= 0.2 * heatmaps.grad
+
+    updated_confidence = DifferentiableBodyProportionEncoder._heatmaps_to_confidence(
+        heatmaps
+    ).flatten(2).amax(dim=2)
+    after, _ = compute_body_proportion_loss(
+        ratios,
+        generated_visibility,
+        ratios,
+        ref_visibility,
+        gen_confidence=updated_confidence,
+    )
+    assert float(updated_confidence.mean().item()) > initial_confidence
+    assert float(after.item()) < before
+
+
 def test_loss_missing_confidence_defaults_to_attached_gen_vis():
     ref_v = torch.ones(1, 8)
     gen_v = torch.zeros(1, 8, requires_grad=True)
