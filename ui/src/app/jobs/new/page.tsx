@@ -145,6 +145,18 @@ export default function TrainingForm() {
       });
   }, [cloneId, runId]);
 
+  // Advanced view: keep canonical admission in sync with editor edits. Syntax
+  // errors are surfaced locally by onValidationChange; once the document parses
+  // again the config is revalidated (debounced) so a stale previous result can
+  // never linger over the current configuration.
+  useEffect(() => {
+    if (!showAdvancedView || !rawYamlValid) return;
+    const handle = setTimeout(() => {
+      void validateCandidate(jobConfig, rawYaml);
+    }, 500);
+    return () => clearTimeout(handle);
+  }, [showAdvancedView, rawYamlValid, jobConfig, rawYaml]);
+
   useEffect(() => {
     if (isGPUInfoLoaded) {
       if (gpuIDs === null && gpuList.length > 0) {
@@ -278,7 +290,7 @@ export default function TrainingForm() {
           <Button
             className="text-white bg-green-600 hover:bg-green-700 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
             onClick={() => saveJob()}
-            disabled={status === 'saving' || status === 'validating' || !rawYamlValid}
+            disabled={status === 'saving' || status === 'validating' || !rawYamlValid || admissionResult?.valid === false}
           >
             {status === 'saving' ? (
               'Saving...'
@@ -337,6 +349,17 @@ export default function TrainingForm() {
                   deferred: [],
                   source: 'ui',
                 });
+              } else {
+                // Syntax recovery: drop the locally generated syntax error at
+                // once so it cannot linger over a now-valid document. Canonical
+                // admission for the recovered config is refreshed by the
+                // advanced-view validation effect below.
+                setAdmissionResult(prev =>
+                  prev?.source === 'ui' &&
+                  prev.diagnostics.some(d => d.rule_id === 'admission.raw_yaml_invalid')
+                    ? null
+                    : prev
+                );
               }
             }}
             transformOnParse={(parsed: any) => {

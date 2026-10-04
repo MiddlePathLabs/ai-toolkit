@@ -117,6 +117,13 @@ export default function AdvancedConfigEditor<T>({
         onValidationChange?.(true);
       }
     } catch (e) {
+      // A failed serialization of an external config update must block saving
+      // instead of silently leaving stale editor text as the submitted YAML.
+      onValidationChange?.(
+        false,
+        e instanceof Error ? e.message : 'Unable to serialize external configuration update.',
+        1
+      );
       console.warn(e);
     }
   }, [config]);
