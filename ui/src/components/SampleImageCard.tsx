@@ -1,14 +1,15 @@
 import React, { useRef, useEffect, useState, ReactNode } from 'react';
 import { isVideo, isAudio, isText, encodeFilePathForUrl } from '@/utils/basic';
+import type { SampleMetadata } from '@/utils/sampleImages';
+import SampleMetadataOverlay from './SampleMetadataOverlay';
 
 interface SampleImageCardProps {
   imageUrl: string;
   alt: string;
-  numSamples: number;
-  sampleImages: string[];
+  metadata: SampleMetadata;
+  showMetadata?: boolean;
   children?: ReactNode;
   className?: string;
-  onDelete?: () => void;
   onClick?: (e: React.MouseEvent<HTMLDivElement>) => void;
   selected?: boolean;
   /** pass your scroll container element (e.g. containerRef.current) */
@@ -20,8 +21,8 @@ interface SampleImageCardProps {
 const SampleImageCard: React.FC<SampleImageCardProps> = ({
   imageUrl,
   alt,
-  numSamples,
-  sampleImages,
+  metadata,
+  showMetadata = true,
   children,
   className = '',
   onClick = () => {},
@@ -36,6 +37,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   // videos with no pre-generated thumb (older samples) fall back to the <video> element
   const [videoFallback, setVideoFallback] = useState(false);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
 
   const isItAudio = isAudio(imageUrl);
   const isItVideo = isVideo(imageUrl);
@@ -135,6 +137,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
       setBlobUrl(null);
       setLoaded(false);
       setVideoFallback(false);
+      setIsVideoPlaying(false);
     };
   }, [isVisible, isItAudio, isItText, isItVideo, imageUrl]);
 
@@ -142,11 +145,24 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
     <div className={`flex flex-col ${className}`}>
       <div
         ref={cardRef}
-        className={`relative w-full cursor-pointer select-none rounded-t-lg transition-colors duration-200 ${
+        role="button"
+        tabIndex={0}
+        aria-label={`${alt}, training step ${metadata.trainingStep ?? 'unknown'}${metadata.isRaw ? ', raw weights' : ''}`}
+        aria-pressed={selected}
+        onKeyDown={e => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            e.currentTarget.click();
+          }
+        }}
+        className={`relative w-full cursor-pointer select-none rounded-t-lg transition-colors duration-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 ${
           selected ? 'bg-blue-500' : ''
         }`}
         style={{ paddingBottom: '100%' }}
-        onClick={onClick}
+        onClick={e => {
+          videoRef.current?.pause();
+          onClick(e);
+        }}
       >
         <div
           className={`absolute rounded-t-lg shadow-md bg-gray-900 overflow-hidden transition-all duration-200 [container-type:inline-size] ${
@@ -187,11 +203,15 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
                 loop
                 autoPlay
                 controls={false}
+                onPlay={() => setIsVideoPlaying(true)}
+                onPause={() => setIsVideoPlaying(false)}
+                onEnded={() => setIsVideoPlaying(false)}
               />
             ) : blobUrl ? (
               <img src={blobUrl} alt={alt} className="w-full h-full object-cover" />
             ) : null
           ) : null}
+          {showMetadata && isVisible && !isVideoPlaying && <SampleMetadataOverlay metadata={metadata} />}
 
           {children && isVisible && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
         </div>

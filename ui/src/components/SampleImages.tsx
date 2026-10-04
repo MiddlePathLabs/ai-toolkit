@@ -13,6 +13,8 @@ import classNames from 'classnames';
 import { FaCaretDown, FaCaretUp } from 'react-icons/fa';
 import SampleImageViewer from './SampleImageViewer';
 import { openConfirm } from './ConfirmModal';
+import { buildSampleMatrix, getSampleItems, getSampleMetadata, parseSampleFilename } from '@/utils/sampleImages';
+import SampleComparisonViewer from './SampleComparisonViewer';
 
 interface SampleImagesMenuProps {
   job?: Job | null;
@@ -73,7 +75,7 @@ interface SampleImagesProps {
 }
 
 export default function SampleImages({ job }: SampleImagesProps) {
-  const { sampleImages, status, refreshSampleImages } = useSampleImages(job.id, 5000);
+  const { sampleImages, plannedSamples, deletedSamples, status, refreshSampleImages } = useSampleImages(job.id, 5000);
   const [selectedSamplePath, setSelectedSamplePath] = useState<string | null>(null);
   // multi-select for bulk delete: shift-click ranges from the anchor, ctrl/cmd-click toggles
   const [selectedSet, setSelectedSet] = useState<Set<string>>(() => new Set());
@@ -84,25 +86,74 @@ export default function SampleImages({ job }: SampleImagesProps) {
   const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null);
   const scrollParentCallback = useCallback((el: HTMLDivElement | null) => setScrollParent(el), []);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const numSamples = useMemo(() => {
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [thumbnailSize, setThumbnailSize] = useState('fit');
+  const [showMetadata, setShowMetadata] = useState(true);
+  const [stepFilter, setStepFilter] = useState('all');
+  const [jumpTarget, setJumpTarget] = useState('');
+  const [pendingJump, setPendingJump] = useState<string | null>(null);
+  const [comparisonOpen, setComparisonOpen] = useState(false);
+  const hasEma = useMemo(() => {
+    if (!job.job_config) return false;
+    const config = JSON.parse(job.job_config) as JobConfig;
+    return Boolean(config.config.process[0].train.ema_config?.use_ema);
+  }, [job.job_config]);
+  const sampleConfig = useMemo(() => {
     if (job?.job_config) {
       const jobConfig = JSON.parse(job.job_config) as JobConfig;
-      const sampleConfig = jobConfig.config.process[0].sample;
-      const numPrompts = sampleConfig.prompts ? sampleConfig.prompts.length : 0;
-      const numSamples = sampleConfig.samples.length;
-      return Math.max(numPrompts, numSamples, 1);
+      return jobConfig.config.process[0].sample;
     }
-    return 10;
+    return null;
   }, [job]);
-
-  // Group samples into rows of `numSamples` for the virtualized list — one row per sample iteration.
-  const rows = useMemo(() => {
-    const out: string[][] = [];
-    for (let i = 0; i < sampleImages.length; i += numSamples) {
-      out.push(sampleImages.slice(i, i + numSamples));
-    }
-    return out;
-  }, [sampleImages, numSamples]);
+  const sampleItems = useMemo(() => getSampleItems(sampleConfig), [sampleConfig]);
+  const numSamples = Math.max(sampleItems.length, 1);
+  const rows = useMemo(
+    () => buildSampleMatrix(sampleImages, sampleConfig, numSamples, { plannedSamples, deletedSamples }),
+    [sampleImages, sampleConfig, numSamples, plannedSamples, deletedSamples],
+  );
+  const rowSteps = useMemo(
+    () =>
+      new Map(
+        rows.map(row => {
+          const path = row.paths.find(path => path !== null);
+          const step = path ? (parseSampleFilename(path)?.trainingStep ?? null) : Number(row.key.split(':')[0]);
+          return [row.key, step !== null && Number.isSafeInteger(step) ? step : null];
+        }),
+      ),
+    [rows],
+  );
+  const steps = useMemo(
+    () => [...new Set([...rowSteps.values()].filter((step): step is number => step !== null && Number.isFinite(step)))],
+    [rowSteps],
+  );
+  const latestStep = steps[steps.length - 1];
+  const visibleRows = useMemo(
+    () =>
+      rows.filter(
+        row =>
+          stepFilter === 'all' || rowSteps.get(row.key) === (stepFilter === 'latest' ? latestStep : Number(stepFilter)),
+      ),
+    [rows, rowSteps, stepFilter, latestStep],
+  );
+  const sortedSampleImages = useMemo(
+    () => visibleRows.flatMap(row => row.paths.filter((path): path is string => path !== null)),
+    [visibleRows],
+  );
+  useEffect(() => {
+    anchorIdxRef.current = null;
+    baseSetRef.current = new Set();
+    setSelectedSet(new Set());
+  }, [stepFilter]);
+  useEffect(() => {
+    if (!pendingJump || !scrollParent) return;
+    const index = visibleRows.findIndex(row => row.key === pendingJump);
+    if (index < 0) return;
+    const frame = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({ index, align: 'start', offset: -(headerRef.current?.clientHeight ?? 0) });
+      setPendingJump(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [pendingJump, visibleRows, scrollParent]);
 
   const handleCardClick = useCallback(
     (sample: string, e: React.MouseEvent) => {
@@ -116,14 +167,14 @@ export default function SampleImages({ job }: SampleImagesProps) {
         return;
       }
       e.preventDefault();
-      const idx = sampleImages.indexOf(sample);
+      const idx = sortedSampleImages.indexOf(sample);
       if (idx === -1) return;
       setSelectedSet(prev => {
         const anchor = anchorIdxRef.current;
-        if (isRange && anchor !== null && anchor < sampleImages.length) {
+        if (isRange && anchor !== null && anchor < sortedSampleImages.length) {
           const next = new Set(baseSetRef.current);
           const [lo, hi] = anchor < idx ? [anchor, idx] : [idx, anchor];
-          for (let i = lo; i <= hi; i++) next.add(sampleImages[i]);
+          for (let i = lo; i <= hi; i++) next.add(sortedSampleImages[i]);
           return next;
         }
         const next = new Set(prev);
@@ -137,7 +188,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
         return next;
       });
     },
-    [sampleImages],
+    [sortedSampleImages],
   );
 
   const deleteSelected = useCallback(() => {
@@ -180,9 +231,9 @@ export default function SampleImages({ job }: SampleImagesProps) {
   useEffect(() => {
     if (selectedSet.size === 0) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (selectedSamplePath) return;
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (selectedSamplePath || comparisonOpen) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('input, textarea, select, button, [contenteditable="true"]')) return;
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
         deleteSelected();
@@ -194,14 +245,14 @@ export default function SampleImages({ job }: SampleImagesProps) {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedSet.size, selectedSamplePath, deleteSelected]);
+  }, [selectedSet.size, selectedSamplePath, comparisonOpen, deleteSelected]);
 
   const scrollToBottom = () => {
     virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' });
   };
 
   const scrollToTop = () => {
-    virtuosoRef.current?.scrollToIndex({ index: 0, align: 'start' });
+    virtuosoRef.current?.scrollToIndex({ index: 0, align: 'start', offset: -(headerRef.current?.clientHeight ?? 0) });
   };
 
   const PageInfoContent = useMemo(() => {
@@ -213,7 +264,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
     let textColor = '';
     let iconColor = '';
 
-    if (sampleImages.length > 0) return null;
+    if (rows.length > 0) return null;
 
     if (status == 'loading') {
       icon = <LuLoader className="animate-spin w-8 h-8" />;
@@ -254,65 +305,203 @@ export default function SampleImages({ job }: SampleImagesProps) {
         <p className="text-sm opacity-75 leading-relaxed">{subtitle}</p>
       </div>
     );
-  }, [status, sampleImages.length]);
+  }, [status, sampleImages.length, rows.length]);
 
-  // Inline style instead of Tailwind grid-cols-N classes — Tailwind only ships grid-cols-1..12,
-  // so class-based columns silently break for larger sample counts.
-  const gridCols = Math.max(numSamples, 3);
-
-  const sampleConfig = useMemo(() => {
-    if (job?.job_config) {
-      const jobConfig = JSON.parse(job.job_config) as JobConfig;
-      return jobConfig.config.process[0].sample;
-    }
-    return null;
-  }, [job]);
+  const gridStyle = { gridTemplateColumns: `repeat(${numSamples}, minmax(0, 1fr))` };
+  const matrixStyle = {
+    width: thumbnailSize === 'fit' ? '100%' : `${numSamples * Number(thumbnailSize) + (numSamples - 1) * 4}px`,
+    minWidth: `${numSamples * 128 + (numSamples - 1) * 4}px`,
+  };
+  const controlClass =
+    'min-h-9 max-sm:min-h-11 rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500';
 
   return (
-    <div ref={scrollParentCallback} className="absolute top-[80px] left-0 right-0 bottom-0 overflow-y-auto">
-      <div className="pb-4">
-        {PageInfoContent}
-        {sampleImages && rows.length > 0 && scrollParent && (
-          <Virtuoso
-            ref={virtuosoRef}
-            customScrollParent={scrollParent}
-            totalCount={rows.length}
-            initialTopMostItemIndex={rows.length - 1}
-            followOutput="auto"
-            increaseViewportBy={400}
-            computeItemKey={index => rows[index]?.[0] ?? index}
-            itemContent={index => {
-              const row = rows[index];
-              if (!row) return null;
-
-              // Only pad the final row when numSamples < MIN_COLS and the row is short.
-              const MIN_COLS = 3;
-              const shouldPad = numSamples < MIN_COLS && row.length < MIN_COLS;
-              const padsNeeded = shouldPad ? MIN_COLS - row.length : 0;
-
-              return (
-                // pb-1 recreates the vertical gap between rows that the original single CSS grid provided via `gap-1`.
-                <div className="grid gap-1 pb-1" style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}>
-                  {row.map(sample => (
-                    <SampleImageCard
-                      key={sample}
-                      imageUrl={sample}
-                      numSamples={numSamples}
-                      sampleImages={sampleImages}
-                      alt="Sample Image"
-                      onClick={e => handleCardClick(sample, e)}
-                      selected={selectedSet.has(sample) || selectedSamplePath === sample}
-                      observerRoot={scrollParent}
-                    />
-                  ))}
-                  {Array.from({ length: padsNeeded }).map((_, i) => (
-                    <div key={`pad-${index}-${i}`} className="invisible" />
-                  ))}
-                </div>
-              );
-            }}
+    <div className="absolute top-[80px] left-0 right-0 bottom-0 flex flex-col">
+      <div className="flex flex-wrap items-center gap-3 border-b border-gray-300 bg-gray-100 px-3 py-2 text-sm text-gray-900 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100">
+        <label className="flex items-center gap-2">
+          Thumbnail size
+          <select
+            aria-label="Thumbnail size"
+            value={thumbnailSize}
+            onChange={e => setThumbnailSize(e.target.value)}
+            className={controlClass}
+          >
+            <option value="fit">Fit</option>
+            <option value="144">Small</option>
+            <option value="224">Medium</option>
+            <option value="320">Large</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-2 max-sm:min-h-11">
+          <input
+            type="checkbox"
+            checked={showMetadata}
+            onChange={e => setShowMetadata(e.target.checked)}
+            className="h-4 w-4 accent-blue-500"
           />
+          Show metadata
+        </label>
+        <label className="flex items-center gap-2">
+          Training step
+          <select
+            aria-label="Training step filter"
+            value={stepFilter}
+            onChange={e => setStepFilter(e.target.value)}
+            className={controlClass}
+          >
+            <option value="all">All steps</option>
+            <option value="latest">Latest step</option>
+            {steps.map(step => (
+              <option key={step} value={step}>
+                {step.toLocaleString()}
+              </option>
+            ))}
+          </select>
+        </label>
+        <form
+          className="flex items-center gap-2"
+          onSubmit={e => {
+            e.preventDefault();
+            if (!jumpTarget) return;
+            setStepFilter('all');
+            setPendingJump(jumpTarget);
+          }}
+        >
+          <select
+            aria-label="Jump to training step"
+            value={jumpTarget}
+            onChange={e => setJumpTarget(e.target.value)}
+            className={controlClass}
+          >
+            <option value="">Jump to step</option>
+            {rows.map((row, index) => (
+              <option key={row.key} value={row.key}>
+                {rowSteps.get(row.key)?.toLocaleString() ?? 'Unknown step'} · row {index + 1}
+              </option>
+            ))}
+          </select>
+          <button type="submit" disabled={!jumpTarget} className={`${controlClass} disabled:opacity-50`}>
+            Go
+          </button>
+        </form>
+        <button
+          type="button"
+          disabled={sortedSampleImages.length < 2}
+          onClick={() => setComparisonOpen(true)}
+          className={`${controlClass} disabled:opacity-50`}
+        >
+          Compare samples
+        </button>
+        {selectedSet.size > 0 && (
+          <button type="button" onClick={deleteSelected} className={controlClass}>
+            Delete selected ({selectedSet.size})
+          </button>
         )}
+        <button
+          type="button"
+          onClick={scrollToTop}
+          disabled={visibleRows.length === 0}
+          className={`${controlClass} disabled:opacity-50`}
+          aria-label="Scroll to first sample row"
+          title="First row"
+        >
+          <FaCaretUp />
+        </button>
+        <button
+          type="button"
+          onClick={scrollToBottom}
+          disabled={visibleRows.length === 0}
+          className={`${controlClass} disabled:opacity-50`}
+          aria-label="Scroll to last sample row"
+          title="Last row"
+        >
+          <FaCaretDown />
+        </button>
+      </div>
+      <div ref={scrollParentCallback} className="min-h-0 flex-1 overflow-auto">
+        <div className="pb-4" style={matrixStyle}>
+          {PageInfoContent}
+          {rows.length > 0 && (
+            <div
+              ref={headerRef}
+              className="sticky top-0 z-[5] grid gap-1 border-b border-gray-300 bg-gray-100 dark:border-gray-700 dark:bg-gray-800"
+              style={gridStyle}
+            >
+              {Array.from({ length: numSamples }, (_, column) => {
+                const item = sampleItems[column];
+                const weightType = hasEma ? (item?.raw_weights ? 'Raw' : 'EMA') : 'Training';
+                return (
+                  <div
+                    key={column}
+                    className="min-w-0 px-2 py-2 text-xs text-gray-700 dark:text-gray-300"
+                    title={item?.prompt}
+                  >
+                    <div className="font-semibold text-gray-900 dark:text-gray-100">
+                      Sample {column + 1} · {weightType}
+                    </div>
+                    <div className="line-clamp-2 mt-1 break-words">
+                      {item?.prompt?.replace(/^integrated_multimodal_description:\s*(?:\[Shot\s+\d+\]\s*)?/i, '') ||
+                        'Prompt unavailable'}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {visibleRows.length > 0 && scrollParent && (
+            <Virtuoso
+              key={stepFilter}
+              ref={virtuosoRef}
+              customScrollParent={scrollParent}
+              totalCount={visibleRows.length}
+              initialTopMostItemIndex={visibleRows.length - 1}
+              followOutput={stepFilter === 'all' || stepFilter === 'latest' ? 'auto' : false}
+              increaseViewportBy={400}
+              computeItemKey={index => visibleRows[index].key}
+              itemContent={index => {
+                const row = visibleRows[index];
+                return (
+                  <div className="pb-1">
+                    <div className="px-2 py-1 text-xs text-gray-600 dark:text-gray-400">
+                      Training step {rowSteps.get(row.key)?.toLocaleString() ?? 'Unknown'}
+                    </div>
+                    <div className="grid gap-1" style={gridStyle}>
+                      {row.paths.map((sample, column) =>
+                        sample ? (
+                          <SampleImageCard
+                            key={sample}
+                            imageUrl={sample}
+                            metadata={getSampleMetadata(sample, sampleConfig, column)}
+                            showMetadata={showMetadata}
+                            alt={`Sample ${column + 1}`}
+                            onClick={e => handleCardClick(sample, e)}
+                            selected={selectedSet.has(sample) || selectedSamplePath === sample}
+                            observerRoot={scrollParent}
+                          />
+                        ) : (
+                          <div
+                            key={`empty-${column}`}
+                            className="flex aspect-square items-center justify-center rounded border border-dashed border-gray-300 bg-gray-50 p-2 text-center text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-400"
+                            aria-label={`Sample ${column + 1}: ${row.missing[column] === 'deleted' ? 'Deleted' : row.missing[column] === 'not-generated' ? 'Not generated' : 'Not available'}`}
+                          >
+                            {row.missing[column] === 'deleted'
+                              ? 'Deleted'
+                              : row.missing[column] === 'not-generated'
+                                ? 'Not generated'
+                                : 'Not available'}
+                          </div>
+                        ),
+                      )}
+                    </div>
+                  </div>
+                );
+              }}
+            />
+          )}
+          {rows.length > 0 && visibleRows.length === 0 && (
+            <p className="p-4 text-sm text-gray-600 dark:text-gray-400">No samples at this training step.</p>
+          )}
+        </div>
       </div>
       <Dialog open={deleteProgress !== null} onClose={() => {}} className="relative z-20">
         <DialogBackdrop className="fixed inset-0 bg-gray-900/75" />
@@ -339,25 +528,21 @@ export default function SampleImages({ job }: SampleImagesProps) {
       <SampleImageViewer
         imgPath={selectedSamplePath}
         numSamples={numSamples}
-        sampleImages={sampleImages}
+        sampleImages={sortedSampleImages}
         onChange={setPath => setSelectedSamplePath(setPath)}
         sampleConfig={sampleConfig}
         refreshSampleImages={refreshSampleImages}
+        matrixRows={visibleRows}
+        showMetadata={showMetadata}
       />
-      <div
-        className="hidden md:flex fixed top-20 mt-4 right-6 w-10 h-10 rounded-full bg-gray-900 shadow-lg items-center justify-center text-white opacity-80 hover:opacity-100 cursor-pointer"
-        onClick={scrollToTop}
-        title="Scroll to Top"
-      >
-        <FaCaretUp className="text-gray-500 dark:text-gray-400" />
-      </div>
-      <div
-        className="hidden md:flex fixed bottom-5 right-6 w-10 h-10 rounded-full bg-gray-900 shadow-lg items-center justify-center text-white opacity-80 hover:opacity-100 cursor-pointer"
-        onClick={scrollToBottom}
-        title="Scroll to Bottom"
-      >
-        <FaCaretDown className="text-gray-500 dark:text-gray-400" />
-      </div>
+      <SampleComparisonViewer
+        open={comparisonOpen}
+        onClose={() => setComparisonOpen(false)}
+        rows={visibleRows}
+        sampleConfig={sampleConfig}
+        showMetadata={showMetadata}
+        hasEma={hasEma}
+      />
     </div>
   );
 }

@@ -12,6 +12,9 @@ import { isVideo, isAudio, isText, encodeFilePathForUrl } from '@/utils/basic';
 import AudioPlayer from './AudioPlayer';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import BoundingBoxOverlay, { parseBoundingBoxes } from './BoundingBoxOverlay';
+import { buildSampleMatrix, getAdjacentSamplePath, getSampleItems, getSampleMetadata } from '@/utils/sampleImages';
+import SampleMetadataOverlay from './SampleMetadataOverlay';
+import type { SampleRow } from '@/utils/sampleImages';
 
 interface Props {
   imgPath: string | null; // current image path
@@ -20,6 +23,8 @@ interface Props {
   sampleConfig: SampleConfig | null;
   onChange: (nextPath: string | null) => void; // parent setter
   refreshSampleImages?: () => void;
+  matrixRows?: SampleRow[];
+  showMetadata?: boolean;
 }
 
 export default function SampleImageViewer({
@@ -29,11 +34,14 @@ export default function SampleImageViewer({
   sampleConfig,
   onChange,
   refreshSampleImages,
+  matrixRows,
+  showMetadata = true,
 }: Props) {
   const [mounted, setMounted] = useState(false);
   const [isOpen, setIsOpen] = useState(Boolean(imgPath));
   const [showingControlIdx, setShowingControlIdx] = useState<number | null>(null);
   const [showBoxes, setShowBoxes] = useState<boolean>(false);
+  const [playingVideoPath, setPlayingVideoPath] = useState<string | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -55,78 +63,33 @@ export default function SampleImageViewer({
     setIsOpen(false);
   }, []);
 
-  const imgInfo = useMemo(() => {
-    // handle windows C:\\Apps\\AI-Toolkit\\AI-Toolkit\\output\\LoRA-Name\\samples\\1763563000704__000004000_0.jpg
-    const ii = { filename: '', step: 0, promptIdx: 0 };
-    if (imgPath) {
-      // handle windows
-      let filename: string | null = null;
-      if (imgPath.includes('\\')) {
-        const parts = imgPath.split('\\');
-        filename = parts[parts.length - 1];
-      } else {
-        filename = imgPath.split('/').pop() || null;
-      }
-      if (!filename) {
-        console.error('Filename could not be determined from imgPath:', imgPath);
-        return ii;
-      }
-      ii.filename = filename;
-      const parts = filename
-        .split('.')[0]
-        .split('_')
-        .filter(p => p !== '');
-      if (parts.length === 3) {
-        ii.step = parseInt(parts[1]);
-        ii.promptIdx = parseInt(parts[2]);
-      } else {
-        console.error('Unexpected filename format for sample image:', filename);
-      }
-    }
-    return ii;
-  }, [imgPath]);
-
-  const setImageAtIndex = useCallback(
-    (idx: number) => {
-      if (idx < 0 || idx >= sampleImages.length) return;
-      setShowingControlIdx(null);
-      onChange(sampleImages[idx]);
-    },
-    [sampleImages, numSamples, onChange],
+  const rows = useMemo(
+    () => matrixRows ?? buildSampleMatrix(sampleImages, sampleConfig, numSamples),
+    [matrixRows, sampleImages, sampleConfig, numSamples],
   );
-
-  const currentIndex = useMemo(() => {
+  const promptIdx = useMemo(() => {
     if (!imgPath) return -1;
-    return sampleImages.findIndex(img => img === imgPath);
-  }, [imgPath, sampleImages]);
-
-  const handleArrowUp = useCallback(() => {
-    if (currentIndex === -1) return;
-    setImageAtIndex(currentIndex - numSamples);
-  }, [numSamples, currentIndex, setImageAtIndex]);
-
-  const handleArrowDown = useCallback(() => {
-    if (currentIndex === -1) return;
-    setImageAtIndex(currentIndex + numSamples);
-  }, [numSamples, currentIndex, setImageAtIndex]);
-
-  const handleArrowLeft = useCallback(() => {
-    if (currentIndex === -1) return;
-    if (imgInfo.promptIdx === 0) return;
-    const minIdx = currentIndex - imgInfo.promptIdx;
-    const nextIdx = currentIndex - 1;
-    if (nextIdx < minIdx) return;
-    setImageAtIndex(nextIdx);
-  }, [sampleImages, currentIndex, imgInfo.promptIdx, setImageAtIndex]);
-
-  const handleArrowRight = useCallback(() => {
-    if (currentIndex === -1) return;
-    const stepMinIdx = currentIndex - imgInfo.promptIdx;
-    const maxIdx = stepMinIdx + numSamples - 1;
-    const nextIdx = currentIndex + 1;
-    if (nextIdx > maxIdx) return;
-    setImageAtIndex(nextIdx);
-  }, [sampleImages, currentIndex, imgInfo.promptIdx, setImageAtIndex]);
+    const row = rows.find(row => row.paths.includes(imgPath));
+    return row?.paths.indexOf(imgPath) ?? -1;
+  }, [rows, imgPath]);
+  const metadata = useMemo(
+    () => getSampleMetadata(imgPath ?? '', sampleConfig, promptIdx),
+    [imgPath, sampleConfig, promptIdx],
+  );
+  const navigate = useCallback(
+    (direction: 'up' | 'down' | 'left' | 'right') => {
+      if (!imgPath) return;
+      const nextPath = getAdjacentSamplePath(rows, imgPath, direction);
+      if (!nextPath) return;
+      setShowingControlIdx(null);
+      onChange(nextPath);
+    },
+    [rows, imgPath, onChange],
+  );
+  const handleArrowUp = useCallback(() => navigate('up'), [navigate]);
+  const handleArrowDown = useCallback(() => navigate('down'), [navigate]);
+  const handleArrowLeft = useCallback(() => navigate('left'), [navigate]);
+  const handleArrowRight = useCallback(() => navigate('right'), [navigate]);
 
   const handleDelete = useCallback(() => {
     if (!imgPath) return;
@@ -152,12 +115,10 @@ export default function SampleImageViewer({
     });
   }, [imgPath, onChange, refreshSampleImages]);
 
-  const sampleItem = useMemo<SampleItem | null>(() => {
-    if (!sampleConfig) return null;
-    if (imgInfo.promptIdx < 0) return null;
-    if (imgInfo.promptIdx >= sampleConfig.samples.length) return null;
-    return sampleConfig.samples[imgInfo.promptIdx];
-  }, [sampleConfig, imgInfo.promptIdx]);
+  const sampleItem = useMemo<SampleItem | null>(
+    () => (metadata.trainingStep === null ? null : (getSampleItems(sampleConfig)[promptIdx] ?? null)),
+    [sampleConfig, promptIdx, metadata.trainingStep],
+  );
 
   const controlImages = useMemo<string[]>(() => {
     if (!imgPath) return [];
@@ -182,15 +143,6 @@ export default function SampleImageViewer({
     controlImageArr = controlImageArr.filter(ci => ci !== null && ci !== undefined && ci !== '');
     return controlImageArr;
   }, [sampleItem, imgPath]);
-
-  const seed = useMemo(() => {
-    if (!sampleItem) return '?';
-    if (sampleItem.seed !== undefined) return sampleItem.seed;
-    if (sampleConfig?.walk_seed) {
-      return sampleConfig.seed + imgInfo.promptIdx;
-    }
-    return sampleConfig?.seed ?? '?';
-  }, [sampleItem, sampleConfig]);
 
   const displayedImgPath = useMemo(() => {
     if (showingControlIdx !== null && controlImages[showingControlIdx]) {
@@ -330,7 +282,7 @@ export default function SampleImageViewer({
             onTouchEnd={onTouchEnd}
             className="relative transform rounded-none sm:rounded-lg bg-gray-800 text-left shadow-xl transition-all data-closed:translate-y-4 data-closed:opacity-0 data-enter:duration-300 data-enter:ease-out data-leave:duration-200 data-leave:ease-in w-full sm:w-auto sm:max-w-[95%] sm:max-h-[95vh] data-closed:sm:translate-y-0 data-closed:sm:scale-95 flex flex-col overflow-hidden touch-pan-y"
           >
-            <div className="overflow-hidden flex items-center justify-center">
+            <div className="relative overflow-hidden flex items-center justify-center">
               {displayedImgPath &&
                 (isText(displayedImgPath) ? (
                   <div className="w-[640px] max-w-full sm:max-w-[95vw] max-h-[82vh] overflow-y-auto p-6 text-sm text-gray-100 whitespace-pre-wrap break-words text-left">
@@ -346,6 +298,7 @@ export default function SampleImageViewer({
                   </div>
                 ) : isVideo(displayedImgPath) ? (
                   <video
+                    key={displayedImgPath}
                     src={`/api/img/${encodeFilePathForUrl(displayedImgPath)}`}
                     className="w-auto h-auto max-w-full sm:max-w-[95vw] max-h-[82vh] object-contain"
                     preload="none"
@@ -353,6 +306,9 @@ export default function SampleImageViewer({
                     loop
                     autoPlay
                     controls={true}
+                    onPlay={() => setPlayingVideoPath(displayedImgPath)}
+                    onPause={() => setPlayingVideoPath(null)}
+                    onEnded={() => setPlayingVideoPath(null)}
                   />
                 ) : (
                   <TransformWrapper
@@ -380,6 +336,9 @@ export default function SampleImageViewer({
                     </TransformComponent>
                   </TransformWrapper>
                 ))}
+              {showMetadata && imgPath && showingControlIdx === null && playingVideoPath !== displayedImgPath && (
+                <SampleMetadataOverlay metadata={metadata} />
+              )}
             </div>
             {/* # make full width */}
             <div className="bg-gray-950 text-sm flex justify-between items-center px-4 py-2">
@@ -428,16 +387,8 @@ export default function SampleImageViewer({
                 </div>
               )}
 
-              <div className="text-xs">
-                <div>
-                  <span className="text-gray-400">Step:</span> {imgInfo.step.toLocaleString()}
-                </div>
-                <div>
-                  <span className="text-gray-400">Sample #:</span> {imgInfo.promptIdx + 1}
-                </div>
-                <div>
-                  <span className="text-gray-400">Seed:</span> {seed}
-                </div>
+              <div className="text-xs whitespace-nowrap">
+                <span className="text-gray-400">Sample #:</span> {promptIdx >= 0 ? promptIdx + 1 : 'Unknown'}
               </div>
             </div>
             <div className="absolute top-2 right-2 flex items-center gap-2 z-20">

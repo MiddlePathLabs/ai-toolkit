@@ -8,6 +8,7 @@ from collections import OrderedDict
 import os
 import re
 import traceback
+import tempfile
 from typing import Union, List, Optional
 
 import numpy as np
@@ -337,6 +338,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
         raw_gen_img_config_list = []
+        sample_timestamp = None
 
         sample_config = self.first_sample_config if is_first else self.sample_config
         start_seed = sample_config.seed
@@ -368,7 +370,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.ema is not None and getattr(sample_item, 'raw_weights', False):
                 filename_prefix = 'RAW_'
 
-            filename = f"{filename_prefix}[time]_{step_num}_[count].{self.sample_config.ext}"
+            sample_index = str(i).zfill(len(str(len(sample_config.prompts))))
+            filename = f"{filename_prefix}[time]_{step_num}_{sample_index}.{sample_config.ext}"
 
             output_path = os.path.join(sample_folder, filename)
 
@@ -395,7 +398,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 extra_args['adapter_image_path'] = test_image_paths[i]
 
             target_list = raw_gen_img_config_list if filename_prefix else gen_img_config_list
-            target_list.append(GenerateImageConfig(
+            image_config = GenerateImageConfig(
                 prompt=prompt,  # it will autoparse the prompt
                 width=sample_item.width,
                 height=sample_item.height,
@@ -421,11 +424,54 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
                 **extra_args
-            ))
+            )
+            if sample_timestamp is None:
+                sample_timestamp = image_config.gen_time
+            image_config.output_filename_no_ext = image_config.output_filename_no_ext.replace(
+                '[time]', str(sample_timestamp)
+            )
+            image_config.sample_index = i
+            image_config.output_path = image_config.get_image_path()
+            target_list.append(image_config)
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
         raw_gen_img_config_list = self.post_process_generate_image_config_list(raw_gen_img_config_list)
+
+        planned_samples = []
+        for configs in (gen_img_config_list, raw_gen_img_config_list):
+            for image_config in configs:
+                image_config.output_filename_no_ext = re.sub(
+                    r"_seed--?\d+_steps-\d+$", "", image_config.output_filename_no_ext
+                ) + f"_seed-{image_config.seed}_steps-{image_config.num_inference_steps}"
+                image_config.output_path = image_config.get_image_path()
+                planned_samples.append({
+                    "filename": os.path.basename(image_config.output_path),
+                    "index": image_config.sample_index,
+                    "seed": image_config.seed,
+                    "steps": image_config.num_inference_steps,
+                })
+        if planned_samples:
+            plans_folder = os.path.join(sample_folder, '.sample-plans')
+            os.makedirs(plans_folder, exist_ok=True)
+            plan_path = os.path.join(plans_folder, f"{sample_timestamp}_{step}.json")
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=plans_folder, suffix='.tmp', delete=False
+                ) as plan_file:
+                    temporary_path = plan_file.name
+                    json.dump({
+                        "timestamp": sample_timestamp,
+                        "trainingStep": step,
+                        "samples": planned_samples,
+                    }, plan_file)
+                    plan_file.flush()
+                    os.fsync(plan_file.fileno())
+                os.replace(temporary_path, plan_path)
+            finally:
+                if temporary_path is not None and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:

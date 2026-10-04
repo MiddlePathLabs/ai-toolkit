@@ -6,6 +6,8 @@ import usePollLoop from '@/hooks/usePollLoop';
 
 export default function useSampleImages(jobID: string, reloadInterval: null | number = null) {
   const [sampleImages, setSampleImages] = useState<string[]>([]);
+  const [plannedSamples, setPlannedSamples] = useState<string[]>([]);
+  const [deletedSamples, setDeletedSamples] = useState<string[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
 
   const refreshSampleImages = () => {
@@ -18,6 +20,8 @@ export default function useSampleImages(jobID: string, reloadInterval: null | nu
         if (data.samples) {
           setSampleImages(data.samples);
         }
+        setPlannedSamples(data.plannedSamples ?? []);
+        setDeletedSamples(data.deletedSamples ?? []);
         setStatus('success');
       })
       .catch(error => {
@@ -28,5 +32,5 @@ export default function useSampleImages(jobID: string, reloadInterval: null | nu
 
   usePollLoop(refreshSampleImages, reloadInterval, [jobID]);
 
-  return { sampleImages, setSampleImages, status, refreshSampleImages };
+  return { sampleImages, setSampleImages, plannedSamples, deletedSamples, status, refreshSampleImages };
 }
