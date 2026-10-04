@@ -77,6 +77,90 @@ def mean_window_scale(members: dict[str, float] | Iterable[float]) -> float:
         return 1.0
     return float(sum(values) / len(values))
 
+def window_sample_coefficients(sample_counts: Iterable[int]) -> tuple[float, ...]:
+    """Return the exact per-microbatch coefficients for one update window.
+
+    A microbatch containing ``B_j`` samples contributes ``B_j / sum(B_j)``.
+    This is deliberately independent of the number of microbatches so unequal
+    partitions remain equivalent to one combined batch.
+    """
+    counts = tuple(int(count) for count in sample_counts)
+    if any(count < 0 for count in counts):
+        raise ValueError(f"sample counts must be nonnegative, got {counts!r}")
+    total = sum(counts)
+    if total <= 0:
+        return tuple(0.0 for _ in counts)
+    return tuple(count / total for count in counts)
+
+
+def _optimizer_parameters(optimizer: Any) -> Iterable[Any]:
+    for group in getattr(unwrap_optimizer(optimizer), "param_groups", ()):
+        yield from group.get("params", ())
+
+
+def materialize_private_gradients(optimizer: Any) -> int:
+    """Move low-precision hook buffers into ``param.grad`` exactly once.
+
+    Adam8bit/Prodigy8bit stochastic accumulation stores the authoritative
+    gradient in ``_accum_grad`` while leaving ``.grad`` empty.  Clipping or
+    AMP unscale before materializing those buffers silently omits them.
+    """
+    moved = 0
+    for parameter in _optimizer_parameters(optimizer):
+        private = getattr(parameter, "_accum_grad", None)
+        if private is None:
+            continue
+        if parameter.grad is None:
+            parameter.grad = private
+        else:
+            parameter.grad = parameter.grad + private
+        delattr(parameter, "_accum_grad")
+        moved += 1
+    return moved
+
+
+def clear_optimizer_gradients(optimizer: Any) -> int:
+    """Discard visible and private gradients for a failed update window."""
+    cleared = 0
+    for parameter in _optimizer_parameters(optimizer):
+        if parameter.grad is not None:
+            parameter.grad = None
+            cleared += 1
+        if hasattr(parameter, "_accum_grad"):
+            delattr(parameter, "_accum_grad")
+            cleared += 1
+    return cleared
+
+
+def prepare_optimizer_step(optimizer: Any) -> None:
+    """Clear any previous overflow result before a new optimizer step.
+
+    Accelerate overwrites its overflow result during ``step``. Plain test or
+    third-party wrappers may expose the same mutable flag but leave the prior
+    value in place, which would misclassify a successful update as skipped.
+    """
+    candidates = (optimizer, unwrap_optimizer(optimizer))
+    seen: set[int] = set()
+    for candidate in candidates:
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        try:
+            if hasattr(candidate, "_is_overflow"):
+                candidate._is_overflow = False
+            elif "step_was_skipped" in getattr(candidate, "__dict__", {}):
+                candidate.step_was_skipped = False
+        except (AttributeError, TypeError):
+            # Read-only Accelerate properties are updated by its own step().
+            continue
+
+
+
+
+def optimizer_step_was_skipped(optimizer: Any) -> bool:
+    """Read Accelerate's AMP-overflow result without guessing from loss values."""
+    return bool(getattr(optimizer, "step_was_skipped", False))
+
 
 def _snapshot_lr(lr: Any) -> Any:
     if torch.is_tensor(lr):
@@ -113,6 +197,30 @@ def _is_fused_backward(optimizer: Any) -> bool:
     if fused is None:
         return False
     return bool(fused)
+
+
+def is_fused_backward_optimizer(optimizer: Any) -> bool:
+    """Return whether a concrete optimizer updates inside backward hooks."""
+    return _is_fused_backward(unwrap_optimizer(optimizer))
+
+
+def known_fused_backward_from_config(
+    optimizer_type: Any, optimizer_params: Optional[dict[str, Any]] = None
+) -> Optional[bool]:
+    """Classify only factory options whose fused mode is explicit and known.
+
+    ``None`` is intentionally returned for unknown/custom factories; the
+    constructed ``OptimizerRuntimeAdapter`` remains authoritative for those.
+    """
+    name = str(optimizer_type or "").lower().replace("-", "")
+    params = optimizer_params or {}
+    if name in {"automagic2", "automagicv2"}:
+        return True
+    if name in {"automagic3", "automagicexperiment", "automagicexperimental"}:
+        return bool(params.get("fused", True))
+    if name in {"adamconvrot", "adam_convrot"}:
+        return bool(params.get("fused", False))
+    return None
 
 
 @dataclass
@@ -319,6 +427,12 @@ class OptimizerRuntimeAdapter:
         return cls(caps)
 
     def validate_for_train_config(self, train_config: Any) -> None:
+        # Fused-backward optimizers are unsafe for every multi-backward window,
+        # not only for adaptive-LR or modality-routing callers.  Keep this
+        # concrete capability check unconditional so ordinary accumulation
+        # cannot bypass it.
+        if self.update_phase == "backward":
+            self._reject_fused_incompatibilities(train_config)
         if uses_adaptive_lr_step_scale(train_config):
             if not self.supports_step_scale:
                 reason = self.unsupported_reason or "supports_step_scale is false"
@@ -326,8 +440,6 @@ class OptimizerRuntimeAdapter:
                     f"per_image_adaptive_lr_mode='lr' requires optimizer step scaling, but "
                     f"{self.optimizer_label} does not support it: {reason}"
                 )
-            if self.update_phase == "backward":
-                self._reject_fused_incompatibilities(train_config)
         if uses_modality_block_routing(train_config):
             if not self.supports_active_param_mask:
                 reason = (
@@ -370,10 +482,10 @@ class OptimizerRuntimeAdapter:
         if not problems:
             return
         raise ValueError(
-            f"per_image_adaptive_lr_mode='lr' with fused-backward optimizer "
-            f"{self.optimizer_label} cannot preserve one-update-per-backward semantics "
-            f"with {', '.join(problems)}. Set those options to a single backward per "
-            f"update, switch to per_image_adaptive_lr_mode: loss, or disable the feature."
+            f"fused-backward optimizer {self.optimizer_label} cannot preserve "
+            f"one-update-per-backward semantics with {', '.join(problems)}. "
+            f"Set those options to a single backward per update, switch to a "
+            f"step-time optimizer, or disable the multi-backward path."
         )
 
     def begin_window(

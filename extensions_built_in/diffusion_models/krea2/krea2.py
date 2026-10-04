@@ -687,9 +687,15 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
                 target_pixels = (lh * self.vae_scale_factor) * (
                     lw * self.vae_scale_factor
                 )
+                original_batch_size = len(batch.file_items)
+                prediction_batch_size = latent_model_input.shape[0]
+                if prediction_batch_size not in (original_batch_size, 2 * original_batch_size):
+                    raise ValueError("Krea reference batch must be the original batch or two CFG branches")
                 ref_latents = self._batch_ref_latents_from_batch(
-                    batch, latent_model_input.shape[0], target_pixels=target_pixels
+                    batch, original_batch_size, target_pixels=target_pixels
                 )
+                if ref_latents is not None and prediction_batch_size == 2 * original_batch_size:
+                    ref_latents = ref_latents + ref_latents
 
         # toolkit timestep (0..1000, 1000 = pure noise) -> Krea flow time t in
         # [0, 1] with t=1 = pure noise. Same convention -> straight divide.
@@ -697,7 +703,10 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         if t.dim() == 0:
             t = t.unsqueeze(0)
         if t.shape[0] != latent_model_input.shape[0]:
-            t = t.expand(latent_model_input.shape[0])
+            if latent_model_input.shape[0] == 2 * t.shape[0]:
+                t = t.repeat(2)
+            else:
+                t = t.expand(latent_model_input.shape[0])
 
         context, text_mask = pad_text_features(
             text_embeddings.text_embeds, self.device_torch, self.torch_dtype

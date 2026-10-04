@@ -66,6 +66,34 @@ def _arch_of(model: Any) -> Any:
         arch = getattr(model_config, "arch", None)
     return arch
 
+def validate_tread_static(
+    train_config: Any,
+    arch: Any,
+) -> None:
+    """Validate config-only TREAD gates before model/loader setup.
+
+    Transformer block count, VSA sparsity and gate-compression remain runtime
+    checks in ``bind_tread``.
+    """
+    if not uses_tread(train_config):
+        return
+    if not is_h3_arch(arch):
+        raise ValueError(
+            f"tread_ratio is H3-only (gate by model.arch), got arch={arch!r}."
+        )
+    if str(arch) == H3_VSA_ARCH:
+        raise ValueError(
+            "TREAD token routing is not available with VSA "
+            "(model.arch=minimax_h3_vsa) until a routed VSA context exists. "
+            "Set tread_ratio: 0 or use a dense H3 checkpoint."
+        )
+    start = int(getattr(train_config, "tread_start", 2))
+    end = int(getattr(train_config, "tread_end", 47))
+    if start < 0 or start >= end:
+        raise ValueError(
+            f"TREAD span [{start}, {end}) needs 0 <= start < end."
+        )
+
 
 def bind_tread(
     train_config: Any,
@@ -87,16 +115,7 @@ def bind_tread(
             except ValueError:
                 pass
         return None
-    if not is_h3_arch(arch):
-        raise ValueError(
-            f"tread_ratio is H3-only (gate by model.arch), got arch={arch!r}."
-        )
-    if str(arch) == H3_VSA_ARCH:
-        raise ValueError(
-            "TREAD token routing is not available with VSA "
-            "(model.arch=minimax_h3_vsa) until a routed VSA context exists. "
-            "Set tread_ratio: 0 or use a dense H3 checkpoint."
-        )
+    validate_tread_static(train_config, arch)
     try:
         transformer = resolve_h3_transformer(model)
     except ValueError:

@@ -1,13 +1,14 @@
 """Reference-video latents for ref2va, without dataloader machinery.
 
-A control VIDEO gets the dataset's temporal treatment — num_frames /
-auto_frame_count, fps — and is area-matched to the target (own aspect kept, /32
-grid), then a single VAE encode whose
-result is cached next to the video in ``_latent_cache/`` (keyed like normal
-latent caches: file signature + the config values that shape the latent).
-Everything is deterministic (even frame spread, no random start) so the cache
-is stable; the audio track is encoded alongside when possible (cached for
-later use, unused in conditioning for now).
+ A control VIDEO gets the dataset's temporal treatment — num_frames /
+ auto_frame_count, fps — and is area-matched to the target (own aspect kept, /32
+ grid), then a single VAE encode whose condition-specific result is cached next
+ to the video in ``_latent_cache/``. The disk and memory entries share one
+ complete provenance recipe: source content, target geometry, frame/audio
+ recipe, and model encoder identity.
+ Everything is deterministic (even frame spread, no random start) so the cache
+ is stable; the audio track is encoded alongside when possible (cached for
+ later use, unused in conditioning for now).
 """
 
 import base64
@@ -20,7 +21,6 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from toolkit.basic import get_quick_signature_string
 from .packing import reference_video_pixel_size
 
 
@@ -150,6 +150,54 @@ def read_frames_at(cap, indices):
     return frames
 
 
+def _content_fingerprint(path: str) -> str:
+    """Hash the source bytes, never just size/mtime."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _model_cache_identity(model) -> str:
+    cached = getattr(model, "_aitk_ref_video_model_identity", None)
+    if cached is not None:
+        return cached
+    config = getattr(model, "model_config", None)
+    if isinstance(config, dict):
+        kwargs = config.get("model_kwargs", {}) or {}
+    else:
+        kwargs = getattr(config, "model_kwargs", {}) or {}
+    checkpoint_fields = {}
+    for key, value in kwargs.items():
+        entry = {"value": str(value)}
+        try:
+            if os.path.isfile(value):
+                entry["fingerprint"] = _content_fingerprint(value)
+        except (OSError, IOError, TypeError):
+            pass
+        checkpoint_fields[str(key)] = entry
+    fields = {
+        "arch": getattr(model, "arch", model.__class__.__qualname__),
+        "latent_space_version": getattr(model, "latent_space_version", ""),
+        "condition_encoder": "encode_condition_images",
+        "vae_encode_fp32": bool(getattr(model, "vae_encode_fp32", False)),
+        "model_kwargs": checkpoint_fields,
+    }
+    te_identity = getattr(model, "te_cache_identity", None)
+    if callable(te_identity):
+        try:
+            fields["text_encoder_identity"] = str(te_identity())
+        except Exception:
+            fields["text_encoder_identity"] = repr(te_identity)
+    identity = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    try:
+        setattr(model, "_aitk_ref_video_model_identity", identity)
+    except Exception:
+        pass
+    return identity
+
+
 def _cache_path(path: str, hash_dict: dict) -> str:
     latent_dir = os.path.join(os.path.dirname(path), "_latent_cache")
     name = os.path.splitext(os.path.basename(path))[0]
@@ -162,29 +210,74 @@ def _cache_path(path: str, hash_dict: dict) -> str:
     return os.path.join(latent_dir, f"{name}_{hash_str}.safetensors")
 
 
+def prepare_ref_video_source(model, path: str, *, force: bool = False) -> dict:
+    """Memoize immutable source facts used by every reference-cache lookup.
+
+    A training forward must not reopen/probe/hash a reference video merely to
+    discover that its full recipe is already in ``_ref_video_cache``. Source
+    replacement is an explicit operation: callers that intentionally re-key a
+    path pass ``force=True`` (via :func:`rekey_ref_video_source`).
+    """
+    source_cache = getattr(model, "_ref_video_source_cache", None)
+    if source_cache is None:
+        source_cache = {}
+        model._ref_video_source_cache = source_cache
+    if not force and path in source_cache:
+        return source_cache[path]
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError(f"Could not open reference video {path}")
+    source = {
+        "source_content_fingerprint": _content_fingerprint(path),
+        "source_geometry": [
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+            float(cap.get(cv2.CAP_PROP_FPS) or 0.0),
+        ],
+    }
+    cap.release()
+    from .text_encoder import video_has_audio
+
+    source["audio_present"] = bool(video_has_audio(path))
+    source_cache[path] = source
+    return source
+
+
+def rekey_ref_video_source(model, path: str) -> dict:
+    """Explicitly re-fingerprint one source and invalidate its memory entries."""
+    source_cache = getattr(model, "_ref_video_source_cache", {})
+    previous = source_cache.get(path)
+    refreshed = prepare_ref_video_source(model, path, force=True)
+    old_fingerprint = (
+        previous.get("source_content_fingerprint") if previous is not None else None
+    )
+    if old_fingerprint is not None:
+        memory_cache = getattr(model, "_ref_video_cache", None) or {}
+        for key in list(memory_cache):
+            try:
+                if json.loads(key).get("source_content_fingerprint") == old_fingerprint:
+                    del memory_cache[key]
+            except (TypeError, ValueError):
+                continue
+    return refreshed
+
+
 @torch.no_grad()
 def load_ref_video_latent(
     model, path: str, dataset_config, target_height: int, target_width: int
 ) -> dict:
-    """Returns {"latent": (C, T, h, w) cpu tensor, "num_frames": int},
-    encoding + disk-caching on first use. ``model`` is the MinimaxH3 model
-    (used for the VAE, audio encode and the frame-count snapper)."""
-    mem_cache = getattr(model, "_ref_video_cache", None)
-    if mem_cache is None:
-        mem_cache = {}
-        model._ref_video_cache = mem_cache
-    if path in mem_cache:
-        return mem_cache[path]
+    """Load one reference latent using the exact disk and memory identity.
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open reference video {path}")
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or dataset_config.fps
-
-    # dataset-identical frame count
+    The in-memory key is the canonical serialized recipe used to derive the
+    disk filename. It therefore cannot return a path-only entry for a changed
+    target geometry, frame recipe, model encoder, or source file.
+    """
+    source = prepare_ref_video_source(model, path)
+    src_w, src_h, total, src_fps = source["source_geometry"]
+    src_fps = src_fps or dataset_config.fps
     if dataset_config.auto_frame_count:
         num_frames = int(total / src_fps * dataset_config.fps)
         snapper = model.get_frame_count_snapper()
@@ -192,39 +285,59 @@ def load_ref_video_latent(
             num_frames = snapper(num_frames)
     else:
         num_frames = dataset_config.num_frames
-
     trim_tail = bool(
         dataset_config.auto_frame_count and dataset_config.trim_auto_frame_count_tail
     )
+    out_h, out_w = reference_video_pixel_size(
+        src_w, src_h, target_height, target_width
+    )
+    source_audio_present = bool(source["audio_present"])
     hash_dict = {
-        "signature": get_quick_signature_string(path),
+        "recipe_namespace": "h3_ref_video_condition_v3",
+        "source_content_fingerprint": source["source_content_fingerprint"],
+        "source_geometry": [src_w, src_h, total, float(src_fps)],
         "ref_sizing": "match_target_area",
-        "target_area": int(target_height * target_width)
-        if target_height and target_width
-        else 0,
-        "num_frames": num_frames,
+        "target_geometry": [int(target_height), int(target_width)],
+        "output_geometry": [int(out_h), int(out_w)],
+        "num_frames": int(num_frames),
         "fps": dataset_config.fps,
         "trim_tail": trim_tail,
-        "latent_space_version": model.latent_space_version,
+        "auto_frame_count": bool(dataset_config.auto_frame_count),
+        "audio_present": source_audio_present,
+        "audio_recipe": {
+            "sample_rate": int(getattr(model, "sample_rate", 0) or 0),
+            "trim_to_frames": trim_tail,
+        },
+        "model_identity": _model_cache_identity(model),
         "is_ref_video": True,
     }
+    memory_key = json.dumps(hash_dict, sort_keys=True, separators=(",", ":"))
+    mem_cache = getattr(model, "_ref_video_cache", None)
+    if mem_cache is None:
+        mem_cache = {}
+        model._ref_video_cache = mem_cache
+    if memory_key in mem_cache:
+        return mem_cache[memory_key]
+
     cache_file = _cache_path(path, hash_dict)
     if os.path.exists(cache_file):
-        cap.release()
         sd = load_file(cache_file, device="cpu")
         entry = {
             "latent": sd["latent"],
             "num_frames": int(sd["num_frames"].item()),
             "audio_rows": sd.get("audio_latent"),
+            "audio_present": bool(
+                sd.get("audio_present", torch.tensor(float(source_audio_present)))
+                .reshape(-1)[0].item()
+            ),
         }
-        mem_cache[path] = entry
+        mem_cache[memory_key] = entry
         return entry
 
-    # match the target's pixel area (the dataset bucket the target trains at)
-    # with the ref's own aspect: same aspect -> identical size; aspect-
-    # preserving resize, no crop
-    out_h, out_w = reference_video_pixel_size(src_w, src_h, target_height, target_width)
-
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError(f"Could not open reference video {path}")
     indices = ref_frame_indices(
         total, src_fps, num_frames, dataset_config.fps, trim_tail
     )
@@ -240,39 +353,44 @@ def load_ref_video_latent(
         frames.append(frame)
 
     pixels = torch.from_numpy(np.stack(frames)).float() / 255.0 * 2.0 - 1.0
-    pixels = pixels.permute(0, 3, 1, 2)  # (T, C, H, W), [-1, 1]
-    latent = model.encode_images([pixels])[0].to("cpu", torch.float16)
+    pixels = pixels.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W), [-1, 1]
+    # H3's condition-specific API owns seed-42 posterior sampling and the
+    # fp16-round-before-normalization rule. Do not substitute encode_images.
+    latent = model.encode_condition_images(pixels)[0].to("cpu", torch.float16)
 
     state_dict = {
         "latent": latent,
         "num_frames": torch.tensor(num_frames, dtype=torch.int64),
+        "audio_present": torch.tensor(
+            [1.0 if source_audio_present else 0.0], dtype=torch.float32
+        ),
     }
-    # the soundtrack rides as clean condition rows iff the file has an audio
-    # stream (the TE presentation's "<Audio j>" label uses the same test)
     audio_rows = None
-    try:
-        from .text_encoder import video_has_audio
+    if source_audio_present:
+        try:
+            import torchaudio
 
-        if not video_has_audio(path):
-            raise RuntimeError("no audio stream")
-        import torchaudio
-
-        waveform, sample_rate = torchaudio.load(path)
-        if trim_tail:
-            # frames cover [0, num_frames / fps) seconds; trim the soundtrack
-            # to the same window so it stays in sync with the sampled frames
-            keep = int(round(num_frames / dataset_config.fps * sample_rate))
-            waveform = waveform[:, :keep]
-        audio_latent = model.encode_audio(
-            [{"waveform": waveform, "sample_rate": sample_rate}]
-        )[0]
-        audio_rows = audio_latent.to("cpu", torch.float16)
-        state_dict["audio_latent"] = audio_rows
-    except Exception:
-        pass
+            waveform, sample_rate = torchaudio.load(path)
+            if trim_tail:
+                keep = int(round(num_frames / dataset_config.fps * sample_rate))
+                waveform = waveform[:, :keep]
+            audio_latent = model.encode_audio(
+                [{"waveform": waveform, "sample_rate": sample_rate}]
+            )[0]
+            audio_rows = audio_latent.to("cpu", torch.float16)
+            state_dict["audio_latent"] = audio_rows
+        except Exception:
+            # The physical source fact remains true even when optional audio
+            # decoding/encoding is unavailable; absent rows are not fabricated.
+            pass
 
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     save_file(state_dict, cache_file)
-    entry = {"latent": latent, "num_frames": num_frames, "audio_rows": audio_rows}
-    mem_cache[path] = entry
+    entry = {
+        "latent": latent,
+        "num_frames": num_frames,
+        "audio_rows": audio_rows,
+        "audio_present": source_audio_present,
+    }
+    mem_cache[memory_key] = entry
     return entry

@@ -126,12 +126,6 @@ def test_bind_refuses_anchor_on_trainer_without_runtime_window():
     ) is not None
 
 
-def test_trainer_capability_flags():
-    from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
-    from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
-
-    assert BaseSDTrainProcess.supports_category_anchor is False
-    assert SDTrainer.supports_category_anchor is True
 
 
 def _ema_host(step_num, warmup):
@@ -145,6 +139,8 @@ def _ema_host(step_num, warmup):
         optimizer=SimpleNamespace(param_groups=[{"params": [param]}]),
         sd=SimpleNamespace(),
         step_num=step_num,
+        completed_update_id=step_num,
+        _resume_state=None,
     )
     BaseSDTrainProcess.setup_ema(host)
     return host

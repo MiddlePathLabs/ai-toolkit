@@ -1,0 +1,29 @@
+job: extension
+config:
+  name: accepted_krea_lora_scrubbed
+  process:
+    - type: diffusion_trainer
+      training_folder: ./output/scrubbed
+      model:
+        name_or_path: ./models/scrubbed/krea2_raw
+        arch: krea2
+      network:
+        type: lora
+        linear: 16
+        linear_alpha: 16
+      train:
+        optimizer: adamw
+        gradient_accumulation: 1
+        gradient_accumulation_steps: 1
+        batch_size: 1
+        loss_type: mse
+        loss_target: noise
+        train_unet: true
+        train_text_encoder: false
+      datasets:
+        - dataset_path: ./datasets/scrubbed_krea_character
+          cache_latents_to_disk: true
+          cache_text_embeddings: false
+      sample:
+        prompts: ["a scrubbed character portrait"]
+        guidance_scale: 1

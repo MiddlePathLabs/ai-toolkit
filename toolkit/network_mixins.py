@@ -1,5 +1,6 @@
-import json
+from contextlib import contextmanager
 import os
+import json
 from collections import OrderedDict
 from typing import Optional, Union, List, Type, TYPE_CHECKING, Dict, Any, Literal
 
@@ -38,8 +39,8 @@ CONV_MODULES = [
     'LoRACompatibleConv'
 ]
 
-ExtractMode = Union[
-    'existing'
+ExtractMode = Literal[
+    'existing',
     'fixed',
     'threshold',
     'ratio',
@@ -209,11 +210,16 @@ class ToolkitModuleMixin:
             with torch.no_grad():
                 runtime_scale.fill_(self.scale)
 
+    def _module_dropout_event(self: Module, x) -> bool:
+        if self.module_dropout is None or not self.training:
+            return False
+        # Draw on the activation device so checkpoint's RNG preservation
+        # replays the same drop decision during backward recomputation.
+        return bool(
+            torch.rand((), device=x.device) < float(self.module_dropout)
+        )
+
     def _call_forward(self: Module, x):
-        # module dropout
-        if self.module_dropout is not None and self.training:
-            if torch.rand(1) < self.module_dropout:
-                return 0.0  # added to original forward
 
         if hasattr(self, 'lora_mid') and self.lora_mid is not None:
             lx = self.lora_mid(self.lora_down(x))
@@ -314,9 +320,15 @@ class ToolkitModuleMixin:
         #     return self.dora_forward(x, *args, **kwargs)
         
         if self.__class__.__name__ == "LokrModule":
+            if self._module_dropout_event(x):
+                return self.org_forward(x, *args, **kwargs)
             return self._call_forward(x)
 
         org_forwarded = self.org_forward(x, *args, **kwargs)
+        if self._module_dropout_event(x):
+            # Module dropout removes only the adapter branch; the frozen base
+            # remains the defined output and stays in the autograd graph.
+            return org_forwarded
 
         if isinstance(x, QTensor):
             x = x.dequantize()
@@ -331,14 +343,7 @@ class ToolkitModuleMixin:
             if not bool(finite.all()):
                 lora_input = torch.where(finite, lora_input, torch.zeros_like(lora_input))
         lora_output = self._call_forward(lora_input)
-        multiplier = self.network_ref().torch_multiplier
-
-        lora_output_batch_size = lora_output.size(0)
-        multiplier_batch_size = multiplier.size(0)
-        if lora_output_batch_size != multiplier_batch_size:
-            num_interleaves = lora_output_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
-            multiplier = multiplier.repeat_interleave(num_interleaves)
+        multiplier = network.multiplier_for_batch(lora_output.size(0))
 
         scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
@@ -529,7 +534,9 @@ class ToolkitNetworkMixin:
         self.train_unet = train_unet
         self.is_checkpointing = False
         self._multiplier: float = 1.0
-        self.is_active: bool = False
+        # ``None`` means the flattened leading dimension is a token expansion.
+        # A CFG context records the semantic branch order before token flattening.
+        self._cfg_branches: Optional[int] = None
         self.is_sdxl = is_sdxl
         self.is_ssd = is_ssd
         self.is_vega = is_vega
@@ -853,6 +860,52 @@ class ToolkitNetworkMixin:
                 tensor_multiplier = multiplier.clone().detach().to(device, dtype=dtype)
 
             self.torch_multiplier = tensor_multiplier.clone().detach()
+
+    @contextmanager
+    def semantic_batch(self: Network, *, cfg_branches: Optional[int] = None):
+        """Describe semantic batch branches before any B×L token flattening.
+
+        The ordinary multiplier expansion is ``repeat_interleave`` because a
+        flattened token batch is ordered ``[sample0 tokens, sample1 tokens]``.
+        CFG tensors are commonly ordered ``[all unconditional, all
+        conditional]`` instead, so their semantic strengths must be repeated
+        by branch first and only then interleaved across each sample's tokens.
+        """
+        previous = self._cfg_branches
+        self._cfg_branches = cfg_branches
+        try:
+            yield self
+        finally:
+            self._cfg_branches = previous
+
+    def multiplier_for_batch(self: Network, output_batch_size: int) -> torch.Tensor:
+        """Expand strengths for a module output's leading dimension.
+
+        With no CFG context, a multiplier of length ``B`` expands to
+        ``[s0, ..., s0, s1, ..., s1]`` for B×L token flattening.  In a CFG
+        context, ``[s0, s1]`` expands to ``[s0, s1, s0, s1]`` for the
+        branch-major ``[uncond(B), cond(B)]`` order, then token repeats are
+        applied if the branches were flattened.
+        """
+        multiplier = self.torch_multiplier.reshape(-1)
+        if output_batch_size == multiplier.numel():
+            return multiplier
+        if multiplier.numel() == 0 or output_batch_size % multiplier.numel():
+            raise ValueError(
+                "Adapter strength count does not divide the semantic/token batch: "
+                f"{multiplier.numel()} vs {output_batch_size}"
+            )
+        expansion = output_batch_size // multiplier.numel()
+        cfg_branches = self._cfg_branches
+        if cfg_branches is not None and expansion >= cfg_branches:
+            if expansion % cfg_branches:
+                raise ValueError(
+                    "CFG branch expansion does not divide the output batch: "
+                    f"{cfg_branches} vs {expansion}"
+                )
+            multiplier = multiplier.repeat(cfg_branches)
+            expansion //= cfg_branches
+        return multiplier.repeat_interleave(expansion)
 
     @property
     def multiplier(self) -> Union[float, List[float], List[List[float]]]:

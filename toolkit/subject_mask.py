@@ -10,8 +10,10 @@ Phase 1: caching only. The resulting masks are attached to FileItemDTO but
 are not consumed by any loss. See `toolkit/config_modules.SubjectMaskConfig`.
 """
 
+import hashlib
+import json
 import os
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -43,7 +45,7 @@ BODY_CLASSES = {"Hair", "Face", "Left-arm", "Right-arm", "Left-leg", "Right-leg"
 CLOTHING_CLASSES = {"Hat", "Sunglasses", "Upper-clothes", "Skirt", "Pants",
                     "Dress", "Belt", "Left-shoe", "Right-shoe", "Bag", "Scarf"}
 
-CACHE_VERSION_KEY = "subject_mask_v2"  # v2: cached from dataloader-transformed pixels (flip+scale+crop), not raw file
+CACHE_VERSION_KEY = "subject_mask_v3"  # transformed-source cache with full identity
 
 
 # ============================================================
@@ -503,6 +505,47 @@ def _mask_output_hw(file_item: 'FileItemDTO', fallback_hw: int) -> tuple:
         return int(ch), int(cw)
     return int(fallback_hw), int(fallback_hw)
 
+def _mask_cache_identity(file_item: 'FileItemDTO', config, out_h: int, out_w: int) -> str:
+    """Hash every representation-changing source and transform field.
+
+    Masks are extracted after the dataloader transform, so crop/flip identity
+    must be part of the filename. A source-content digest prevents a
+    same-size/same-mtime replacement from reusing an aligned-looking mask.
+    """
+    from toolkit.dataloader_mixins import content_fingerprint
+
+    source_digest = getattr(file_item, "source_content_fingerprint", None)
+    if not source_digest:
+        source_digest = content_fingerprint(file_item.path)
+    identity = {
+        "cache_version": CACHE_VERSION_KEY,
+        "source": source_digest,
+        "flip_x": bool(getattr(file_item, "flip_x", False)),
+        "flip_y": bool(getattr(file_item, "flip_y", False)),
+        "scale_to": [
+            getattr(file_item, "scale_to_width", None),
+            getattr(file_item, "scale_to_height", None),
+        ],
+        "crop": [
+            getattr(file_item, "crop_x", None),
+            getattr(file_item, "crop_y", None),
+            getattr(file_item, "crop_width", None),
+            getattr(file_item, "crop_height", None),
+        ],
+        "output": [int(out_h), int(out_w)],
+        "config": {
+            "cache_resolution": int(getattr(config, "cache_resolution", 0)),
+            "body_close_radius": int(getattr(config, "body_close_radius", 0)),
+            "mask_dilate_radius": int(getattr(config, "mask_dilate_radius", 0)),
+            "skin_bias": float(getattr(config, "skin_bias", 0.0)),
+            "primary_only": bool(getattr(config, "primary_only", True)),
+            "sam_size": str(getattr(config, "sam_size", "")),
+            "segformer_res": int(getattr(config, "segformer_res", 0)),
+        },
+    }
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()[:24]
+
 
 def cache_subject_masks(
     file_items: List['FileItemDTO'],
@@ -512,19 +555,18 @@ def cache_subject_masks(
     """Extract and cache subject masks for all file items.
 
     Caches each image's masks to:
-        {image_dir}/_face_id_cache/{stem}_subject_masks_{H}x{W}.safetensors
-    (one file per bucket shape — multi-resolution training keeps independent
-    caches per resolution so a 256-bucket mask never clobbers a 512-bucket one.)
+        {image_dir}/_face_id_cache/{stem}_subject_masks_{H}x{W}_{identity}.safetensors
+    where ``identity`` includes source content, effective flip/scale/crop,
+    output geometry, and mask extraction recipe. This is one file per fully
+    transformed representation, so same-shaped crops cannot alias.
 
-    Keys: ``person``, ``body``, ``clothing`` (uint8 0/255 at
-    ``config.cache_resolution``), plus a version sentinel
-    (``subject_mask_v1 = torch.ones(1)``).
-
-    Attaches to each file item:
+    Keys: ``person``, ``body``, ``clothing`` (uint8 0/255), plus a version
+    sentinel (``subject_mask_v3 = torch.ones(1)``).
         file_item.subject_mask  : torch.bool (H_c, W_c)
         file_item.body_mask     : torch.bool (H_c, W_c)
         file_item.clothing_mask : torch.bool (H_c, W_c)
-    where (H_c, W_c) == (cache_resolution, cache_resolution).
+    where ``(H_c, W_c)`` is the effective transformed output geometry (bucket
+    crop dimensions when available, otherwise ``cache_resolution`` square).
 
     Skips extraction if cache exists and has the matching version key.
 
@@ -558,8 +600,10 @@ def cache_subject_masks(
         # gets loaded for every other resolution's items and torch.stack fails
         # at collate time.
         out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
+        identity = _mask_cache_identity(file_item, config, out_h, out_w)
         cache_path = os.path.join(
-            cache_dir, f'{stem}_subject_masks_{out_h}x{out_w}.safetensors',
+            cache_dir,
+            f'{stem}_subject_masks_{out_h}x{out_w}_{identity}.safetensors',
         )
 
         # ------------------------------------------------------------- cache hit
@@ -603,7 +647,7 @@ def cache_subject_masks(
         if extractor is None:
             extractor = SubjectMaskExtractor(config)
 
-        # v2: extract masks from the *dataloader-transformed* pixels so cached
+        # v3: extract masks from the *dataloader-transformed* pixels so cached
         # masks align with the training tensor (and thus latent grid). Applies
         # the same flip → resize → crop chain as
         # toolkit/dataloader_mixins.load_and_process_image (lines 774-793).

@@ -1,17 +1,21 @@
 """Body-proportion anchor loss: visibility-weighted L1 of bone-length ratios
-plus a missing-keypoint penalty.
+plus a differentiable confidence shortfall for missing reference parts.
 
 The frozen ViTPose perceptor runs on the live x0-decoded pixels and its 8 (or
-10 with head) pose-invariant ratios are matched against the cached GT ratios.
+10 with head) pose-invariant ratios are matched against cached GT ratios.
+Confidence is kept attached to the estimator output for the missing-body
+shortfall; the hard missing fraction returned for diagnostics is detached.
 Pure tensor math; imports no model weights. Body-proportion does NOT
 participate in the diffusion/depth ``loss_split`` alternation -- it fires every
 step within its timestep window.
 """
 from __future__ import annotations
 
-from typing import Tuple
+import math
+from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def compute_body_proportion_loss(
@@ -20,35 +24,52 @@ def compute_body_proportion_loss(
     ref_ratios: torch.Tensor,
     ref_vis: torch.Tensor,
     vis_threshold: float = 0.2,
+    *,
+    gen_confidence: Optional[torch.Tensor] = None,
+    confidence_temperature: float = 0.05,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Body-proportion matching loss for a batch.
+    """Compute ratio matching plus a trainable confidence shortfall.
 
-    Args:
-        gen_ratios: (B, N) generator ratios (gradient flows).
-        gen_vis: (B, N) generator ratio visibility weights.
-        ref_ratios: (B, N) cached GT ratios.
-        ref_vis: (B, N) cached GT ratio visibility weights.
-        vis_threshold: below this a predicted ratio counts as "missing".
+    ``gen_vis`` is the raw, attached per-ratio confidence used by the ratio L1
+    term and, when ``gen_confidence`` is omitted, by the missing-body term.
+    ``gen_confidence`` can name that same tensor explicitly for callers that
+    need to expose the gradient path. High-confidence reference rows receive a
+    zero-at-threshold soft hinge shortfall, with a corrective derivative while
+    confidence is below ``vis_threshold``.
 
     Returns:
         ``(loss_per_sample, missing_fraction)`` -- both ``(B,)``; the first
-        carries the gradient. The caller applies timestep weighting, per-sample
-        loss weights, the valid mask, and reduction.
-
-    The loss is the visibility-weighted L1 of the ratios (a ratio contributes
-    only when BOTH ref and gen consider it visible) plus a missing-keypoint
-    penalty: the fraction of high-confidence ref ratios the prediction dropped
-    below ``vis_threshold``. This penalizes the model for losing body parts it
-    was shown, not just for ratio drift.
+        carries the gradient and the second is a detached diagnostic.
     """
     combined_vis = torch.min(ref_vis, gen_vis)
     weighted_diff = (gen_ratios - ref_ratios).abs() * combined_vis
-    l1 = weighted_diff.sum(dim=-1) / combined_vis.sum(dim=-1).clamp(min=1e-6)  # (B,)
+    l1 = weighted_diff.sum(dim=-1) / combined_vis.sum(dim=-1).clamp(min=1e-6)
 
-    missing_mask = (ref_vis >= 0.5) & (gen_vis < vis_threshold)
-    missing_count = missing_mask.float().sum(dim=-1)
-    ref_high_count = (ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
-    missing_fraction = missing_count / ref_high_count  # (B,) in [0, 1]
+    high_ref = (ref_vis >= 0.5).to(gen_ratios.dtype)
+    ref_high_count = high_ref.sum(dim=-1).clamp(min=1.0)
+    if gen_confidence is None:
+        gen_confidence = gen_vis
+    if gen_confidence.shape != gen_ratios.shape:
+        raise ValueError(
+            "gen_confidence must have the same shape as gen_ratios; "
+            f"got {tuple(gen_confidence.shape)} vs {tuple(gen_ratios.shape)}"
+        )
 
-    loss_per_sample = l1 + missing_fraction
+    temperature = max(float(confidence_temperature), 1e-6)
+    threshold = torch.as_tensor(
+        float(vis_threshold),
+        dtype=gen_confidence.dtype,
+        device=gen_confidence.device,
+    )
+    # Soft hinge is zero at the threshold and positive below it.
+    soft_hinge = F.softplus((threshold - gen_confidence) / temperature)
+    soft_hinge = temperature * (soft_hinge - math.log(2.0))
+    shortfall = soft_hinge.clamp_min(0.0)
+    missing_penalty = (shortfall * high_ref).sum(dim=-1) / ref_high_count
+    missing_fraction = (
+        (gen_confidence.detach() < float(vis_threshold)).to(gen_ratios.dtype)
+        * high_ref
+    ).sum(dim=-1) / ref_high_count
+
+    loss_per_sample = l1 + missing_penalty
     return loss_per_sample, missing_fraction.detach()

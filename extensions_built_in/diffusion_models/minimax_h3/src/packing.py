@@ -221,6 +221,29 @@ def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
         .contiguous()
     )
 
+def fit_audio_rows(rows: torch.Tensor, num_audio_latents: int) -> torch.Tensor:
+    """Trim/pad packed stereo rows independently for each channel.
+
+    Audio rows are channel-major (all left-channel frames, then all
+    right-channel frames).  Fitting the flattened row axis would therefore
+    corrupt stereo boundaries whenever the source and target lengths differ.
+    """
+    if rows.ndim != 2:
+        raise ValueError(f"audio rows must be 2D (rows, channels), got {rows.shape}")
+    if rows.shape[0] % AUDIO_CHANNELS:
+        raise ValueError(
+            f"audio rows must contain an even number of channel-major rows, got {rows.shape[0]}"
+        )
+    source_frames = rows.shape[0] // AUDIO_CHANNELS
+    per_channel = rows.reshape(AUDIO_CHANNELS, source_frames, rows.shape[-1])
+    if source_frames > num_audio_latents:
+        per_channel = per_channel[:, :num_audio_latents]
+    elif source_frames < num_audio_latents:
+        per_channel = torch.nn.functional.pad(
+            per_channel, (0, 0, 0, num_audio_latents - source_frames)
+        )
+    return per_channel.reshape(AUDIO_CHANNELS * num_audio_latents, rows.shape[-1])
+
 
 def unpack_audio_tokens(rows: torch.Tensor, num_audio_latents: int) -> torch.Tensor:
     """(B, 2*T, C) channel-major rows -> (B, 2, C, T)."""

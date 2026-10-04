@@ -323,10 +323,24 @@ def test_body_proportion_real_forward_is_differentiable(monkeypatch):
         def __init__(self):
             super().__init__()
             self.dummy = torch.nn.Parameter(torch.zeros(1))
+
         def forward(self, x, dataset_index=None):
             B = x.shape[0]
-            return SimpleNS(heatmaps=torch.randn(B, 17, 64, 48))
-
+            base = torch.nn.functional.adaptive_avg_pool2d(
+                x.float().mean(dim=1, keepdim=True), (64, 48)
+            )
+            yy, xx = torch.meshgrid(
+                torch.linspace(-1.0, 1.0, 64, device=x.device),
+                torch.linspace(-1.0, 1.0, 48, device=x.device),
+                indexing="ij",
+            )
+            maps = []
+            for k in range(17):
+                cx = -0.75 + 1.5 * (k % 6) / 5.0
+                cy = -0.75 + 1.5 * (k // 6) / 2.0
+                peak = 1.0 - 2.0 * ((xx - cx) ** 2 + (yy - cy) ** 2)
+                maps.append(peak.view(1, 1, 64, 48) + 0.001 * base)
+            return SimpleNS(torch.cat(maps, dim=1).expand(B, -1, -1, -1))
     class SimpleNS:
         def __init__(self, heatmaps): self.heatmaps = heatmaps
 
@@ -349,9 +363,13 @@ def test_body_proportion_real_forward_is_differentiable(monkeypatch):
     # build encoder
     enc = bp.DifferentiableBodyProportionEncoder()
     pixels = torch.rand(1, 3, 64, 48, requires_grad=True)
-    ratios, vis = enc(pixels)
+    ratios, vis, confidence = enc(pixels, return_confidence=True)
     assert ratios.shape[1] in (8, 10)
     assert torch.isfinite(ratios).all()
+    confidence_grad = torch.autograd.grad(
+        confidence.sum(), pixels, retain_graph=True, allow_unused=False
+    )[0]
+    assert float(confidence_grad.abs().sum().item()) > 0
     loss = ratios.sum() + vis.sum()
     loss.backward()
     assert pixels.grad is not None and float(pixels.grad.abs().sum().item()) > 0

@@ -328,10 +328,12 @@ class DataLoaderBatchDTO:
                 if len(self.file_items[0].extra_values) > 0
                 else None
             )
-            self.audio_data: Union[List, None] = (
-                [x.audio_data for x in self.file_items]
-                if self.file_items[0].audio_data is not None
-                else None
+            # Keep one raw-audio slot per item.  In particular, do not let item
+            # zero's missing soundtrack hide a later item's real soundtrack.
+            self.audio_data: List = [x.audio_data for x in self.file_items]
+            self.audio_present = torch.tensor(
+                [x.audio_data is not None for x in self.file_items],
+                dtype=torch.bool,
             )
             self.audio_tensor: Union[torch.Tensor, None] = None
             self.first_frame_latents: Union[torch.Tensor, None] = None
@@ -370,9 +372,43 @@ class DataLoaderBatchDTO:
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:
-                # this get_latent call with trigger loading all cached items from the disk.
-                # DTO.stack keeps any extra streams (audio, ...) riding on the batch latents
-                self.latents = DTO.stack([x.get_latent() for x in self.file_items])
+                # Load each item first so an explicit persisted presence fact
+                # survives DTO.stack's missing-extra zero fill.  Keep the
+                # per-item marker scalar; DTO.stack then produces a [B] fact.
+                latent_items = []
+                presence_values = []
+                for item in self.file_items:
+                    item_latent = item.get_latent()
+                    if isinstance(item_latent, DTO):
+                        explicit = item_latent.get("audio_present")
+                        if explicit is not None:
+                            if torch.is_tensor(explicit):
+                                present = bool(explicit.detach().reshape(-1)[0].item())
+                            else:
+                                present = bool(explicit)
+                        else:
+                            # Legacy caches have no marker; an audio extra is
+                            # the only reliable stored presence fact.
+                            present = item_latent.get("audio") is not None
+                        extras = dict(item_latent.extras)
+                        extras["audio_present"] = torch.tensor(
+                            present, dtype=torch.float32
+                        )
+                        item_latent = DTO(item_latent.tensor, **extras)
+                    else:
+                        present = item.audio_data is not None
+                        item_latent = DTO(
+                            item_latent,
+                            audio_present=torch.tensor(
+                                present, dtype=torch.float32
+                            ),
+                        )
+                    presence_values.append(present)
+                    latent_items.append(item_latent)
+                self.audio_present = torch.tensor(presence_values, dtype=torch.bool)
+                # DTO.stack keeps any extra streams (audio, ...) riding on the
+                # batch latents, including the normalized presence fact.
+                self.latents = DTO.stack(latent_items)
                 if any(
                     [x._cached_first_frame_latent is not None for x in self.file_items]
                 ):
@@ -863,10 +899,11 @@ class DataLoaderBatchDTO:
 
     @property
     def audio_latents(self) -> Union[torch.Tensor, None]:
-        # cached audio rides inside the latents DTO
+        # cached audio rides inside the latents DTO; H3 also attaches clean
+        # rows here for uncached mixed-presence batches before condition build.
         if isinstance(self.latents, DTO):
-            return self.latents.get('audio')
-        return None
+            return self.latents.get("audio")
+        return getattr(self, "_h3_audio_rows", None)
 
     def cleanup(self):
         del self.latents

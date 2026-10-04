@@ -25,8 +25,15 @@ from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
-from toolkit.optimizer_runtime import uses_adaptive_lr_step_scale
-from toolkit.h3_audio_only import compute_audio_only_objective, is_audio_only_batch
+from toolkit.optimizer_runtime import (
+    uses_adaptive_lr_step_scale,
+    materialize_private_gradients,
+    clear_optimizer_gradients,
+    prepare_optimizer_step,
+    optimizer_step_was_skipped,
+    window_sample_coefficients,
+)
+from toolkit.h3_audio_only import is_audio_only_batch
 from toolkit.h3_dopsd import (
     decomposed_teacher_loss,
     dopsd_teacher_wanted,
@@ -380,6 +387,10 @@ class SDTrainer(BaseSDTrainProcess):
     # hook_train_loop opens the optimizer runtime window, which is where the
     # category_stop anchor scale is applied
     supports_category_anchor = True
+    def _completed_update_clock(self) -> int:
+        """Clock teacher phases from successful optimizer updates only."""
+        return int(getattr(self, "completed_update_id", 0))
+
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
@@ -2639,17 +2650,184 @@ class SDTrainer(BaseSDTrainProcess):
         per_sample = per_sample * ratio
         return per_sample.view(b, *([1] * (loss.ndim - 1))).expand_as(loss)
 
+    @staticmethod
+    def _mask_excluded_elements(
+        values: Optional[torch.Tensor],
+        weights: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Detach excluded elements before objective arithmetic.
+
+        A zero/absent mask is an exclusion, not a request to evaluate a
+        potentially non-finite model value and multiply it by zero later.
+        ``torch.where`` selects a detached zero on excluded elements, so no
+        NaN/Inf branch can contribute a value or gradient to the objective.
+        """
+        if values is None or not torch.is_tensor(values) or weights is None:
+            return values
+        weights = torch.as_tensor(
+            weights, device=values.device, dtype=torch.float32
+        )
+        if weights.ndim == values.ndim - 1 and values.ndim >= 2:
+            # Video losses are [B,C,T,H,W], while their masks arrive as
+            # [B,C,H,W]; image masks use the channel axis.
+            weights = weights.unsqueeze(2 if values.ndim == 5 else 1)
+        try:
+            weights = weights.expand_as(values)
+        except RuntimeError:
+            # Preserve the existing broadcast error at reduction time for
+            # malformed callers rather than silently changing their shape.
+            return values
+        active = torch.isfinite(weights) & (weights > 0)
+        return torch.where(active, values, torch.zeros_like(values))
+
+    @staticmethod
+    def _per_sample_weighted_mean(
+        values: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        normalization_weights: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce elementwise errors with one FP32 denominator per sample.
+
+        ``weights`` controls the contribution in the numerator. By default it
+        also supplies the denominator, which is the historical focus-mask
+        behavior. Region emphasis can pass ``normalization_weights`` as the
+        binary/focus mask instead: configured subject amplitudes then affect
+        the loss without being divided out of its denominator.
+        """
+        values = values.reshape(values.shape[0], -1).float()
+
+        def _reshape_weights(raw: Optional[torch.Tensor]) -> torch.Tensor:
+            if raw is None:
+                return torch.ones_like(values, dtype=torch.float32)
+            raw = torch.as_tensor(raw, device=values.device, dtype=torch.float32)
+            if raw.ndim == 0:
+                return raw.expand_as(values)
+            raw = raw.reshape(raw.shape[0], -1)
+            if raw.shape[1] == 1:
+                return raw.expand(-1, values.shape[1])
+            return raw.expand_as(values)
+
+        weights = _reshape_weights(weights)
+        denominator_weights = (
+            weights if normalization_weights is None
+            else _reshape_weights(normalization_weights)
+        )
+        finite_values = torch.isfinite(values)
+        active = torch.isfinite(weights) & (weights > 0)
+        denominator_active = (
+            torch.isfinite(denominator_weights)
+            & (denominator_weights > 0)
+        )
+        active_nonfinite = active & ~finite_values
+        effective = active & finite_values
+        safe_values = torch.where(
+            effective, values, torch.zeros_like(values)
+        )
+        safe_weights = torch.where(
+            effective, weights, torch.zeros_like(weights)
+        )
+        safe_denominator_weights = torch.where(
+            denominator_active & finite_values,
+            denominator_weights,
+            torch.zeros_like(denominator_weights),
+        )
+        numerator = (safe_values * safe_weights).sum(dim=1)
+        mass = safe_denominator_weights.sum(dim=1)
+        has_mass = mass > 0
+        denominator = torch.where(has_mass, mass, torch.ones_like(mass))
+        result = torch.where(
+            has_mass, numerator / denominator, torch.zeros_like(numerator)
+        )
+        valid = has_mass & ~active_nonfinite.any(dim=1)
+        return result, valid
+
+
+    def _set_objective_eligibility(self, eligible: torch.Tensor) -> None:
+        self._last_objective_eligible = bool(torch.as_tensor(eligible).any().item())
+
+    def _audio_loss_per_sample(
+        self,
+        audio_pred: torch.Tensor,
+        audio_target: torch.Tensor,
+        audio_mask: Optional[torch.Tensor],
+        loss_multiplier: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if audio_pred is None or audio_target is None:
+            count = loss_multiplier.shape[0]
+            return (
+                torch.zeros(count, device=self.device_torch, dtype=torch.float32),
+                torch.zeros(count, device=self.device_torch, dtype=torch.bool),
+            )
+        batch_size = int(audio_pred.shape[0])
+        multiplier = loss_multiplier.to(audio_pred.device, dtype=torch.float32).reshape(-1)
+        if multiplier.numel() != batch_size:
+            raise ValueError(
+                f"loss multiplier has {multiplier.numel()} rows for audio batch "
+                f"size {batch_size}"
+            )
+        if audio_mask is None:
+            audio_mask = torch.ones(
+                batch_size, dtype=torch.bool, device=audio_pred.device
+            )
+        else:
+            audio_mask = torch.as_tensor(
+                audio_mask, device=audio_pred.device, dtype=torch.bool
+            ).reshape(-1)
+            if audio_mask.numel() != batch_size:
+                raise ValueError(
+                    f"audio_mask has {audio_mask.numel()} rows for "
+                    f"batch size {batch_size}"
+                )
+        positive_weight = torch.isfinite(multiplier) & (multiplier > 0)
+        eligible = audio_mask & positive_weight
+        per_sample = torch.zeros(
+            batch_size, device=audio_pred.device, dtype=torch.float32
+        )
+        if not eligible.any():
+            return per_sample, eligible
+
+        # Index before subtraction/square.  An absent or zero-weight row with
+        # NaN audio must not create a NaN intermediate or gradient.
+        row_ids = eligible.nonzero(as_tuple=False).reshape(-1)
+        raw_diff = (
+            audio_pred.index_select(0, row_ids).float()
+            - audio_target.index_select(0, row_ids).float()
+        )
+        if not torch.isfinite(raw_diff).all():
+            raise FloatingPointError(
+                "nonfinite H3 audio objective for an eligible row"
+            )
+        rows = raw_diff.square().reshape(row_ids.numel(), -1).mean(dim=1)
+        if not uses_adaptive_lr_step_scale(self.train_config):
+            rows = rows * multiplier.index_select(0, row_ids)
+        per_sample.index_copy_(0, row_ids, rows)
+        return per_sample, eligible
+
     def _loss_for_audio_only_batch(
             self,
             audio_pred,
             audio_target,
+            audio_mask,
             audio_sigma,
             noisy_latents,
             timesteps,
             batch: 'DataLoaderBatchDTO',
             additional_loss,
+            loss_multiplier,
     ):
-        """Joint forward already ran. Omit video MSE; do not multiply it by zero."""
+        """Joint forward already ran. Omit video MSE; preserve B-denominator audio."""
+        if audio_pred is not None:
+            audio_row_active = torch.isfinite(loss_multiplier) & (loss_multiplier > 0)
+            if audio_mask is not None:
+                audio_row_active = audio_row_active & torch.as_tensor(
+                    audio_mask, device=loss_multiplier.device, dtype=torch.bool
+                ).reshape(-1)
+            audio_pred = self._mask_excluded_elements(
+                audio_pred, audio_row_active
+            )
+            audio_target = self._mask_excluded_elements(
+                audio_target, audio_row_active
+            )
         if self.train_config.do_guidance_loss and audio_target is not None:
             gate = self._log_guidance_sigma_gate(timesteps)
             if gate.any():
@@ -2681,11 +2859,15 @@ class SDTrainer(BaseSDTrainProcess):
                         audio_dims = [1] * (a_target.dim() - 1)
                         if self.train_config.do_guidance_loss_cfg_zero:
                             batch_size = a_target.shape[0]
-                            a_pos_flat = a_target.view(batch_size, -1)
-                            a_neg_flat = audio_uncond.view(batch_size, -1)
+                            a_pos_flat = a_target.reshape(batch_size, -1)
+                            a_neg_flat = audio_uncond.reshape(batch_size, -1)
                             a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
-                            a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
-                            audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+                            a_squared_norm = torch.sum(
+                                a_neg_flat.square(), dim=1, keepdim=True
+                            ).clamp_min(1e-8)
+                            audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(
+                                -1, *audio_dims
+                            )
                         audio_guidance_scale = self._guidance_loss_target_batch
                         if isinstance(audio_guidance_scale, list):
                             audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
@@ -2707,13 +2889,15 @@ class SDTrainer(BaseSDTrainProcess):
 
 
 
-        audio_loss = compute_audio_only_objective(
-            audio_pred,
-            audio_target,
-            self.train_config.audio_loss_multiplier,
+        audio_per_sample, eligible = self._audio_loss_per_sample(
+            audio_pred, audio_target, audio_mask, loss_multiplier
         )
-        self.additional_logs['loss/audio'] = audio_loss.item()
-        return audio_loss + additional_loss
+        self._set_objective_eligibility(eligible)
+        audio_loss = audio_per_sample.mean() * float(self.train_config.audio_loss_multiplier)
+        self.additional_logs['loss/audio'] = audio_loss.detach().item()
+        if additional_loss is not None:
+            audio_loss = audio_loss + additional_loss
+        return audio_loss
 
     # you can expand these in a child class to make customization easier
     def calculate_loss(
@@ -2731,7 +2915,7 @@ class SDTrainer(BaseSDTrainProcess):
         _is_reg_list = batch.get_is_reg_list()
         is_reg = any(_is_reg_list)
         additional_loss = 0.0
-
+        additional_objective_eligible = False
         # Depth-anchor sample gating (Task 5b). Fully inert when depth is off:
         # _depth_gates stays None, so no depth code is reachable and the loss
         # path below is byte-for-byte the original.
@@ -2791,23 +2975,58 @@ class SDTrainer(BaseSDTrainProcess):
         audio_pred = noise_pred.get('audio') if isinstance(noise_pred, DTO) else None
         audio_target = noise_pred.get('audio_target') if isinstance(noise_pred, DTO) else None
         audio_sigma = noise_pred.get('audio_sigma') if isinstance(noise_pred, DTO) else None
+        audio_mask = noise_pred.get('audio_mask') if isinstance(noise_pred, DTO) else None
+        with torch.no_grad():
+            loss_multiplier = torch.as_tensor(
+                batch.loss_multiplier_list,
+                device=self.device_torch,
+                dtype=torch.float32,
+            ).reshape(-1)
+        # Guard joint-audio guidance arithmetic with the same row policy as
+        # the final audio reduction: absent/zero-weight rows are not evaluated.
+        if audio_pred is not None:
+            audio_row_active = torch.isfinite(loss_multiplier) & (loss_multiplier > 0)
+            if audio_mask is not None:
+                audio_row_active = audio_row_active & torch.as_tensor(
+                    audio_mask, device=loss_multiplier.device, dtype=torch.bool
+                ).reshape(-1)
+            audio_pred = self._mask_excluded_elements(
+                audio_pred, audio_row_active
+            )
+            audio_target = self._mask_excluded_elements(
+                audio_target, audio_row_active
+            )
 
         if is_audio_only_batch(batch):
             return self._loss_for_audio_only_batch(
                 audio_pred=audio_pred,
                 audio_target=audio_target,
+                audio_mask=audio_mask,
                 audio_sigma=audio_sigma,
                 noisy_latents=noisy_latents,
                 timesteps=timesteps,
                 batch=batch,
                 additional_loss=additional_loss,
+                loss_multiplier=loss_multiplier,
             )
 
 
+        _subject_weight = self._build_subject_mask_weight(
+            batch, noisy_latents.shape, dtype=torch.float32
+        )
+        _subject_focus_weight = None
+        if _subject_weight is not None:
+            # Keep the focus mask as the denominator. Subject/body/clothing
+            # values are amplitudes and must remain in the numerator.
+            _subject_focus_weight = mask_multiplier
+            if not isinstance(mask_multiplier, torch.Tensor):
+                mask_multiplier = float(mask_multiplier) * _subject_weight.float()
+            else:
+                mask_multiplier = mask_multiplier.float() * _subject_weight.float()
+        # Mask the model output before optional norm/scaler/guidance arithmetic.
+        noise_pred = self._mask_excluded_elements(noise_pred, mask_multiplier)
         has_mask = batch.mask_tensor is not None
 
-        with torch.no_grad():
-            loss_multiplier = torch.tensor(batch.loss_multiplier_list).to(self.device_torch, dtype=torch.float32)
 
         if self.train_config.match_noise_norm:
             # match the norm of the noise
@@ -2852,27 +3071,26 @@ class SDTrainer(BaseSDTrainProcess):
             if self.train_config.inverted_mask_prior and prior_pred is not None and has_mask:
                 assert not self.train_config.train_turbo
                 with torch.no_grad():
-                    prior_mask = batch.mask_tensor.to(self.device_torch, dtype=dtype)
+                    prior_mask = batch.mask_tensor.to(
+                        self.device_torch, dtype=torch.float32
+                    )
                     if len(noise_pred.shape) == 5:
                         # video B,C,T,H,W
                         lat_height = batch.latents.shape[3]
                         lat_width = batch.latents.shape[4]
-                    else: 
+                    else:
                         lat_height = batch.latents.shape[2]
                         lat_width = batch.latents.shape[3]
-                    # resize to size of noise_pred
-                    prior_mask = torch.nn.functional.interpolate(prior_mask, size=(lat_height, lat_width), mode='bicubic')
-                    # stack first channel to match channels of noise_pred
-                    prior_mask = torch.cat([prior_mask[:1]] * noise_pred.shape[1], dim=1)
-                    
+                    prior_mask = torch.nn.functional.interpolate(
+                        prior_mask, size=(lat_height, lat_width), mode='bicubic'
+                    )
+                    # Preserve every batch row; never broadcast row zero over B.
+                    prior_mask = prior_mask.expand(-1, noise_pred.shape[1], -1, -1)
                     if len(noise_pred.shape) == 5:
-                        prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
-                        prior_mask = prior_mask.repeat(1, 1, noise_pred.shape[2], 1, 1) 
-
+                        prior_mask = prior_mask.unsqueeze(2).expand(
+                            -1, -1, noise_pred.shape[2], -1, -1
+                        )
                     prior_mask_multiplier = 1.0 - prior_mask
-                    
-                    # scale so it is a mean of 1
-                    prior_mask_multiplier = prior_mask_multiplier / prior_mask_multiplier.mean()
                 if hasattr(self.sd, 'get_loss_target'):
                     target = self.sd.get_loss_target(
                         noise=noise, 
@@ -2889,7 +3107,7 @@ class SDTrainer(BaseSDTrainProcess):
             target = prior_pred
             if dopsd_teacher_wanted(
                 getattr(self.sd, "dopsd_settings", None),
-                step_num=self.step_num,
+                completed_update_id=self._completed_update_clock(),
                 batch=batch,
             ):
                 if isinstance(prior_pred, DTO) and prior_pred.get('audio') is not None:
@@ -2941,6 +3159,7 @@ class SDTrainer(BaseSDTrainProcess):
             target = noise
             
         if self.dfe is not None:
+            additional_objective_eligible = True
             if self.dfe.version == 1:
                 model = self.sd
                 if model is not None and hasattr(model, 'get_stepped_pred'):
@@ -3055,13 +3274,14 @@ class SDTrainer(BaseSDTrainProcess):
                         # zero cfg
                         # ref https://github.com/WeichenFan/CFG-Zero-star/blob/cdac25559e3f16cb95f0016c04c709ea1ab9452b/wan_pipeline.py#L557
                         batch_size = target.shape[0]
-                        positive_flat = target.view(batch_size, -1)
-                        negative_flat = unconditional_target.view(batch_size, -1)
-                        # Calculate dot production
+                        # Compute CFG-Zero's dot/norm ratio in FP32 even when
+                        # the model path itself is fp16/bf16.
+                        positive_flat = target.float().reshape(batch_size, -1)
+                        negative_flat = unconditional_target.float().reshape(batch_size, -1)
                         dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-                        # Squared norm of uncondition
-                        squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
-                        # st_star = v_cond^T * v_uncond / ||v_uncond||^2
+                        squared_norm = torch.sum(
+                            negative_flat.square(), dim=1, keepdim=True
+                        ).clamp_min(1e-8)
                         st_star = dot_product / squared_norm
 
                         alpha = st_star
@@ -3101,11 +3321,15 @@ class SDTrainer(BaseSDTrainProcess):
                         audio_dims = [1] * (a_target.dim() - 1)
                         if self.train_config.do_guidance_loss_cfg_zero:
                             batch_size = a_target.shape[0]
-                            a_pos_flat = a_target.view(batch_size, -1)
-                            a_neg_flat = audio_uncond.view(batch_size, -1)
+                            a_pos_flat = a_target.reshape(batch_size, -1)
+                            a_neg_flat = audio_uncond.reshape(batch_size, -1)
                             a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
-                            a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
-                            audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
+                            a_squared_norm = torch.sum(
+                                a_neg_flat.square(), dim=1, keepdim=True
+                            ).clamp_min(1e-8)
+                            audio_uncond = audio_uncond * (
+                                a_dot / a_squared_norm
+                            ).view(-1, *audio_dims)
 
                         audio_guidance_scale = self._guidance_loss_target_batch
                         if isinstance(audio_guidance_scale, list):
@@ -3140,6 +3364,13 @@ class SDTrainer(BaseSDTrainProcess):
                 target = noise_pred + guidance_scale * (target - noise_pred)
 
         pred = noise_pred
+        # Exclude masked samples/elements before any squared-error, norm, or
+        # guidance arithmetic.  This is masking, not NaN replacement: only
+        # inactive branches are replaced by detached zeros.
+        noise_pred = self._mask_excluded_elements(noise_pred, mask_multiplier)
+        pred = self._mask_excluded_elements(pred, mask_multiplier)
+        noisy_latents = self._mask_excluded_elements(noisy_latents, mask_multiplier)
+        target = self._mask_excluded_elements(target, mask_multiplier)
 
         if self.train_config.train_turbo:
             pred, target = self.process_output_for_turbo(pred, noisy_latents, timesteps, noise, batch)
@@ -3149,12 +3380,23 @@ class SDTrainer(BaseSDTrainProcess):
         if loss_target == 'source' or loss_target == 'unaugmented':
             assert not self.train_config.train_turbo
             # ignore_snr = True
-            if batch.sigmas is None:
-                raise ValueError("Batch sigmas is None. This should not happen")
-
-            # src https://github.com/huggingface/diffusers/blob/324d18fba23f6c9d7475b0ff7c777685f7128d40/examples/t2i_adapter/train_t2i_adapter_sdxl.py#L1190
-            denoised_latents = noise_pred * (-batch.sigmas) + noisy_latents
-            weighing = batch.sigmas ** -2.0
+            if self.sd.is_flow_matching:
+                # Flow interpolation is defined by the sampled timestep, not
+                # the scheduler's mutable inference lookup table.
+                sigmas = timesteps.to(self.device_torch, dtype=torch.float32).reshape(-1) / 1000.0
+            else:
+                if batch.sigmas is None:
+                    raise ValueError("Batch sigmas is None. This should not happen")
+                sigmas = torch.as_tensor(
+                    batch.sigmas, device=self.device_torch, dtype=torch.float32
+                ).reshape(-1)
+            if (sigmas <= 0).any():
+                raise ValueError(
+                    "source/unaugmented objective requires strictly positive sigma"
+                )
+            sigma_view = sigmas.view(-1, *([1] * (noisy_latents.ndim - 1)))
+            denoised_latents = noise_pred.float() * (-sigma_view) + noisy_latents.float()
+            weighing = sigma_view.square().reciprocal()
             if loss_target == 'source':
                 # denoise the latent and compare to the latent in the batch
                 target = batch.latents
@@ -3173,6 +3415,7 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     raise ValueError(f"Unknown prediction type {self.sd.noise_scheduler.config.prediction_type}")
 
+            target = self._mask_excluded_elements(target, mask_multiplier)
             # mse loss without reduction
             loss_per_element = (weighing.float() * (denoised_latents.float() - target.float()) ** 2)
             loss = loss_per_element
@@ -3205,6 +3448,7 @@ class SDTrainer(BaseSDTrainProcess):
                         local_loss_scale = velocity_equiv_weight
                         
                 if self.train_config.do_fft_loss:
+                    additional_objective_eligible = True
                     with torch.no_grad():
                         target_mag = torch.fft.rfft2(batch.latents.to(t0.device).float(), norm="ortho").abs()
                     pred_mag = torch.fft.rfft2(t0.float(), norm="ortho").abs()
@@ -3260,7 +3504,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         if dopsd_teacher_wanted(
             getattr(self.sd, "dopsd_settings", None),
-            step_num=self.step_num,
+            completed_update_id=self._completed_update_clock(),
             batch=batch,
         ):
             settings = getattr(self.sd, "dopsd_settings", None)
@@ -3317,60 +3561,141 @@ class SDTrainer(BaseSDTrainProcess):
 
 
         if self.train_config.do_prior_divergence and prior_pred is not None:
-            loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
+            prior_pred_for_divergence = self._mask_excluded_elements(
+                prior_pred, mask_multiplier
+            )
+            pred_for_divergence = self._mask_excluded_elements(
+                pred, mask_multiplier
+            )
+            loss = loss + (
+                torch.nn.functional.mse_loss(
+                    pred_for_divergence.float(),
+                    prior_pred_for_divergence.float(),
+                    reduction="none",
+                )
+                * -1.0
+            )
 
-        # Subject-mask region weighting (Phase 3 auto-masking). Composes
-        # multiplicatively into mask_multiplier; no-op (None) when disabled.
-        _subject_weight = self._build_subject_mask_weight(batch, noisy_latents.shape, dtype=dtype)
-        if _subject_weight is not None:
-            if not isinstance(mask_multiplier, torch.Tensor):
-                mask_multiplier = _subject_weight
-            else:
-                mask_multiplier = mask_multiplier * _subject_weight
 
         if self.train_config.train_turbo:
             mask_multiplier = mask_multiplier[:, 3:, :, :]
-            # resize to the size of the loss
-            mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
+            mask_multiplier = torch.nn.functional.interpolate(
+                mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest'
+            )
+            if torch.is_tensor(_subject_focus_weight):
+                _subject_focus_weight = _subject_focus_weight[:, 3:, :, :]
+                _subject_focus_weight = torch.nn.functional.interpolate(
+                    _subject_focus_weight, size=(pred.shape[2], pred.shape[3]), mode='nearest'
+                )
 
-        # multiply by our mask
-        try:
-            if len(noise_pred.shape) == 5:
-                # video B,C,T,H,W
-                mask_multiplier = mask_multiplier.unsqueeze(2)  # add time dimension back for video
-                mask_multiplier = mask_multiplier.repeat(1, 1, noise_pred.shape[2], 1, 1)
-            loss = loss * mask_multiplier
-        except Exception as e:
-            # todo handle mask with video models
-            print("Could not apply mask multiplier to loss")
-            print(e)
-            pass
+        visual_normalization_weights = None
+        if torch.is_tensor(mask_multiplier):
+            visual_weights = mask_multiplier.to(
+                device=loss.device, dtype=torch.float32
+            )
+            if loss.ndim == 5 and visual_weights.ndim == 4:
+                visual_weights = visual_weights.unsqueeze(2).expand(
+                    -1, -1, loss.shape[2], -1, -1
+                )
+            if _subject_weight is not None:
+                if torch.is_tensor(_subject_focus_weight):
+                    visual_normalization_weights = _subject_focus_weight.to(
+                        device=loss.device, dtype=torch.float32
+                    )
+                    if loss.ndim == 5 and visual_normalization_weights.ndim == 4:
+                        visual_normalization_weights = (
+                            visual_normalization_weights.unsqueeze(2).expand(
+                                -1, -1, loss.shape[2], -1, -1
+                            )
+                        )
+                    if (
+                        visual_normalization_weights.ndim == visual_weights.ndim
+                        and visual_normalization_weights.shape[1] == 1
+                        and visual_weights.shape[1] != 1
+                    ):
+                        visual_normalization_weights = (
+                            visual_normalization_weights.expand(
+                                -1, visual_weights.shape[1], *visual_normalization_weights.shape[2:]
+                            )
+                        )
+                else:
+                    visual_normalization_weights = torch.full_like(
+                        visual_weights, float(_subject_focus_weight)
+                    )
+        else:
+            visual_weights = None if float(mask_multiplier) == 1.0 else torch.full(
+                loss.shape, float(mask_multiplier), device=loss.device
+            )
+        visual_loss, visual_valid = self._per_sample_weighted_mean(
+            loss, visual_weights, visual_normalization_weights
+        )
+        multiplier_float = loss_multiplier.to(loss.device).float()
+        positive_weight = torch.isfinite(multiplier_float) & (multiplier_float > 0)
+        raw_visual_nonfinite = ~torch.isfinite(
+            loss.reshape(loss.shape[0], -1)
+        )
+        if visual_weights is None:
+            visual_active = torch.ones_like(
+                loss.reshape(loss.shape[0], -1), dtype=torch.bool
+            )
+        else:
+            visual_active = (
+                torch.isfinite(visual_weights)
+                & (visual_weights > 0)
+            ).reshape(loss.shape[0], -1)
+        if (
+            positive_weight
+            & (visual_active & raw_visual_nonfinite).any(dim=1)
+        ).any():
+            raise FloatingPointError(
+                "nonfinite visual objective for an eligible sample"
+            )
+        objective_eligible = visual_valid & positive_weight
 
         prior_loss = None
         if self.train_config.inverted_mask_prior and prior_pred is not None and prior_mask_multiplier is not None:
             assert not self.train_config.train_turbo
+            prior_pred_for_loss = self._mask_excluded_elements(
+                prior_pred, prior_mask_multiplier
+            )
+            pred_for_prior_loss = self._mask_excluded_elements(
+                pred, prior_mask_multiplier
+            )
             if self.train_config.loss_type == "mae":
-                prior_loss = torch.nn.functional.l1_loss(pred.float(), prior_pred.float(), reduction="none")
+                raw_prior_loss = torch.nn.functional.l1_loss(
+                    pred_for_prior_loss.float(),
+                    prior_pred_for_loss.float(),
+                    reduction="none",
+                )
             else:
-                prior_loss = torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none")
-
-            prior_loss = prior_loss * prior_mask_multiplier * self.train_config.inverted_mask_prior_multiplier
-            if not torch.isfinite(prior_loss).all():
-                print_acc("Prior loss is nan")
-                prior_loss = None
-            else:
-                if len(noise_pred.shape) == 5:
-                    # video B,C,T,H,W
-                    prior_loss = prior_loss.mean([1, 2, 3, 4])
-                else:
-                    prior_loss = prior_loss.mean([1, 2, 3])
-                # loss = loss + prior_loss
-                # loss = loss + prior_loss
-            # loss = loss + prior_loss
-        if len(noise_pred.shape) == 5:
-            loss = loss.mean([1, 2, 3, 4])
-        else:
-            loss = loss.mean([1, 2, 3])
+                raw_prior_loss = torch.nn.functional.mse_loss(
+                    pred_for_prior_loss.float(),
+                    prior_pred_for_loss.float(),
+                    reduction="none",
+                )
+            prior_active = (
+                torch.isfinite(prior_mask_multiplier.float())
+                & (prior_mask_multiplier.float() > 0)
+            ).reshape(raw_prior_loss.shape[0], -1)
+            prior_nonfinite = ~torch.isfinite(
+                raw_prior_loss.reshape(raw_prior_loss.shape[0], -1)
+            )
+            prior_mass_positive = prior_active.any(dim=1)
+            if (prior_mass_positive & prior_nonfinite.any(dim=1)).any():
+                raise FloatingPointError(
+                    "nonfinite inverted-mask prior objective for an eligible sample"
+                )
+            prior_per_sample, prior_valid = self._per_sample_weighted_mean(
+                raw_prior_loss,
+                prior_mask_multiplier.float(),
+            )
+            prior_loss = (
+                prior_per_sample
+                * float(self.train_config.inverted_mask_prior_multiplier)
+                * multiplier_float
+            )
+            prior_valid = prior_valid & positive_weight
+        loss = visual_loss
         # per-image adaptive LR: record each item's raw per-sample loss (pre-multiplier) against
         # its timestep, keyed by file path. Model- and network-agnostic — this is the one shared
         # loss path for every architecture and both LoKr and LoRA. Never raises into training.
@@ -3433,30 +3758,44 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             loss = loss.mean()
         
-        # check for audio loss
+        audio_per_sample, audio_valid = self._audio_loss_per_sample(
+            audio_pred, audio_target, audio_mask, loss_multiplier
+        )
+        audio_loss = audio_per_sample.mean() * float(
+            self.train_config.audio_loss_multiplier
+        )
+        if getattr(batch, "dopsd_anchor", False):
+            audio_loss = audio_loss * self.sd.dopsd_settings.preservation_weight
+        objective_eligible = objective_eligible | audio_valid
+        self.additional_logs['loss/img'] = loss.detach().item()
         if audio_pred is not None and audio_target is not None:
-            audio_loss = torch.nn.functional.mse_loss(audio_pred.float(), audio_target.float(), reduction="mean")
-            audio_loss = audio_loss * self.train_config.audio_loss_multiplier
-            if getattr(batch, "dopsd_anchor", False):
-                audio_loss = audio_loss * self.sd.dopsd_settings.preservation_weight
-            self.additional_logs['loss/img'] = loss.item()
-            self.additional_logs['loss/audio'] = audio_loss.item()
+            self.additional_logs['loss/audio'] = audio_loss.detach().item()
             loss = loss + audio_loss
 
         # check for additional losses
         if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
-
             loss = loss + self.adapter.additional_loss.mean()
+            objective_eligible = objective_eligible | torch.ones(
+                (), dtype=torch.bool, device=loss.device
+            )
             self.adapter.additional_loss = None
 
         if self.train_config.target_norm_std:
-            # seperate out the batch and channels
+            # separate out the batch and channels
             pred_std = noise_pred.std([2, 3], keepdim=True)
-            norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
+            norm_std_loss = torch.abs(
+                self.train_config.target_norm_std_value - pred_std
+            ).mean()
             loss = loss + norm_std_loss
-
+            objective_eligible = objective_eligible | torch.ones(
+                (), dtype=torch.bool, device=loss.device
+            )
 
         loss = loss + additional_loss
+        if additional_objective_eligible:
+            objective_eligible = objective_eligible | torch.ones(
+                (), dtype=torch.bool, device=loss.device
+            )
 
         # Depth-anchor loss: added only on depth-objective samples (in timestep
         # band, positive weight, not reg, not an alternating sample on a
@@ -3503,9 +3842,25 @@ class SDTrainer(BaseSDTrainProcess):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
             if additional_model_loss is not None:
                 loss = loss + additional_model_loss
+                objective_eligible = objective_eligible | torch.ones(
+                    (), dtype=torch.bool, device=loss.device
+                )
                 self.additional_logs["additional_model_loss"] = additional_model_loss.item()
             # per-term breakdown, if the model keeps one
             self.additional_logs.update(getattr(self.sd, "additional_loss_logs", None) or {})
+        if (
+            _depth_gates is not None
+            or _normal_active
+            or _body_proportion_active
+            or _face_identity_active
+            or _body_shape_active
+            or _vae_anchor_active
+            or (self.adapter is not None and getattr(self.adapter, "additional_loss", None) is not None)
+        ):
+            objective_eligible = objective_eligible | torch.ones(
+                (), dtype=torch.bool, device=loss.device
+            )
+        self._set_objective_eligibility(objective_eligible)
 
         if self.train_config.max_loss_debug and self.train_config.max_loss is not None:
             if loss.item() > self.train_config.max_loss:
@@ -3878,11 +4233,13 @@ class SDTrainer(BaseSDTrainProcess):
             with self.timer('llm_loss'):
                 loss = self.sd.get_llm_loss(batch)
             self.additional_logs.update(getattr(self.sd, "additional_loss_logs", None) or {})
-            if not torch.isfinite(loss):
-                print_acc("loss is nan")
-                loss = torch.zeros_like(loss).requires_grad_(True)
+            if not torch.isfinite(loss).all():
+                raise FloatingPointError(
+                    "nonfinite language-model objective; inspect model loss terms"
+                )
             with self.timer('backward'):
-                loss = loss * loss_multiplier.mean()
+                if not uses_adaptive_lr_step_scale(self.train_config):
+                    loss = loss * loss_multiplier.mean()
                 # backward stays inside the network context (see the note in the diffusion path)
                 self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
         return loss.detach()
@@ -4000,11 +4357,18 @@ class SDTrainer(BaseSDTrainProcess):
                     if batch.clip_image_tensor is not None:
                         clip_images = batch.clip_image_tensor.to(self.device_torch, dtype=dtype).detach()
 
-            mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
+            mask_multiplier = torch.ones(
+                (noisy_latents.shape[0], 1, 1, 1),
+                device=self.device_torch,
+                dtype=torch.float32,
+            )
             if batch.mask_tensor is not None and self.sd.do_masked_loss:
                 with self.timer('get_mask_multiplier'):
-                    # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
+                    # Keep focus masks in FP32; per-sample normalization is
+                    # performed when reducing the elementwise loss.
+                    mask_multiplier = batch.mask_tensor.to(
+                        self.device_torch, dtype=torch.float32
+                    ).detach()
                     # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
                     if len(noisy_latents.shape) == 5:
                         # video B,C,T,H,W
@@ -4016,11 +4380,11 @@ class SDTrainer(BaseSDTrainProcess):
                     mask_multiplier = torch.nn.functional.interpolate(
                         mask_multiplier, size=(h, w)
                     )
-                    # expand to match latents
-                    mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
-                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
-                    # make avg 1.0
-                    mask_multiplier = mask_multiplier / mask_multiplier.mean()
+                    # Expand to channels while preserving FP32; reduction
+                    # normalizes each sample independently.
+                    mask_multiplier = mask_multiplier.expand(
+                        -1, noisy_latents.shape[1], -1, -1
+                    )
 
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):
@@ -4499,7 +4863,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                 dopsd_teacher_now = dopsd_teacher_wanted(
                     getattr(self.sd, "dopsd_settings", None),
-                    step_num=self.step_num,
+                    completed_update_id=self._completed_update_clock(),
                     batch=batch,
                 )
                 saved_control_tensor_list = None
@@ -4789,15 +5153,20 @@ class SDTrainer(BaseSDTrainProcess):
                             preservation_loss = preservation_loss + audio_preservation_loss
 
                         loss = loss + preservation_loss
+                        self._last_objective_eligible = True
 
-                # check if nan
-                if not torch.isfinite(loss):
-                    print_acc("loss is nan")
-                    loss = torch.zeros_like(loss).requires_grad_(True)
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError(
+                        "nonfinite diffusion objective; inspect prediction, target, "
+                        "mask, and auxiliary terms"
+                    )
+                if not getattr(self, "_last_objective_eligible", True):
+                    # Empty windows are not a disconnected numeric-zero loss:
+                    # leave gradients untouched and let the lifecycle skip the
+                    # optimizer/scheduler/EMA update.
+                    return loss.detach()
 
                 with self.timer('backward'):
-                    # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
-                    loss = loss * loss_multiplier.mean()
                     # IMPORTANT if gradient checkpointing do not leave with network when doing backward
                     # it will destroy the gradients. This is because the network is a context manager
                     # and will change the multipliers back to 0.0 when exiting. They will be
@@ -4942,36 +5311,77 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
-            batch_list = batch
+            batch_list = [item for item in batch if item is not None]
         else:
-            batch_list = [batch]
-        total_loss = None
-        self.optimizer.zero_grad()
-        # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
-        # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
-        n_accum = len(batch_list)
-        if self.train_config.gradient_accumulation_steps > 1:
-            n_accum *= self.train_config.gradient_accumulation_steps
-        accum_scale = 1.0 / n_accum
-        for batch in batch_list:
+            batch_list = [batch] if batch is not None else []
+        flush_only = not batch_list and bool(
+            getattr(self, "_optimizer_window_active", False)
+        )
+        if not batch_list and not flush_only:
+            self._last_optimizer_update_success = False
+            self._last_optimizer_update_skipped = False
+            return OrderedDict({'loss': 0.0})
+
+        repeated_accumulation = int(
+            getattr(self.train_config, "gradient_accumulation_steps", 1) or 1
+        ) != 1
+        window_start = (
+            not bool(getattr(self, "_optimizer_window_active", False))
+            and not flush_only
+        )
+        if window_start:
+            self.optimizer.zero_grad()
+            # Accelerated optimizers may retain authoritative gradients in
+            # private low-precision buffers; start each window cleanly.
+            clear_optimizer_gradients(self.optimizer)
+            self._optimizer_window_active = True
+            self._window_sample_total = 0
+            self._window_has_objective = False
+        total_loss = torch.zeros((), device=self.device_torch)
+        counts = []
+        if not flush_only:
+            for item in batch_list:
+                file_items = getattr(item, "file_items", None)
+                count = len(file_items) if file_items is not None else 0
+                if count <= 0 and getattr(item, "latents", None) is not None:
+                    count = int(item.latents.shape[0])
+                if count <= 0:
+                    raise ValueError("training batch has no samples")
+                counts.append(count)
+        coefficients = (
+            tuple(float(count) for count in counts)
+            if repeated_accumulation
+            else window_sample_coefficients(counts)
+        )
+        if counts:
+            self._window_sample_total += sum(counts)
+        window_has_objective = bool(getattr(self, "_window_has_objective", False))
+        batch_iter = zip(batch_list, coefficients) if not flush_only else ()
+        for batch_item, accum_scale in batch_iter:
             router = getattr(self, "modality_router", None)
             runtime = getattr(self, "optimizer_runtime", None)
             if router is not None and (runtime is None or runtime.update_phase == "step"):
-                router.observe_batch(batch)
+                router.observe_batch(batch_item)
             if self.sd.is_multistage:
                 # handle multistage switching
-                if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
-                    # iterate to make sure we only train trainable_multistage_boundaries
+                if (
+                    self.steps_this_boundary >= self.train_config.switch_boundary_every
+                    or self.current_boundary_index not in self.sd.trainable_multistage_boundaries
+                ):
                     while True:
                         self.steps_this_boundary = 0
                         self.current_boundary_index += 1
                         if self.current_boundary_index >= len(self.sd.multistage_boundaries):
                             self.current_boundary_index = 0
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
-                            # if this boundary is trainable, we can stop looking
                             break
-            loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
-
+            loss = self.train_single_accumulation(
+                batch_item, accum_scale=accum_scale
+            )
+            window_has_objective = (
+                window_has_objective
+                or bool(getattr(self, "_last_objective_eligible", True))
+            )
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -4979,70 +5389,105 @@ class SDTrainer(BaseSDTrainProcess):
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
+        self._window_has_objective = window_has_objective
 
-
-        if not self.is_grad_accumulation_step:
-            # grads of memory-managed (offloaded) params are async D2H copies into
-            # pinned tensors; join them before anything on the CPU reads .grad
+        self._last_optimizer_update_success = False
+        self._last_optimizer_update_skipped = False
+        if not self.is_grad_accumulation_step and window_has_objective:
+            # grads of memory-managed (offloaded) params are async D2H copies
+            # into pinned tensors; join them before reading .grad.
             sync_grad_transfers()
             runtime = getattr(self, 'optimizer_runtime', None)
             opened_step_window = False
             try:
                 opened_step_window = self._open_optimizer_runtime_window(phase="step")
-                # Mask must already have nulled inactive grads. clip_grad_norm_
-                # skips p.grad is None, so the norm is the active subset. Clip
-                # before the mask and the full-set norm silently mis-scales
-                # the active gradients.
-                # fix this for multi params
+                # Materialize private low-precision buffers before the single
+                # AMP unscale and before any group norm is measured.
+                materialize_private_gradients(self.optimizer)
+                if repeated_accumulation:
+                    total_samples = max(int(self._window_sample_total), 1)
+                    for group in self.optimizer.param_groups:
+                        for parameter in group.get("params", ()):
+                            if parameter.grad is not None:
+                                parameter.grad.div_(total_samples)
                 if self.train_config.optimizer != 'adafactor':
                     if isinstance(self.params[0], dict):
-                        for i in range(len(self.params)):
-                            self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
+                        # Accelerate's clip helper unscales internally. Use
+                        # one explicit unscale with the native torch clip for
+                        # each parameter group so group norm policy remains
+                        # unchanged without unscaling once per group.
+                        if hasattr(self.accelerator, "unscale_gradients"):
+                            self.accelerator.unscale_gradients(self.optimizer)
+                        for group in self.params:
+                            torch.nn.utils.clip_grad_norm_(
+                                group['params'], self.train_config.max_grad_norm
+                            )
                     else:
-                        self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
-                self._inject_gradient_noise()
-                # only step if we are not accumulating
+                        self.accelerator.clip_grad_norm_(
+                            self.params, self.train_config.max_grad_norm
+                        )
+                prepare_optimizer_step(self.optimizer)
                 with self.timer('optimizer_step'):
                     self.optimizer.step()
-
-                    self.optimizer.zero_grad(set_to_none=True)
+                skipped = optimizer_step_was_skipped(self.optimizer)
+                self._last_optimizer_update_skipped = skipped
+                if skipped:
+                    clear_optimizer_gradients(self.optimizer)
+                else:
+                    self._last_optimizer_update_success = True
+                    self.completed_update_id += 1
                     if self.adapter and isinstance(self.adapter, CustomAdapter):
                         self.adapter.post_weight_update()
-                if self.ema is not None:
-                    with self.timer('ema_update'):
-                        self.ema.update()
-                self._record_fisher_trace()
-                self._inject_weight_noise()
+                    if self.ema is not None:
+                        with self.timer('ema_update'):
+                            self.ema.update()
+                    self._record_fisher_trace()
+                    self._inject_weight_noise()
             finally:
                 if opened_step_window and runtime is not None:
                     runtime.end_window(self.optimizer)
+                if not self._last_optimizer_update_success:
+                    clear_optimizer_gradients(self.optimizer)
                 self._reset_routing_window()
-            if uses_adaptive_lr_step_scale(self.train_config):
+                self._optimizer_window_active = False
+                self._window_sample_total = 0
+                self._window_has_objective = False
+            if (
+                self._last_optimizer_update_success
+                and uses_adaptive_lr_step_scale(self.train_config)
+            ):
                 self._record_adaptive_lr_log_metrics()
-
-
-
-
+        elif not window_has_objective and not self.is_grad_accumulation_step:
+            # Empty objective windows are a lifecycle skip, not a fake
+            # disconnected zero loss.  Processed-input counters still advance.
+            clear_optimizer_gradients(self.optimizer)
+            self._reset_routing_window()
+            self._optimizer_window_active = False
+            self._window_sample_total = 0
+            self._window_has_objective = False
         else:
-            # gradient accumulation. Just a place for breakpoint
+            # Gradient accumulation continues in the caller's next window.
             pass
 
-        # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
-        with self.timer('scheduler_step'):
-            self.lr_scheduler.step()
+        if self._last_optimizer_update_success and self.lr_scheduler is not None:
+            with self.timer('scheduler_step'):
+                self.lr_scheduler.step()
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):
-                # Let's make sure we don't update any embedding weights besides the newly added token
                 self.embedding.restore_embeddings()
         if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter):
             with self.timer('restore_adapter'):
-                # Let's make sure we don't update any embedding weights besides the newly added token
                 self.adapter.restore_embeddings()
 
-        loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
-        )
+        loss_value = (total_loss / max(len(batch_list), 1)).detach().item()
+        loss_dict = OrderedDict({
+            'loss': loss_value,
+            'completed_update_id': int(self.completed_update_id),
+            'optimizer_update': float(self._last_optimizer_update_success),
+            'optimizer_step_skipped': float(self._last_optimizer_update_skipped),
+        })
+
 
         for metric_name in (
             '_last_grad_noise_norm',

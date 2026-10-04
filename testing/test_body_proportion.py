@@ -92,6 +92,50 @@ def test_soft_argmax_gradient_flows():
     assert hm.grad is not None
     assert torch.isfinite(hm.grad).all()
 
+def test_heatmap_confidence_stays_corrective_below_zero():
+    """Missing-body confidence retains a derivative for all-negative maps."""
+    heatmaps = torch.full((1, 17, 4, 4), -1.0, requires_grad=True)
+    confidence = DifferentiableBodyProportionEncoder._heatmaps_to_confidence(
+        heatmaps
+    ).flatten(2).amax(dim=2)
+    confidence.sum().backward()
+    assert torch.isfinite(heatmaps.grad).all()
+    assert float(heatmaps.grad.abs().sum().item()) > 0.0
+
+def test_heatmap_peak_one_clears_visibility_threshold():
+    """Beta-10 softplus keeps an ordinary peak on the visible side."""
+    heatmaps = torch.full((1, 17, 4, 4), -1.0)
+    heatmaps[:, :, 2, 2] = 1.0
+    confidence = DifferentiableBodyProportionEncoder._heatmaps_to_confidence(
+        heatmaps
+    ).flatten(2).amax(dim=2)
+    assert torch.all(confidence > DifferentiableBodyProportionEncoder.VIS_THRESHOLD)
+    assert torch.allclose(confidence, torch.ones_like(confidence), atol=1e-3)
+
+
+def test_low_response_confidence_keeps_corrective_loss_derivative():
+    """A below-threshold response still backpropagates through the shortfall."""
+    heatmaps = torch.full((1, 8, 1, 1), -0.25, requires_grad=True)
+    confidence = DifferentiableBodyProportionEncoder._heatmaps_to_confidence(
+        heatmaps
+    ).flatten(2).amax(dim=2)
+    assert float(confidence.max().item()) < DifferentiableBodyProportionEncoder.VIS_THRESHOLD
+
+    ratios = torch.zeros_like(confidence)
+    refs = torch.zeros_like(confidence)
+    loss, missing = compute_body_proportion_loss(
+        ratios,
+        confidence,
+        refs,
+        torch.ones_like(confidence),
+        gen_confidence=confidence,
+    )
+    assert torch.allclose(missing, torch.ones(1))
+    loss.mean().backward()
+    assert heatmaps.grad is not None
+    assert torch.isfinite(heatmaps.grad).all()
+    assert float(heatmaps.grad.abs().sum().item()) > 0.0
+
 
 # ---------------------------------------------------------------------------
 # Ratio computation (pure math, no ViTPose)
@@ -126,6 +170,21 @@ def test_compute_ratios_body_only_dim():
     assert ratios.shape == (1, 8)
     assert ratio_vis.shape == (1, 8)
     assert torch.isfinite(ratios).all()
+
+def test_compute_ratios_bound_encoder_call_does_not_shift_arguments():
+    """The live ``forward`` calls this helper through ``self``.
+
+    Keep this regression separate from the class-level math calls above:
+    without the static binding, production receives ``self`` as
+    ``keypoints`` and raises ``multiple values for ref_ratios``.
+    """
+    kp, vis = _perfect_keypoints()
+    encoder = DifferentiableBodyProportionEncoder.__new__(
+        DifferentiableBodyProportionEncoder
+    )
+    ratios, ratio_vis = encoder._compute_ratios(kp, vis)
+    assert ratios.shape == (1, 8)
+    assert ratio_vis.shape == (1, 8)
 
 
 def test_compute_ratios_with_head_adds_two():
@@ -187,16 +246,40 @@ def test_loss_positive_when_different():
     assert (loss > 0).all()
 
 
-def test_loss_missing_penalty():
-    # ref confident, gen dropped below threshold -> missing fraction
+def test_loss_missing_penalty_is_reported_and_trainable_with_confidence():
+    # The hard missing fraction is diagnostic; the raw confidence shortfall is
+    # the trainable term and must provide a corrective derivative.
     ref_v = torch.ones(1, 8)
-    gen_v = torch.zeros(1, 8)  # all "missing"
+    gen_v = torch.zeros(1, 8)
+    gen_r = torch.zeros(1, 8)
+    ref_r = torch.zeros(1, 8)
+    confidence = torch.full((1, 8), 0.05, requires_grad=True)
+    loss, missing = compute_body_proportion_loss(
+        gen_r,
+        gen_v,
+        ref_r,
+        ref_v,
+        gen_confidence=confidence,
+    )
+    assert abs(missing.item() - 1.0) < 1e-6
+    assert float(loss.item()) > 0.0
+    loss.mean().backward()
+    assert confidence.grad is not None
+    assert torch.isfinite(confidence.grad).all()
+    assert float(confidence.grad.abs().sum().item()) > 0.0
+
+
+def test_loss_missing_confidence_defaults_to_attached_gen_vis():
+    ref_v = torch.ones(1, 8)
+    gen_v = torch.zeros(1, 8, requires_grad=True)
     gen_r = torch.zeros(1, 8)
     ref_r = torch.zeros(1, 8)
     loss, missing = compute_body_proportion_loss(gen_r, gen_v, ref_r, ref_v)
-    assert abs(missing.item() - 1.0) < 1e-6  # all 8 ratios missing
-    # l1 term is 0 (both zero) so loss == missing fraction
-    assert abs(loss.item() - 1.0) < 1e-6
+    assert abs(missing.item() - 1.0) < 1e-6
+    loss.mean().backward()
+    assert gen_v.grad is not None
+    assert torch.isfinite(gen_v.grad).all()
+    assert float(gen_v.grad.abs().sum().item()) > 0.0
 
 
 def test_loss_gradient_flows():
@@ -272,6 +355,39 @@ def test_cache_hit_skips_recompute(tmp_path):
     cache_body_proportion([fi], SimpleNamespace(include_head=False), encoder=SimpleNamespace(encode=_encode))
     assert called["n"] == 0  # hit -> no recompute
     assert torch.equal(fi.get_body_proportion_gt(), first)
+
+def test_cache_recipe_change_recomputes_scaled_confidence_cache(tmp_path):
+    """Caches written with the old post-softplus scale are not reused."""
+    from safetensors.torch import load_file, save_file
+
+    image_path = _make_image(tmp_path / "img.png")
+    cfg = DatasetConfig(dataset_path=str(tmp_path), resolution=32)
+    fi = _make_file_item(image_path, cfg)
+    cache_dir = os.path.join(os.path.dirname(image_path), "_body_proportion_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(
+        cache_dir, f"{os.path.splitext(os.path.basename(image_path))[0]}_bodyprop.safetensors"
+    )
+    save_file(
+        {
+            "body_proportion_gt": torch.rand(16),
+            "body_proportion_v6_smooth_confidence": torch.ones(1),
+        },
+        cache_path,
+    )
+    called = {"n": 0}
+
+    def _encode(pil_image, include_head=False):
+        called["n"] += 1
+        return torch.ones(16)
+
+    cache_body_proportion(
+        [fi],
+        SimpleNamespace(include_head=False),
+        encoder=SimpleNamespace(encode=_encode),
+    )
+    assert called["n"] == 1
+    assert CACHE_VERSION_KEY_BODY in load_file(cache_path)
 
 
 def test_cache_include_head_uses_head_version_key(tmp_path):

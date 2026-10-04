@@ -4,7 +4,7 @@ import os
 import random
 import traceback
 from functools import lru_cache
-from typing import List, TYPE_CHECKING
+from typing import List, TYPE_CHECKING, Iterable
 
 import cv2
 import numpy as np
@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 from tqdm import tqdm
 import albumentations as A
 
@@ -25,6 +25,154 @@ from toolkit.print import print_acc
 from toolkit.h3_audio_only import uses_h3_standalone_audio, validate_audio_only_caption_dropout
 from toolkit.h3_dopsd import assign_other_photo_pairs
 from toolkit.accelerator import get_accelerator
+
+class StatefulRandomSampler(Sampler[int]):
+    """Random sampler whose permutation and cursor can be persisted.
+
+    PyTorch's ``RandomSampler`` creates a fresh permutation when an iterator is
+    constructed, so restoring only global RNG state cannot resume in the middle
+    of an epoch.  This sampler owns the permutation and advances its cursor as
+    indices are consumed.  It is opt-in; ordinary loaders retain their existing
+    behavior.
+    """
+
+    def __init__(self, data_source, generator: torch.Generator):
+        super().__init__()
+        self.data_source = data_source
+        self.generator = generator
+        self.epoch = 0
+        self.cursor = 0
+        self.indices = None
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def _new_permutation(self):
+        self.indices = torch.randperm(
+            len(self.data_source), generator=self.generator
+        ).tolist()
+        self.cursor = 0
+
+    def __iter__(self):
+        if self.indices is None or self.cursor >= len(self.indices):
+            if self.indices is not None:
+                self.epoch += 1
+            self._new_permutation()
+        while self.cursor < len(self.indices):
+            index = self.indices[self.cursor]
+            self.cursor += 1
+            yield index
+
+    def state_dict(self) -> dict:
+        return {
+            "schema": 1,
+            "epoch": int(self.epoch),
+            "cursor": int(self.cursor),
+            "indices": None if self.indices is None else list(self.indices),
+            "generator_state": self.generator.get_state().clone(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state.get("schema", 0)) != 1:
+            raise ValueError("unsupported stateful sampler schema")
+        indices = state.get("indices")
+        if indices is not None:
+            indices = [int(value) for value in indices]
+            expected = set(range(len(self.data_source)))
+            if len(indices) != len(expected) or set(indices) != expected:
+                raise ValueError("saved sampler permutation does not match the dataset")
+        cursor = int(state.get("cursor", 0))
+        if cursor < 0 or (indices is not None and cursor > len(indices)):
+            raise ValueError("saved sampler cursor is outside the permutation")
+        generator_state = state.get("generator_state")
+        if not torch.is_tensor(generator_state):
+            raise ValueError("saved sampler state has no generator state")
+        self.epoch = int(state.get("epoch", 0))
+        self.cursor = cursor
+        self.indices = indices
+        self.generator.set_state(generator_state.cpu())
+
+
+def _datasets_from_loader(loader) -> Iterable:
+    dataset = loader.dataset
+    if isinstance(dataset, ConcatDataset):
+        return dataset.datasets
+    return (dataset,)
+
+
+def _dataset_order_state(dataset) -> dict:
+    file_ids = [
+        (
+            str(getattr(item, "path", "")),
+            bool(getattr(item, "flip_x", False)),
+            bool(getattr(item, "flip_y", False)),
+        )
+        for item in getattr(dataset, "file_list", ())
+    ]
+    state = {"file_ids": file_ids}
+    if hasattr(dataset, "batch_indices"):
+        state["batch_indices"] = [list(batch) for batch in dataset.batch_indices]
+    if hasattr(dataset, "buckets"):
+        state["bucket_indices"] = {
+            str(key): list(bucket.file_list_idx)
+            for key, bucket in dataset.buckets.items()
+        }
+    return state
+
+
+def get_dataloader_state(loader) -> dict:
+    """Capture loader permutation/cursor and mutable dataset ordering."""
+    sampler = getattr(loader, "sampler", None)
+    if not isinstance(sampler, StatefulRandomSampler):
+        return {
+            "schema": 1,
+            "num_workers": int(getattr(loader, "num_workers", 0)),
+            "sampler": None,
+            "datasets": [_dataset_order_state(dataset) for dataset in _datasets_from_loader(loader)],
+        }
+    return {
+        "schema": 1,
+        "num_workers": int(getattr(loader, "num_workers", 0)),
+        "sampler": sampler.state_dict(),
+        "generator": loader.generator.get_state().clone() if loader.generator is not None else None,
+        "datasets": [_dataset_order_state(dataset) for dataset in _datasets_from_loader(loader)],
+    }
+
+
+def load_dataloader_state(loader, state: dict) -> None:
+    """Restore loader order after freshly constructing its dataset objects."""
+    if int(state.get("schema", 0)) != 1:
+        raise ValueError("unsupported dataloader state schema")
+    if int(state.get("num_workers", -1)) != int(getattr(loader, "num_workers", 0)):
+        raise ValueError("checkpoint dataloader worker count differs from the current run")
+    saved_datasets = state.get("datasets") or []
+    datasets = list(_datasets_from_loader(loader))
+    if len(saved_datasets) != len(datasets):
+        raise ValueError("checkpoint dataset count differs from the current run")
+    for dataset, saved in zip(datasets, saved_datasets):
+        if saved.get("file_ids") != _dataset_order_state(dataset).get("file_ids"):
+            raise ValueError("checkpoint dataset file order differs from the current run")
+        if "bucket_indices" in saved and hasattr(dataset, "buckets"):
+            for key, indices in saved["bucket_indices"].items():
+                if key not in dataset.buckets:
+                    raise ValueError("checkpoint bucket set differs from the current run")
+                dataset.buckets[key].file_list_idx = list(indices)
+        if "batch_indices" in saved and hasattr(dataset, "batch_indices"):
+            dataset.batch_indices = [list(batch) for batch in saved["batch_indices"]]
+    sampler = getattr(loader, "sampler", None)
+    saved_sampler = state.get("sampler")
+    if saved_sampler is None:
+        if isinstance(sampler, StatefulRandomSampler):
+            raise ValueError("checkpoint has no stateful sampler")
+        return
+    if not isinstance(sampler, StatefulRandomSampler):
+        raise ValueError("current loader does not expose a stateful sampler")
+    sampler.load_state_dict(saved_sampler)
+    generator_state = state.get("generator")
+    if generator_state is not None:
+        if loader.generator is None:
+            raise ValueError("current loader has no independent iterator generator")
+        loader.generator.set_state(generator_state.cpu())
 
 import platform
 
@@ -548,6 +696,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
                 )
+                if self.is_caching_text_embeddings:
+                    # Resolve JSON/short-caption authority before any text
+                    # cache key is built; sidecars are only the fallback.
+                    file_item.load_caption(self.caption_dict, force=True)
                 self.file_list.append(file_item)
             except Exception as e:
                 print_acc(traceback.format_exc())
@@ -673,6 +825,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        # Refresh JSON/sidecar authority before cached prompt lookup so a
+        # caption edit re-keys the copied item during a running job.
+        file_item.load_caption(self.caption_dict, force=True)
         try:
             file_item.load_and_process_image(self.transform)
         except Exception as e:
@@ -682,7 +837,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 raise
             new_index = self._get_replacement_index(index)
             return self._get_single_item(new_index, _attempts=_attempts + 1)
-        file_item.load_caption(self.caption_dict)
         return file_item
 
     def __getitem__(self, item):
@@ -711,6 +865,7 @@ def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
+        stateful_sampler: bool = False,
 ) -> DataLoader:
     if dataset_options is None or len(dataset_options) == 0:
         return None
@@ -780,19 +935,36 @@ def get_dataloader_from_datasets(
     if torch.cuda.is_available() and dataset_config_list[0].pin_memory:
         dataloader_kwargs['pin_memory'] = True
 
+    sampler = None
+    if stateful_sampler:
+        sampler_generator = torch.Generator(device="cpu")
+        # Clone the current CPU RNG without consuming it.  Input transforms
+        # continue to use the process RNG, while sampler state is independent
+        # and can be restored at an exact cursor.
+        sampler_generator.set_state(torch.random.get_rng_state())
+        sampler = StatefulRandomSampler(concatenated_dataset, sampler_generator)
+        # Iterator construction draws a base seed even with zero workers.
+        # Keep that draw out of the model/augmentation RNG on mid-epoch resume.
+        iterator_generator = torch.Generator(device="cpu")
+        iterator_generator.set_state(torch.random.get_rng_state())
+        dataloader_kwargs["generator"] = iterator_generator
+
     if has_buckets:
         # make sure they all have buckets
         for dataset in datasets:
-            assert dataset.dataset_config.buckets, f"buckets not found on dataset {dataset.dataset_config.folder_path}, you either need all buckets or none"
+            assert dataset.dataset_config.buckets, f"buckets not found on dataset {dataset.dataset_config.folder_path}; all datasets must use buckets"
 
-        data_loader = DataLoader(
-            concatenated_dataset,
-            batch_size=None,  # we batch in the datasets for now
+        loader_kwargs = dict(
+            batch_size=None,
             drop_last=False,
-            shuffle=True,
-            collate_fn=dto_collation,  # Use the custom collate function
-            **dataloader_kwargs
+            collate_fn=dto_collation,
+            **dataloader_kwargs,
         )
+        if sampler is None:
+            loader_kwargs["shuffle"] = True
+        else:
+            loader_kwargs["sampler"] = sampler
+        data_loader = DataLoader(concatenated_dataset, **loader_kwargs)
     else:
         # without buckets the dataloader batches across all datasets at once,
         # so a dataset level batch_size cannot apply
@@ -801,13 +973,16 @@ def get_dataloader_from_datasets(
                 raise ValueError(
                     f"Dataset level batch_size requires buckets to be enabled. Dataset {config.folder_path or config.dataset_path} has buckets disabled."
                 )
-        data_loader = DataLoader(
-            concatenated_dataset,
+        loader_kwargs = dict(
             batch_size=batch_size,
-            shuffle=True,
             collate_fn=dto_collation,
-            **dataloader_kwargs
+            **dataloader_kwargs,
         )
+        if sampler is None:
+            loader_kwargs["shuffle"] = True
+        else:
+            loader_kwargs["sampler"] = sampler
+        data_loader = DataLoader(concatenated_dataset, **loader_kwargs)
     return data_loader
 
 

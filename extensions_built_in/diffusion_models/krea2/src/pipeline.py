@@ -172,9 +172,13 @@ def predict_velocity(
     the velocity ``noise - clean`` reshaped back to ``(B, C, h, w)``. No time
     flip / negation: Krea's convention matches toolkit's.
     """
-    patch = model.config.patch
     b, c, h, w = latents.shape
-
+    patch = model.config.patch
+    if ref_latents is not None and len(ref_latents) != b:
+        raise ValueError(
+            "Reference latent batch must match the noisy latent batch: "
+            f"{len(ref_latents)} != {b}"
+        )
     if ref_kv_cache is not None and not isolate_refs:
         raise ValueError(
             "ref_kv_cache requires isolate_refs: cached ref K/V are only "

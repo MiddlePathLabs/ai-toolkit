@@ -445,14 +445,14 @@ class MiniMaxH3FinalLayer(nn.Module):
         x: torch.Tensor,  # (B, S, hidden)
         temb: torch.Tensor,  # (M, time_embed_dim)
         timestep_indices: torch.Tensor,  # (B, S) long into the M rows
+        sanitize: bool = False,
     ):
         shift, scale = self.adaln_proj(temb)
         dt = x.dtype
-        san = getattr(self, "sanitize_nonfinite_rows", False)  # see MiniMaxH3Block.forward
-        h = self.norm(x) * (1.0 + _mod_rows(scale, timestep_indices, dt, san)) + _mod_rows(
-            shift, timestep_indices, dt, san
+        h = self.norm(x) * (1.0 + _mod_rows(scale, timestep_indices, dt, sanitize)) + _mod_rows(
+            shift, timestep_indices, dt, sanitize
         )
-        if san:
+        if sanitize:
             h = _zero_nonfinite_rows(h)
         h = h.to(self.video_out.weight.dtype)
         return self.video_out(h), self.audio_out(h)
@@ -517,8 +517,9 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         self.final_layer = MiniMaxH3FinalLayer(p)
 
         self.gradient_checkpointing = False
-        # training only: zero non-finite gradient components at every block boundary
-        # (set by MiniMaxH3Model.get_noise_prediction). Inference never sets it.
+        # Compatibility fallback for direct callers that do not pass the
+        # per-forward guard. H3's model wrapper passes that value explicitly
+        # so no-grad guidance cannot desynchronize a pending checkpoint.
         self.sanitize_backward_nonfinite = False
         # None = dense attention. Set by the FastH3 model wrapper; only takes
         # effect on gate_compress checkpoints when the caller passes the grid.
@@ -579,6 +580,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         vsa_video_grid: Optional[
             Tuple[int, int, int]
         ] = None,  # target-video token grid (t, h, w)
+        sanitize_backward_nonfinite: Optional[bool] = None,
     ):
         """Returns (video_out (B, Nv, 96), audio_out (B, Na, 32)) — the
         data-ward velocity ``clean - noise`` for every row, in input order.
@@ -676,12 +678,15 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 generator=generator,
             )
 
-        # training-only non-finite guards (see MiniMaxH3Block.forward). The block flag
-        # rides the checkpoint args so a recompute sees the original forward's value; the
-        # final layer runs outside the checkpointed regions and keeps reading the
-        # attribute, which each real forward refreshes before use.
-        san = self.sanitize_backward_nonfinite
-        self.final_layer.sanitize_nonfinite_rows = san
+        # training-only non-finite guards (see MiniMaxH3Block.forward). The block
+        # flag rides the checkpoint args so a recompute sees the original value.
+        # Callers may pass the per-forward value to keep no-grad guidance from
+        # mutating state on a graph whose backward is still pending.
+        san = (
+            self.sanitize_backward_nonfinite
+            if sanitize_backward_nonfinite is None
+            else bool(sanitize_backward_nonfinite)
+        )
 
         full_state = None
         for i, block in enumerate(self.blocks):
@@ -708,7 +713,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 x = scatter_tread_hidden(x, full_state[0], keep_idx)
                 rotary_emb, adaln_indices, attn_mask = full_state[1:]
                 full_state = None
-            if self.sanitize_backward_nonfinite and x.requires_grad:
+            if san and x.requires_grad:
                 # Text rows overflow to inf in the last block (their outputs are never read
                 # out, so the forward is fine), but backward through those values yields
                 # NaN for the text positions and poisons every adapter upstream via the
@@ -717,7 +722,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 # boundary tensor, not just the routed window.)
                 x.register_hook(_zero_nonfinite_grad)
 
-        video_all, audio_all = self.final_layer(x, temb, inverse)
+        video_all, audio_all = self.final_layer(x, temb, inverse, san)
         video_out = video_all.index_select(1, video_indices)
         audio_out = audio_all.index_select(1, audio_indices)
         return video_out, audio_out

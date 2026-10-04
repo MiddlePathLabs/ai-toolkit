@@ -525,13 +525,19 @@ def batch_is_photo_only(batch: Any) -> bool:
 def dopsd_teacher_wanted(
     settings: Optional[DopsdSettings],
     *,
-    step_num: int,
+    completed_update_id: int,
     batch: Any,
 ) -> bool:
+    """Whether the current objective uses the teacher at an update boundary.
+
+    ``completed_update_id`` is intentionally not the processed-input clock:
+    accumulation, empty windows, and skipped AMP steps must not advance the
+    identity-first phase.
+    """
     if settings is None or not settings.enabled:
         return False
     if not identity_first_teacher_active(
-        step_num,
+        completed_update_id,
         settings.identity_first_steps,
         identity_first=settings.identity_first,
         dopsd_enabled=True,
@@ -540,6 +546,70 @@ def dopsd_teacher_wanted(
     if settings.other_ref and not batch_is_photo_only(batch):
         return False
     return True
+
+
+def validate_dopsd_static(
+    settings: DopsdSettings,
+    *,
+    arch: Any,
+    train_config: Any = None,
+    optimizer_runtime: Any = None,
+) -> None:
+    """Validate config-only D-OPSD constraints before model/cache setup.
+
+    The loaded model/version and concrete optimizer remain checked by
+    :func:`validate_dopsd`; this helper intentionally does not inspect or
+    mutate a model.
+    """
+    if not settings.enabled:
+        return
+    if not is_h3_arch(arch):
+        raise ValueError(
+            "model_kwargs.dopsd is MiniMax-H3 only "
+            f"(model.arch starts with {H3_ARCH_PREFIX}); got arch={arch!r}."
+        )
+    if (
+        (settings.loss_mag_weight != 1.0 or settings.loss_dc_weight != 1.0)
+        and train_config is not None
+        and str(getattr(train_config, "loss_type", "mse")) != "mse"
+    ):
+        raise ValueError(
+            "dopsd_loss_mag_weight / dopsd_loss_dc_weight split the MSE; "
+            f"they need train.loss_type: mse (got {train_config.loss_type!r})."
+        )
+    if settings.teacher_sigma_min >= settings.teacher_sigma_max:
+        raise ValueError(
+            "dopsd_teacher_sigma_min must be below dopsd_teacher_sigma_max, got "
+            f"{settings.teacher_sigma_min} / {settings.teacher_sigma_max}"
+        )
+    if settings.teacher_gated and train_config is not None:
+        batch_size = int(getattr(train_config, "batch_size", 1) or 1)
+        if batch_size != 1:
+            raise ValueError(
+                "D-OPSD teacher sigma gates require train.batch_size: 1 "
+                f"(got {batch_size})."
+            )
+    if settings.other_ref and train_config is not None:
+        batch_size = int(getattr(train_config, "batch_size", 1) or 1)
+        if batch_size != 1:
+            raise ValueError(
+                "dopsd_ref_mode='other' requires train.batch_size: 1 "
+                f"(got {batch_size})."
+            )
+    if settings.identity_first and settings.identity_first_steps == 0:
+        raise ValueError(
+            "dopsd_identity_first is set but resolved to 0 optimizer updates."
+        )
+    if (
+        settings.identity_first
+        and optimizer_runtime is not None
+        and not getattr(optimizer_runtime, "supports_step_scale", False)
+    ):
+        label = getattr(optimizer_runtime, "optimizer_label", type(optimizer_runtime).__name__)
+        raise ValueError(
+            f"dopsd_identity_first requires optimizer step scaling; {label} "
+            "does not expose supports_step_scale."
+        )
 
 
 def validate_dopsd(
@@ -553,6 +623,12 @@ def validate_dopsd(
     """Fail closed before the first batch. Pairing groups validate at dataset init."""
     if not settings.enabled:
         return
+    validate_dopsd_static(
+        settings,
+        arch=arch,
+        train_config=train_config,
+        optimizer_runtime=optimizer_runtime,
+    )
     if not is_h3_arch(arch):
         raise ValueError(
             "model_kwargs.dopsd is MiniMax-H3 only "

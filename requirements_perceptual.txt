@@ -16,7 +16,9 @@
 # ---------------------------------------------------------------------------
 # Modules needing NO new pip dependencies (probe PASS — deps already satisfied)
 # ---------------------------------------------------------------------------
-# vae_anchor.py    — torch, safetensors, tqdm only. Downloads Flux 2 VAE weights.
+# vae_anchor.py    — torch, safetensors, tqdm only. Requires a manually
+#                    provisioned licensed Flux 2 ae.safetensors checkpoint in
+#                    the matching BFL layout; no automatic weight download.
 # normal_id.py     — pure PyTorch Sapiens 0.3B encoder; weights via huggingface_hub
 #                    (facebook/sapiens-normal-0.3b). huggingface_hub already pinned.
 # body_shape.py    — torchvision.models.resnet34 (bundled). HybrIK ResNet-34 weights

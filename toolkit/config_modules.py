@@ -506,6 +506,12 @@ class TrainConfig:
         self.content_or_style: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.steps: int = kwargs.get('steps', 1000)
+        self.resume_mode = kwargs.get('resume_mode', 'auto')
+        if self.resume_mode not in ('auto', 'exact', 'weights_only'):
+            raise ValueError(
+                "train.resume_mode must be 'auto', 'exact', or 'weights_only', "
+                f"got {self.resume_mode!r}"
+            )
         self.lr = kwargs.get('lr', 1e-6)
         self.unet_lr = kwargs.get('unet_lr', self.lr)
         self.text_encoder_lr = kwargs.get('text_encoder_lr', self.lr)
@@ -1354,8 +1360,9 @@ class VAEAnchorConfig:
     by setting ``loss_weight > 0``. Decodes the predicted x0 through the training
     model's VAE, encodes those pixels with a SEPARATE frozen Flux 2 VAE encoder,
     and matches the multi-scale features against cached GT via cosine similarity.
-    The Flux 2 VAE weights auto-download from HuggingFace (ai-toolkit/flux2_vae).
-    Requires einops (for the flux2 autoencoder). Does NOT participate in loss_split.
+    The encoder and a matching licensed local checkpoint are required before
+    cache setup; admission never auto-downloads, substitutes, or falls back to
+    an unrelated VAE. Does NOT participate in loss_split.
     """
 
     def __init__(self, **kwargs):
@@ -2162,3 +2169,16 @@ def validate_configs(
     
     if train_config.diff_output_preservation and train_config.blank_prompt_preservation:
         raise ValueError("Cannot use both differential output preservation and blank prompt preservation at the same time. Please set one of them to False.")
+
+
+def collect_admission_diagnostics(raw_config, *, source: str = "api"):
+    """Return the pure Krea/H3 admission contract without model construction.
+
+    Kept as a small compatibility entry point for callers that already import
+    configuration helpers from this module.  The implementation lives in the
+    standard-library-only admission module so CLI/API diagnostics do not pull
+    model, optimizer, GPU or cache dependencies.
+    """
+    from toolkit.admission import collect_admission_diagnostics as _collect
+
+    return _collect(raw_config, source=source)

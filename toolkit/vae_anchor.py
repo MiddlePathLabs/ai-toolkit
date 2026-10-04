@@ -1,19 +1,16 @@
-"""Cross-VAE perceptual anchor using the Flux 2 VAE encoder.
+"""Cross-VAE perceptual anchor using a matching Flux 2 VAE encoder.
 
-A frozen Flux 2 VAE ENCODER (custom BFL AutoEncoder, loaded by file path from
-``extensions_built_in/diffusion_models/flux2/src/autoencoder.py``) acts as a
-perceptual discriminator: the live loss decodes the predicted x0 through the
-training model's VAE, encodes those pixels with the Flux 2 encoder, and matches
-the multi-scale features against cached GT via cosine similarity.
+The repository's canonical ``toolkit.models.v2.vae.flux2_kl.AutoEncoder`` is
+the only accepted backend. A caller must provide a local, licensed
+``ae.safetensors`` checkpoint in the matching BFL layout through
+``vae_model_path``. The anchor never downloads a checkpoint, substitutes the
+training VAE, or accepts unchecked partial loading.
 
-Adapted for this fork: the DECODE side uses ``self.sd.decode_latents`` (the
-training model's own VAE path, correct for Krea 2's AutoencoderKLQwenImage)
-rather than the source's manual ``vae.decode`` with scaling_factor/shift_factor
-(which is incompatible with the Qwen VAE's latents_mean/latents_std). The Flux
-2 VAE is used ONLY for the perceptual feature ENCODE.
-
-Weights: HuggingFace ``ai-toolkit/flux2_vae`` / ``ae.safetensors`` (auto-download
-via huggingface_hub). The ``einops`` dep is required by the flux2 autoencoder.
+The live loss decodes the predicted x0 through the training model's VAE,
+encodes those pixels with the separate frozen Flux 2 encoder, and matches
+multi-scale features against cached GT via cosine similarity. The matching
+encoder remains gradient-enabled with frozen parameters so the loss gradient
+reaches generated pixels.
 """
 from __future__ import annotations
 
@@ -30,13 +27,21 @@ from tqdm import tqdm
 
 FEATURE_LEVELS = ["level_0", "level_1", "level_2", "level_3", "mid"]
 LEVEL_CHANNELS = {"level_0": 128, "level_1": 256, "level_2": 512, "level_3": 512, "mid": 512}
-CACHE_VERSION_KEY = "vae_anchor_v1"
+# These are properties of the BFL Flux 2 KL encoder in
+# ``toolkit.models.v2.vae.flux2_kl``.  They are deliberately explicit: a
+# different VAE can have the same broad API while producing incompatible
+# features, and must not silently satisfy this auxiliary loss.
+FLUX2_INPUT_CHANNELS = 3
+FLUX2_MOMENT_CHANNELS = 64  # 2 * z_channels (32), before 2x2 packing/BN.
+FLUX2_LATENT_CHANNELS = 128  # 2 * 2 pixel shuffle * z_channels.
+CACHE_VERSION_KEY = "vae_anchor_v3_flux2_kl_contract"
 
 
 class VAEAnchorEncoder(nn.Module):
-    """Frozen Flux 2 VAE encoder for the perceptual anchor loss.
+    """Frozen matching Flux 2 VAE encoder for the perceptual anchor loss.
 
-    Loads only the encoder (+ bn) of the Flux 2 VAE. Forward hooks on the
+    The full canonical AutoEncoder is loaded strictly from the supplied
+    checkpoint, then only its encoder is retained. Forward hooks on the
     encoder's down/mid blocks capture multi-scale features for the loss.
     """
 
@@ -46,50 +51,142 @@ class VAEAnchorEncoder(nn.Module):
         self._hooks: List = []
         self._encoder = None
         self._loaded = False
+        self._contract_validated = False
         self._vae_path = vae_path
 
     @staticmethod
+    def _module_out_channels(module: nn.Module) -> Optional[int]:
+        channels = getattr(module, "out_channels", None)
+        if channels is None:
+            conv = getattr(module, "conv2", None)
+            channels = getattr(conv, "out_channels", None)
+        return int(channels) if channels is not None else None
+
+    @classmethod
+    def _validate_encoder_contract(cls, encoder: nn.Module) -> None:
+        """Reject a same-shaped-but-wrong VAE before hooks or cache setup.
+
+        The canonical BFL encoder has four resolution levels, two residual
+        blocks per level, and the channel progression 128/256/512/512.  The
+        hooked outputs are the second residual block at each level plus
+        ``mid.block_2``; they are pre-latent-normalization activations.
+        """
+        down = getattr(encoder, "down", None)
+        if down is None or len(down) != 4:
+            raise ValueError("Flux 2 encoder must expose exactly four down levels")
+        for level, name in enumerate(("level_0", "level_1", "level_2", "level_3")):
+            blocks = getattr(down[level], "block", None)
+            if blocks is None or len(blocks) < 2:
+                raise ValueError(f"Flux 2 encoder {name} must expose block[1]")
+            actual = cls._module_out_channels(blocks[1])
+            expected = LEVEL_CHANNELS[name]
+            if actual != expected:
+                raise ValueError(
+                    f"Flux 2 encoder {name} channel contract is {expected}, got {actual}"
+                )
+
+        mid = getattr(encoder, "mid", None)
+        mid_block = getattr(mid, "block_2", None)
+        if mid_block is None or cls._module_out_channels(mid_block) != LEVEL_CHANNELS["mid"]:
+            raise ValueError("Flux 2 encoder mid.block_2 must output 512 channels")
+
+        conv_in = getattr(encoder, "conv_in", None)
+        conv_out = getattr(encoder, "conv_out", None)
+        quant_conv = getattr(encoder, "quant_conv", None)
+        if getattr(conv_in, "in_channels", None) != FLUX2_INPUT_CHANNELS:
+            raise ValueError("Flux 2 encoder input must be 3-channel RGB")
+        if getattr(conv_out, "out_channels", None) != FLUX2_MOMENT_CHANNELS:
+            raise ValueError("Flux 2 encoder must emit 64 latent moments")
+        if getattr(quant_conv, "in_channels", None) != FLUX2_MOMENT_CHANNELS:
+            raise ValueError("Flux 2 quant_conv input must be 64 latent moments")
+        if getattr(quant_conv, "out_channels", None) != FLUX2_MOMENT_CHANNELS:
+            raise ValueError("Flux 2 quant_conv output must be 64 latent moments")
+
+    @classmethod
+    def _validate_autoencoder_contract(cls, vae: nn.Module) -> None:
+        cls._validate_encoder_contract(getattr(vae, "encoder", None))
+        bn = getattr(vae, "bn", None)
+        if (
+            bn is None
+            or getattr(bn, "num_features", None) != FLUX2_LATENT_CHANNELS
+            or getattr(bn, "affine", True)
+            or not getattr(bn, "track_running_stats", False)
+        ):
+            raise ValueError(
+                "Flux 2 checkpoint must provide the canonical 128-channel "
+                "non-affine BatchNorm latent normalization"
+            )
+
+    @staticmethod
     def _resolve_vae_path(vae_path: str) -> str:
-        if vae_path and os.path.exists(vae_path):
-            return vae_path
-        from huggingface_hub import hf_hub_download
-        print("  VAE anchor: downloading Flux 2 VAE from ai-toolkit/flux2_vae...")
-        return hf_hub_download(repo_id="ai-toolkit/flux2_vae", filename="ae.safetensors")
+        """Resolve only a local matching checkpoint; never download/fallback."""
+        if not vae_path:
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: provide vae_model_path pointing "
+                "to a licensed local Flux 2 ae.safetensors checkpoint in the "
+                "matching BFL layout. Automatic downloads and unrelated VAE "
+                "substitutions are disabled."
+            )
+        path = os.path.abspath(os.path.expanduser(vae_path))
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: matching Flux 2 checkpoint "
+                f"not found at {vae_path!r}. Set vae_model_path to an existing "
+                "licensed ae.safetensors file; no automatic download or VAE "
+                "fallback is permitted."
+            )
+        if not path.lower().endswith(".safetensors"):
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: vae_model_path must be a "
+                "matching Flux 2 ae.safetensors checkpoint, not "
+                f"{vae_path!r}."
+            )
+        return path
 
     def load(self, device: torch.device, dtype: torch.dtype):
         if self._loaded:
             return
         self._vae_path = self._resolve_vae_path(self._vae_path)
-        # Import the flux2 AutoEncoder by file path to avoid the heavy
-        # extensions_built_in package __init__ chain.
-        import importlib.util
-        _ae_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "extensions_built_in", "diffusion_models", "flux2", "src", "autoencoder.py",
-        )
-        _spec = importlib.util.spec_from_file_location("flux2_autoencoder", _ae_path)
-        _ae_mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_ae_mod)
-        AutoEncoder = _ae_mod.AutoEncoder
-        AutoEncoderParams = _ae_mod.AutoEncoderParams
+        # Reuse the exact BFL Flux2 implementation used by the model loaders.
+        # AutoEncoder.load_model performs normal checkpoint/config shape sniffing
+        # and strict state-dict loading; do not hand-load a partial encoder.
+        from toolkit.models.v2.vae.flux2_kl import AutoEncoder
 
-        ae = AutoEncoder(AutoEncoderParams())
-        state_dict = load_file(self._vae_path)
-        encoder_keys = {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
-        encoder_sd = (
-            {k[len("encoder."):]: v for k, v in encoder_keys.items()}
-            if encoder_keys else state_dict
-        )
-        ae.encoder.load_state_dict(encoder_sd, strict=False)
-        bn_keys = {k: v for k, v in state_dict.items() if k.startswith("bn.")}
-        if bn_keys:
-            ae.bn.load_state_dict({k[len("bn."):]: v for k, v in bn_keys.items()}, strict=False)
+        try:
+            vae = AutoEncoder.load_model(
+                self._vae_path,
+                dtype=torch.float32,
+                device=None,
+                use_comfy_weights=False,
+            )
+            # Validate the loaded module as well as its state dict.  Strict
+            # loading only proves that keys fit this class; it does not prove
+            # that a replacement VAE has the Flux 2 feature recipe.
+            self._validate_autoencoder_contract(vae)
+        except Exception as exc:
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: the local checkpoint is not "
+                "compatible with toolkit.models.v2.vae.flux2_kl.AutoEncoder "
+                "or failed the strict Flux 2 shape/hook/normalization contract. "
+                "Supply the matching licensed Flux 2 ae.safetensors checkpoint; "
+                "unrelated VAEs are not supported."
+            ) from exc
 
-        self._encoder = ae.encoder
+        if not hasattr(vae, "encoder"):
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: matching Flux 2 checkpoint did "
+                "not produce an encoder component."
+            )
+        self._encoder = vae.encoder
+        # Keep the frozen estimator in its loaded precision/device, while
+        # retaining autograd through its forward into generated pixels.
         self._encoder.to(device=device, dtype=dtype).eval()
         self._encoder.requires_grad_(False)
+        del vae
         self._register_hooks()
+        self._contract_validated = True
         self._loaded = True
+
 
     def _register_hooks(self):
         for h in self._hooks:
@@ -109,16 +206,35 @@ class VAEAnchorEncoder(nn.Module):
         self._hooks.append(encoder.down[3].block[1].register_forward_hook(_hook("level_3")))
         self._hooks.append(encoder.mid.block_2.register_forward_hook(_hook("mid")))
 
+    def _validate_feature_outputs(self, features: Dict[str, torch.Tensor]) -> None:
+        if set(features) != set(FEATURE_LEVELS):
+            raise RuntimeError(
+                "VAE-anchor backend unavailable: Flux 2 encoder hooks did not "
+                f"capture exactly {FEATURE_LEVELS}; got {sorted(features)}."
+            )
+        for level in FEATURE_LEVELS:
+            tensor = features[level]
+            expected = LEVEL_CHANNELS[level]
+            if tensor.ndim != 4 or tensor.shape[1] != expected:
+                raise RuntimeError(
+                    "VAE-anchor backend unavailable: Flux 2 feature "
+                    f"{level} must be (B,{expected},H,W), got {tuple(tensor.shape)}."
+                )
+
     def encode_with_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Encode pixels in [-1, 1] (B,3,H,W); return (final, features_dict).
 
-        Gradients flow through the encoder to the input pixels.
+        Gradients flow through the encoder to the input pixels.  The captured
+        features are pre-latent-normalization activations, matching the
+        canonical encoder blocks and the cached-reference path.
         """
         assert self._loaded, "Call load() first"
         self._features.clear()
         enc_dtype = next(self._encoder.parameters()).dtype
         final = self._encoder(x.to(dtype=enc_dtype))
         features = {k: v for k, v in self._features.items()}
+        if self._contract_validated:
+            self._validate_feature_outputs(features)
         return final, features
 
     @staticmethod

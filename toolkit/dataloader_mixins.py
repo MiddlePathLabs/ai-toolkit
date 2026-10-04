@@ -39,6 +39,168 @@ from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
 
+
+# Cache provenance is deliberately content-based.  ``os.stat`` signatures are
+# useful for cheap UI refreshes, but they alias a same-size replacement whose
+# mtime is restored.  Fingerprint each source once while the DTO is prepared
+# and carry the result through all cache-key builders.
+def content_fingerprint(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """Return a stable SHA-256 fingerprint for one cache source.
+
+    The caller owns preparation-time memoization (the DTO stores this value);
+    this helper must not memoize by stat fields because that would reintroduce
+    the same-size/same-mtime alias this provenance is intended to prevent.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _fingerprint_optional(path: str) -> str:
+    if path is None:
+        return ""
+    try:
+        return content_fingerprint(path) if os.path.isfile(path) else str(path)
+    except (OSError, IOError, TypeError):
+        # Missing controls are still part of identity by their path; the
+        # producer will raise the actionable load error when it is consumed.
+        return str(path)
+
+def _memoized_fingerprint(cache: dict, path: str) -> str:
+    key = str(path)
+    if key not in cache:
+        cache[key] = _fingerprint_optional(path)
+    return cache[key]
+
+
+def _cache_model_identity(model) -> str:
+    """Serialize representation-changing model/encoder provenance.
+
+    In particular, include both the resolved encoder source and the explicit
+    ``model_kwargs.text_encoder_path`` override.  The latter is intentionally
+    included even when a model exposes a legacy ``te_cache_identity`` helper.
+    """
+    if model is None:
+        return "model:none"
+    cached = getattr(model, "_aitk_cache_model_identity", None)
+    if cached is not None:
+        return cached
+    config = getattr(model, "model_config", None)
+    if isinstance(config, dict):
+        kwargs = config.get("model_kwargs", {}) or {}
+        te_name = config.get("te_name_or_path")
+    else:
+        kwargs = getattr(config, "model_kwargs", {}) or {}
+        te_name = getattr(config, "te_name_or_path", None)
+    te_override = kwargs.get("text_encoder_path")
+    source = te_override or te_name
+    encoder = ""
+    if source and isinstance(source, (str, bytes, os.PathLike)) and os.path.isdir(source):
+        parts = []
+        for root, _dirs, names in os.walk(source):
+            for name in sorted(names):
+                item = os.path.join(root, name)
+                parts.append((os.path.relpath(item, source), _fingerprint_optional(item)))
+        encoder = json.dumps(parts, sort_keys=True, separators=(",", ":"))
+    elif source:
+        encoder = _fingerprint_optional(source)
+    legacy = getattr(model, "te_cache_identity", None)
+    try:
+        legacy_identity = legacy() if callable(legacy) else legacy
+    except Exception:
+        legacy_identity = repr(legacy)
+    fields = {
+        "arch": getattr(model, "arch", model.__class__.__qualname__),
+        "text_encoder_path": str(te_override or ""),
+        "text_encoder_source": str(source or ""),
+        "text_encoder_fingerprint": encoder,
+        "te_cache_identity": str(legacy_identity or ""),
+        "text_embedding_space_version": str(
+            getattr(model, "text_embedding_space_version", "")
+        ),
+        "dtype": str(getattr(model, "te_torch_dtype", "")),
+        "control_images": bool(getattr(model, "encode_control_in_text_embeddings", False)),
+        "first_frame": bool(
+            getattr(model, "encode_first_frame_in_text_embeddings", False)
+        ),
+    }
+    identity = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    try:
+        setattr(model, "_aitk_cache_model_identity", identity)
+    except Exception:
+        pass
+    return identity
+
+
+def _latent_cache_model_identity(model) -> str:
+    """Identity for target latent encoding, including resolved VAE sources."""
+    if model is None:
+        return "model:none"
+    config = getattr(model, "model_config", None)
+    kwargs = (
+        config.get("model_kwargs", {}) if isinstance(config, dict)
+        else getattr(config, "model_kwargs", {})
+    ) or {}
+
+    def _path_identity(value):
+        entry = {"value": str(value)}
+        try:
+            if os.path.isfile(value):
+                entry["fingerprint"] = content_fingerprint(value)
+        except (OSError, IOError, TypeError):
+            pass
+        return entry
+
+    checkpoint_fields = {}
+    for key, value in kwargs.items():
+        if "text_encoder" in str(key) or str(key).startswith("te_"):
+            continue
+        checkpoint_fields[str(key)] = _path_identity(value)
+
+    # ModelConfig.vae_path is a separate field for the standard loaders. H3
+    # and other extension models resolve multiple VAEs from model_kwargs.
+    vae_sources = {}
+    for name in ("vae_path", "video_vae_path", "audio_vae_path"):
+        values = []
+        config_value = (
+            config.get(name) if isinstance(config, dict)
+            else getattr(config, name, None)
+        )
+        model_value = getattr(model, name, None)
+        for value in (config_value, model_value):
+            if value is not None and str(value) not in values:
+                values.append(str(value))
+        if values:
+            vae_sources[name] = [_path_identity(value) for value in values]
+
+    model_source = (
+        config.get("name_or_path") if isinstance(config, dict)
+        else getattr(config, "name_or_path", None)
+    )
+    fields = {
+        "arch": getattr(model, "arch", model.__class__.__qualname__),
+        "model_source": _path_identity(model_source) if model_source is not None else "",
+        "latent_space_version": str(getattr(model, "latent_space_version", "")),
+        "vae_encode_fp32": bool(getattr(model, "vae_encode_fp32", False)),
+        "vae_dtype": str(getattr(model, "vae_torch_dtype", "")),
+        "vae_sources": vae_sources,
+        "checkpoint_fields": checkpoint_fields,
+    }
+    condition_encoder = getattr(model, "encode_condition_images", None)
+    if callable(condition_encoder):
+        condition_identity = (
+            getattr(model, "condition_encoder_identity", None)
+            or f"{condition_encoder.__module__}:{condition_encoder.__qualname__}"
+        )
+        fields["condition_encoder_identity"] = str(condition_identity)
+        fields["condition_encoder_recipe"] = str(
+            getattr(model, "condition_encoder_recipe", "")
+        )
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
     from toolkit.data_transfer_object.data_loader import FileItemDTO
@@ -352,16 +514,55 @@ class CaptionProcessingDTOMixin:
             self.trigger_word = dataset_config.trigger_word
 
     # todo allow for loading from sd-scripts style dict
-    def load_caption(self: 'FileItemDTO', caption_dict: Union[dict, None]=None):
+    def load_caption(
+        self: 'FileItemDTO',
+        caption_dict: Union[dict, None] = None,
+        force: bool = False,
+    ):
+        if force:
+            # Dataset JSON is authoritative when present. Reset every derived
+            # caption/cache path so a mid-run edit gets a new key; old files
+            # intentionally remain orphaned on disk.
+            self.raw_caption = None
+            self.raw_caption_short = None
+            self.caption = None
+            self.caption_short = None
+            self.caption_dop = None
+            self.caption_dopsd = None
+            self._text_embedding_path = None
+            self._dop_text_embedding_path = None
+            self._blank_text_embedding_path = None
+            self._dop_blank_text_embedding_path = None
+            self._dopsd_text_embedding_path = None
+            self._dopsd_blank_text_embedding_path = None
+            for attr in ("prompt_embeds", "dop_prompt_embeds", "dopsd_prompt_embeds"):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+            self._loaded_text_embedding_path = None
+            self._caption_was_dropped = False
         if self.raw_caption is not None:
             # we already loaded it
             pass
-        elif caption_dict is not None and self.path in caption_dict and "caption" in caption_dict[self.path]:
-            self.raw_caption = caption_dict[self.path]["caption"]
-            if 'caption_short' in caption_dict[self.path]:
-                self.raw_caption_short = caption_dict[self.path]["caption_short"]
-                if self.dataset_config.use_short_captions:
-                    self.raw_caption = caption_dict[self.path]["caption_short"]
+        elif (
+            caption_dict is not None
+            and self.path in caption_dict
+            and (
+                isinstance(caption_dict[self.path], str)
+                or (
+                    isinstance(caption_dict[self.path], dict)
+                    and "caption" in caption_dict[self.path]
+                )
+            )
+        ):
+            entry = caption_dict[self.path]
+            if isinstance(entry, dict):
+                self.raw_caption = entry["caption"]
+                if 'caption_short' in entry:
+                    self.raw_caption_short = entry['caption_short']
+                    if self.dataset_config.use_short_captions:
+                        self.raw_caption = entry['caption_short']
+            else:
+                self.raw_caption = entry
         else:
             # see if prompt file exists
             path_no_ext = os.path.splitext(self.path)[0]
@@ -376,7 +577,7 @@ class CaptionProcessingDTOMixin:
                     prompt = clean_caption(prompt)
                     if short_caption is not None:
                         short_caption = clean_caption(short_caption)
-                    
+
                     if prompt.strip() == '' and self.dataset_config.default_caption is not None:
                         prompt = self.dataset_config.default_caption
             else:
@@ -1248,8 +1449,20 @@ class ControlFileItemDTOMixin:
                                 found_control_videos.append(os.path.join(control_path, file_name_no_ext + ext))
                                 self.has_control_image = True
                                 break
-            # control VIDEO paths ride on the item; the model encodes and
-            # disk-caches them on first use (see minimax_h3 ref2va)
+            # Reference-video cache identity is prepared once while dataset
+            # items are built, before repeated training forwards.
+            if found_control_videos and sd is not None:
+                try:
+                    from extensions_built_in.diffusion_models.minimax_h3.src.ref_video_cache import (
+                        prepare_ref_video_source,
+                    )
+                    for video_path in found_control_videos:
+                        prepare_ref_video_source(sd, video_path)
+                except ImportError:
+                    # Other video-control models may provide their own cache
+                    # implementation; do not make generic item construction
+                    # depend on the H3 extension being installed.
+                    pass
             self.control_video_paths = found_control_videos or None
             self.control_path = found_control_images
             if len(self.control_path) == 0:
@@ -1912,6 +2125,9 @@ def _dto_extras_from_state_dict(state_dict) -> dict:
     extras = {}
     if 'audio_latent' in state_dict:
         extras['audio'] = state_dict['audio_latent']
+    if 'audio_present' in state_dict:
+        # Keep the fact as a scalar row so DTO.stack yields [B], not [B, 1].
+        extras['audio_present'] = state_dict['audio_present'].reshape(-1)[:1]
     for k, v in state_dict.items():
         if k.startswith(DISK_PREFIX):
             extras[k[len(DISK_PREFIX):]] = v
@@ -1929,13 +2145,34 @@ class LatentCachingFileItemDTOMixin:
         self._cached_tensor_uint8: Union[torch.Tensor, None] = None
         self._cached_waveform_int16: Union[torch.Tensor, None] = None
         self._cached_waveform_sample_rate: Union[int, None] = None
+        self._cached_audio_present: Union[bool, None] = None
         self._latent_path: Union[str, None] = None
         self.is_latent_cached = False
         self.is_caching_to_disk = False
         self.is_caching_to_memory = False
         self.latent_load_device = 'cpu'
-        # todo, increment this if we change the latent format to invalidate cache
-        self.latent_version = 1
+        # Preparation-time provenance. Flipped/repeated DTOs retain this exact
+        # digest, while a newly prepared path is hashed again.
+        path = getattr(self, "path", None)
+        self.source_content_fingerprint = (
+            content_fingerprint(path) if path and os.path.isfile(path) else str(path or "")
+        )
+        cache_text = bool(
+            getattr(kwargs.get("dataset_config"), "cache_text_embeddings", False)
+        )
+        self._cache_model_identity = (
+            _cache_model_identity(kwargs.get("sd")) if cache_text else "text-cache-disabled"
+        )
+        self._latent_model_identity = _latent_cache_model_identity(kwargs.get("sd"))
+        # v2 changes the cache namespace: source content and transform/control
+        # provenance are now part of the latent identity.
+        self.latent_version = 2
+    def refresh_source_cache_provenance(self: 'FileItemDTO'):
+        """Refresh the preparation fingerprint before an explicit re-key."""
+        path = getattr(self, "path", None)
+        if path and os.path.isfile(path):
+            self.source_content_fingerprint = content_fingerprint(path)
+        self._latent_path = None
 
     def get_latent_info_dict(self: 'FileItemDTO'):
         item = OrderedDict([
@@ -1949,6 +2186,26 @@ class LatentCachingFileItemDTOMixin:
             ("latent_space_version", self.latent_space_version),
             ("latent_version", self.latent_version),
         ])
+        item["source_content_fingerprint"] = self.source_content_fingerprint
+        item["model_identity"] = self._latent_model_identity
+        item["transform_recipe"] = {
+            "scale": getattr(self.dataset_config, "scale", 1.0),
+            "random_crop": bool(getattr(self.dataset_config, "random_crop", False)),
+            "standardize_images": bool(
+                getattr(self.dataset_config, "standardize_images", False)
+            ),
+            "augments": getattr(self.dataset_config, "augments", []) or [],
+        }
+        item["audio_recipe"] = {
+            "do_audio": bool(getattr(self.dataset_config, "do_audio", False)),
+            "audio_normalize": bool(
+                getattr(self.dataset_config, "audio_normalize", False)
+            ),
+            "audio_preserve_pitch": bool(
+                getattr(self.dataset_config, "audio_preserve_pitch", False)
+            ),
+            "sample_rate": int(getattr(self, "sample_rate", 0) or 0),
+        }
         is_video = False
         # when adding items, do it after so we dont change old latents
         if self.flip_x:
@@ -1998,6 +2255,8 @@ class LatentCachingFileItemDTOMixin:
         if self._latent_path is not None and not recalculate:
             return self._latent_path
         else:
+            if recalculate:
+                self.refresh_source_cache_provenance()
             # we store latents in a folder in same path as image called _latent_cache
             img_dir = os.path.dirname(self.path)
             latent_dir = os.path.join(img_dir, '_latent_cache')
@@ -2482,6 +2741,12 @@ class LatentCachingMixin:
             first_frame_latent = None
             audio_latent = None
             frames = None
+            audio_present = bool(file_item.audio_data is not None)
+            # Persist the physical source fact independently of do_audio
+            # supervision policy and encoded-silence construction.
+            state_dict['audio_present'] = torch.tensor(
+                [1.0 if audio_present else 0.0], dtype=torch.float32
+            )
             # add batch dimension
             cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
             if self.dataset_config.cache_tensors_to_disk:
@@ -2544,7 +2809,14 @@ class LatentCachingMixin:
                     first_frames = frames[:, 0]
                 else:
                     raise ValueError(f"Unknown frame shape {frames.shape}")
-                first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
+                condition_encoder = getattr(self.sd, "encode_condition_images", None)
+                if callable(condition_encoder):
+                    # H3's first-frame condition has a deterministic posterior
+                    # recipe that is intentionally different from target VAE
+                    # encoding. Keep cached and uncached i2v paths identical.
+                    first_frame_latent = condition_encoder(first_frames).squeeze(0)
+                else:
+                    first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
                 if to_disk:
                     if cache_uint8:
                         state_dict['first_frame_latent'] = _latent_to_uint8(first_frame_latent).cpu()
@@ -2557,26 +2829,37 @@ class LatentCachingMixin:
                 if to_disk:
                     state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
 
-            if is_video or getattr(file_item, "is_audio_only", False):
-                state_dict['num_frames'] = torch.tensor(file_item.num_frames, dtype=torch.int32)
-
-            # save_latent
+            # Keep all extras returned by the model and add the physical
+            # presence fact even when no audio latent was produced.
+            if isinstance(latent, DTO):
+                extras = dict(latent.extras)
+                latent_tensor = latent.tensor
+            else:
+                extras = {}
+                latent_tensor = latent
+            extras["audio_present"] = torch.tensor(
+                [1.0 if audio_present else 0.0], dtype=torch.float32
+            )
+            if audio_latent is not None:
+                extras["audio"] = audio_latent
+            if getattr(file_item, "is_audio_only", False):
+                extras["audio_only"] = torch.tensor(True)
+            latent = DTO(latent_tensor, **extras)
             if to_disk:
-                # metadata
-                meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+                # Keep the temporal fact in the file itself; it is restored by
+                # get_latent() after disk-only cleanup and across restarts.
+                state_dict["num_frames"] = torch.tensor(
+                    int(getattr(file_item, "num_frames", 1)), dtype=torch.int64
+                )
                 os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                save_file(state_dict, latent_path, metadata=meta)
-
-            if to_memory:
-                # keep it in memory; audio rides inside the latent DTO
-                if audio_latent is not None:
-                    extras = {"audio": audio_latent}
-                    if getattr(file_item, "is_audio_only", False):
-                        extras["audio_only"] = torch.tensor(True)
-                    latent = DTO(latent, **extras)
-                file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
-                if first_frame_latent is not None:
-                    file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
+                metadata = get_meta_for_safetensors(
+                    file_item.get_latent_info_dict()
+                )
+                save_file(state_dict, latent_path, metadata=metadata)
+            file_item._cached_audio_present = audio_present
+            file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
+            if first_frame_latent is not None:
+                file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
 
             del imgs
             del latent
@@ -2613,46 +2896,112 @@ class TextEmbeddingFileItemDTOMixin:
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False, dopsd_other_ref_key=None):
-        # make sure the caption is loaded here
-        # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
+    def get_text_embedding_info_dict(
+        self: 'FileItemDTO',
+        caption_override=None,
+        text_only=False,
+        dopsd_self_ref=False,
+        dopsd_other_ref_key=None,
+    ):
+        # Resolve the effective caption before hashing. Dataset callers pass the
+        # authoritative JSON mapping; this fallback is for standalone DTO use.
         if self.caption is None:
             self.load_caption()
         item = OrderedDict([
             ("caption", self.caption if caption_override is None else caption_override),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
+            ("model_identity", self._cache_model_identity),
+            ("encoder_recipe", "selected-layer-natural-length-v2"),
         ])
         if dopsd_other_ref_key:
             item["dopsd_other_ref"] = str(dopsd_other_ref_key)
+            item["source_content_fingerprint"] = self.source_content_fingerprint
             return item
         if dopsd_self_ref:
-            # teacher embeds carry the item's own media as the vision reference
+            # Teacher embeds carry the item's own media as the vision reference.
+            # Keep source and transform identity in this role-specific key.
             item["dopsd_self_ref"] = True
+            item["source_content_fingerprint"] = self.source_content_fingerprint
+            item["vision_transform"] = {
+                "flip_x": bool(getattr(self, "flip_x", False)),
+                "flip_y": bool(getattr(self, "flip_y", False)),
+                "crop": [
+                    getattr(self, "crop_x", 0),
+                    getattr(self, "crop_y", 0),
+                    getattr(self, "crop_width", 0),
+                    getattr(self, "crop_height", 0),
+                ],
+                "num_frames": int(getattr(self, "num_frames", 1)),
+            }
             return item
-        # dropout embeds are encoded as plain text, keep control conditioning
-        # out of their cache key
-        if text_only:
-            return item
-        # if we have a control image, cache the path
-        if self.encode_control_in_text_embeddings and self.control_path is not None:
-            item["control_path"] = self.control_path
-            if getattr(self, 'text_embedding_uses_target_size', False) and getattr(self, 'crop_width', None):
+
+        # Caption-only dropout MUST retain the same visual controls as the
+        # live path. ``text_only`` remains an API-compatible argument but no
+        # longer drops control identity from the key.
+        control_paths = getattr(self, "control_path", None)
+        control_fingerprint_cache = getattr(self, "_control_fingerprint_cache", None)
+        if control_fingerprint_cache is None:
+            control_fingerprint_cache = {}
+            self._control_fingerprint_cache = control_fingerprint_cache
+        if control_paths is not None:
+            if not isinstance(control_paths, list):
+                control_paths = [control_paths]
+            item["control_paths"] = []
+            for path in control_paths:
+                path_key = str(path)
+                item["control_paths"].append({
+                    "path": path_key,
+                    "fingerprint": _memoized_fingerprint(
+                        control_fingerprint_cache, path
+                    ),
+                })
+            if (
+                getattr(self, "text_embedding_uses_target_size", False)
+                and getattr(self, "crop_width", None)
+            ):
                 item["control_target_size"] = [self.crop_width, self.crop_height]
-        if self.encode_control_in_text_embeddings and getattr(self, 'control_video_paths', None):
-            item["control_videos"] = sorted(self.control_video_paths)
-            # v2: reference-video vision blocks are no longer resampled by the
-            # processor (do_sample_frames=False); older video-ref embeds are
-            # misaligned with their presentation. Only items WITH control
-            # videos carry this key, so no other cache is touched.
+        control_videos = getattr(self, "control_video_paths", None) or []
+        if control_videos:
+            # Order is semantic: references receive numbered roles in this
+            # order, so sorting would alias distinct conditioning.
+            item["control_videos"] = []
+            for path in control_videos:
+                path_key = str(path)
+                item["control_videos"].append({
+                    "path": path_key,
+                    "fingerprint": _memoized_fingerprint(
+                        control_fingerprint_cache, path
+                    ),
+                })
             item["control_videos_version"] = 2
-        # first-frame vision conditioning changes the embedding content -> new cache key
+            item["control_video_recipe"] = {
+                "fps": getattr(self.dataset_config, "fps", 24),
+                "num_frames": getattr(self.dataset_config, "num_frames", 1),
+                "auto_frame_count": bool(
+                    getattr(self.dataset_config, "auto_frame_count", False)
+                ),
+                "trim_tail": bool(
+                    getattr(self.dataset_config, "trim_auto_frame_count_tail", False)
+                ),
+            }
         elif (
             getattr(self, "encode_first_frame_in_text_embeddings", False)
             and self.dataset_config.do_i2v
             and self.is_video
         ):
             item["first_frame_in_te"] = True
+            item["source_content_fingerprint"] = self.source_content_fingerprint
+            item["vision_transform"] = {
+                "flip_x": bool(getattr(self, "flip_x", False)),
+                "flip_y": bool(getattr(self, "flip_y", False)),
+                "crop": [
+                    getattr(self, "crop_x", 0),
+                    getattr(self, "crop_y", 0),
+                    getattr(self, "crop_width", 0),
+                    getattr(self, "crop_height", 0),
+                ],
+            }
         return item
 
     def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False, dopsd_other_ref_key=None):
@@ -2716,9 +3065,8 @@ class TextEmbeddingFileItemDTOMixin:
         if self._dop_blank_text_embedding_path is not None and not recalculate:
             return self._dop_blank_text_embedding_path
         else:
-            # if the DOP dropout caption matches the dropout caption, this hashes to
-            # the same path as the blank embedding and the cache file is shared.
-            # text_only: dropout embeds carry no control conditioning
+            # DOP dropout keeps the same control/vision role identity as the
+            # live path; ``text_only`` is retained for API compatibility.
             self._dop_blank_text_embedding_path = self._build_text_embedding_path(
                 caption_override=self.get_dop_dropout_caption(), text_only=True
             )
@@ -2766,10 +3114,8 @@ class TextEmbeddingFileItemDTOMixin:
         if self._blank_text_embedding_path is not None and not recalculate:
             return self._blank_text_embedding_path
         else:
-            # if the dropout caption matches the normal caption (and the item has no
-            # control conditioning), this hashes to the same path as the normal
-            # embedding and the cache file is shared.
-            # text_only: dropout embeds carry no control conditioning
+            # Caption-only dropout keeps the same control/vision role identity
+            # as the live path; ``text_only`` is retained for API compatibility.
             self._blank_text_embedding_path = self._build_text_embedding_path(
                 caption_override=self.get_dropout_caption(), text_only=True
             )
@@ -2837,30 +3183,32 @@ class TextEmbeddingCachingMixin:
             # use tqdm to show progress
             i = 0
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
+                # JSON/short-caption authority is resolved before any path is
+                # computed. This also lets a changed caption re-key without
+                # deleting the previous orphan cache file.
+                file_item.refresh_source_cache_provenance()
+                file_item.load_caption(getattr(self, "caption_dict", None), force=True)
                 file_item.latent_load_device = self.sd.device
 
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # (path, caption) pairs to encode for this item
                 encode_targets = [(text_embedding_path, file_item.caption)]
                 if self.dataset_config.diff_output_preservation:
                     dop_path = file_item.get_dop_text_embedding_path(recalculate=True)
                     if dop_path != text_embedding_path:
                         # trigger word was in the caption, cache the DOP version too
                         encode_targets.append((dop_path, file_item.caption_dop))
-                # dropout embeds are encoded as plain text (no control images)
-                dropout_target_paths = set()
+                # Dropout changes text only; visual controls remain part of the
+                # cached conditioning when configured.
                 if self.dataset_config.caption_dropout_rate > 0:
                     blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
                     if blank_path != text_embedding_path:
                         # cache the dropout caption embedding (blank, or trigger word only)
                         encode_targets.append((blank_path, file_item.get_dropout_caption()))
-                        dropout_target_paths.add(blank_path)
                     if self.dataset_config.diff_output_preservation:
                         # cache the DOP version of the dropout caption (class only)
                         dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
                         if dop_blank_path not in [t[0] for t in encode_targets] + [text_embedding_path]:
                             encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
-                            dropout_target_paths.add(dop_blank_path)
                 # only process if not saved to disk
                 encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
                 if len(encode_targets) > 0:
@@ -2913,17 +3261,12 @@ class TextEmbeddingCachingMixin:
                         if getattr(file_item, 'crop_width', None) and getattr(file_item, 'crop_height', None):
                             target_size = (file_item.crop_width, file_item.crop_height)
                         for path, caption in encode_targets:
-                            if path in dropout_target_paths:
-                                # dropout embeds are plain text. Only fall back to the
-                                # control images if the model cannot encode without them
-                                try:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
-                                except Exception:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
-                                        caption, control_images=ctrl_img, target_size=target_size)
-                            else:
-                                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
-                                    caption, control_images=ctrl_img, target_size=target_size)
+                            # Caption dropout changes text only. Vision controls
+                            # and their role/order remain present in the cached
+                            # embed exactly as in the live path.
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                caption, control_images=ctrl_img, target_size=target_size
+                            )
                             prompt_embeds.save(path)
                             del prompt_embeds
                     elif (
@@ -2946,15 +3289,11 @@ class TextEmbeddingCachingMixin:
                         if self.sd.has_multiple_control_images:
                             ctrl_img = [ctrl_img]
                         for path, caption in encode_targets:
-                            if path in dropout_target_paths:
-                                # dropout embeds are plain text. Only fall back to the
-                                # control images if the model cannot encode without them
-                                try:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
-                                except Exception:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            else:
-                                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                            # Caption dropout still includes the first-frame
+                            # vision condition; only the caption is empty.
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                caption, control_images=ctrl_img
+                            )
                             prompt_embeds.save(path)
                             del prompt_embeds
                         file_item.tensor = None

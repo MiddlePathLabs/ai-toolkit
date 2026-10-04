@@ -149,7 +149,7 @@ class MiniMaxH3Pipeline:
             frame = torch.from_numpy(np.array(img)).float()
             frame = (frame / 255.0) * 2.0 - 1.0  # (H, W, 3) -> [-1, 1]
             frame = frame.permute(2, 0, 1)[None, :, None]  # (1, 3, 1, H, W)
-            cond_latents = model.encode_keyframe_latents(frame)  # (1, 24, 1, h, w) fp32
+            cond_latents = model.encode_condition_images(frame)  # (1, 24, 1, h, w) fp32
             # released noise-aug recipe: x = t * clean + (1 - t) * noise at t = 0.999
             cond_latents = (
                 KEYFRAME_NOISE_AUG_T * cond_latents.to(device)

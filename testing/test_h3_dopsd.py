@@ -187,9 +187,9 @@ def test_phase2_skips_teacher_and_other_photo_batch():
     )
     photo_batch = SimpleNamespace(file_items=[_photo("a.jpg", r"E:\s")])
     clip_batch = SimpleNamespace(file_items=[_photo("c.mp4", r"E:\s", video=True)])
-    assert dopsd_teacher_wanted(settings, step_num=0, batch=photo_batch)
-    assert not dopsd_teacher_wanted(settings, step_num=5, batch=photo_batch)
-    assert not dopsd_teacher_wanted(settings, step_num=0, batch=clip_batch)
+    assert dopsd_teacher_wanted(settings, completed_update_id=0, batch=photo_batch)
+    assert not dopsd_teacher_wanted(settings, completed_update_id=5, batch=photo_batch)
+    assert not dopsd_teacher_wanted(settings, completed_update_id=0, batch=clip_batch)
 
 
 def test_unweighted_errors_are_raw():

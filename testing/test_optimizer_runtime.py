@@ -10,6 +10,10 @@ from toolkit.optimizer_runtime import (
     OptimizerRuntimeAdapter,
     classify_optimizer,
     mean_window_scale,
+    window_sample_coefficients,
+    materialize_private_gradients,
+    clear_optimizer_gradients,
+    prepare_optimizer_step,
     uses_adaptive_lr_step_scale,
 )
 
@@ -65,6 +69,62 @@ def test_mean_window_scale_counts_each_item_once():
     members["a"] = 1.0
     members["reg"] = 1.0
     assert mean_window_scale(members) == pytest.approx(1.0)
+
+
+def test_window_coefficients_match_combined_sgd_oracle_for_unequal_partitions():
+    counts = (1, 3, 2)
+    means = (torch.tensor(2.0), torch.tensor(-1.0), torch.tensor(4.0))
+    coeffs = window_sample_coefficients(counts)
+    partition_gradient = sum(
+        coefficient * mean for coefficient, mean in zip(coeffs, means)
+    )
+    combined_gradient = sum(
+        count * mean for count, mean in zip(counts, means)
+    ) / sum(counts)
+    assert partition_gradient.item() == pytest.approx(combined_gradient.item())
+    assert window_sample_coefficients((0, 0)) == (0.0, 0.0)
+    with pytest.raises(ValueError, match="nonnegative"):
+        window_sample_coefficients((1, -1))
+
+
+def test_private_low_precision_gradient_is_materialized_and_discarded():
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    parameter._accum_grad = torch.full_like(parameter, 3.0)
+    assert parameter.grad is None
+    assert materialize_private_gradients(optimizer) == 1
+    assert torch.equal(parameter.grad, torch.full_like(parameter, 3.0))
+    parameter._accum_grad = torch.full_like(parameter, 4.0)
+    clear_optimizer_gradients(optimizer)
+    assert parameter.grad is None
+    assert not hasattr(parameter, "_accum_grad")
+def test_prepare_optimizer_step_clears_stale_mutable_skip_result():
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    optimizer.step_was_skipped = True
+    prepare_optimizer_step(optimizer)
+    assert optimizer.step_was_skipped is False
+
+
+
+def test_factory_epsilon_override_reaches_real_adamw():
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = get_optimizer(
+        [parameter], "adamw", learning_rate=1e-3, optimizer_params={"eps": 3e-4}
+    )
+    assert optimizer.param_groups[0]["eps"] == pytest.approx(3e-4)
+
+
+def test_adaptive_window_oracle_scales_combined_gradient_once():
+    counts = (2, 1)
+    means = (torch.tensor(3.0), torch.tensor(-2.0))
+    multipliers = (0.25, 1.75)
+    coeffs = window_sample_coefficients(counts)
+    unscaled = sum(c * mean for c, mean in zip(coeffs, means))
+    expected = unscaled * mean_window_scale(multipliers)
+    # LR-mode adaptive weighting is a final update scale, not a second loss
+    # multiplier on each microbatch.
+    assert expected.item() == pytest.approx(unscaled.item())
 
 
 def test_begin_window_allows_zero_rejects_nonfinite_and_negative():
@@ -186,6 +246,25 @@ def test_fused_backward_rejects_multi_backward_windows():
         adapter.validate_for_train_config(_train_cfg(single_item_batching=True))
     with pytest.raises(ValueError, match="mean_flow"):
         adapter.validate_for_train_config(_train_cfg(loss_type="mean_flow"))
+
+
+def test_fused_backward_gate_is_independent_of_adaptive_lr():
+    opt = get_optimizer(_params(), "automagic2", 1e-6, {})
+    adapter = OptimizerRuntimeAdapter.inspect(opt, optimizer_type="automagic2")
+    no_adaptive_lr = _train_cfg(
+        per_image_adaptive_lr=False,
+        per_image_adaptive_lr_mode="loss",
+        gradient_accumulation=1,
+    )
+    adapter.validate_for_train_config(no_adaptive_lr)
+    with pytest.raises(ValueError, match="fused-backward"):
+        adapter.validate_for_train_config(
+            _train_cfg(
+                per_image_adaptive_lr=False,
+                per_image_adaptive_lr_mode="loss",
+                gradient_accumulation=2,
+            )
+        )
 
 
 def test_group_lr_scale_restored_after_step_and_exception():

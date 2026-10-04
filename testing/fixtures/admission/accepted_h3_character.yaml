@@ -1,0 +1,47 @@
+job: extension
+config:
+  name: accepted_h3_character_scrubbed
+  process:
+    - type: diffusion_trainer
+      training_folder: ./output/scrubbed
+      model:
+        name_or_path: ./models/scrubbed/minimax_h3_ref2va
+        arch: minimax_h3_ref2va
+        model_kwargs:
+          partition: ref2va_pruned
+          vae_encode_fp32: true
+        assistant_lora_path: ./models/scrubbed/h3_training_adapter.safetensors
+      network:
+        type: lora
+        linear: 16
+        linear_alpha: 16
+        network_kwargs:
+          ignore_if_contains: [adaln_proj]
+      train:
+        optimizer: automagic3
+        optimizer_params:
+          fused: true
+        gradient_accumulation: 1
+        gradient_accumulation_steps: 1
+        batch_size: 1
+        loss_type: mse
+        loss_target: noise
+        timestep_type: sigmoid
+        audio_loss_multiplier: 1.0
+        do_guidance_loss: false
+      datasets:
+        - dataset_path: ./datasets/scrubbed_h3_character
+          buckets: true
+          cache_latents_to_disk: true
+          cache_text_embeddings: false
+          do_audio: true
+          audio_normalize: false
+          audio_preserve_pitch: false
+          auto_frame_count: true
+          fps: 24
+          num_frames: 39
+          caption_dropout_rate: 0.0
+      sample:
+        num_frames: 107
+        fps: 24
+        guidance_scale: 1

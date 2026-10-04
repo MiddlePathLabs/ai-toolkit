@@ -798,6 +798,23 @@ class MinimaxH3Model(BaseModel):
         )
         return latents.float()
 
+    @torch.no_grad()
+    def encode_condition_images(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode visual conditions with H3's deterministic posterior recipe.
+
+        Accepts either ``(B, 3, H, W)`` images or ``(B, 3, T, H, W)``
+        clips in ``[-1, 1]``.  The condition path is intentionally separate
+        from target/generic image encoding: it uses the fresh CPU seed-42
+        posterior sample and fp16-round-before-normalization behavior.
+        """
+        if images.ndim == 4:
+            images = images.unsqueeze(2)
+        if images.ndim != 5:
+            raise ValueError(
+                f"condition images must be 4D or 5D, got shape {tuple(images.shape)}"
+            )
+        return self.encode_keyframe_latents(images)
+
     def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
         # differentiable: pixel-space losses backprop through the video VAE
         if self.vae.device == torch.device("cpu"):
@@ -919,7 +936,7 @@ class MinimaxH3Model(BaseModel):
                     "first_frame_latents or raw tensors in batch"
                 )
             first_frames = frames[:, 0] if frames.ndim == 5 else frames
-            first_latents = self.encode_keyframe_latents(
+            first_latents = self.encode_condition_images(
                 first_frames.unsqueeze(2).to(device)
             )
         if first_latents.ndim == 4:
@@ -930,6 +947,132 @@ class MinimaxH3Model(BaseModel):
             + (1.0 - KEYFRAME_NOISE_AUG_T) * cond_noise
         )
         return patchify_video_latents(first_latents).to(dtype), None, ("first",), ()
+
+    @staticmethod
+    def _audio_present_for_batch(batch, batch_size: int, device: torch.device):
+        """Return the physical soundtrack fact, never the ``do_audio`` policy."""
+        if batch is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        present = getattr(batch, "audio_present", None)
+        if present is not None:
+            present = torch.as_tensor(present, device=device).reshape(-1).to(torch.bool)
+            if present.numel() != batch_size:
+                raise ValueError(
+                    f"audio_present has {present.numel()} rows for batch size {batch_size}"
+                )
+            return present
+        audio_data = getattr(batch, "audio_data", None)
+        if isinstance(audio_data, dict):
+            if batch_size != 1:
+                raise ValueError(
+                    "audio_data mapping is only valid for a batch of size 1; "
+                    f"got batch size {batch_size}"
+                )
+            return torch.ones(1, dtype=torch.bool, device=device)
+        if isinstance(audio_data, (list, tuple)):
+            if len(audio_data) != batch_size:
+                raise ValueError(
+                    f"audio_data has {len(audio_data)} rows for batch size {batch_size}"
+                )
+            return torch.tensor(
+                [item is not None for item in audio_data],
+                dtype=torch.bool,
+                device=device,
+            )
+        # Legacy cached batches may carry an audio stream without the explicit
+        # marker.  A single row is unambiguous; for a stacked batch, DTO.stack
+        # zero-fills absent legacy streams, so infer only the nonzero rows rather
+        # than turning every absent item into a supervised target.
+        cached_audio = getattr(batch, "audio_latents", None)
+        if cached_audio is not None:
+            cached_audio = torch.as_tensor(cached_audio, device=device)
+            if cached_audio.ndim == 2 and batch_size == 1:
+                return torch.ones(1, dtype=torch.bool, device=device)
+            if cached_audio.ndim >= 3 and cached_audio.shape[0] == batch_size:
+                return cached_audio.detach().abs().reshape(batch_size, -1).any(dim=1)
+        return torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    def _prepare_audio_batch(
+        self,
+        batch,
+        batch_size: int,
+        a_lat: int,
+        do_audio: bool,
+        sigma_a: torch.Tensor,
+        device: torch.device,
+    ):
+        """Prepare one clean/noise audio pair shared by every H3 forward pass."""
+        silence = self._silence_audio_rows(a_lat).to(device, torch.float32)
+        clean = silence.expand(batch_size, -1, -1).clone()
+        audio_present = self._audio_present_for_batch(batch, batch_size, device)
+
+        if do_audio:
+            cached = getattr(batch, "audio_latents", None) if batch is not None else None
+            if cached is not None:
+                cached = cached.to(device, torch.float32)
+                if cached.ndim == 2:
+                    cached = cached.unsqueeze(0)
+                if cached.shape[0] != batch_size:
+                    raise ValueError(
+                        f"cached audio has {cached.shape[0]} rows for batch size {batch_size}"
+                    )
+                for index in torch.where(audio_present)[0].tolist():
+                    clean[index] = packing.fit_audio_rows(cached[index], a_lat)
+            else:
+                audio_data = getattr(batch, "audio_data", None) if batch is not None else None
+                if isinstance(audio_data, dict):
+                    audio_data = [audio_data]
+                if isinstance(audio_data, (list, tuple)):
+                    indices = [
+                        index
+                        for index, item in enumerate(audio_data)
+                        if index < batch_size
+                        and bool(audio_present[index].item())
+                        and item is not None
+                    ]
+                    if indices:
+                        encoded = self.encode_audio(
+                            [audio_data[index] for index in indices]
+                        ).to(device, torch.float32)
+                        for encoded_index, batch_index in enumerate(indices):
+                            clean[batch_index] = packing.fit_audio_rows(
+                                encoded[encoded_index], a_lat
+                            )
+
+        existing_noise = None
+        if batch is not None and isinstance(getattr(batch, "latents", None), DTO):
+            existing_noise = batch.latents.get("audio_noise")
+        if existing_noise is None and batch is not None:
+            existing_noise = getattr(batch, "_h3_audio_noise", None)
+        if existing_noise is not None and tuple(existing_noise.shape) == tuple(clean.shape):
+            audio_noise = existing_noise.to(device, torch.float32)
+        else:
+            audio_noise = torch.randn_like(clean)
+
+        audio_mask = audio_present & bool(do_audio)
+        audio_target = (
+            (audio_noise - clean).detach() if audio_mask.any() else None
+        )
+        audio_rows = (
+            (1.0 - sigma_a.view(-1, 1, 1)) * clean
+            + sigma_a.view(-1, 1, 1) * audio_noise
+        )
+
+        if batch is not None:
+            if getattr(batch, "latents", None) is not None:
+                batch.latents = DTO(
+                    batch.latents,
+                    audio=clean,
+                    audio_noise=audio_noise,
+                    audio_present=audio_present,
+                )
+            else:
+                # Real training batches normally carry visual latents already;
+                # keep a side-channel fallback for uncached/unit callers.
+                batch._h3_audio_rows = clean
+                batch._h3_audio_noise = audio_noise
+                batch.audio_present = audio_present
+        return audio_rows, audio_target, audio_mask, audio_present, clean
 
     def get_noise_prediction(
         self,
@@ -958,6 +1101,31 @@ class MinimaxH3Model(BaseModel):
             t_v = 1.0 - sigma_v
             t_a = 1.0 - sigma_a
 
+            # Resolve clean audio and its shared noise before any condition
+            # builder (D-OPSD teacher consumes batch.audio_latents).
+            if batch is not None and getattr(batch, "num_frames", None):
+                num_frames = batch.num_frames
+            else:
+                num_frames = (t_lat - 2) // 5 * 17 + 5 if t_lat > 1 else 1
+            a_lat = packing.audio_latent_num_frames(num_frames)
+            dataset_config = getattr(batch, "dataset_config", None)
+            do_audio = bool(
+                batch is not None
+                and dataset_config is not None
+                and dataset_config.do_audio
+                and num_frames > 1
+            )
+            (
+                audio_rows,
+                audio_target,
+                audio_mask,
+                audio_present,
+                _clean_audio_rows,
+            ) = self._prepare_audio_batch(
+                batch, batch_size, a_lat, do_audio, sigma_a, device
+            )
+            noisy_audio_rows = audio_rows
+
             # --- conditioning rows (fl2va keyframe / ref2va references) ----
             (
                 cond_rows,
@@ -965,87 +1133,6 @@ class MinimaxH3Model(BaseModel):
                 keyframe_anchors,
                 ref_blocks,
             ) = self._build_condition(batch, (t_lat, h_lat, w_lat), device, dtype)
-
-            # --- audio rows -------------------------------------------------
-            if batch is not None and getattr(batch, "num_frames", None):
-                num_frames = batch.num_frames
-            else:
-                # invert 17n+5 -> 5n+2 from the latent frame count
-                num_frames = (t_lat - 2) // 5 * 17 + 5 if t_lat > 1 else 1
-            a_lat = packing.audio_latent_num_frames(num_frames)
-            # audio only trains for video batches from datasets that asked for
-            # it. Cached latents can carry audio after do_audio was turned off,
-            # and image (single frame) batches must never pick up a soundtrack
-            # — either way it rides along as silence with no audio loss.
-            do_audio = (
-                batch is not None
-                and batch.dataset_config is not None
-                and batch.dataset_config.do_audio
-                and num_frames > 1
-            )
-            raw_audio = None
-            if do_audio and batch.audio_latents is not None:
-                raw_audio = batch.audio_latents.to(device, torch.float32)
-            elif do_audio and getattr(batch, "audio_data", None) is not None:
-                raw_audio = self.encode_audio(batch.audio_data).to(
-                    device, torch.float32
-                )
-
-            sa = sigma_a.view(-1, 1, 1)
-            audio_target = None
-            noisy_audio_rows = None
-            if raw_audio is not None:
-                expected_rows = a_lat * packing.AUDIO_CHANNELS
-                if raw_audio.shape[1] > expected_rows:
-                    raw_audio = raw_audio[:, :expected_rows]
-                elif raw_audio.shape[1] < expected_rows:
-                    raw_audio = torch.nn.functional.pad(
-                        raw_audio, (0, 0, 0, expected_rows - raw_audio.shape[1])
-                    )
-                # the audio noise is drawn once per step and shared by every
-                # pass (prior, primary, cfg/guidance, preservation) so they all
-                # see the same soundtrack and every pass's target matches. It
-                # rides on the latents DTO along with the trimmed audio so
-                # on-the-fly encodes aren't repeated per pass.
-                audio_noise = (
-                    batch.latents.get("audio_noise")
-                    if isinstance(batch.latents, DTO)
-                    else None
-                )
-                if audio_noise is not None and audio_noise.shape == raw_audio.shape:
-                    audio_noise = audio_noise.to(device, torch.float32)
-                else:
-                    audio_noise = torch.randn_like(raw_audio)
-                    if batch.latents is not None:
-                        batch.latents = DTO(
-                            batch.latents, audio=raw_audio, audio_noise=audio_noise
-                        )
-                audio_rows = (1.0 - sa) * raw_audio + sa * audio_noise
-                # model predicts clean - noise; audio_pred is negated below so
-                # the target follows ai-toolkit's noise - clean convention
-                audio_target = (audio_noise - raw_audio).detach()
-                # what audio perceptual losses need to rebuild the clean
-                # estimate (x0 = noisy - sigma_a * pred); rides the pred DTO
-                noisy_audio_rows = audio_rows
-            else:
-                # no soundtrack: VAE-encoded silence noised at the audio sigma
-                # rides along without contributing to the loss. Its noise is
-                # shared across passes like a real soundtrack's, so teacher /
-                # guidance probes see the same audio rows as the student.
-                silence = self._silence_audio_rows(a_lat).to(device)
-                silence = silence.expand(batch_size, -1, -1)
-                audio_noise = (
-                    batch.latents.get("audio_noise")
-                    if batch is not None and isinstance(batch.latents, DTO)
-                    else None
-                )
-                if audio_noise is not None and audio_noise.shape == silence.shape:
-                    audio_noise = audio_noise.to(device, torch.float32)
-                else:
-                    audio_noise = torch.randn_like(silence)
-                    if batch is not None and batch.latents is not None:
-                        batch.latents = DTO(batch.latents, audio_noise=audio_noise)
-                audio_rows = (1.0 - sa) * silence + sa * audio_noise
 
             # embeds cached with a longer max_text_length: cap the caption
             # tail (vision blocks are never touched)
@@ -1117,22 +1204,18 @@ class MinimaxH3Model(BaseModel):
         # Training pass (LoRA/adapters): the pruned fp16 checkpoint drives the text
         # rows to inf in the last block. Harmless for the base model, fatal for
         # adapters (NaN grads everywhere) — guard both the LoRA input and the
-        # backward path. A grad pass sets the flags and leaves them set. A no-grad
-        # pass (sampling / guidance-loss probe) runs the untouched forward with the
-        # guards off, then restores what was there before: a gradient-checkpointed
-        # training forward may still be awaiting its backward, and its recompute
-        # has to see the flags the original forward saw or torch.utils.checkpoint
-        # raises CheckpointError. See transformer._zero_nonfinite_grad and
-        # network_mixins.
+        # backward path. A grad pass leaves the network guard enabled until its
+        # checkpointed backward recompute. A no-grad pass restores that network
+        # state before returning so an outstanding training graph sees the same
+        # value. The transformer receives its guard as a per-forward argument,
+        # avoiding model-attribute desynchronization across guidance probes.
         training = torch.is_grad_enabled()
         network = getattr(self, "network", None)
-        prev_transformer_flag = self.model.sanitize_backward_nonfinite
         prev_network_flag = (
             getattr(network, "zero_nonfinite_lora_inputs", False)
             if network is not None
             else False
         )
-        self.model.sanitize_backward_nonfinite = training
         if network is not None:
             network.zero_nonfinite_lora_inputs = training
         try:
@@ -1148,12 +1231,11 @@ class MinimaxH3Model(BaseModel):
                 text_indices=text_indices.to(device),
                 # target-video token grid (patch 1x2x2); VSA tiling and TREAD still/clip routing
                 vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+                sanitize_backward_nonfinite=training,
             )
         finally:
-            if not training:
-                self.model.sanitize_backward_nonfinite = prev_transformer_flag
-                if network is not None:
-                    network.zero_nonfinite_lora_inputs = prev_network_flag
+            if not training and network is not None:
+                network.zero_nonfinite_lora_inputs = prev_network_flag
 
         if num_cond_audio > 0:
             # reference soundtrack rows are conditioning, not targets
@@ -1161,15 +1243,18 @@ class MinimaxH3Model(BaseModel):
 
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
-        if audio_target is not None:
-            # every pass's DTO carries its own audio stream; preds flipped to
-            # ai-toolkit's noise - clean convention
+        if do_audio:
+            # Keep the batch contract even when every row is absent: audio_mask
+            # and audio_present remain [B], while audio_target stays None so the
+            # trainer cannot invent a loss for encoded-silence context.
             return DTO(
                 -noise_pred,
                 audio=-audio_pred,
                 audio_target=audio_target,
                 audio_noisy=noisy_audio_rows,
                 audio_sigma=sigma_a,
+                audio_mask=audio_mask,
+                audio_present=audio_present,
             )
         return -noise_pred
 
@@ -1179,11 +1264,9 @@ class MinimaxH3Model(BaseModel):
         return (noise - batch.latents).detach()
 
     def timestep_to_base_sigma(self, sigma_v: torch.Tensor) -> torch.Tensor:
-        """Video sigma (timesteps / 1000, post shift-12) -> the shared base
-        sigma both streams are derived from. Sigma thresholds (guidance-loss
-        gate, teacher gates, logs) are defined in this base space, as in
-        musubi-tuner: base 0.15 is video sigma ~0.68, not 0.15."""
-        return packing.shift_sigma(sigma_v, 1.0 / packing.VIDEO_SIGMA_SHIFT)
+        """Invert the active model video shift into shared base sigma space."""
+        shift = getattr(self, "video_sigma_shift", packing.VIDEO_SIGMA_SHIFT)
+        return packing.shift_sigma(sigma_v, 1.0 / shift)
 
     # ------------------------------------------------------------------
     # Sampling (training previews)
@@ -1459,7 +1542,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             frames = (torch.stack(resized) * 2.0 - 1.0).unsqueeze(2)
             if as_video_frames:
                 frames = frames.expand(-1, -1, as_video_frames, -1, -1).contiguous()
-            ref_latents = self.encode_keyframe_latents(frames)
+            ref_latents = self.encode_condition_images(frames)
             ref_noise = torch.randn_like(ref_latents)
             ref_latents = (
                 KEYFRAME_NOISE_AUG_T * ref_latents
@@ -1498,7 +1581,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         else:
             # video items: (B, T, C, H, W) -> (B, C, T, H, W)
             frames = px.permute(0, 2, 1, 3, 4).contiguous()
-        ref_latents = self.encode_keyframe_latents(frames)
+        ref_latents = self.encode_condition_images(frames)
         ref_noise = torch.randn_like(ref_latents)
         ref_latents = (
             KEYFRAME_NOISE_AUG_T * ref_latents
@@ -1506,20 +1589,28 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         )
         audio_rows = None
         a_lat = 0
+        prepared_audio = getattr(batch, "audio_latents", None)
         if (
-            batch.dataset_config is not None
-            and batch.dataset_config.do_audio
-            and batch.audio_latents is not None
+            getattr(getattr(batch, "dataset_config", None), "do_audio", False)
+            and prepared_audio is not None
             and getattr(batch, "num_frames", 1) > 1
         ):
             a_lat = packing.audio_latent_num_frames(batch.num_frames)
+            prepared_audio = torch.as_tensor(prepared_audio)
+            if prepared_audio.ndim == 2:
+                prepared_audio = prepared_audio.unsqueeze(0)
+            if prepared_audio.ndim != 3 or prepared_audio.shape[0] != ref_latents.shape[0]:
+                raise ValueError(
+                    "prepared H3 audio must have shape [B, rows, channels], "
+                    f"got {tuple(prepared_audio.shape)} for B={ref_latents.shape[0]}"
+                )
             audio_rows = torch.stack(
                 [
-                    self._fit_audio_rows(
-                        batch.audio_latents[b].detach().to(device, torch.float32),
+                    packing.fit_audio_rows(
+                        prepared_audio[index].detach().to(device, torch.float32),
                         a_lat,
                     )
-                    for b in range(batch.audio_latents.shape[0])
+                    for index in range(prepared_audio.shape[0])
                 ]
             ).to(dtype)
         blocks = (
@@ -1568,14 +1659,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             .transpose(0, 1)
             .reshape(1, 3, len(frames), ph, pw)
         )
-        generator = torch.Generator(device="cpu").manual_seed(KEYFRAME_ENCODE_SEED)
-        latents = self.video_vae.encode(
-            pixels.to(self.vae.device, self.video_vae.dtype),
-            sample=True,
-            generator=generator,
-            fp16_round=True,
-            fp32=self.vae_encode_fp32,
-        )
+        latents = self.encode_condition_images(pixels)
         # soundtrack rides clean when the clip has one (same test as the TE label)
         audio_rows = None
         try:
@@ -1594,7 +1678,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                 [{"waveform": waveform, "sample_rate": sample_rate}]
             )[0]
             a_lat = packing.audio_latent_num_frames(n)
-            audio_rows = self._fit_audio_rows(rows.float(), a_lat)
+            audio_rows = packing.fit_audio_rows(rows.float(), a_lat)
         except Exception:
             pass
         return {"latent": latents[0].float(), "audio_rows": audio_rows}
@@ -1619,7 +1703,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         pixels = torch.from_numpy(np.asarray(image)).float() / 255.0 * 2.0 - 1.0
         pixels = pixels.permute(2, 0, 1)[None, :, None]  # (1, 3, 1, H, W)
         pixels = pixels.expand(-1, -1, n, -1, -1).contiguous()
-        latents = self.encode_keyframe_latents(pixels)
+        latents = self.encode_condition_images(pixels)
         return {"latent": latents[0].float(), "audio_rows": None}
 
     def _append_video_ref_blocks(
@@ -1665,7 +1749,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             if all(a is not None for a in auds):
                 a_lat = packing.audio_latent_num_frames(entry["num_frames"])
                 trimmed = [
-                    self._fit_audio_rows(a.to(device, torch.float32), a_lat)
+                    packing.fit_audio_rows(a.to(device, torch.float32), a_lat)
                     for a in auds
                 ]
                 if len({t.shape for t in trimmed}) == 1:
@@ -1682,17 +1766,6 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             )
             all_rows.append(patchify_video_latents(ref_latents).to(dtype))
 
-    @staticmethod
-    def _fit_audio_rows(rows: torch.Tensor, a_lat: int) -> torch.Tensor:
-        """Trim/pad channel-major packed rows (2*T, C) to 2*a_lat rows,
-        per stereo channel."""
-        t = rows.shape[0] // 2
-        per_ch = rows.reshape(2, t, rows.shape[-1])
-        if t > a_lat:
-            per_ch = per_ch[:, :a_lat]
-        elif t < a_lat:
-            per_ch = torch.nn.functional.pad(per_ch, (0, 0, 0, a_lat - t))
-        return per_ch.reshape(2 * a_lat, rows.shape[-1])
 
     def generate_single_image(
         self,

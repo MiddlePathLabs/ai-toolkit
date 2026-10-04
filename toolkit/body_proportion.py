@@ -3,9 +3,11 @@
 A frozen ViTPose-Plus-Base pose estimator produces 17 COCO keypoints; from
 those we compute 8 pose-invariant bone-length ratios (10 with head) that
 characterize a person's proportions independent of pose. Gradients flow
-through a differentiable affine warp (replicating the HF processor) into the
-ViTPose forward and a vendored soft-argmax heatmap decode, so the same
-instance serves the live body-proportion loss.
+through a differentiable affine warp (replicating the HF processor), the
+ViTPose forward, and a vendored soft-argmax heatmap decode into the generated
+pixels. The live path also returns the estimator's raw per-ratio confidence so
+the missing-body shortfall has a real corrective derivative instead of a
+detached positive scalar.
 
 Only the body-PROPORTION auxiliary loss is ported here. The source module
 also contained an SMPL body-shape CONDITIONING feature (HMR2 /
@@ -32,12 +34,11 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
-
-NUM_BODY_RATIOS = 8
-NUM_HEAD_RATIOS = 2
-# Cache version key encodes include_head so changing it invalidates the cache.
-CACHE_VERSION_KEY_BODY = "body_proportion_v3"
-CACHE_VERSION_KEY_HEAD = "body_proportion_v4_head"
+# Cache version keys encode confidence semantics and include_head so changing the
+# live estimator recipe invalidates stale GT ratios.  The v8/v9 keys specifically
+# record the beta-10 confidence without a second post-softplus division.
+CACHE_VERSION_KEY_BODY = "body_proportion_v8_softplus_beta10"
+CACHE_VERSION_KEY_HEAD = "body_proportion_v9_head_softplus_beta10"
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,26 @@ class DifferentiableBodyProportionEncoder(nn.Module):
         return _soft_argmax_2d(hm)
 
     @staticmethod
-    def _compute_ratios(keypoints, visibilities, ref_ratios=None, include_head=False):
+    def _heatmaps_to_confidence(heatmaps: torch.Tensor) -> torch.Tensor:
+        """Convert raw heatmaps to a smooth nonnegative confidence score.
+
+        ``F.softplus(input, beta=10)`` already includes the ``1 / beta`` factor.
+        Do not divide its result again: a normal heatmap peak of ``1`` should
+        remain approximately ``1`` and clear ``VIS_THRESHOLD``.  A hard clamp
+        at zero would make the missing-body shortfall locally nondifferentiable
+        when every heatmap response is negative; beta-10 softplus remains near
+        zero for absent parts while preserving a finite corrective derivative.
+        """
+        return F.softplus(heatmaps, beta=10.0)
+
+    @staticmethod
+    def _compute_ratios(
+        keypoints,
+        visibilities,
+        ref_ratios=None,
+        include_head=False,
+        return_confidence=False,
+    ):
         """Pose-invariant bone-length ratios from COCO keypoints.
 
         Args:
@@ -139,8 +159,12 @@ class DifferentiableBodyProportionEncoder(nn.Module):
             ref_ratios: (B, N) optional cached ratios; low-confidence ratios are
                 replaced with these (detached, zero gradient).
             include_head: add head ratios (nose-to-shoulder, ear-to-ear).
+            return_confidence: also return the raw per-ratio confidence. This
+                is the same attached tensor as the second return value and is
+                provided for callers that need to name the confidence path.
         Returns:
-            (ratios (B, N), ratio_vis (B, N)) with N = 8 or 10.
+            ``(ratios, ratio_confidence)`` with N = 8 or 10, plus the raw
+            confidence again when ``return_confidence`` is true.
         """
         kp = keypoints
         vis = visibilities
@@ -196,12 +220,16 @@ class DifferentiableBodyProportionEncoder(nn.Module):
 
         ratios = torch.stack(ratio_list, dim=-1)
         ratio_vis = torch.stack(vis_list, dim=-1)
-
+        raw_ratio_vis = ratio_vis
         if ref_ratios is not None:
             low_conf = ratio_vis < threshold
             ratios = torch.where(low_conf, ref_ratios.detach(), ratios)
-            ratio_vis = torch.where(low_conf, torch.zeros_like(ratio_vis), ratio_vis)
+            # Keep raw confidence attached for the missing-body shortfall. The
+            # ratio L1 still receives zero gradient for a fallback row because
+            # its ratio was replaced with detached reference data.
 
+        if return_confidence:
+            return ratios, ratio_vis, raw_ratio_vis
         return ratios, ratio_vis
 
     @torch.no_grad()
@@ -221,22 +249,32 @@ class DifferentiableBodyProportionEncoder(nn.Module):
         )
         heatmaps = outputs.heatmaps.float()  # (1, 17, 64, 48)
         coords = self._heatmaps_to_coords(heatmaps)  # (1, 17, 2)
-        confidence = heatmaps.flatten(2).max(dim=2).values  # (1, 17)
+        confidence = self._heatmaps_to_confidence(heatmaps).flatten(2).amax(dim=2)  # (1, 17)
         ratios, ratio_vis = self._compute_ratios(coords, confidence, include_head=include_head)
         n = ratios.shape[-1]
         if float(ratio_vis.mean().item()) < 0.1:
             return torch.zeros(n * 2)
         return torch.cat([ratios.squeeze(0), ratio_vis.squeeze(0)], dim=0).cpu()  # (2*N,)
 
-    def forward(self, pixels: torch.Tensor, ref_ratios=None, include_head: bool = False):
+    def forward(
+        self,
+        pixels: torch.Tensor,
+        ref_ratios=None,
+        include_head: bool = False,
+        return_confidence: bool = False,
+    ):
         """Differentiable training path.
 
         Args:
             pixels: (B, 3, H, W) in [0, 1].
             ref_ratios: (B, N) cached reference ratios for low-conf fallback.
             include_head: add head ratios.
+            return_confidence: also return raw per-ratio confidence. This is the
+                same attached tensor as the second return value and is exposed
+                separately for callers that need to name the gradient path.
         Returns:
-            (ratios (B, N), ratio_vis (B, N)).
+            ``(ratios, ratio_confidence)`` and, when requested, the same raw
+            confidence as a third ``(B, N)`` tensor.
         """
         from transformers.models.vitpose.image_processing_vitpose import (
             box_to_center_and_scale, get_warp_matrix,
@@ -285,15 +323,20 @@ class DifferentiableBodyProportionEncoder(nn.Module):
                     dataset_index=torch.tensor([0], device=sample.device),
                 ).heatmaps.float()
                 coords = self._heatmaps_to_coords(heatmaps)
-                # Detach peak confidence to avoid "green dot" artifacts (source comment).
-                confidence = heatmaps.flatten(2).max(dim=2).values.detach()
+                # Keep confidence attached: missing-body supervision uses a
+                # differentiable shortfall on this estimator output.
+                confidence = self._heatmaps_to_confidence(heatmaps).flatten(2).amax(dim=2)
                 all_kp.append(coords)
                 all_vis.append(confidence)
 
         keypoints = torch.cat(all_kp, dim=0)  # (B, 17, 2)
         visibilities = torch.cat(all_vis, dim=0)  # (B, 17)
         return self._compute_ratios(
-            keypoints, visibilities, ref_ratios=ref_ratios, include_head=include_head
+            keypoints,
+            visibilities,
+            ref_ratios=ref_ratios,
+            include_head=include_head,
+            return_confidence=return_confidence,
         )
 
 

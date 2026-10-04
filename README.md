@@ -14,14 +14,14 @@ This fork tracks `upstream/main` closely (currently 0 commits behind) and adds t
 
 ### Krea 2 perceptual anchor training
 
-Auxiliary losses that anchor a Krea 2 LoRA to structural ground truth, so edits preserve identity/geometry instead of drifting. Each anchor can be enabled independently, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):
+Auxiliary losses that can anchor a Krea 2 LoRA to structural ground truth; they do not guarantee identity/geometry usefulness without the required model weights and runtime evidence. Each anchor can be enabled independently only when its dependency/admission gate is satisfied, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):
 
 - **Depth anchor** — Depth Anything V2 (incl. DA2-Large option) depth-GT loss with a caching pipeline (depth maps are precomputed and round-tripped through the Krea VAE so train-time decode matches), unified latent decode, and depth-step-based preview rendering.
 - **Face identity anchor** — ArcFace embedding loss.
-- **Body proportion anchor** — ViTPose keypoint-based loss.
+- **Body proportion anchor** — ViTPose keypoint-based loss with an attached confidence-shortfall gradient; synthetic CPU graph evidence does not certify useful real-checkpoint gradients, so the licensed dependency/runtime gate remains required.
 - **Surface normal anchor** — Sapiens normal-map loss.
 - **Body shape anchor** — HybrIK-based loss.
-- **Cross-VAE anchor** — perceptual loss through a frozen Flux 2 VAE encoder.
+- **Cross-VAE anchor** — perceptual loss through a frozen Flux 2 VAE encoder; requires a matching licensed local `ae.safetensors` checkpoint and remains unavailable when that backend is not present.
 - **Auto subject masking + region-weighted loss** — YOLO person detection + SegFormer semantics restrict anchor losses to the subject.
 - A **loss split resolver** and **loss watch** instrumentation manage how the anchor losses combine with the base flow-matching loss, and a **Perceptual Anchors UI panel** (with safe depth-config migration) exposes all of it in the GUI.
 
@@ -33,7 +33,7 @@ Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.
 
 ### Per-image adaptive learning rate
 
-`per_image_adaptive_lr` adjusts LR per training image based on rolling loss-window statistics, with logging, warmup windows (`per_image_adaptive_lr_warmup_windows`), resolution-aware adjustment scaling, and a `per_image_adaptive_lr_stats_only` mode that logs adjustments without applying them. Default application is `train.per_image_adaptive_lr_mode: loss`. The experimental `lr` mode is documented below.
+`per_image_adaptive_lr` tracks each dataset image's loss trend across update windows, with logging, warmup windows (`per_image_adaptive_lr_warmup_windows`), resolution-aware adjustment scaling, and an observation-only `per_image_adaptive_lr_stats_only` mode. The default `train.per_image_adaptive_lr_mode: loss` applies the advertised sample weight to the joint visual/audio objective once; the experimental `lr` mode leaves loss terms unchanged and scales the whole successful optimizer update. Audio tuning is therefore also affected by dataset mix and `train.audio_loss_multiplier`; `num_repeats` changes sampling frequency and is not a loss multiplier.
 
 ### Rose optimizer
 
@@ -45,7 +45,76 @@ Stateless `rose` optimizer (`toolkit/optimizers/rose.py`), usable like any other
 
 ### H3 standalone voice (audio-only) datasets
 
-On MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must land on the 17n+5 frame grid at 24 fps (~0.917s to ~5.167s). Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
+On MiniMax-H3, `datasets[].do_audio: true` enumerates standalone `.wav` / `.mp3` / `.flac` / `.m4a` (and the rest of the global audio extensions) as voice items, not ACE-Step. Requires `datasets[].buckets: true`. Durations must decode to the 17n+5 frame grid at 24 fps and the audio-VAE hop alignment; the voice gate is content/geometry based, not a visual product minimum-duration rule. Audio-only loss uses `train.audio_loss_multiplier` (default `1.0`) and does not add a video term.
+
+### H3/Krea admission and saved-job migration
+
+Before loading weights or preparing caches, Python resolves every process and
+dataset override through the side-effect-free admission contract:
+
+```bash
+python -m toolkit.admission path/to/job.yaml
+```
+
+The JSON result is `{valid, diagnostics, deferred, resolved}`. Each diagnostic
+contains `rule_id`, `severity`, `fields`, plain-language `reason`, actionable
+`remedy`, and `phase`; `deferred` entries are runtime-only checks, not a
+validation pass. The CLI does not construct models/optimizers/accelerators,
+decode or collate media, write caches, or launch jobs (it may inspect known
+dataset paths read-only to identify possible audio files). The same interface
+is available to API/UI callers as
+`toolkit.admission.collect_admission_diagnostics(config, source="api")`.
+H3 rejects legacy accumulation, mean-flow, fused multi-backward windows,
+target-builder collisions, image-only auxiliary overrides, unsupported clocks
+or Fast/VSA controls, and self-D-OPSD voice targets. H3 audio itself is not
+blanket-blocked: known files still receive the bucket, duration, silence, and
+hop-alignment final checks.
+
+Existing saved jobs remain editable, but imported, cloned, queued, direct-CLI,
+and worker launches must revalidate the current configuration before saving or
+changing queue/running state. Old jobs using
+`gradient_accumulation_steps != 1`, `mean_flow`, unsupported H3 auxiliaries,
+or fused multi-backward settings require an explicit config edit; admission
+never silently translates, removes, or downgrades those fields. A scrubbed
+accepted character recipe is maintained at
+`testing/fixtures/admission/accepted_h3_character.yaml`.
+
+### Release capability contract (Krea/H3 remediation)
+
+This fork's Krea/H3 admission and training behavior is evidence-scoped. A CPU regression result does not certify a real checkpoint, GPU precision path, or visual/audio quality. The following labels are intentional:
+
+- **Verified CPU contract** means the production consumer and an independent CPU oracle were exercised. It does not imply model-weight usefulness.
+- **Temporary gate** means a known-broken or unproven path is rejected until its production acceptance evidence exists.
+- **Experimental / uncertified** means the path is retained for controlled experiments, but this fork has no release-quality tolerance or multi-rank proof for it. Uncertified is not proof of corruption.
+
+For joint H3 training, the fixed sample-weight contract is
+
+```text
+L = (1/B) * sum_i w_i * [visual_i + audio_loss_multiplier * audio_present_i * audio_i]
+```
+
+`visual_i` and `audio_i` are means over each item's own target elements. Standalone voice omits `visual_i`; an absent soundtrack contributes no audio term but remains in the overall `B` denominator. `audio_present` is a data fact, `do_audio` is supervision policy, and encoded silence is context. `num_repeats` changes sampling frequency and is not a replacement for `w_i` or `audio_loss_multiplier`. This is the F11 visual-only-to-joint/voice semantics cutover; prior visual-only adaptive-weight A/B results are not joint-objective evidence.
+
+For the current flow wrappers, `sigma` is resolved in FP32 from the actual interpolation (`sigma = timestep / 1000` for the toolkit wrapper), `x_sigma = (1 - sigma) * x0 + sigma * epsilon`, and the noise-clean velocity target is `epsilon - x0`. H3 keeps its native time/sign conversion inside the H3 wrapper; the official scheduler/inference grid is a semantic reference, not a drop-in replacement for toolkit training targets. The unaugmented DDPM velocity conversion remains rejected for Krea/H3 until a model-specific contract is proven.
+
+H3 latent and condition caches use versioned, provenance-bearing identities. The repaired cache namespace includes `latent_space_version=minimax_h3_v2` and latent provenance version `2`, while reference-video conditions use `recipe_namespace=h3_ref_video_condition_v3`; identities also include source-content fingerprint, model/VAE/checkpoint identity, transform/control/audio recipe, encoder identity, and target geometry where applicable. H3 condition keyframes use the dedicated CPU seed-42 posterior sample plus fp16-to-fp32 roundtrip before normalization; target posterior sampling remains a separate semantic and is intentionally fixed when it is cached. Cache fixes invalidate changed representations only: old entries are left in place and are not considered valid solely because shapes match; unrelated user caches are not deleted.
+
+Krea guidance is **RAW training recommended / Turbo inference recommended**. Turbo training-adapter and edit roles are fork-specific warnings, not official equivalence claims. Krea full-tune preview/edit CFG, source-target, and CFG-Zero paths remain temporary-gated until real production acceptance evidence; adapter-only CPU state tests do not prove preview quality. H3 audio has precise 24-fps/32-kHz/stereo and 17n+5 frame/hop gates; it is not blanket-blocked, but non-grid durations, missing cached audio, and unsupported standalone-voice combinations remain scoped gates.
+
+Quantized-base loading, FP32 islands, low-precision/AMP, offload, compile, sparse/VSA/TREAD, and distributed modes retain their current experimental labels unless the release report names an exercised tolerance. The current evidence is CPU-only for arithmetic/lifecycle and static/cache contracts; no blanket GPU claim is made. Distributed synchronization, rank-state resume, and exact replay outside controlled `num_workers=0` are **experimental / uncertified**.
+
+`train.resume_mode` is `auto` by default. A fresh output directory starts normally; `auto` resumes only a complete matching raw `training_state.pt` within the admitted deterministic scope. Legacy or inference-only files require an explicit `weights_only` choice. `exact` restores matched raw parameters, optimizer, scheduler, EMA/count, Python/NumPy/Torch RNG, data order, and `completed_update_id`. Its current admitted scope is CPU, single-process, `num_workers: 0`, no buckets, accumulation 1, and compile off. GPU, bucketed, multiworker, accumulated and compiled exact replay are unavailable, not silently approximated. `weights_only` deliberately resets optimizer/scheduler/EMA/counters/RNG/order and is never called resume.
+
+Remediation verification (2026-10-04): 321 scoped Python cases and 9 UI policy cases passed; UI/extension typechecks and Ruff's syntax/undefined-name checks passed. The CPU raw-checkpoint smoke resumed update 3 through update 6 with maximum parameter error `0.0`, preserving EMA while keeping raw training weights distinct from the inference export. Isolated production API handlers rejected invalid YAML, incompatible configs, spoofed job metadata, and invalid stored start/queue requests before database mutation.
+
+Deployment evidence is separate: the already-running GUI still returned HTTP 404 for the new `/api/admission` route. It was inspected and closed without saving or launching a job; no service was restarted. Updated-GUI visual acceptance and real Krea/H3 checkpoint/GPU acceptance remain open. Do not treat these CPU/source-handler checks as release approval for those capabilities.
+
+Pinned references used for this release ledger:
+
+- Official [Krea repository revision `db3984fbc6e13b34c0064990fc2d95ac64d00058`](https://github.com/krea-ai/krea-2/commit/db3984fbc6e13b34c0064990fc2d95ac64d00058).
+- Official [MiniMax H3 revision `d21241f0a4b3acbb34c97dae47fa417b7065e438`](https://github.com/MiniMax-AI/MiniMax-H3/commit/d21241f0a4b3acbb34c97dae47fa417b7065e438) and [checkpoint metadata revision `42ed227ee7df40d41602854ae760620d6eb651fe`](https://huggingface.co/MiniMaxAI/MiniMax-H3/commit/42ed227ee7df40d41602854ae760620d6eb651fe).
+- [Diffusers H3 scheduler revision `8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd`](https://github.com/huggingface/diffusers/commit/8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd).
+
 
 ### MiniMax-H3 findings ported from musubi-tuner
 
@@ -71,12 +140,12 @@ Measured behaviour from [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musu
 
 Default-off. Fail-closed at startup when the optimizer cannot honor the requested mode.
 
-- **Per-image adaptive LR `lr` mode** — `train.per_image_adaptive_lr_mode: lr` (default `loss`). Requires `train.per_image_adaptive_lr: true`. `loss` multiplies only the per-sample visual diffusion loss before backward; prior, audio, adapter, preservation, and anchor terms stay at full LR. `lr` leaves every loss component unscaled and multiplies the optimizer's applied update for the whole window. Requires an optimizer that `supports_step_scale`. Discrete watcher multipliers are not min/max LR bounds. On optimizers that normalise by a gradient-range statistic (Rose), a uniform loss scale cancels, so `loss` mode mainly shifts visual-vs-audio balance on AV steps and does nothing on photo-only steps. Measured A/B at character-LoRA scale: `lr` mode was on par with base (with transient mid-run destabilization) and slightly below the plain champion optimizer when stacked on it — not adopted for that recipe. The default `loss` mode was not part of the controlled A/B series.
+- **Per-image adaptive LR `lr` mode** — `train.per_image_adaptive_lr_mode: lr` (default `loss`). Requires `train.per_image_adaptive_lr: true`. In `loss` mode the effective objective is `(1/B) * sum_i w_i * [visual_i + audio_loss_multiplier * audio_present_i * audio_i]`; standalone voice omits `visual_i`, absent soundtrack rows remain in the overall `B` denominator, and zero-weight rows are excluded before sensitive arithmetic. In `lr` mode every loss component remains unscaled and the optimizer's applied update for the whole successful window is scaled instead. Requires an optimizer that `supports_step_scale`. Discrete watcher multipliers are not min/max LR bounds. On optimizers that normalise by a gradient-range statistic (Rose), a uniform loss scale cancels. Older visual-only adaptive-weight A/B results are pre-cutover evidence and must not be compared as joint/voice results.
 - **H3 modality block routing** — `train.modality_block_routing` with optional `photo_blocks`, `clip_blocks`, `voice_blocks`. Default off; a blank/omitted key leaves that modality unrestricted. Spec is a range list such as `"3-12, 14-15, 22,27,31-33"`, parsed against `len(transformer.blocks)`. H3 LoRA/LoKr only. Requires an optimizer that `supports_active_param_mask` (Automagic3 is rejected). Mixed-modality windows are left unrestricted (every block trains); refiners and non-trunk adapters stay active. Measured A/B at rank-16 / 2000-step character-LoRA scale: no measurable quality benefit (interference protection only, no speed gain) — keep off for that recipe. That A/B measured the mask as built: the full backward still runs (masked gradients are computed, then dropped) and the token refiner keeps training. It is not a test of a block window with the refiner frozen; for that, see `network.train_blocks` below.
 - **H3 block window (`network.train_blocks`)** — LoRA on a range of trunk blocks and nothing else, e.g. `"20-49"`. The token refiner, `final_layer`, and blocks outside the range get no adapter, so nothing before the first selected block is trainable and autograd stops there (Fizgig measured ~23% faster steps on int8 for its 20-49 recipe). Applies to every item type (photos, clips, voice). H3 LoRA/LoKr only; mutually exclusive with `network_kwargs.only_if_contains`; `ignore_if_contains` still applies. Verified at network build by module ownership (fails if any adapter sits outside the window or a selected block got none). Refused while the text encoder or an embedding trains (text rows pass through every block). Uncompiled runs also check on the first training forward that the block before the window needs no grad; compiled runs skip that runtime check. After Fizgig's "Default" training mode.
 - **Low-noise share (`train.low_noise_share`)** — fraction of training draws below sigma 0.5, e.g. `0.6`. Solves the static shift that puts exactly that share of the training grid below 0.5 and uses it for the training draw only; the model's configured shift (12 on H3), sampling and previews are unchanged. H3's own draw puts ~6.6% of steps below 0.5 (and never goes below sigma ~0.126); `0.6` is Fizgig's "Likeness and Style". On H3 the share is the *video* share: audio rows keep the model's fixed video→audio pairing (`remap_sigma` from shift 12, the pairing inference uses at every step), so audio lands cleaner — `0.6` puts ~86% of audio draws below 0.5 (default ~24%). Remapping from the training shift instead would pair clean video with noisy audio, a combination inference never produces; Fizgig trains the same way. Both shares are logged at startup. Requires `noise_scheduler: flowmatch`, `timestep_type: shift`, a static-shift scheduler, `content_or_style: balanced`, full denoising range, and `first_timestep_chance: 0`; anything else fails at startup. The startup log prints the solved shift and sigma range.
 - **Category stop (`train.category_stop`)** — `photo_step` / `clip_step` / `voice_step` retire that category once the training step reaches it; blank = never. `mode: anchor` (default) keeps training it at 0.1× the optimizer's applied update (requires `supports_step_scale`); `mode: stop` skips its batches before the forward pass. Requires `batch_size: 1` (train-level and any `datasets[].batch_size`, which overrides it when buckets are on) and no gradient accumulation (one category per update). `mode` must be a string: an unquoted YAML `off` loads as a boolean and is refused, not read as anchor. Regularisation items (`is_reg`) never count toward a category, so they are neither scaled nor skipped. Anchor mode needs a trainer that opens the optimizer runtime window (`diffusion_trainer` does) and is refused otherwise. Step-based, so it holds across resume. After Fizgig's per-category stop epoch.
-- **EMA warmup (`train.ema_config.warmup`)** — ramps the EMA decay in as `min(ema_decay, (1+n)/(10+n))` so early checkpoints and samples track the weights instead of the zero-init adapter. Default off (constant decay, as before). The update count isn't saved, so on resume it restarts at the resumed step (the ramp is already saturated past ~440 steps) rather than at 0. Fizgig's measured default is `ema_decay: 0.98` with this ramp.
+- **EMA warmup (`train.ema_config.warmup`)** — ramps the EMA decay in as `min(ema_decay, (1+n)/(10+n))`, where `n` is the completed successful optimizer-update count. Scheduler, EMA and this count advance only after a real optimizer update; empty, OOM-discarded and AMP-skipped windows do not advance it. Raw resumable checkpoints must restore the matched `completed_update_id`, EMA shadow/count, optimizer/scheduler, RNG and data-order state atomically. An inference/export file is a weights-only warm start and does not resume that trajectory. Exact replay is only claimed for controlled deterministic input order (first acceptance scope: `num_workers=0`); multiworker, distributed and nondeterministic paths remain uncertified.
 - **H3 TREAD token routing** — training-only clip-step token skip (Krause et al., [arXiv 2501.04765](https://arxiv.org/abs/2501.04765)). H3-only (`model.arch: minimax_h3*`; VSA / `gate_compress` is rejected at bind). Default off. Clip steps with batch size 1 and more than one latent video frame skip a random `tread_ratio` of *target* video tokens around blocks `[tread_start, tread_end)` and keep `1 - tread_ratio`; skipped rows rejoin in their start-block state. Text, condition, and audio rows stay. Stills, inference, and `batch_size != 1` never route. Bind rejects a post-rejoin tail shorter than 3 blocks (`tread_end` 47 on a 50-block trunk is the Fizgig prior). No UI until a config-file experiment passes the speed gate.
 - **H3 D-OPSD other-photo / identity-first** — extends existing `model.model_kwargs.dopsd` (self-reference: one ref2va DiT, two forwards). Default-off. `dopsd_ref_mode: other` pairs each still with a different photo in the same folder (never itself, never its own flip, never another folder); clips and voice sit out. `dopsd_identity_first` is teacher-only at 1/3 LR for `dopsd_identity_first_steps` optimizer updates (`-1` → 650), then drops the teacher (one forward, full LR). Other-photo requires `train.batch_size: 1`. Identity-first requires an optimizer that `supports_step_scale`. No second teacher model. A/B tested and not adopted for the character-LoRA recipe; kept for further experimentation. No UI until a config-file experiment. (Those A/Bs predate the prior-embeds fix above: the teacher saw the plain caption, so they are worth re-running.)
 - **Timestep focus (`train.timestep_focus_prob`)** — musubi's H3 timestep focus. With probability P a draw lands uniformly in base sigma `[timestep_focus_min, timestep_focus_max)` (default `0.4`–`0.8`, video sigma ~0.89–0.98 on H3, where content is decided); otherwise it stays as drawn. Band density becomes `P + (1-P)·band_share`; musubi measured ~2x faster convergence of that band at `0.5`. The band is on the model's own schedule, so it composes with `low_noise_share` (band points are weighted to stay uniform in base sigma on a re-bent grid) and is intersected with the denoising range. Fails closed with the cubic `content_or_style` bias and the fixed-step timestep types. Default off.

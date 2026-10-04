@@ -1517,10 +1517,32 @@ class BaseModel:
 
         return trainable_parameters
 
+    @staticmethod
+    def _requires_grad_snapshot(module):
+        """Capture each parameter flag without collapsing mixed trainability."""
+        if module is None or not hasattr(module, "named_parameters"):
+            return None
+        return {
+            name: parameter.requires_grad
+            for name, parameter in module.named_parameters()
+        }
+
+    @staticmethod
+    def _restore_requires_grad(module, state):
+        """Restore an exact snapshot, while accepting legacy boolean states."""
+        if module is None or state is None:
+            return
+        if isinstance(state, dict):
+            for name, parameter in module.named_parameters():
+                if name in state:
+                    parameter.requires_grad_(bool(state[name]))
+            return
+        module.requires_grad_(bool(state))
+
     def save_device_state(self):
         # saves the current device state for all modules
         # this is useful for when we want to alter the state and restore it
-        unet_has_grad = self.get_model_has_grad()
+        unet_requires_grad = self._requires_grad_snapshot(self.unet)
 
         self.device_state = {
             **empty_preset,
@@ -1531,65 +1553,48 @@ class BaseModel:
             'unet': {
                 'training': self.unet.training,
                 'device': self.unet.device,
-                'requires_grad': unet_has_grad,
+                'requires_grad': unet_requires_grad,
             },
         }
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
-            # unloaded TEs are FakeTextEncoder stubs; arch probes into TE internals would raise
-            any_fake = any(isinstance(e, FakeTextEncoder) for e in self.text_encoder)
             for encoder in self.text_encoder:
-                te_has_grad = False if any_fake else self.get_te_has_grad()
                 self.device_state['text_encoder'].append({
                     'training': encoder.training,
                     'device': encoder.device,
-                    # todo there has to be a better way to do this
-                    'requires_grad': te_has_grad
+                    'requires_grad': self._requires_grad_snapshot(encoder),
                 })
         elif self.text_encoder is not None:
-            if isinstance(self.text_encoder, FakeTextEncoder):
-                te_has_grad = False
-            else:
-                te_has_grad = self.get_te_has_grad()
-
             self.device_state['text_encoder'] = {
                 'training': self.text_encoder.training,
                 'device': self.text_encoder.device,
-                'requires_grad': te_has_grad
+                'requires_grad': self._requires_grad_snapshot(self.text_encoder),
             }
         if self.adapter is not None:
             if isinstance(self.adapter, IPAdapter):
-                requires_grad = self.adapter.image_proj_model.training
                 adapter_device = self.unet.device
             elif isinstance(self.adapter, T2IAdapter):
-                requires_grad = self.adapter.adapter.conv_in.weight.requires_grad
                 adapter_device = self.adapter.device
             elif isinstance(self.adapter, ControlNetModel):
-                requires_grad = self.adapter.conv_in.training
                 adapter_device = self.adapter.device
             elif isinstance(self.adapter, ClipVisionAdapter):
-                requires_grad = self.adapter.embedder.training
                 adapter_device = self.adapter.device
             elif isinstance(self.adapter, CustomAdapter):
-                requires_grad = self.adapter.training
                 adapter_device = self.adapter.device
             elif isinstance(self.adapter, ReferenceAdapter):
-                # todo update this!!
-                requires_grad = True
                 adapter_device = self.adapter.device
             else:
                 raise ValueError(f"Unknown adapter type: {type(self.adapter)}")
             self.device_state['adapter'] = {
                 'training': self.adapter.training,
                 'device': adapter_device,
-                'requires_grad': requires_grad,
+                'requires_grad': self._requires_grad_snapshot(self.adapter),
             }
-
         if self.refiner_unet is not None:
             self.device_state['refiner_unet'] = {
                 'training': self.refiner_unet.training,
                 'device': self.refiner_unet.device,
-                'requires_grad': self.refiner_unet.conv_in.weight.requires_grad,
+                'requires_grad': self._requires_grad_snapshot(self.refiner_unet),
             }
 
     def restore_device_state(self):
@@ -1612,10 +1617,9 @@ class BaseModel:
         else:
             self.unet.eval()
         self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
+        self._restore_requires_grad(
+            self.unet, state['unet']['requires_grad']
+        )
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):
@@ -1624,28 +1628,33 @@ class BaseModel:
                     else:
                         encoder.eval()
                     encoder.to(state['text_encoder'][i]['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder'][i]['requires_grad'])
+                    self._restore_requires_grad(
+                        encoder, state['text_encoder'][i]['requires_grad']
+                    )
                 else:
                     if state['text_encoder']['training']:
                         encoder.train()
                     else:
                         encoder.eval()
                     encoder.to(state['text_encoder']['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder']['requires_grad'])
+                    self._restore_requires_grad(
+                        encoder, state['text_encoder']['requires_grad']
+                    )
         elif self.text_encoder is not None:
             if state['text_encoder']['training']:
                 self.text_encoder.train()
             else:
                 self.text_encoder.eval()
             self.text_encoder.to(state['text_encoder']['device'])
-            self.text_encoder.requires_grad_(
-                state['text_encoder']['requires_grad'])
+            self._restore_requires_grad(
+                self.text_encoder, state['text_encoder']['requires_grad']
+            )
 
         if self.adapter is not None:
             self.adapter.to(state['adapter']['device'])
-            self.adapter.requires_grad_(state['adapter']['requires_grad'])
+            self._restore_requires_grad(
+                self.adapter, state['adapter']['requires_grad']
+            )
             if state['adapter']['training']:
                 self.adapter.train()
             else:
@@ -1653,8 +1662,9 @@ class BaseModel:
 
         if self.refiner_unet is not None:
             self.refiner_unet.to(state['refiner_unet']['device'])
-            self.refiner_unet.requires_grad_(
-                state['refiner_unet']['requires_grad'])
+            self._restore_requires_grad(
+                self.refiner_unet, state['refiner_unet']['requires_grad']
+            )
             if state['refiner_unet']['training']:
                 self.refiner_unet.train()
             else:
@@ -1767,6 +1777,9 @@ class BaseModel:
             quantize_device=self.device_torch,
             base_model=self,
             use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
+            # Keep holder-declared precision islands on the actual
+            # post-load path, including holders with custom state-dict loads.
+            exclude_quant_modules=self.get_quantization_exclude_modules(),
         )
 
     def convert_lora_weights_before_save(self, state_dict):

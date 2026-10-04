@@ -16,7 +16,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from toolkit.config_modules import DatasetConfig, VAEAnchorConfig
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
-from toolkit.vae_anchor import VAEAnchorEncoder, FEATURE_LEVELS, CACHE_VERSION_KEY
+from toolkit.vae_anchor import (
+    VAEAnchorEncoder,
+    FEATURE_LEVELS,
+    FLUX2_INPUT_CHANNELS,
+    FLUX2_MOMENT_CHANNELS,
+    FLUX2_LATENT_CHANNELS,
+    CACHE_VERSION_KEY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +58,53 @@ def test_dataset_overrides_default_none():
     assert d.vae_anchor_loss_max_t is None
 
 
-# ---------------------------------------------------------------------------
+def test_load_rejects_unavailable_backend_without_download(tmp_path):
+    encoder = VAEAnchorEncoder()
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        encoder.load(torch.device("cpu"), torch.float32)
+
+    missing = VAEAnchorEncoder(str(tmp_path / "missing_ae.safetensors"))
+    with pytest.raises(RuntimeError, match="not found"):
+        missing.load(torch.device("cpu"), torch.float32)
+
+def test_flux2_contract_matches_canonical_encoder_source():
+    """The anchor contract follows flux2_kl.AutoEncoder, not another VAE."""
+    class _Block:
+        def __init__(self, channels):
+            self.conv2 = torch.nn.Conv2d(channels, channels, 1)
+
+    levels = [
+        SimpleNamespace(block=[_Block(ch), _Block(ch)])
+        for ch in (128, 256, 512, 512)
+    ]
+    encoder = SimpleNamespace(
+        down=levels,
+        mid=SimpleNamespace(block_2=_Block(512)),
+        conv_in=torch.nn.Conv2d(FLUX2_INPUT_CHANNELS, 128, 3),
+        conv_out=torch.nn.Conv2d(512, FLUX2_MOMENT_CHANNELS, 3),
+        quant_conv=torch.nn.Conv2d(FLUX2_MOMENT_CHANNELS, FLUX2_MOMENT_CHANNELS, 1),
+    )
+    vae = SimpleNamespace(
+        encoder=encoder,
+        bn=torch.nn.BatchNorm2d(FLUX2_LATENT_CHANNELS, affine=False),
+    )
+    VAEAnchorEncoder._validate_autoencoder_contract(vae)
+
+    wrong = levels.copy()
+    wrong[2] = SimpleNamespace(block=[_Block(256), _Block(256)])
+    bad_encoder = SimpleNamespace(
+        down=wrong,
+        mid=encoder.mid,
+        conv_in=encoder.conv_in,
+        conv_out=encoder.conv_out,
+        quant_conv=encoder.quant_conv,
+    )
+    with pytest.raises(ValueError, match="level_2 channel contract"):
+        VAEAnchorEncoder._validate_encoder_contract(bad_encoder)
+
+
+#
 # compute_loss (pure tensor math)
-# ---------------------------------------------------------------------------
 
 def test_compute_loss_zero_when_identical():
     feats = {lv: torch.randn(2, 16, 8, 8) for lv in FEATURE_LEVELS}
