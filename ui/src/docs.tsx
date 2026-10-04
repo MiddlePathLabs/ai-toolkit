@@ -52,6 +52,17 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.process[0].model.arch': {
+    title: 'Model Architecture',
+    summary: 'Selects a presentation recipe; the Python admission result remains authoritative.',
+    description: (
+      <>
+        Model cards provide defaults and help text only. A model suffix such as <code>krea2:turbo</code> or
+        <code>krea2:o_edit</code> identifies a recipe role, not a filename guess. Existing values from a previous
+        model stay visible in the conflict summary until you explicitly remove them.
+      </>
+    ),
+  },
   'datasets.control_path': {
     title: 'Control Dataset',
     description: (
@@ -111,9 +122,10 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Do Audio',
     description: (
       <>
-        For models that support audio with video, this option will load the audio from the video and resize it to match
-        the video sequence. Since the video is automatically resized, the audio may drop or raise in pitch to match the
-        new speed of the video. It is important to prep your dataset to have the proper length before training.
+        For audio-capable video models this loads soundtrack data and aligns it to the target sequence. For MiniMax-H3,
+        <code>audio_present</code> is a data fact separate from this supervision policy: absent rows use encoded silence
+        as context and remain in the joint batch denominator, but contribute no audio loss. Keep H3 targets at 24 fps,
+        32 kHz stereo, and the admitted 17n+5 frame/hop grid; out-of-grid or unsupported voice inputs are rejected.
       </>
     ),
   },
@@ -157,14 +169,14 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Per-Image Adaptive LR',
     description: (
       <>
-        Tracks each dataset image's loss trend across training. Images that stay hard without
-        improving (often a bad or mismatched caption) get their learning rate throttled, escalating
-        the longer they stay stuck, so one bad image can't keep yanking the weights all run.
-        Consistently healthy images get a small boost. Works for every model architecture and both
-        LoKr and LoRA. Needs a few evaluation windows of history before it starts acting. The window
-        auto-sizes to your unique image count regardless of resolution list or repeats, so a large
-        multi-resolution dataset won't inflate it — but on a short run (e.g. Krea at ~2000 steps) it
-        may still be worth lowering the warmup below so it has time to actually do something.
+        Tracks each dataset image's loss trend across successful update windows. In the default <code>loss</code> mode,
+        the effective sample weight reaches the joint visual/audio objective once:
+        <code>(1/B) * sum(w_i * (visual_i + audio_multiplier * audio_present_i * audio_i))</code>.
+        Standalone voice has no visual term and absent soundtrack rows remain in the overall batch denominator.
+        The experimental <code>lr</code> mode leaves loss terms unchanged and scales the whole optimizer update instead.
+        Tune <code>audio_loss_multiplier</code> after this joint/voice semantics cutover; <code>num_repeats</code> changes
+        sampling frequency and is not a loss multiplier. Needs a few evaluation windows of history before acting. The
+        window auto-sizes to unique image count; on short runs lower the warmup if needed.
       </>
     ),
   },
@@ -360,16 +372,17 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Audio Loss Multiplier',
     description: (
       <>
-        When training audio and video, sometimes the video loss is so great that it outweights the audio loss, causing
-        the audio to become distorted. If you are noticing this happen, you can increase the audio loss multiplier to
-        give more weight to the audio loss. You could try something like 2.0, 10.0 etc. Warning, setting this too high
-        could overfit and damage the model.
+        In a joint H3 batch, this multiplies each present item's audio term inside the explicit
+        <code>(1/B)</code> sample-weighted objective. Missing soundtrack rows remain in the denominator but contribute no
+        audio term; standalone voice has no video term. Dataset/sample weights and this multiplier interact, so retune
+        audio after the visual-only-to-joint semantics cutover. A zero multiplier keeps real audio as context while
+        disabling direct audio supervision; because H3 shares parameters, it does not freeze or preserve audio quality.
+        Setting this too high can overfit and damage the model.
         <br />
         <br />
-        MiniMax-H3 video-only training: keep <code>Do Audio</code> on and set this to 0. The model then still sees each
-        clip's real soundtrack as context (as it always does at inference) but gets no audio loss. Turning{' '}
-        <code>Do Audio</code> off instead replaces the soundtrack with silence. Either way, H3 is single-stream: a
-        video-only LoRA still changes the weights the audio path uses, so check its audio.
+        MiniMax-H3 video-only training: keep <code>Do Audio</code> on and set this to 0. The model still sees each clip's
+        real soundtrack as context. Turning <code>Do Audio</code> off instead uses encoded silence. H3 is single-stream:
+        a video-only LoRA still changes weights used by audio, so check its audio.
       </>
     ),
   },
@@ -692,13 +705,14 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Body-Proportion Anchor',
     description: (
       <>
-        Enables a frozen ViTPose-Plus-Base pose estimator as a perceptual anchor. The anchor decodes the
-        predicted clean latent through the VAE, runs ViTPose to get 17 COCO keypoints, derives 8
-        pose-invariant bone-length ratios (10 with head), and adds a visibility-weighted L1 loss plus a
-        missing-keypoint penalty against cached GT ratios. Enable sets this weight to 0.01 (a starting
-        value, not a performance claim); disable sets it to 0. ViTPose weights download lazily on first
-        enable. Body-proportion does not participate in the diffusion/depth loss-split alternation. Like
-        the other anchors it decodes x0 under gradient, so Low VRAM is disabled while it is active.
+        predicted clean latent through the VAE, runs ViTPose to get 17 COCO keypoints, derives 8 pose-invariant
+        bone-length ratios (10 with head), and adds a visibility-weighted L1 loss plus a differentiable confidence
+        shortfall against cached GT ratios. The hard missing fraction is a detached diagnostic, while the attached
+        confidence shortfall provides the corrective gradient into generated pixels. This CPU graph evidence does not
+        certify useful gradients from a licensed ViTPose checkpoint; keep the feature behind its runtime dependency and
+        checkpoint gate. Enable sets this weight to 0.01 (a starting value, not a performance claim); disable sets it
+        to 0. ViTPose weights are not silently replaced. Body-proportion does not participate in diffusion/depth loss-split
+        alternation. Like the other anchors it decodes x0 under gradient, so Low VRAM is disabled while active.
       </>
     ),
   },
@@ -850,12 +864,13 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'VAE Anchor',
     description: (
       <>
-        Cross-VAE perceptual anchor: decodes the predicted x0 through the training model's VAE, encodes
-        those pixels with a SEPARATE frozen Flux 2 VAE encoder, and matches the multi-scale features
-        against cached GT via cosine similarity (5 levels, higher-resolution weighted more). The Flux 2
-        VAE downloads from Hugging Face on first enable. Anchors to the Flux 2 VAE feature space
-        (independent of Krea 2's VAE). Like the other anchors it decodes x0 under gradient, so Low VRAM
-        is disabled while it is active.
+        Cross-VAE perceptual anchor: decodes predicted x0 through the training model's VAE, encodes those pixels with the
+        separate frozen Flux 2 VAE encoder, and matches multi-scale features against cached GT via cosine similarity
+        (5 levels, higher-resolution weighted more). The backend requires a licensed local Flux 2 <code>ae.safetensors</code>
+        checkpoint in the matching BFL layout via <code>vae_model_path</code>; it never downloads or substitutes another
+        VAE. If that checkpoint is unavailable, validation rejects the option before caching/training. The strict source
+        layout is CPU-checked, but actual checkpoint keys/features and useful generated-input gradients remain
+        uncertified until a matching local checkpoint is exercised. Low VRAM is disabled while active.
       </>
     ),
   },
@@ -930,10 +945,25 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.resume_mode': {
+    title: 'Resume Mode',
+    summary: 'Choose exact raw-state resume or an explicit weights-only warm start.',
+    description: (
+      <>
+        <code>auto</code> (default) resumes only a complete matching raw <code>training_state.pt</code>; it does not
+        guess from inference-only or legacy files. <code>exact</code> requires a matched completed-update snapshot,
+        single-process CPU, <code>num_workers: 0</code>, no buckets, accumulation 1, and compile off, with parameters,
+        optimizer, scheduler, EMA/count, Python/NumPy/Torch RNG and data order restored together.
+        GPU/bucketed/compiled exact replay is unavailable. <code>weights_only</code> deliberately resets optimizer/scheduler/EMA,
+        counters, RNG and data order. Mismatches fail with an actionable remedy instead of silently starting a fake
+        resume.
+      </>
+    ),
+  },
   'network.pretrained_lora_path': {
-    title: 'Resume from LoRA',
-    summary: 'Start from an existing LoRA instead of training from scratch.',
-    description: 'Path to a .safetensors LoRA. Weights load as the starting point for this run.',
+    title: 'Pretrained LoRA / Weights-Only Warm Start',
+    summary: 'Load LoRA weights as a new training start; this is not an exact resume.',
+    description: 'Loads only the selected weights. It does not restore optimizer, scheduler, EMA/count, RNG, or data-order state. Exact resume requires a matched raw completed-update checkpoint and controlled deterministic input order.',
   },
   'network.dropout': {
     title: 'Network Dropout',
@@ -1003,7 +1033,7 @@ const docs: { [key: string]: ConfigDoc } = {
   'datasets.cache_latents': {
     title: 'Cache Latents in RAM',
     summary: 'Keep VAE latents in memory instead of (or as well as) disk.',
-    description: 'Faster than disk cache, uses a lot of RAM. Disk cache is the checkbox above.',
+    description: 'Faster than disk cache, uses a lot of RAM. H3 cached target posterior samples are intentionally fixed; condition-keyframe sampling uses its separate seed-42 recipe. Cache identities include source/model/transform provenance, so old mismatched entries are not accepted solely because shapes match.',
   },
   'datasets.num_workers': {
     title: 'Data Workers',
@@ -1107,18 +1137,18 @@ const docs: { [key: string]: ConfigDoc } = {
   },
   'model.compile_mode': {
     title: 'Compile Mode',
-    summary: 'torch.compile strategy. Default is safest.',
-    description: 'max-autotune is slower to start. reduce-overhead helps small batches.',
+    summary: 'Experimental torch.compile strategy; runtime evidence is required per model path.',
+    description: 'Compilation can change graph breaks, checkpoint replay, and global compiler state. Leave off for the supported baseline unless the selected Krea/H3 path has a matching compile smoke and tolerance result.',
   },
   'model.compile_fullgraph': {
     title: 'Compile Fullgraph',
-    summary: 'Require a single compiled graph. Fails if the model breaks the graph.',
-    description: 'Leave off unless you are chasing extra speed and know it compiles cleanly.',
+    summary: 'Experimental single-graph requirement.',
+    description: 'Fails when the model breaks the graph. No compile-on exact-resume or quality claim is made by CPU baseline tests; compare against compile-off first.',
   },
   'model.compile_dynamic': {
     title: 'Compile Dynamic',
-    summary: 'Allow varying shapes (resolutions, batch) in the compiled model.',
-    description: 'On by default so multi-resolution training does not recompile every step.',
+    summary: 'Experimental support for varying shapes in compiled graphs.',
+    description: 'Dynamic shapes can trigger recompiles and state contamination. Use only with a scoped model smoke; sequential trainer/global-state behavior remains an acceptance gate.',
   },
   'model.cache_size_limit': {
     title: 'Compile Cache Limit',
@@ -1128,7 +1158,7 @@ const docs: { [key: string]: ConfigDoc } = {
   'model.quantize_exclude': {
     title: 'Quantize Exclude',
     summary: 'Layer-name substrings to leave in full precision.',
-    description: 'Comma-separated. Use if quantizing a layer makes training NaN.',
+    description: 'Comma-separated. Protected linears and FP32-sensitive islands must be forwarded to the actual post-load path. Backend-specific quantized-base gradients and quality tolerances remain experimental unless measured for this exact mode.',
   },
   'model.vae_path': {
     title: 'VAE Path',

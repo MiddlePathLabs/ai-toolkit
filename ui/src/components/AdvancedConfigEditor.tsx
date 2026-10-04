@@ -12,6 +12,8 @@ type Props<T> = {
   // Maps form state to what the editor shows (e.g. hiding untouched defaults).
   // Must be idempotent over transformOnParse output so edits don't round-trip.
   transformForDisplay?: (config: T) => any;
+  onValidationChange?: (valid: boolean, message?: string, line?: number) => void;
+  onRawChange?: (raw: string) => void;
 };
 
 const yamlConfig: YAML.DocumentOptions &
@@ -38,7 +40,14 @@ function toYaml(obj: any): string {
   return doc.toString(yamlConfig);
 }
 
-export default function AdvancedConfigEditor<T>({ config, setConfig, transformOnParse, transformForDisplay }: Props<T>) {
+export default function AdvancedConfigEditor<T>({
+  config,
+  setConfig,
+  transformOnParse,
+  transformForDisplay,
+  onValidationChange,
+  onRawChange,
+}: Props<T>) {
   const { theme } = useTheme();
   const toDisplay = (value: any) => (transformForDisplay ? transformForDisplay(value) : value);
   const displayConfig = toDisplay(config);
@@ -64,8 +73,11 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
     try {
       const yamlContent = toYaml(displayConfig);
       setEditorValue(yamlContent);
+      onRawChange?.(yamlContent);
+      onValidationChange?.(true);
       lastConfigUpdateStringRef.current = JSON.stringify(displayConfig);
     } catch (e) {
+      onValidationChange?.(false, e instanceof Error ? e.message : 'Unable to serialize configuration.', 1);
       console.warn(e);
     }
   };
@@ -88,21 +100,21 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
         const selection = editor.getSelection();
         const scrollTop = editor.getScrollTop();
 
-        // Update content
         const yamlContent = toYaml(displayConfig);
 
-        // Only update if the content is actually different
-        if (yamlContent !== editor.getValue()) {
-          // Set value directly on the editor model instead of using React state
-          editor.getModel()?.setValue(yamlContent);
-
-          // Restore cursor position and selection
-          if (position) editor.setPosition(position);
-          if (selection) editor.setSelection(selection);
-          editor.setScrollTop(scrollTop);
-        }
-
+        // Keep both Monaco and the parent raw-YAML state in sync for external
+        // config updates (imports, model changes, and explicit conflict removal).
+        // Otherwise Save can submit a valid parent object with stale editor text.
         lastConfigUpdateStringRef.current = currentUpdate;
+        if (yamlContent !== editor.getValue()) {
+          editor.getModel()?.setValue(yamlContent);
+        }
+        if (position) editor.setPosition(position);
+        if (selection) editor.setSelection(selection);
+        editor.setScrollTop(scrollTop);
+        setEditorValue(yamlContent);
+        onRawChange?.(yamlContent);
+        onValidationChange?.(true);
       }
     } catch (e) {
       console.warn(e);
@@ -126,11 +138,13 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
 
   const handleChange = (value: string | undefined) => {
     if (value === undefined) return;
+    onRawChange?.(value);
 
     try {
       let parsed = YAML.parse(value);
       setHasError(false);
       setMarkers([]);
+      onValidationChange?.(true);
 
       // Don't update config if the change came from the editor itself
       // to avoid a circular update loop
@@ -146,7 +160,9 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
     } catch (e: any) {
       setHasError(true);
       const line = e?.linePos?.[0]?.line ?? e?.linePos?.line ?? 1;
-      setMarkers([{ message: e?.message ?? 'Invalid YAML', line }]);
+      const message = e?.message ?? 'Invalid YAML';
+      onValidationChange?.(false, message, line);
+      setMarkers([{ message, line }]);
     }
   };
 

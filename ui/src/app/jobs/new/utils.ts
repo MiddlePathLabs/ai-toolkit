@@ -1,6 +1,8 @@
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { ModelArch } from './options';
 import { objectCopy } from '@/utils/basic';
+import { setNestedValue } from '@/utils/hooks';
+import { requestAdmission, type AdmissionResult } from '@/utils/admission';
 
 const expandDatasetDefaults = (
   defaults: { [key: string]: any },
@@ -21,131 +23,48 @@ const expandDatasetDefaults = (
   return expandedDefaults;
 };
 
-export const handleModelArchChange = (
+export const buildModelArchChange = (
   modelArchs: ModelArch[],
   currentArchName: string,
   newArchName: string,
   jobConfig: JobConfig,
-  setJobConfig: (value: any, key: string) => void,
-) => {
+): JobConfig | null => {
   const currentArch = modelArchs.find(a => a.name === currentArchName);
-  if (!currentArch || currentArch.name === newArchName) {
-    return;
-  }
-
-  // update the defaults when a model is selected
   const newArch = modelArchs.find(model => model.name === newArchName);
-
-  // update vram setting
-  if (!newArch?.additionalSections?.includes('model.low_vram')) {
-    setJobConfig(false, 'config.process[0].model.low_vram');
-  }
-
-  // handle layer offloading setting
-  if (!newArch?.additionalSections?.includes('model.layer_offloading')) {
-    if ('layer_offloading' in jobConfig.config.process[0].model) {
-      const newModel = objectCopy(jobConfig.config.process[0].model);
-      delete newModel.layer_offloading;
-      delete newModel.layer_offloading_text_encoder_percent;
-      delete newModel.layer_offloading_transformer_percent;
-      setJobConfig(newModel, 'config.process[0].model');
-    }
-  } else {
-    // set to false if not set
-    if (!('layer_offloading' in jobConfig.config.process[0].model)) {
-      setJobConfig(false, 'config.process[0].model.layer_offloading');
-      setJobConfig(1.0, 'config.process[0].model.layer_offloading_text_encoder_percent');
-      setJobConfig(1.0, 'config.process[0].model.layer_offloading_transformer_percent');
-    }
-  }
+  if (!currentArch || !newArch || currentArch.name === newArchName) return null;
 
   const numDatasets = jobConfig.config.process[0].datasets.length;
+  const newDefaults = expandDatasetDefaults(newArch.defaults || {}, numDatasets);
+  let candidate = objectCopy(jobConfig);
+  const setValue = (value: unknown, key: string) => {
+    candidate = setNestedValue(candidate, value, key);
+  };
 
-  let currentDefaults = expandDatasetDefaults(currentArch.defaults || {}, numDatasets);
-  let newDefaults = expandDatasetDefaults(newArch?.defaults || {}, numDatasets);
-
-  // set new model
-  setJobConfig(newArchName, 'config.process[0].model.arch');
-
-  // update datasets
-  const hasControlPath = newArch?.additionalSections?.includes('datasets.control_path') || false;
-  const hasMultiControlPaths = newArch?.additionalSections?.includes('datasets.multi_control_paths') || false;
-  const hasNumFrames = newArch?.additionalSections?.includes('datasets.num_frames') || false;
-  const hasAutoFrameCount = newArch?.additionalSections?.includes('datasets.auto_frame_count') || false;
-  const controls = newArch?.controls ?? [];
-  const datasets = jobConfig.config.process[0].datasets.map(dataset => {
-    const newDataset = objectCopy(dataset);
-    newDataset.controls = controls;
-    if (hasMultiControlPaths) {
-      // make sure the config has the multi control paths
-      newDataset.control_path_1 = newDataset.control_path_1 || null;
-      newDataset.control_path_2 = newDataset.control_path_2 || null;
-      newDataset.control_path_3 = newDataset.control_path_3 || null;
-      // if we previously had a single control path and now
-      // we selected a multi control model
-      if (newDataset.control_path && newDataset.control_path !== '') {
-        // only set if not overwriting
-        if (!newDataset.control_path_1) {
-          newDataset.control_path_1 = newDataset.control_path;
-        }
-      }
-      delete newDataset.control_path; // remove single control path
-    } else if (hasControlPath) {
-      newDataset.control_path = newDataset.control_path || null;
-      if (newDataset.control_path_1 && newDataset.control_path_1 !== '') {
-        newDataset.control_path = newDataset.control_path_1;
-      }
-      if ('control_path_1' in newDataset) {
-        delete newDataset.control_path_1;
-      }
-      if ('control_path_2' in newDataset) {
-        delete newDataset.control_path_2;
-      }
-      if ('control_path_3' in newDataset) {
-        delete newDataset.control_path_3;
-      }
-    } else {
-      // does not have control images
-      if ('control_path' in newDataset) {
-        delete newDataset.control_path;
-      }
-      if ('control_path_1' in newDataset) {
-        delete newDataset.control_path_1;
-      }
-      if ('control_path_2' in newDataset) {
-        delete newDataset.control_path_2;
-      }
-      if ('control_path_3' in newDataset) {
-        delete newDataset.control_path_3;
-      }
-    }
-    if (!hasNumFrames) {
-      newDataset.num_frames = 1; // reset num_frames if not applicable
-    }
-    if (!hasAutoFrameCount) {
-      delete newDataset.auto_frame_count;
-    }
-    return newDataset;
-  });
-  setJobConfig(datasets, 'config.process[0].datasets');
-
-  // update samples
-  const hasSampleCtrlImg = newArch?.additionalSections?.includes('sample.ctrl_img') || false;
-  const samples = jobConfig.config.process[0].sample.samples.map(sample => {
-    const newSample = objectCopy(sample);
-    if (!hasSampleCtrlImg) {
-      delete newSample.ctrl_img; // remove ctrl_img if not applicable
-    }
-    return newSample;
-  });
-  setJobConfig(samples, 'config.process[0].sample.samples');
-
-  // revert defaults from previous model
-  for (const key in currentDefaults) {
-    setJobConfig(currentDefaults[key][1], key);
+  // Preserve every value from the previous model. Presentation cards may hide
+  // unsupported sections, but only the explicit conflict action may remove them.
+  setValue(newArchName, 'config.process[0].model.arch');
+  for (let index = 0; index < numDatasets; index += 1) {
+    setValue(newArch.controls ?? [], `config.process[0].datasets[${index}].controls`);
   }
-
   for (const key in newDefaults) {
-    setJobConfig(newDefaults[key][0], key);
+    const value = newDefaults[key][0];
+    if (value !== undefined) setValue(value, key);
   }
+  return candidate;
+};
+
+export const handleModelArchChange = async (
+  modelArchs: ModelArch[],
+  currentArchName: string,
+  newArchName: string,
+  jobConfig: JobConfig,
+  setJobConfig: (value: unknown, key?: string) => void,
+  onValidated?: (result: AdmissionResult, candidate: JobConfig) => void,
+): Promise<AdmissionResult | null> => {
+  const candidate = buildModelArchChange(modelArchs, currentArchName, newArchName, jobConfig);
+  if (!candidate) return null;
+  const result = await requestAdmission(candidate);
+  onValidated?.(result, candidate);
+  setJobConfig(candidate);
+  return result;
 };

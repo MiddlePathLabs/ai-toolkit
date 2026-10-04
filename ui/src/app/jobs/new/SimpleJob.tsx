@@ -10,6 +10,7 @@ import {
 import { useModelArchs } from '@/extensions/modelArchs';
 import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { formatAdmissionError, type AdmissionResult } from '@/utils/admission';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -38,11 +39,10 @@ import {
   getDepthToggleUpdates,
   isLowVramLocked,
 } from './depthUiPolicy';
-
 type Props = {
   jobConfig: JobConfig;
-  setJobConfig: (value: any, key: string) => void;
-  status: 'idle' | 'saving' | 'success' | 'error';
+  setJobConfig: (value: any, key?: string) => void;
+  status: 'idle' | 'validating' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
   gpuIDs: string | null;
@@ -50,6 +50,8 @@ type Props = {
   gpuList: any;
   datasetOptions: any;
   isLoading?: boolean;
+  onAdmissionResult?: (result: AdmissionResult) => void;
+  onAdmissionUnavailable?: (message: string) => void;
 };
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -74,6 +76,8 @@ export default function SimpleJob({
   gpuList,
   datasetOptions,
   isLoading,
+  onAdmissionResult,
+  onAdmissionUnavailable,
 }: Props) {
   const { archs: modelArchs, groupedModelOptions } = useModelArchs();
   const modelArch = useMemo(() => {
@@ -319,8 +323,19 @@ export default function SimpleJob({
             <SelectInput
               label="Model Architecture"
               value={jobConfig.config.process[0].model.arch}
+              docKey="config.process[0].model.arch"
               onChange={value => {
-                handleModelArchChange(modelArchs, jobConfig.config.process[0].model.arch, value, jobConfig, setJobConfig);
+                void handleModelArchChange(
+                  modelArchs,
+                  jobConfig.config.process[0].model.arch,
+                  value,
+                  jobConfig,
+                  setJobConfig,
+                )
+                  .then(result => {
+                    if (result) onAdmissionResult?.(result);
+                  })
+                  .catch(error => onAdmissionUnavailable?.(formatAdmissionError(error)));
               }}
               options={groupedModelOptions}
             />

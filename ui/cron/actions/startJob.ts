@@ -5,6 +5,11 @@ import path from 'path';
 import fs from 'fs';
 import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getOfflineMode, getModelsPath } from '../paths';
 import { resolveDetachedPythonPath } from '../pythonPath';
+import {
+  formatAdmissionDiagnostics,
+  type AdmissionDiagnostic,
+  validateStoredConfigBeforeMutation,
+} from '../admission';
 const isWindows = process.platform === 'win32';
 
 const appendJobLog = (logPath: string, message: string) => {
@@ -174,6 +179,35 @@ const watchDetachedJob = (pid: number, jobID: string, logPath: string) => {
   // Never hold the worker open on account of this poll.
   if (timer.unref) timer.unref();
 };
+const formatStoredAdmissionFailure = (failure: { body: Record<string, unknown> }): string => {
+  const diagnostics = failure.body.diagnostics;
+  if (Array.isArray(diagnostics)) {
+    const typedDiagnostics = diagnostics.filter(
+      (diagnostic): diagnostic is AdmissionDiagnostic =>
+        !!diagnostic &&
+        typeof diagnostic === 'object' &&
+        typeof (diagnostic as Record<string, unknown>).rule_id === 'string' &&
+        typeof (diagnostic as Record<string, unknown>).reason === 'string' &&
+        typeof (diagnostic as Record<string, unknown>).remedy === 'string' &&
+        Array.isArray((diagnostic as Record<string, unknown>).fields),
+    );
+    if (typedDiagnostics.length > 0) return formatAdmissionDiagnostics(typedDiagnostics);
+  }
+  return typeof failure.body.error === 'string'
+    ? failure.body.error
+    : 'Canonical admission rejected this configuration.';
+};
+
+const markQueuedJobRejected = async (jobID: string, message: string): Promise<void> => {
+  const result = await prisma.job.updateMany({
+    where: { id: jobID, status: 'queued' },
+    data: { status: 'error', info: message, pid: null },
+  });
+  if (result.count === 0) {
+    console.error(`Job ${jobID} was no longer queued when its canonical rejection was recorded`);
+  }
+};
+
 
 const startAndWatchJob = (job: Job) => {
   // starts and watches the job asynchronously
@@ -217,7 +251,8 @@ const startAndWatchJob = (job: Job) => {
     // update the config dataset path
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
-    if (job.job_type === 'inference') {
+    const processType = jobConfig?.config?.process?.[0]?.type;
+    if (typeof processType === 'string' && processType.trim().toLowerCase() === 'inferenceengine') {
       // the engine publishes engine.json (endpoint + token) and writes its
       // outputs under the job folder, which the UI proxy/file routes know
       jobConfig.config.process[0].engine = {
@@ -414,7 +449,24 @@ export default async function startJob(jobID: string) {
     console.error(`Job with ID ${jobID} not found`);
     return;
   }
-  // update job status to 'running', this will run sync so we don't start multiple jobs.
+  const admissionFailure = await validateStoredConfigBeforeMutation(job.job_config, {
+    source: 'worker',
+    context: { job_id: job.id, job_name: job.name },
+  });
+  if (admissionFailure) {
+    const details = formatStoredAdmissionFailure(admissionFailure);
+    const message =
+      admissionFailure.status === 422
+        ? `Canonical admission rejected job ${jobID}:\n${details}`
+        : `Job ${jobID} launch blocked: ${details}`;
+    if (admissionFailure.status === 422) {
+      await markQueuedJobRejected(jobID, message);
+    } else {
+      console.error(message);
+    }
+    return;
+  }
+
   await prisma.job.update({
     where: { id: jobID },
     data: {

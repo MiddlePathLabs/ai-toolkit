@@ -102,9 +102,13 @@ export interface GenerateDefaults {
   sampleTags?: SampleTags;
 }
 
+export type ModelRole = 'raw' | 'turbo' | 'edit' | 'ref2va' | 'fast' | 'audio' | 'other';
+
 export interface ModelArch {
   name: string;
   label: string;
+  /** Stable recipe role supplied by the extension, independent of checkpoint filenames. */
+  modelRole?: ModelRole;
   /** label shown by the Generate page instead of `label` (training-specific
    * wording like "w/ Training Adapter" does not apply to inference) */
   generateNameOverride?: string;

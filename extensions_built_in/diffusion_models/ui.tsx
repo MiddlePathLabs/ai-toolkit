@@ -11,6 +11,28 @@ import {
 
 const defaultNameOrPath = "";
 const defaultLinearRank = 32;
+const kreaModelNotes = (
+  <div className="space-y-2">
+    <p>
+      Krea RAW is the recommended training recipe. Turbo training-adapter
+      and edit variants are fork-specific roles and stay marked as warnings by
+      canonical admission; the model role comes from this metadata, never from a
+      checkpoint filename. Full-tune preview/edit CFG and source/CFG-Zero paths
+      remain temporarily gated until real production acceptance evidence exists;
+      CPU state tests do not certify visual quality.
+    </p>
+    <p>
+      Save, queue and launch run the managed Python admission checks again. A
+      warning is persistent, deferred runtime checks are not a certification,
+      and incompatible hidden values require an explicit removal action. GPU
+      quality, quantized-base behavior, offload, compile, sparse and distributed
+      support are experimental unless a matching scoped smoke is recorded.
+    </p>
+    <Link href="https://github.com/krea-ai/krea-2" className="text-blue-400 hover:underline">
+      Krea training and model reference
+    </Link>
+  </div>
+);
 
 export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
@@ -954,6 +976,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "minimax_h3",
     label: "MiniMax-H3",
+    modelRole: "raw",
     group: "video",
     isVideoModel: true,
     defaults: {
@@ -1154,12 +1177,20 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           as single frames, and a sample with num_frames 1 renders a single
           image.
         </p>
+        <p>
+          The H3 CPU contract covers channel-preserving packing, encoded-silence context, audio presence policy, and
+          the fixed 24-fps/32-kHz stereo geometry. Quantized-base gradients, offload, compile/checkpoint replay,
+          sparse VSA/TREAD tolerances, and distributed synchronization are experimental/uncertified for this fork unless
+          a matching scoped runtime smoke is recorded. Missing model weights or unsupported audio geometry fail closed;
+          the UI metadata does not certify checkpoint usefulness.
+        </p>
       </div>
     ),
   },
   {
     name: "minimax_h3_ref2va",
     label: "MiniMax-H3 Ref2V",
+    modelRole: "ref2va",
     group: "video",
     isVideoModel: true,
     defaults: {
@@ -1434,6 +1465,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "minimax_h3_vsa",
     label: "FastH3 8-Step V2",
+    modelRole: "fast",
     group: "video",
     isVideoModel: true,
     defaults: {
@@ -1919,8 +1951,10 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "krea2",
     label: "Krea 2 (raw)",
+    modelRole: "raw",
     group: "image",
     gateUrl: "https://huggingface.co/krea/Krea-2-Raw",
+    modelNotes: kreaModelNotes,
     defaults: {
       "config.process[0].model.name_or_path": [
         "krea/Krea-2-Raw",
@@ -1953,9 +1987,11 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "krea2:turbo",
     label: "Krea 2 Turbo (w/ Training Adapter)",
+    modelRole: "turbo",
     generateNameOverride: "Krea 2 Turbo",
     group: "image",
     gateUrl: "https://huggingface.co/krea/Krea-2-Turbo",
+    modelNotes: kreaModelNotes,
     defaults: {
       "config.process[0].model.name_or_path": [
         "krea/Krea-2-Turbo",
@@ -1995,7 +2031,9 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "krea2:o_edit",
     label: "Krea 2 (raw) [Edit Training]",
+    modelRole: "edit",
     gateUrl: "https://huggingface.co/krea/Krea-2-Raw",
+    modelNotes: kreaModelNotes,
     group: "experimental",
     defaults: {
       "config.process[0].model.name_or_path": [
@@ -2042,8 +2080,10 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
   {
     name: "krea2:o_edit_turbo",
     label: "Krea 2 Turbo (w/ Training Adapter) [Edit Training]",
+    modelRole: "edit",
     generateNameOverride: "Krea 2 Turbo (Edit)",
     gateUrl: "https://huggingface.co/krea/Krea-2-Turbo",
+    modelNotes: kreaModelNotes,
     group: "experimental",
     defaults: {
       "config.process[0].model.name_or_path": [

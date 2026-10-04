@@ -50,6 +50,8 @@ export const CaptionDatasetModal: React.FC = () => {
   const [hasLoadedExistingJob, setHasLoadedExistingJob] = useState(false);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
   const [activeTab, setActiveTab] = useState<'simple' | 'advanced'>('simple');
+  const [rawYamlValid, setRawYamlValid] = useState(true);
+  const [rawYaml, setRawYaml] = useState<string | undefined>();
   const open = modalInfo !== null;
   const isSavingRef = useRef(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -61,6 +63,8 @@ export const CaptionDatasetModal: React.FC = () => {
     // reset the state
     setJobConfig(objectCopy(defaultCaptionJobConfig));
     setActiveTab('simple');
+    setRawYaml(undefined);
+    setRawYamlValid(true);
     setExistingJobName(null);
     // set the path_to_caption
     if (modalInfo?.datasetPath) {
@@ -124,6 +128,10 @@ export const CaptionDatasetModal: React.FC = () => {
 
   const saveJob = async () => {
     if (isSavingRef.current) return;
+    if (!rawYamlValid) {
+      alert('The YAML editor has syntax errors. Fix them before adding this job to the queue.');
+      return;
+    }
     if (!modalInfo?.datasetPath) {
       alert('Dataset path is missing. Please try again.');
       return;
@@ -139,6 +147,7 @@ export const CaptionDatasetModal: React.FC = () => {
         name: isEdit && existingJobName ? existingJobName : uuidv4(),
         gpu_ids: gpuIDs,
         job_config: jobConfig,
+        ...(activeTab === 'advanced' && rawYaml !== undefined ? { raw_yaml: rawYaml } : {}),
         job_type: 'caption',
         job_ref: modalInfo.datasetPath,
       })
@@ -213,7 +222,12 @@ export const CaptionDatasetModal: React.FC = () => {
             />
           ) : (
             <div className="h-[60vh] mt-2">
-              <AdvancedConfigEditor config={jobConfig} setConfig={setJobConfig} />
+              <AdvancedConfigEditor
+                config={jobConfig}
+                setConfig={setJobConfig}
+                onRawChange={setRawYaml}
+                onValidationChange={valid => setRawYamlValid(valid)}
+              />
             </div>
           )}
 
@@ -227,6 +241,7 @@ export const CaptionDatasetModal: React.FC = () => {
             </button>
             <button
               type="submit"
+              disabled={!rawYamlValid || isSaving}
               className="rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               Add to Queue

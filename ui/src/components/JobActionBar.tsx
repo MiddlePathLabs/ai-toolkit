@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image } from 'lucide-react';
 import { LuLoader } from 'react-icons/lu';
-import { Button } from '@headlessui/react';
+import { Button, Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
 import { Job } from '@prisma/client';
 import {
@@ -15,7 +15,7 @@ import {
   sampleJobNow,
 } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
-import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
+import { formatAdmissionError } from '@/utils/admission';
 import { redirect } from 'next/navigation';
 import { openCaptionDatasetModal } from '@/components/CaptionDatasetModal';
 
@@ -88,6 +88,7 @@ export default function JobActionBar({
     } catch (e) {
       console.error(`Error running job action "${action}":`, e);
       clearPending();
+      alert(formatAdmissionError(e));
     }
   };
 

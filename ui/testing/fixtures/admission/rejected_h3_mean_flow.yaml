@@ -1,0 +1,17 @@
+job: extension
+config:
+  name: rejected-h3-mean-flow
+  process:
+    - type: sd
+      model:
+        arch: minimax_h3
+        name_or_path: Comfy-Org/MiniMax-H3
+      train:
+        loss_type: mean_flow
+        noise_scheduler: flowmatch
+        gradient_accumulation: 1
+      datasets:
+        - folder_path: ./datasets/example
+          num_frames: 39
+          fps: 24
+          do_audio: true

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-
+import { validateStoredConfigBeforeMutation } from '@/server/admission';
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
 
@@ -11,6 +11,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   if (!job) {
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
+
+  const failure = await validateStoredConfigBeforeMutation(job.job_config, { source: 'api' });
+  if (failure) return NextResponse.json(failure.body, { status: failure.status });
 
   // get highest queue position
   const highestQueuePosition = await prisma.job.aggregate({

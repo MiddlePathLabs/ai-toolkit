@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig, pruneUntouchedLossBlocks } from './jobConfig';
+import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
 import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
@@ -18,9 +18,10 @@ import { Button } from '@headlessui/react';
 import { FaChevronLeft } from 'react-icons/fa';
 import SimpleJob from './SimpleJob';
 import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
+import AdmissionFeedback from '@/components/AdmissionFeedback';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
-
+import { formatAdmissionError, requestAdmission, type AdmissionResult } from '@/utils/admission';
 const isDev = process.env.NODE_ENV === 'development';
 
 export default function TrainingForm() {
@@ -36,8 +37,25 @@ export default function TrainingForm() {
   const [showAdvancedView, setShowAdvancedView] = useState(false);
 
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
-  const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'validating' | 'saving' | 'success' | 'error'>('idle');
+  const [admissionResult, setAdmissionResult] = useState<AdmissionResult | null>(null);
+  const [admissionUnavailable, setAdmissionUnavailable] = useState<string | null>(null);
+  const [rawYaml, setRawYaml] = useState<string | undefined>();
+  const [rawYamlValid, setRawYamlValid] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const validateCandidate = async (candidate: JobConfig, raw?: string): Promise<AdmissionResult | null> => {
+    setAdmissionUnavailable(null);
+    try {
+      const result = await requestAdmission(candidate, raw);
+      setAdmissionResult(result);
+      return result;
+    } catch (error) {
+      setAdmissionResult(null);
+      setAdmissionUnavailable(formatAdmissionError(error));
+      return null;
+    }
+  };
 
   const handleImportConfig = () => {
     fileInputRef.current?.click();
@@ -48,36 +66,39 @@ export default function TrainingForm() {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
+      const text = reader.result as string;
       try {
-        const text = reader.result as string;
-        let parsed: any;
-        if (file.name.endsWith('.json') || file.name.endsWith('.jsonc')) {
-          parsed = JSON.parse(text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''));
-        } else {
-          parsed = YAML.parse(text);
-        }
-
-        // Set required fields (same pattern as AdvancedJob.handleChange)
-        try {
-          parsed.config.process[0].sqlite_db_path = './aitk_db.db';
-          parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-          parsed.config.process[0].device = 'cuda';
-          parsed.config.process[0].performance_log_every = 10;
-        } catch (err) {
-          console.warn('Could not set required fields on imported config:', err);
-        }
-
-        migrateJobConfig(parsed);
-        setJobConfig(parsed);
-      } catch (err) {
-        console.error('Failed to parse config file:', err);
-        alert('Failed to parse config file. Please check the file format.');
+        const parsed =
+          file.name.endsWith('.json') || file.name.endsWith('.jsonc')
+            ? JSON.parse(text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''))
+            : YAML.parse(text);
+        const candidate = migrateJobConfig(parsed as JobConfig);
+        setRawYaml(undefined);
+        setRawYamlValid(true);
+        await validateCandidate(candidate);
+        setJobConfig(candidate);
+      } catch (error) {
+        setRawYamlValid(false);
+        setAdmissionUnavailable(null);
+        setAdmissionResult({
+          valid: false,
+          diagnostics: [
+            {
+              rule_id: 'admission.raw_yaml_invalid',
+              severity: 'error',
+              fields: ['config'],
+              reason: `The imported configuration could not be parsed: ${formatAdmissionError(error)}`,
+              remedy: 'Fix the imported YAML/JSON syntax and import it again.',
+              phase: 'static',
+            },
+          ],
+          deferred: [],
+          source: 'ui',
+        });
       }
     };
     reader.readAsText(file);
-
-    // Reset so the same file can be re-imported
     e.target.value = '';
   };
 
@@ -103,36 +124,26 @@ export default function TrainingForm() {
     }
   }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
 
-  // clone existing job
+  // Clone and edit both run canonical admission before exposing a runnable state.
   useEffect(() => {
-    if (cloneId) {
-      apiClient
-        .get(`/api/jobs?id=${cloneId}`)
-        .then(res => res.data)
-        .then(data => {
-          console.log('Clone Training:', data);
-          setGpuIDs(data.gpu_ids);
-          const newJobConfig = migrateJobConfig(JSON.parse(data.job_config));
-          newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
-          setJobConfig(newJobConfig);
-        })
-        .catch(error => console.error('Error fetching training:', error));
-    }
-  }, [cloneId]);
-
-  useEffect(() => {
-    if (runId) {
-      apiClient
-        .get(`/api/jobs?id=${runId}`)
-        .then(res => res.data)
-        .then(data => {
-          console.log('Training:', data);
-          setGpuIDs(data.gpu_ids);
-          setJobConfig(migrateJobConfig(JSON.parse(data.job_config)));
-        })
-        .catch(error => console.error('Error fetching training:', error));
-    }
-  }, [runId]);
+    const sourceId = cloneId || runId;
+    if (!sourceId) return;
+    apiClient
+      .get(`/api/jobs?id=${sourceId}`)
+      .then(async res => {
+        const data = res.data;
+        const loaded = migrateJobConfig(JSON.parse(data.job_config) as JobConfig);
+        if (cloneId) loaded.config.name = `${loaded.config.name}_copy`;
+        setGpuIDs(data.gpu_ids);
+        setRawYaml(undefined);
+        setRawYamlValid(true);
+        await validateCandidate(loaded);
+        setJobConfig(loaded);
+      })
+      .catch(error => {
+        setAdmissionUnavailable(formatAdmissionError(error));
+      });
+  }, [cloneId, runId]);
 
   useEffect(() => {
     if (isGPUInfoLoaded) {
@@ -149,39 +160,39 @@ export default function TrainingForm() {
   }, [settings, isSettingsLoaded]);
 
   const saveJob = async () => {
-    if (status === 'saving') return;
-    setStatus('saving');
+    if (status === 'saving' || status === 'validating') return;
+    if (!rawYamlValid) {
+      setStatus('error');
+      return;
+    }
+    setStatus('validating');
+    const result = await validateCandidate(jobConfig, showAdvancedView ? rawYaml : undefined);
+    if (!result || !result.valid) {
+      setStatus('error');
+      setTimeout(() => setStatus('idle'), 2000);
+      return;
+    }
 
+    setStatus('saving');
     apiClient
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
         gpu_ids: gpuIDs,
-        // Strip loss blocks the user never enabled; migrateJobConfig re-merges
-        // their disabled defaults when the job is loaded back into the form.
-        job_config: pruneUntouchedLossBlocks(jobConfig),
+        job_config: jobConfig,
+        ...(showAdvancedView && rawYaml === undefined ? {} : { raw_yaml: showAdvancedView ? rawYaml : undefined }),
       })
       .then(res => {
         setStatus('success');
-        if (runId) {
-          router.push(`/jobs/${runId}`);
-        } else {
-          router.push(`/jobs/${res.data.id}`);
-        }
+        if (runId) router.push(`/jobs/${runId}`);
+        else router.push(`/jobs/${res.data.id}`);
       })
       .catch(error => {
-        if (error.response?.status === 409) {
-          alert('Training name already exists. Please choose a different name.');
-        } else {
-          alert('Failed to save job. Please try again.');
-        }
-        console.log('Error saving training:', error);
+        if (error.response?.status === 409) alert('Training name already exists. Please choose a different name.');
+        else alert(formatAdmissionError(error));
+        setStatus('error');
       })
-      .finally(() =>
-        setTimeout(() => {
-          setStatus('idle');
-        }, 2000),
-      );
+      .finally(() => setTimeout(() => setStatus('idle'), 2000));
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -267,10 +278,12 @@ export default function TrainingForm() {
           <Button
             className="text-white bg-green-600 hover:bg-green-700 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
             onClick={() => saveJob()}
-            disabled={status === 'saving'}
+            disabled={status === 'saving' || status === 'validating' || !rawYamlValid}
           >
             {status === 'saving' ? (
               'Saving...'
+            ) : status === 'validating' ? (
+              'Validating...'
             ) : (
               <>
                 <span className="sm:hidden">{runId ? 'Update' : 'Create'}</span>
@@ -288,15 +301,44 @@ export default function TrainingForm() {
         style={{ display: 'none' }}
         onChange={handleFileSelected}
       />
+      <AdmissionFeedback
+        config={jobConfig}
+        result={admissionResult}
+        unavailable={admissionUnavailable}
+        onRemove={next => {
+          setJobConfig(next);
+          void validateCandidate(next);
+        }}
+      />
+
 
       {showAdvancedView ? (
         <div className="pt-[48px] absolute top-0 left-0 w-full h-full overflow-auto">
           <AdvancedConfigEditor
             config={jobConfig}
             setConfig={setJobConfig}
-            // Show the same config that Create/Update saves: untouched, disabled
-            // loss blocks are hidden here and re-merged into form state on parse.
-            transformForDisplay={pruneUntouchedLossBlocks}
+            onRawChange={setRawYaml}
+            onValidationChange={(valid, message, line) => {
+              setRawYamlValid(valid);
+              if (!valid) {
+                setAdmissionUnavailable(null);
+                setAdmissionResult({
+                  valid: false,
+                  diagnostics: [
+                    {
+                      rule_id: 'admission.raw_yaml_invalid',
+                      severity: 'error',
+                      fields: ['config'],
+                      reason: `${message || 'Invalid YAML'} (line ${line || 1}).`,
+                      remedy: 'Fix the highlighted YAML syntax before saving or starting this job.',
+                      phase: 'static',
+                    },
+                  ],
+                  deferred: [],
+                  source: 'ui',
+                });
+              }
+            }}
             transformOnParse={(parsed: any) => {
               try {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';
@@ -330,6 +372,14 @@ export default function TrainingForm() {
               gpuList={gpuList}
               datasetOptions={datasetOptions}
               isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
+              onAdmissionResult={result => {
+                setAdmissionUnavailable(null);
+                setAdmissionResult(result);
+              }}
+              onAdmissionUnavailable={message => {
+                setAdmissionResult(null);
+                setAdmissionUnavailable(message);
+              }}
             />
           </ErrorBoundary>
 
