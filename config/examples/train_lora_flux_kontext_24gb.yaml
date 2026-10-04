@@ -47,7 +47,6 @@ config:
       train:
         batch_size: 1
         steps: 3000  # total number of steps to train 500 - 4000 is a good range
-        gradient_accumulation_steps: 1
         train_unet: true
         train_text_encoder: false  # probably won't work with flux
         gradient_checkpointing: true  # need the on unless you have a ton of vram
