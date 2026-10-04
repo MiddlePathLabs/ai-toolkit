@@ -8,9 +8,23 @@ import { resolveDetachedPythonPath } from '../pythonPath';
 import {
   formatAdmissionDiagnostics,
   type AdmissionDiagnostic,
+  type AdmissionRunner,
   validateStoredConfigBeforeMutation,
 } from '../admission';
 const isWindows = process.platform === 'win32';
+
+export interface StartJobStore {
+  job: {
+    findUnique: (args: unknown) => Promise<Job | null>;
+    updateMany: (args: unknown) => Promise<{ count: number }>;
+    update: (args: unknown) => Promise<unknown>;
+  };
+}
+
+export interface StartJobDependencies {
+  store?: StartJobStore;
+  admissionRunner?: AdmissionRunner;
+}
 
 const appendJobLog = (logPath: string, message: string) => {
   fs.appendFile(logPath, message, error => {
@@ -198,13 +212,17 @@ const formatStoredAdmissionFailure = (failure: { body: Record<string, unknown> }
     : 'Canonical admission rejected this configuration.';
 };
 
-const markQueuedJobRejected = async (jobID: string, message: string): Promise<void> => {
-  const result = await prisma.job.updateMany({
+const markQueuedJobFailed = async (
+  store: StartJobStore,
+  jobID: string,
+  message: string,
+): Promise<void> => {
+  const result = await store.job.updateMany({
     where: { id: jobID, status: 'queued' },
     data: { status: 'error', info: message, pid: null },
   });
   if (result.count === 0) {
-    console.error(`Job ${jobID} was no longer queued when its canonical rejection was recorded`);
+    console.error(`Job ${jobID} was no longer queued when its launch failure was recorded`);
   }
 };
 
@@ -441,8 +459,12 @@ const startAndWatchJob = (job: Job) => {
   });
 };
 
-export default async function startJob(jobID: string) {
-  const job: Job | null = await prisma.job.findUnique({
+export default async function startJob(
+  jobID: string,
+  dependencies: StartJobDependencies = {},
+): Promise<void> {
+  const store = dependencies.store ?? (prisma as unknown as StartJobStore);
+  const job: Job | null = await store.job.findUnique({
     where: { id: jobID },
   });
   if (!job) {
@@ -451,6 +473,7 @@ export default async function startJob(jobID: string) {
   }
   const admissionFailure = await validateStoredConfigBeforeMutation(job.job_config, {
     source: 'worker',
+    runner: dependencies.admissionRunner,
     context: { job_id: job.id, job_name: job.name },
   });
   if (admissionFailure) {
@@ -459,15 +482,11 @@ export default async function startJob(jobID: string) {
       admissionFailure.status === 422
         ? `Canonical admission rejected job ${jobID}:\n${details}`
         : `Job ${jobID} launch blocked: ${details}`;
-    if (admissionFailure.status === 422) {
-      await markQueuedJobRejected(jobID, message);
-    } else {
-      console.error(message);
-    }
+    await markQueuedJobFailed(store, jobID, message);
     return;
   }
 
-  await prisma.job.update({
+  await store.job.update({
     where: { id: jobID },
     data: {
       status: 'running',

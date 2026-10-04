@@ -2,7 +2,7 @@ export {
   AdmissionUnavailableError,
   parseRawYaml,
   rawYamlDiagnostic,
-  resolveManagedPythonPath,
+  resolvePythonPath,
   runAdmission,
   shouldRunTrainingAdmission,
   validateStoredConfigBeforeMutation,

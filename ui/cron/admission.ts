@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
-import fs from 'fs';
 import path from 'path';
 import YAML from 'yaml';
+import { resolvePythonPath } from './pythonPath';
 export type AdmissionSeverity = 'error' | 'warning';
 
 export interface AdmissionDiagnostic {
@@ -35,20 +35,7 @@ export const formatAdmissionDiagnostics = (diagnostics: AdmissionDiagnostic[]): 
     })
     .join('\n') || 'Canonical admission rejected this configuration.';
 
-const isWindows = process.platform === 'win32';
 const toolkitRoot = path.resolve('@', '..', '..');
-
-export const resolveManagedPythonPath = (): string | null => {
-  const configured = process.env.AI_TOOLKIT_PYTHON;
-  const candidates = configured
-    ? [configured]
-    : [
-        path.join(toolkitRoot, '..', 'python_embeded', isWindows ? 'python.exe' : 'python'),
-        path.join(toolkitRoot, 'python_embeded', isWindows ? 'python.exe' : 'python'),
-      ];
-  return candidates.find(candidate => fs.existsSync(candidate)) ?? null;
-};
-
 
 const isAdmissionResult = (value: unknown): value is AdmissionResult => {
   if (!value || typeof value !== 'object') return false;
@@ -56,10 +43,10 @@ const isAdmissionResult = (value: unknown): value is AdmissionResult => {
   return typeof result.valid === 'boolean' && Array.isArray(result.diagnostics) && Array.isArray(result.deferred);
 };
 
-export const runAdmission = (config: unknown, source = 'api'): Promise<AdmissionResult> => {
-  const python = resolveManagedPythonPath();
-  if (!python) return Promise.reject(new AdmissionUnavailableError('managed interpreter was not found'));
+export { resolvePythonPath };
 
+export const runAdmission = (config: unknown, source = 'api'): Promise<AdmissionResult> => {
+  const python = resolvePythonPath();
   return new Promise((resolve, reject) => {
     const child = spawn(python, ['-m', 'toolkit.admission', '--stdin', '--source', source], {
       cwd: toolkitRoot,
