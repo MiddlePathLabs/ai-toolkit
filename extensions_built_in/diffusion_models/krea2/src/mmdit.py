@@ -586,13 +586,19 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
 
         for block, blockkv in zip(self.blocks, blockcaches):
             if self.gradient_checkpointing and torch.is_grad_enabled():
+                checkpoint_context = getattr(
+                    self, "_aitk_semantic_checkpoint_context_fn", None
+                )
+                checkpoint_kwargs = {"use_reentrant": False}
+                if checkpoint_context is not None:
+                    checkpoint_kwargs["context_fn"] = checkpoint_context
                 combined = checkpoint(
                     block,
                     combined,
                     blockvec,
                     freqs,
                     mask,
-                    use_reentrant=False,
+                    **checkpoint_kwargs,
                 )
             else:
                 combined = block(
@@ -604,7 +610,6 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
                     kv_capture=ref_kv_capture,
                     kv_cache=blockkv,
                 )
-
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen - reflen, :]
 

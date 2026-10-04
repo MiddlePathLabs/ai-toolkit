@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import os
 import json
 from collections import OrderedDict
@@ -533,6 +533,7 @@ class ToolkitNetworkMixin:
         self.train_text_encoder = train_text_encoder
         self.train_unet = train_unet
         self.is_checkpointing = False
+        self.is_active: bool = False
         self._multiplier: float = 1.0
         # ``None`` means the flattened leading dimension is a token expansion.
         # A CFG context records the semantic branch order before token flattening.
@@ -877,6 +878,12 @@ class ToolkitNetworkMixin:
             yield self
         finally:
             self._cfg_branches = previous
+
+
+    def semantic_checkpoint_context(self: Network):
+        """Return checkpoint contexts that preserve CFG semantics on recompute."""
+        cfg_branches = self._cfg_branches
+        return nullcontext(), self.semantic_batch(cfg_branches=cfg_branches)
 
     def multiplier_for_batch(self: Network, output_batch_size: int) -> torch.Tensor:
         """Expand strengths for a module output's leading dimension.

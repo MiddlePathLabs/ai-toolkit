@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import copy
 import gc
 import inspect
@@ -73,6 +74,47 @@ DO_NOT_TRAIN_WEIGHTS = [
 ]
 
 DeviceStatePreset = Literal['cache_latents', 'generate']
+
+
+@contextmanager
+def _semantic_cfg_prediction(network, model):
+    if network is None:
+        yield
+        return
+
+    semantic_batch = getattr(network, "semantic_batch", None)
+    if semantic_batch is None:
+        network = unwrap_model(network)
+        semantic_batch = getattr(network, "semantic_batch", None)
+    if semantic_batch is None:
+        yield
+        return
+
+    checkpoint_context = getattr(network, "semantic_checkpoint_context", None)
+    context_attr = "_aitk_semantic_checkpoint_context_fn"
+    missing = object()
+    bound_models = []
+    if model is not None:
+        for candidate in (model, unwrap_model(model)):
+            if candidate is None or any(candidate is bound for bound in bound_models):
+                continue
+            bound_models.append(candidate)
+    previous = [
+        (candidate, getattr(candidate, context_attr, missing))
+        for candidate in bound_models
+    ]
+    for candidate, _ in previous:
+        if checkpoint_context is not None:
+            setattr(candidate, context_attr, checkpoint_context)
+    try:
+        with semantic_batch(cfg_branches=2):
+            yield
+    finally:
+        for candidate, prior in reversed(previous):
+            if prior is missing:
+                delattr(candidate, context_attr)
+            else:
+                setattr(candidate, context_attr, prior)
 
 
 class BlankNetwork:
@@ -1070,12 +1112,14 @@ class BaseModel:
         if 'batch' in signatures:
             kwargs['batch'] = batch
 
-        noise_pred = self.get_noise_prediction(
-            latent_model_input=latent_model_input,
-            timestep=timestep,
-            text_embeddings=text_embeddings,
-            **kwargs
-        )
+        network = getattr(self, "network", None) if do_classifier_free_guidance else None
+        with _semantic_cfg_prediction(network, self.unet):
+            noise_pred = self.get_noise_prediction(
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                text_embeddings=text_embeddings,
+                **kwargs
+            )
 
         conditional_pred = noise_pred
 

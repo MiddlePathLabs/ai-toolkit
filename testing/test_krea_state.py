@@ -3,10 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 from torch.utils.checkpoint import checkpoint
-
+from torch import nn
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from extensions_built_in.diffusion_models.krea2.src import pipeline as krea_pipeline
+
+import toolkit.models.base_model as base_model_module
 from toolkit.lora_special import LoRAModule
 from toolkit.models.base_model import BaseModel
 from toolkit.network_mixins import ToolkitNetworkMixin
@@ -121,6 +123,207 @@ def test_token_expansion_keeps_sample_order_without_cfg_context():
     per_row = delta[:, 0]
     expected = torch.tensor([1, 1, 1, 3, 3, 3], dtype=per_row.dtype)
     assert torch.allclose(per_row / per_row[0], expected)
+
+
+@pytest.mark.parametrize("strengths", ([2.0], [2.0, 2.0]))
+def test_equal_cfg_strengths_match_legacy_batch_expansion(strengths):
+    network, module, _ = _lora_module()
+    network.multiplier = list(strengths)
+    x = torch.ones(len(strengths) * 2 * 3, 3)
+
+    legacy = module(x)
+    with network.semantic_batch(cfg_branches=2):
+        cfg = module(x)
+
+    torch.testing.assert_close(cfg, legacy)
+
+
+def test_network_mixin_starts_inactive_for_early_lycoris_reads():
+    network = _Network()
+
+    assert network.is_active is False
+
+
+def test_production_cfg_prediction_matches_independent_strength_and_gradient_oracle(
+    monkeypatch,
+):
+    from extensions_built_in.diffusion_models.krea2.krea2 import Krea2Model
+
+    network = _Network()
+    base = nn.Linear(3, 1, bias=False)
+    base.weight.requires_grad_(False)
+    adapter = LoRAModule(
+        "text",
+        base,
+        lora_dim=2,
+        alpha=2,
+        network=network,
+    )
+    network._modules_list = [adapter]
+    adapter.apply_to()
+    with torch.no_grad():
+        adapter.lora_down.weight.fill_(0.5)
+        adapter.lora_up.weight.fill_(0.25)
+    network.is_active = True
+
+    class TextConditionedDiT(nn.Module):
+        config = SimpleNamespace(patch=2, txtlayers=1)
+
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(2.0))
+            self.gradient_checkpointing = True
+
+        @property
+        def device(self):
+            return self.scale.device
+
+        @property
+        def dtype(self):
+            return self.scale.dtype
+
+        def _predict(self, img, context):
+            b, text_len = context.shape[:2]
+            text = adapter(context.reshape(-1, 3)).reshape(b, text_len, 1)
+            return img * self.scale + text.mean(dim=1, keepdim=True)
+
+        def forward(self, img, context, t, **kwargs):
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                checkpoint_context = getattr(
+                    self, "_aitk_semantic_checkpoint_context_fn", None
+                )
+                checkpoint_kwargs = {"use_reentrant": False}
+                if checkpoint_context is not None:
+                    checkpoint_kwargs["context_fn"] = checkpoint_context
+                return checkpoint(
+                    self._predict, img, context, **checkpoint_kwargs
+                )
+            return self._predict(img, context)
+
+    class PreparedModel(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        @property
+        def config(self):
+            return self.module.config
+
+        @property
+        def device(self):
+            return self.module.device
+
+        @property
+        def dtype(self):
+            return self.module.dtype
+
+        def forward(self, *args, **kwargs):
+            return self.module(*args, **kwargs)
+
+    transformer = TextConditionedDiT()
+    prepared_model = PreparedModel(transformer)
+    monkeypatch.setattr(
+        base_model_module,
+        "unwrap_model",
+        lambda candidate: (
+            candidate.module
+            if isinstance(candidate, PreparedModel)
+            else candidate
+        ),
+    )
+    model = object.__new__(Krea2Model)
+    model.model = prepared_model
+    model.device_torch = torch.device("cpu")
+    model.torch_dtype = torch.float32
+    model.is_edit = False
+    model.kv_cache = False
+    model.model_config = SimpleNamespace(model_kwargs={})
+    model.network = network
+
+    conditional = AdvancedPromptEmbeds(
+        text_embeds=[
+            torch.tensor([[0.2, 0.3, 0.4], [0.5, 0.6, 0.7]]),
+            torch.tensor([[1.2, 1.3, 1.4], [1.5, 1.6, 1.7]]),
+        ]
+    )
+    unconditional = AdvancedPromptEmbeds(
+        text_embeds=[
+            torch.tensor([[-0.2, -0.3, -0.4], [-0.5, -0.6, -0.7]]),
+            torch.tensor([[-1.2, -1.3, -1.4], [-1.5, -1.6, -1.7]]),
+        ]
+    )
+    timesteps = torch.tensor([100.0, 200.0])
+    latents = torch.randn(2, 4, 2, 2)
+
+    network.multiplier = [1.0, 3.0]
+    joint_prediction = model.predict_noise(
+        latents=latents,
+        conditional_embeddings=conditional,
+        unconditional_embeddings=unconditional,
+        timestep=timesteps,
+        guidance_scale=1.25,
+        is_input_scaled=True,
+    )
+    joint_prediction.sum().backward()
+    joint_adapter_grads = [
+        parameter.grad.detach().clone()
+        for parameter in (adapter.lora_down.weight, adapter.lora_up.weight)
+    ]
+    joint_scale_grad = transformer.scale.grad.detach().clone()
+
+    for parameter in transformer.parameters():
+        parameter.grad = None
+    adapter.zero_grad(set_to_none=True)
+    independent_predictions = []
+    for index, strength in enumerate((1.0, 3.0)):
+        sample_latents = latents[index:index + 1]
+        network.multiplier = [strength]
+        independent_predictions.append(
+            model.predict_noise(
+                latents=sample_latents,
+                conditional_embeddings=AdvancedPromptEmbeds(
+                    text_embeds=[conditional.text_embeds[index]]
+                ),
+                unconditional_embeddings=AdvancedPromptEmbeds(
+                    text_embeds=[unconditional.text_embeds[index]]
+                ),
+                timestep=timesteps[index:index + 1],
+                guidance_scale=1.25,
+                is_input_scaled=True,
+            )
+        )
+        independent_predictions[-1].sum().backward()
+    independent_prediction = torch.cat(independent_predictions, dim=0)
+
+    torch.testing.assert_close(joint_prediction, independent_prediction)
+    for joint_grad, parameter in zip(
+        joint_adapter_grads, (adapter.lora_down.weight, adapter.lora_up.weight)
+    ):
+        torch.testing.assert_close(joint_grad, parameter.grad)
+    torch.testing.assert_close(joint_scale_grad, transformer.scale.grad)
+    assert network._cfg_branches is None
+    assert not hasattr(prepared_model, "_aitk_semantic_checkpoint_context_fn")
+    assert not hasattr(transformer, "_aitk_semantic_checkpoint_context_fn")
+
+    def fail_prediction(*_args, **_kwargs):
+        raise RuntimeError("sentinel prediction failure")
+
+    monkeypatch.setattr(transformer, "forward", fail_prediction)
+    network.multiplier = [1.0, 3.0]
+    with pytest.raises(RuntimeError, match="sentinel prediction failure"):
+        model.predict_noise(
+            latents=latents,
+            conditional_embeddings=conditional,
+            unconditional_embeddings=unconditional,
+            timestep=timesteps,
+            guidance_scale=1.25,
+            is_input_scaled=True,
+        )
+    assert network._cfg_branches is None
+    assert not hasattr(prepared_model, "_aitk_semantic_checkpoint_context_fn")
+    assert not hasattr(transformer, "_aitk_semantic_checkpoint_context_fn")
+
+
 
 
 def test_module_dropout_returns_base_and_replays_checkpoint_rng():
