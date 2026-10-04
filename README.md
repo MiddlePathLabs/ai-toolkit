@@ -109,6 +109,8 @@ Remediation verification (2026-10-04): 321 scoped Python cases and 9 UI policy c
 
 Deployment evidence is separate: the already-running GUI still returned HTTP 404 for the new `/api/admission` route. It was inspected and closed without saving or launching a job; no service was restarted. Updated-GUI visual acceptance and real Krea/H3 checkpoint/GPU acceptance remain open. Do not treat these CPU/source-handler checks as release approval for those capabilities.
 
+UI validation: run `npm run typecheck` from `ui/`; it checks both the worker and Next.js TypeScript configurations without emitting files or starting services. The worker uses different compiler settings, so checking only `tsconfig.json` does not cover the first stage of `npm run build`.
+
 Pinned references used for this release ledger:
 
 - Official [Krea repository revision `db3984fbc6e13b34c0064990fc2d95ac64d00058`](https://github.com/krea-ai/krea-2/commit/db3984fbc6e13b34c0064990fc2d95ac64d00058).

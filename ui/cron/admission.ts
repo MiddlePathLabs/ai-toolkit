@@ -209,7 +209,7 @@ export const parseRawYaml = (text: string): RawYamlResult => {
 
 export const rawYamlDiagnostic = (rawYaml: string): AdmissionResult | null => {
   const parsed = parseRawYaml(rawYaml);
-  if (parsed.valid) return null;
+  if (parsed.valid === true) return null;
   return {
     valid: false,
     diagnostics: [

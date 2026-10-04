@@ -10,7 +10,7 @@
     "db_build_start": "npm run update_db && npm run build && npm run start",
     "build_and_start": "npm run install_deps && npm run db_build_start",
     "test:noising": "sucrase-node testing/noising-config.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.json",
     "lint": "next lint",
     "update_db": "npx prisma generate && npx prisma db push",
     "format": "prettier --write \"**/*.{js,jsx,ts,tsx,css,scss}\"",
