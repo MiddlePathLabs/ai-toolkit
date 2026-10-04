@@ -507,9 +507,9 @@ class TrainConfig:
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.steps: int = kwargs.get('steps', 1000)
         self.resume_mode = kwargs.get('resume_mode', 'auto')
-        if self.resume_mode not in ('auto', 'exact', 'weights_only'):
+        if self.resume_mode not in ('auto', 'continue', 'exact', 'weights_only'):
             raise ValueError(
-                "train.resume_mode must be 'auto', 'exact', or 'weights_only', "
+                "train.resume_mode must be 'auto', 'continue', 'exact', or 'weights_only', "
                 f"got {self.resume_mode!r}"
             )
         self.lr = kwargs.get('lr', 1e-6)

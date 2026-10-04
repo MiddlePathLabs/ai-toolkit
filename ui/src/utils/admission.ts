@@ -48,8 +48,6 @@ export const requestAdmission = async (config: unknown, rawYaml?: string): Promi
     throw new AdmissionClientError(message || 'Canonical admission is unavailable; the configuration was not changed.');
   }
 };
- 
-
 const readResponseData = (error: unknown): unknown => {
   if (!error || typeof error !== 'object' || !('response' in error)) return undefined;
   const response = error.response;
@@ -63,7 +61,111 @@ const readErrorMessage = (error: unknown): string | null => {
   return error instanceof Error ? error.message : null;
 };
 
+export type AdmissionValidationStatus = 'pending' | 'invalid' | 'valid' | 'runtime_pending' | 'unavailable';
+
+export interface AdmissionValidation {
+  candidateKey: string;
+  status: AdmissionValidationStatus;
+  result: AdmissionResult | null;
+  unavailable: string | null;
+}
+
+export interface AdmissionValidator {
+  setCandidate: (candidateKey: string) => void;
+  invalidate: () => void;
+  validate: (config: JobConfig, rawYaml?: string) => Promise<AdmissionResult | null>;
+}
+
+export const getAdmissionCandidateKey = (config: unknown, rawYaml?: string): string =>
+  JSON.stringify([config, rawYaml ?? null]);
+
+export const getCurrentAdmissionValidation = (
+  validation: AdmissionValidation | null,
+  candidateKey: string,
+): AdmissionValidation | null => validation?.candidateKey === candidateKey ? validation : null;
+
+export const createAdmissionValidator = (
+  onChange: (validation: AdmissionValidation) => void,
+  runner: typeof requestAdmission = requestAdmission,
+): AdmissionValidator => {
+  let candidateKey: string | undefined;
+  let requestId = 0;
+  const invalidate = () => { requestId += 1; };
+  const setCandidate = (key: string) => {
+    if (candidateKey === key) return;
+    candidateKey = key;
+    invalidate();
+  };
+  const validate = async (config: JobConfig, rawYaml?: string): Promise<AdmissionResult | null> => {
+    const key = getAdmissionCandidateKey(config, rawYaml);
+    if (key !== candidateKey) return null;
+    const id = ++requestId;
+    onChange({ candidateKey: key, status: 'pending', result: null, unavailable: null });
+    try {
+      const result = await runner(config, rawYaml);
+      if (key !== candidateKey || id !== requestId) return null;
+      const status = !result.valid ? 'invalid' : result.deferred.length > 0 ? 'runtime_pending' : 'valid';
+      onChange({ candidateKey: key, status, result, unavailable: null });
+      return result;
+    } catch (error) {
+      if (key !== candidateKey || id !== requestId) return null;
+      onChange({ candidateKey: key, status: 'unavailable', result: null, unavailable: formatAdmissionError(error) });
+      return null;
+    }
+  };
+  return { setCandidate, invalidate, validate };
+};
+
 type PathPart = string | number | '*';
+type SettingValue = string | number | boolean;
+
+interface RemediationRule {
+  field: RegExp;
+  label: string;
+  value?: SettingValue;
+}
+
+const processField = (suffix: string): RegExp =>
+  new RegExp(`^config\\.process\\[\\d+\\]\\.${suffix}$`);
+const datasetField = (suffix: string): RegExp =>
+  processField(`datasets\\[\\d+\\]\\.${suffix}`);
+
+const remediationRules: Record<string, RemediationRule[]> = {
+  'admission.mean_flow': [
+    { field: processField('train\\.loss_type'), label: 'Set loss type to MSE', value: 'mse' },
+  ],
+  'admission.dopsd_loss': [
+    { field: processField('train\\.loss_type'), label: 'Set loss type to MSE', value: 'mse' },
+  ],
+  'admission.h3_standalone_audio': [
+    { field: datasetField('buckets'), label: 'Enable buckets for this dataset', value: true },
+    { field: datasetField('caption_dropout_rate'), label: 'Disable voice caption dropout', value: 0 },
+  ],
+  'admission.h3_target_fps': [
+    { field: datasetField('fps'), label: 'Set target FPS to 24', value: 24 },
+  ],
+  'admission.h3_fast_conditioning': [
+    { field: datasetField('do_i2v'), label: 'Disable image-to-video conditioning', value: false },
+  ],
+  'admission.legacy_accumulation': [
+    { field: processField('train\\.gradient_accumulation_steps'), label: 'Remove legacy accumulation setting' },
+  ],
+  'admission.flow_unaugmented_target': [
+    { field: processField('train\\.loss_target'), label: 'Use the noise loss target', value: 'noise' },
+  ],
+  'admission.krea_low_vram_auxiliary': [
+    { field: processField('model\\.low_vram'), label: 'Disable low-VRAM tiled decoding', value: false },
+  ],
+  'admission.latent_cache_augmentation': [
+    { field: datasetField('cache_latents'), label: 'Disable in-memory latent caching', value: false },
+    { field: datasetField('cache_latents_to_disk'), label: 'Disable disk latent caching', value: false },
+  ],
+  'admission.temporary_safety_block': [
+    { field: processField('network\\.(?:network_kwargs\\.)?module_dropout'), label: 'Remove unsupported module dropout' },
+    { field: processField('train\\.loss_target'), label: 'Use the noise loss target', value: 'noise' },
+    { field: processField('train\\.do_guidance_loss_cfg_zero'), label: 'Disable CFG-Zero guidance loss', value: false },
+  ],
+};
 
 const parsePath = (path: string): PathPart[] => {
   const parts: PathPart[] = [];
@@ -82,7 +184,7 @@ const expandPaths = (value: unknown, parts: PathPart[], prefix: PathPart[] = [])
   }
   if (!value || typeof value !== 'object') return [];
   const record = value as Record<string, unknown>;
-  if (!(String(part) in record)) return [];
+  if (rest.length > 0 && !(String(part) in record)) return [];
   return expandPaths(record[String(part)], rest, [...prefix, part]);
 };
 
@@ -96,70 +198,46 @@ const readPath = (value: unknown, path: PathPart[]): unknown => {
   return current;
 };
 
-const deletePath = (value: unknown, path: PathPart[]): void => {
-  if (path.length === 0 || !value || typeof value !== 'object') return;
-  const parentPath = path.slice(0, -1);
-  const leaf = path[path.length - 1];
-  const parent = readPath(value, parentPath);
-  if (!parent || typeof parent !== 'object') return;
-  if (Array.isArray(parent) && typeof leaf === 'number') parent.splice(leaf, 1);
-  else if (typeof leaf === 'string') delete (parent as Record<string, unknown>)[leaf];
-};
-
-const removableField = (field: string): boolean => !field.endsWith('.model.arch') && field !== 'config.process';
-
-
-const compareRemovalPaths = (left: string, right: string): number => {
-  const a = parsePath(left);
-  const b = parsePath(right);
-  // Remove nested values before their parents, then remove array siblings from
-  // the end so deleting one item cannot invalidate a later concrete index.
-  if (a.length !== b.length) return b.length - a.length;
-  for (let index = 0; index < a.length; index += 1) {
-    const leftPart = a[index];
-    const rightPart = b[index];
-    if (typeof leftPart === 'number' && typeof rightPart === 'number' && leftPart !== rightPart) {
-      return rightPart - leftPart;
-    }
-    if (typeof leftPart === 'string' && typeof rightPart === 'string' && leftPart !== rightPart) {
-      return rightPart.localeCompare(leftPart);
-    }
-  }
-  return 0;
-};
-
-export interface IncompatibleSetting {
+export interface AdmissionRemediation {
+  id: string;
   path: string;
-  value: unknown;
+  currentValue: unknown;
+  value?: SettingValue;
+  label: string;
   rule_id: string;
 }
 
-export const getIncompatibleSettings = (config: JobConfig, result: AdmissionResult): IncompatibleSetting[] => {
-  const settings: IncompatibleSetting[] = [];
+export const getAdmissionRemediations = (config: JobConfig, result: AdmissionResult): AdmissionRemediation[] => {
+  const actions: AdmissionRemediation[] = [];
   for (const diagnostic of result.diagnostics.filter(item => item.severity === 'error')) {
-    for (const field of diagnostic.fields.filter(removableField)) {
-      const paths = expandPaths(config, parsePath(field));
-      for (const resolvedPath of paths) {
-        const value = readPath(config, resolvedPath);
-        if (value !== undefined && typeof resolvedPath[resolvedPath.length - 1] === 'string') {
-          const path = resolvedPath
-            .map((part, index) =>
-              typeof part === 'number' ? `[${part}]` : index === 0 ? part : `.${part}`,
-            )
-            .join('');
-          settings.push({ path, value, rule_id: diagnostic.rule_id });
+    for (const field of diagnostic.fields) {
+      for (const parts of expandPaths(config, parsePath(field))) {
+        const path = parts.map((part, index) => typeof part === 'number' ? `[${part}]` : index === 0 ? part : `.${part}`).join('');
+        for (const rule of remediationRules[diagnostic.rule_id] ?? []) {
+          if (!rule.field.test(path)) continue;
+          const currentValue = readPath(config, parts);
+          if (currentValue !== null && typeof currentValue === 'object') continue;
+          if (currentValue === rule.value) continue;
+          const id = `${diagnostic.rule_id}:${path}`;
+          if (actions.some(action => action.id === id)) continue;
+          actions.push({ id, path, currentValue, value: rule.value, label: rule.label, rule_id: diagnostic.rule_id });
         }
       }
     }
   }
-  return settings.filter((setting, index, all) => all.findIndex(item => item.path === setting.path) === index);
+  return actions;
 };
 
-export const removeIncompatibleSettings = (config: JobConfig, result: AdmissionResult): JobConfig => {
+export const applyAdmissionRemediation = (config: JobConfig, result: AdmissionResult, actionId: string): JobConfig => {
+  const action = getAdmissionRemediations(config, result).find(item => item.id === actionId);
+  if (!action) return config;
   const next = JSON.parse(JSON.stringify(config)) as JobConfig;
-  for (const setting of getIncompatibleSettings(config, result).sort((left, right) => compareRemovalPaths(left.path, right.path))) {
-    deletePath(next, parsePath(setting.path));
-  }
+  const parts = parsePath(action.path);
+  const leaf = parts[parts.length - 1];
+  const parent = readPath(next, parts.slice(0, -1));
+  if (!parent || typeof parent !== 'object' || Array.isArray(parent) || typeof leaf !== 'string') return config;
+  if (action.value === undefined) delete (parent as Record<string, unknown>)[leaf];
+  else (parent as Record<string, unknown>)[leaf] = action.value;
   return next;
 };
 

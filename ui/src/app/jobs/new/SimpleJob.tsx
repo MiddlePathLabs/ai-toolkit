@@ -5,12 +5,12 @@ import {
   quantizationOptions,
   defaultQtype,
   jobTypeOptions,
+  resumeModeOptions,
   SampleTags,
 } from './options';
 import { useModelArchs } from '@/extensions/modelArchs';
 import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
-import { formatAdmissionError, type AdmissionResult } from '@/utils/admission';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -31,7 +31,7 @@ import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
-import { handleModelArchChange } from './utils';
+import { buildModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
 import {
@@ -50,8 +50,6 @@ type Props = {
   gpuList: any;
   datasetOptions: any;
   isLoading?: boolean;
-  onAdmissionResult?: (result: AdmissionResult) => void;
-  onAdmissionUnavailable?: (message: string) => void;
 };
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -76,8 +74,6 @@ export default function SimpleJob({
   gpuList,
   datasetOptions,
   isLoading,
-  onAdmissionResult,
-  onAdmissionUnavailable,
 }: Props) {
   const { archs: modelArchs, groupedModelOptions } = useModelArchs();
   const modelArch = useMemo(() => {
@@ -325,17 +321,13 @@ export default function SimpleJob({
               value={jobConfig.config.process[0].model.arch}
               docKey="config.process[0].model.arch"
               onChange={value => {
-                void handleModelArchChange(
+                const candidate = buildModelArchChange(
                   modelArchs,
                   jobConfig.config.process[0].model.arch,
                   value,
                   jobConfig,
-                  setJobConfig,
-                )
-                  .then(result => {
-                    if (result) onAdmissionResult?.(result);
-                  })
-                  .catch(error => onAdmissionUnavailable?.(formatAdmissionError(error)));
+                );
+                if (candidate) setJobConfig(candidate);
               }}
               options={groupedModelOptions}
             />
@@ -784,7 +776,7 @@ export default function SimpleJob({
               </>
             )}
             <TextInput
-              label="Resume from LoRA"
+              label="Warm Start from LoRA Weights"
               className="pt-2"
               value={jobConfig.config.process[0].network?.pretrained_lora_path ?? ''}
               docKey="network.pretrained_lora_path"
@@ -869,6 +861,19 @@ export default function SimpleJob({
             </Card>
           )}
           <Card title="Save">
+            <SelectInput
+              label="Resume Mode"
+              docKey="train.resume_mode"
+              value={jobConfig.config.process[0].train.resume_mode ?? 'auto'}
+              onChange={value => setJobConfig(value, 'config.process[0].train.resume_mode')}
+              options={resumeModeOptions}
+            />
+            <p className="mb-2 text-xs text-gray-400">
+              Auto resumes a complete matching raw checkpoint: Exact in the supported CPU scope, otherwise Continue.
+              Continue restores weights, optimizer, scheduler, EMA, counters and global RNG, but restarts data traversal.
+              Existing checkpoints require complete raw training state; fresh outputs start normally. Exact also restores
+              data order under its stricter CPU constraints. Weights only resets training state and starts at step 0.
+            </p>
             <SelectInput
               label="Data Type"
               value={jobConfig.config.process[0].save.dtype}

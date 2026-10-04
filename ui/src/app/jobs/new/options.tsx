@@ -166,6 +166,13 @@ export const quantizationOptions: SelectOption[] = [
 
 export const defaultQtype = 'qfloat8';
 
+export const resumeModeOptions: SelectOption[] = [
+  { value: 'auto', label: 'Auto — exact on supported CPU, otherwise continue' },
+  { value: 'continue', label: 'Continue — restore training state, not exact replay' },
+  { value: 'exact', label: 'Exact — deterministic CPU replay' },
+  { value: 'weights_only', label: 'Weights only — start a new training run' },
+];
+
 interface JobTypeOption extends SelectOption {
   disableSections?: DisableableSections[];
   processSections?: string[];

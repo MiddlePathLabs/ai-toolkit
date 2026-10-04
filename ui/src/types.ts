@@ -300,6 +300,7 @@ export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
   steps: number;
+  resume_mode?: 'auto' | 'continue' | 'exact' | 'weights_only';
   gradient_accumulation: number;
   train_unet: boolean;
   train_text_encoder: boolean;

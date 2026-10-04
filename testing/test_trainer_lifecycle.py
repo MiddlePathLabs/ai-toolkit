@@ -562,3 +562,56 @@ def test_f14_base_sigma_is_exact_across_grids_and_boundaries():
         base = MinimaxH3Model.timestep_to_base_sigma(holder, sig_v.clone())
         expect = [float(s / (shift - (shift - 1.0) * s)) for s in sig_v.tolist()]
         assert base.tolist() == pytest.approx(expect, rel=1e-6)
+
+
+def test_real_hook_injects_gradient_noise_after_clip_before_update():
+    model = torch.nn.Linear(1, 1, bias=True)
+    with torch.no_grad():
+        model.weight.fill_(0.5)
+        model.bias.fill_(0.1)
+    model.weight._is_lora = True
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.2)
+    trainer = _trainer_for_real_hook(model, optimizer)
+    trainer.train_config.max_grad_norm = 0.05
+    trainer.train_config.gradient_noise = SimpleNamespace(
+        enabled=True, mode="absolute", sigma=0.1, log_every=1,
+    )
+    trainer.step_num = 0
+    trainer._inject_gradient_noise = SDTrainer._inject_gradient_noise.__get__(trainer)
+    clipped_gradient = 1.2 * 0.05 / (2.0 * 1.2 ** 2) ** 0.5
+    noise = torch.randn((1, 1), generator=torch.Generator().manual_seed(173)) * 0.1
+    torch.manual_seed(173)
+    result = trainer.hook_train_loop([_batch([1.0], [0.0])])
+    assert result["optimizer_update"] == 1.0
+    torch.testing.assert_close(
+        model.weight, torch.tensor([[0.5]]) - 0.2 * (clipped_gradient + noise),
+        rtol=1e-5, atol=1e-7,
+    )
+    assert model.bias.item() == pytest.approx(0.1 - 0.2 * clipped_gradient, abs=1e-7)
+    assert result["grad_noise_norm"] == pytest.approx(abs(noise.item()))
+
+
+@pytest.mark.parametrize(
+    ("window_active", "update_success"),
+    [(True, True), (False, False)],
+    ids=["open-window", "closed-failed-update"],
+)
+def test_manual_checkpoint_waits_for_successful_closed_optimizer_boundary(window_active, update_success):
+    from extensions_built_in.sd_trainer.DiffusionTrainer import DiffusionTrainer
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0]])
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    pending = []
+    trainer = SimpleNamespace(
+        is_ui_trainer=True,
+        _optimizer_window_active=window_active,
+        _last_optimizer_update_success=update_success,
+        optimizer=optimizer,
+        should_save=lambda: True,
+        update_db_key=lambda *_args: pending.append("cleared"),
+        save=lambda _step: pending.append("saved"),
+    )
+    DiffusionTrainer.maybe_save(trainer)
+    assert pending == []
+    assert model.weight.grad.item() == 3.0

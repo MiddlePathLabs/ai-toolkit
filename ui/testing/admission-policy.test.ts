@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import test from 'node:test';
 import YAML from 'yaml';
 import {
@@ -18,9 +19,13 @@ import prisma from '../src/server/prisma';
 import type { JobConfig } from '../src/types';
 import {
   formatAdmissionError,
-  getIncompatibleSettings,
-  removeIncompatibleSettings,
+  applyAdmissionRemediation,
+  createAdmissionValidator,
+  getAdmissionCandidateKey,
+  getAdmissionRemediations,
+  getCurrentAdmissionValidation,
   type AdmissionResult,
+  type AdmissionValidation,
 } from '../src/utils/admission';
 
 const toolkitRoot = path.resolve(__dirname, '..', '..');
@@ -105,14 +110,14 @@ test('invalid raw YAML is distinguishable from the last valid parent config', ()
   assert.equal(parsed.valid, false);
 });
 
-test('incompatible values remain visible until an explicit removal action', () => {
+test('named repairs preserve stored values until clicked and change only their own setting', () => {
   const config = {
     config: {
       process: [
         {
           model: { arch: 'minimax_h3_vsa', assistant_lora_path: 'adapter.safetensors' },
           train: { loss_type: 'mean_flow' },
-          datasets: [{ do_i2v: true }],
+          datasets: [{ folder_path: '/data/video', do_i2v: true, control_path: '/data/controls' }],
         },
       ],
     },
@@ -123,14 +128,14 @@ test('incompatible values remain visible until an explicit removal action', () =
       {
         rule_id: 'admission.mean_flow',
         severity: 'error',
-        fields: ['config.process[0].train.loss_type'],
+        fields: ['config.process[0].train.loss_type', 'config.process[0].model.arch'],
         reason: 'unsupported',
         remedy: 'choose mse',
       },
       {
         rule_id: 'admission.h3_fast_conditioning',
         severity: 'error',
-        fields: ['config.process[0].datasets[0].do_i2v'],
+        fields: ['config.process[0].datasets[0].do_i2v', 'config.process[0].datasets[0].control_path', 'config.process[0].model.arch'],
         reason: 'unsupported',
         remedy: 'disable i2v',
       },
@@ -139,16 +144,200 @@ test('incompatible values remain visible until an explicit removal action', () =
   };
 
   const process = config.config.process[0];
-  const visible = getIncompatibleSettings(config, result);
+  const visible = getAdmissionRemediations(config, result);
   assert.deepEqual(visible.map(item => item.path), [
     'config.process[0].train.loss_type',
     'config.process[0].datasets[0].do_i2v',
   ]);
   assert.equal(process.datasets[0].do_i2v, true);
+  assert.equal(process.train.loss_type as string, 'mean_flow');
 
-  const cleaned = removeIncompatibleSettings(config, result);
-  assert.equal(cleaned.config.process[0].datasets[0].do_i2v, undefined);
-  assert.equal(cleaned.config.process[0].train.loss_type, undefined);
+  const mse = applyAdmissionRemediation(config, result, visible[0].id);
+  assert.equal(mse.config.process[0].train.loss_type, 'mse');
+  assert.deepEqual(mse.config.process[0].datasets, config.config.process[0].datasets);
+  assert.deepEqual(mse.config.process[0].model, config.config.process[0].model);
+  assert.equal(process.train.loss_type as string, 'mean_flow');
+
+  const noConditioning = applyAdmissionRemediation(mse, result, visible[1].id);
+  assert.equal(noConditioning.config.process[0].datasets[0].do_i2v, false);
+  assert.equal(noConditioning.config.process[0].datasets[0].folder_path, '/data/video');
+  assert.equal(noConditioning.config.process[0].datasets[0].control_path, '/data/controls');
+});
+
+test('a named MSE repair makes a rejected imported fixture pass canonical admission', async () => {
+  const config = readFixture(path.join(uiAdmissionFixtures, 'rejected_h3_mean_flow.yaml')) as JobConfig;
+  const rejected = await runAdmission(config, 'ui-repair-test');
+  const action = getAdmissionRemediations(config, rejected).find(item => item.rule_id === 'admission.mean_flow');
+  assert.ok(action);
+  const repaired = applyAdmissionRemediation(config, rejected, action.id);
+  assert.deepEqual(repaired.config.process[0].model, config.config.process[0].model);
+  assert.deepEqual(repaired.config.process[0].datasets, config.config.process[0].datasets);
+  const accepted = await runAdmission(repaired, 'ui-repair-test');
+  assert.equal(accepted.valid, true);
+});
+
+test('standalone voice bucket repair preserves the contextual dataset path and passes static admission', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aitk-admission-repair-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const voicePath = path.join(root, 'voice.wav');
+  fs.writeFileSync(voicePath, '');
+  const config = {
+    config: {
+      process: [{
+        model: { arch: 'minimax_h3', name_or_path: 'Comfy-Org/MiniMax-H3' },
+        train: { loss_type: 'mse', noise_scheduler: 'flowmatch' },
+        datasets: [{ dataset_path: voicePath, folder_path: root, do_audio: true, buckets: false }],
+      }],
+    },
+  } as unknown as JobConfig;
+  const rejected = await runAdmission(config, 'ui-voice-repair-test');
+  assert.equal(rejected.valid, false);
+  const actions = getAdmissionRemediations(config, rejected);
+  assert.deepEqual(actions.map(action => action.path), ['config.process[0].datasets[0].buckets']);
+  assert.equal(actions[0].label, 'Enable buckets for this dataset');
+  const repaired = applyAdmissionRemediation(config, rejected, actions[0].id);
+  assert.deepEqual(repaired.config.process[0].datasets, [{
+    dataset_path: voicePath, folder_path: root, do_audio: true, buckets: true,
+  }]);
+  assert.deepEqual(repaired.config.process[0].model, config.config.process[0].model);
+  assert.equal(config.config.process[0].datasets[0].buckets, false);
+  const accepted = await runAdmission(repaired, 'ui-voice-repair-test');
+  assert.equal(accepted.valid, true);
+  assert.ok(accepted.deferred.some(item => item.rule_id === 'admission.h3_audio_duration_runtime'));
+});
+
+test('only a known scalar rule offers removal; contextual paths and structured values stay intact', () => {
+  const config = {
+    config: {
+      process: [{
+        model: { arch: 'minimax_h3', name_or_path: '/models/h3', assistant_lora_path: '/models/adapter' },
+        train: { gradient_accumulation_steps: -1, gradient_accumulation: 2 },
+        datasets: [{ folder_path: '/data/voice', buckets: false }],
+      }],
+    },
+  } as unknown as JobConfig;
+  const result: AdmissionResult = {
+    valid: false,
+    diagnostics: [{
+      rule_id: 'admission.legacy_accumulation',
+      severity: 'error',
+      fields: [
+        'config.process[0].train.gradient_accumulation_steps',
+        'config.process[0].model.name_or_path',
+        'config.process[0].model.assistant_lora_path',
+        'config.process[0].datasets[0].folder_path',
+        'config.process[0].datasets[0]',
+        'config.process[0].train',
+      ],
+      reason: 'unsupported legacy setting',
+      remedy: 'use modern accumulation',
+    }],
+    deferred: [],
+  };
+  const actions = getAdmissionRemediations(config, result);
+  assert.deepEqual(actions.map(action => action.path), ['config.process[0].train.gradient_accumulation_steps']);
+  const repaired = applyAdmissionRemediation(config, result, actions[0].id);
+  assert.deepEqual(repaired.config.process[0].train, { gradient_accumulation: 2 });
+  assert.deepEqual(repaired.config.process[0].model, config.config.process[0].model);
+  assert.deepEqual(repaired.config.process[0].datasets, config.config.process[0].datasets);
+  assert.equal(applyAdmissionRemediation(config, result, 'admission.legacy_accumulation:config.process[0].datasets[0]'), config);
+  const structured = JSON.parse(JSON.stringify(config));
+  structured.config.process[0].train.gradient_accumulation_steps = { preserve: true };
+  assert.deepEqual(getAdmissionRemediations(structured, result), []);
+});
+
+function deferredAdmission() {
+  let resolve!: (result: AdmissionResult) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<AdmissionResult>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+test('Simple corrections clear stale rejection immediately and ignore late validation of the old config', async () => {
+  const before = { config: { process: [{ train: { loss_type: 'mean_flow' } }] } } as unknown as JobConfig;
+  const after = { config: { process: [{ train: { loss_type: 'mse' } }] } } as unknown as JobConfig;
+  const rejected: AdmissionResult = { valid: false, diagnostics: [], deferred: [] };
+  const accepted: AdmissionResult = { valid: true, diagnostics: [], deferred: [] };
+  const oldRequest = deferredAdmission();
+  const newRequest = deferredAdmission();
+  const responses = [Promise.resolve(rejected), oldRequest.promise, newRequest.promise];
+  const events: AdmissionValidation[] = [];
+  const validator = createAdmissionValidator(state => events.push(state), () => responses.shift()!);
+  const beforeKey = getAdmissionCandidateKey(before);
+  validator.setCandidate(beforeKey);
+  await validator.validate(before);
+  assert.equal(getCurrentAdmissionValidation(events.at(-1)!, beforeKey)?.status, 'invalid');
+  const lateValidation = validator.validate(before);
+  const afterKey = getAdmissionCandidateKey(after);
+  validator.setCandidate(afterKey);
+  assert.equal(getCurrentAdmissionValidation(events.at(-1)!, afterKey), null);
+  const currentValidation = validator.validate(after);
+  assert.equal(getCurrentAdmissionValidation(events.at(-1)!, afterKey)?.status, 'pending');
+  newRequest.resolve(accepted);
+  assert.equal(await currentValidation, accepted);
+  const publishedCount = events.length;
+  oldRequest.resolve(rejected);
+  assert.equal(await lateValidation, null);
+  assert.equal(events.length, publishedCount);
+  assert.equal(getCurrentAdmissionValidation(events.at(-1)!, afterKey)?.status, 'valid');
+});
+
+test('a late unavailable response cannot replace newer authoritative validation of the same candidate', async () => {
+  const config = { config: { process: [] } } as unknown as JobConfig;
+  const slow = deferredAdmission();
+  const fast = deferredAdmission();
+  const responses = [slow.promise, fast.promise];
+  const events: AdmissionValidation[] = [];
+  const validator = createAdmissionValidator(state => events.push(state), () => responses.shift()!);
+  validator.setCandidate(getAdmissionCandidateKey(config));
+  const previous = validator.validate(config);
+  const authoritative = validator.validate(config);
+  const accepted: AdmissionResult = { valid: true, diagnostics: [], deferred: [] };
+  fast.resolve(accepted);
+  assert.equal(await authoritative, accepted);
+  slow.reject(new Error('previous request unavailable'));
+  assert.equal(await previous, null);
+  assert.equal(events.at(-1)?.status, 'valid');
+  assert.equal(events.at(-1)?.unavailable, null);
+});
+
+test('raw syntax invalidation rejects in-flight results and recovery distinguishes runtime pending from unavailable', async () => {
+  const config = { config: { process: [] } } as unknown as JobConfig;
+  const pending = deferredAdmission();
+  const accepted: AdmissionResult = { valid: true, diagnostics: [], deferred: [] };
+  const runtimePending: AdmissionResult = {
+    ...accepted,
+    deferred: [{ rule_id: 'admission.runtime_deferred', severity: 'warning', fields: [], reason: 'loaded model needed', remedy: 'run final guard' }],
+  };
+  const events: AdmissionValidation[] = [];
+  let calls = 0;
+  const validator = createAdmissionValidator(state => events.push(state), async () => {
+    calls += 1;
+    if (calls === 1) return pending.promise;
+    if (calls === 2) throw new Error('canonical service unavailable');
+    return runtimePending;
+  });
+  validator.setCandidate(getAdmissionCandidateKey(config, 'config: {}'));
+  const old = validator.validate(config, 'config: {}');
+  validator.invalidate();
+  const publishedCount = events.length;
+  pending.resolve(accepted);
+  assert.equal(await old, null);
+  assert.equal(events.length, publishedCount);
+  const recoveredRaw = 'config:\n  process: []\n';
+  const recoveredKey = getAdmissionCandidateKey(config, recoveredRaw);
+  validator.setCandidate(recoveredKey);
+  assert.equal(getCurrentAdmissionValidation(events.at(-1)!, recoveredKey), null);
+  await validator.validate(config, recoveredRaw);
+  assert.equal(events.at(-1)?.status, 'unavailable');
+  assert.match(events.at(-1)?.unavailable ?? '', /canonical service unavailable/);
+  await validator.validate(config, recoveredRaw);
+  assert.equal(events.at(-1)?.status, 'runtime_pending');
+  assert.equal(events.at(-1)?.result?.valid, true);
+  assert.equal(events.at(-1)?.unavailable, null);
 });
 
 test('stored training admission rejects invalid JSON before a start mutation', async () => {
@@ -256,7 +445,7 @@ test('launch errors render canonical diagnostic reasons and remedies', () => {
   assert.match(message, /choose mse/);
 });
 
-test('conflict removal protects model identity and whole array entries', () => {
+test('unknown rules never offer generic deletion of model identity or whole array entries', () => {
   const config = {
     config: {
       process: [
@@ -280,8 +469,8 @@ test('conflict removal protects model identity and whole array entries', () => {
     ],
     deferred: [],
   };
-  assert.deepEqual(getIncompatibleSettings(config, result), []);
-  assert.deepEqual(removeIncompatibleSettings(config, result), config);
+  assert.deepEqual(getAdmissionRemediations(config, result), []);
+  assert.equal(applyAdmissionRemediation(config, result, 'admission.identity:config.process[0].datasets[0]'), config);
 });
 
 test('queue start admits only queued jobs and leaves valid queue state unchanged until all pass', async () => {

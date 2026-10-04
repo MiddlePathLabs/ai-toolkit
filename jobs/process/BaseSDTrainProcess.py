@@ -80,7 +80,7 @@ from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 
 from jobs.process import BaseTrainProcess
-from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
+from toolkit.metadata import get_meta_for_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
 import gc
@@ -173,8 +173,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.resume_mode = self.train_config.resume_mode
         self._resume_state_path = os.path.join(self.save_root, "training_state.pt")
         self._resume_state = None
+        self._weights_only_owns_raw_state = False
         self._resume_state_restored = False
-        self._resume_snapshot_step_override = None
+        self._resume_next_step = None
         # Watcher is created when either the live feature OR stats-only mode is on. stats-only
         # runs observe()/epoch_boundary() (so verdicts/resolution lines print) but the multiplier
         # write below is skipped — see the train loop. If both flags are set, stats-only wins and
@@ -571,7 +572,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         processed-input step.
         """
         return OrderedDict({
-            'step': int(getattr(self, 'step_num', 0)),
+            'step': int(getattr(self, '_resume_next_step', None)
+                        if getattr(self, '_resume_next_step', None) is not None
+                        else getattr(self, 'step_num', 0)),
             'epoch': int(getattr(self, 'epoch_num', 0)),
             'completed_update_id': int(getattr(self, 'completed_update_id', 0)),
         })
@@ -621,7 +624,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 reasons.append(f"dataset[{index}] uses buckets")
         return not reasons, reasons
 
+    def _resume_parameter_identity(self):
+        names = {}
+        components = [
+            ("network", getattr(self, "network", None)),
+            ("embedding", getattr(self, "embedding", None)),
+            ("adapter", getattr(self, "adapter", None)),
+            ("decorator", getattr(self, "decorator", None)),
+            ("snr_gos", getattr(self, "snr_gos", None)),
+        ]
+        for name in ("unet", "text_encoder", "refiner_unet"):
+            component = getattr(self.sd, name, None)
+            if isinstance(component, list):
+                components.extend((f"{name}.{index}", item) for index, item in enumerate(component))
+            else:
+                components.append((name, component))
+        for prefix, component in components:
+            if component is None or not hasattr(component, "named_parameters"):
+                continue
+            for name, parameter in unwrap_model(component).named_parameters():
+                names.setdefault(id(parameter), f"{prefix}.{name.replace('_orig_mod.', '')}")
+        return [
+            [
+                {"name": names.get(id(parameter)), "shape": tuple(parameter.shape), "dtype": str(parameter.dtype)}
+                for parameter in group.get("params", ())
+            ]
+            for group in self.optimizer.param_groups
+        ]
+
+    @staticmethod
+    def _refuse_weights_only_over_existing_trajectory(process):
+        if getattr(process, "resume_mode", None) != "weights_only":
+            return
+        if getattr(process, "_weights_only_owns_raw_state", False):
+            return
+        if not os.path.exists(process._resume_state_path):
+            return
+        raise ValueError(
+            f"{process._resume_state_path} already contains a raw training trajectory. "
+            "weights_only starts a new run and would replace that file on save. "
+            "Select the pretrained or inference weights in a new output folder so the previous trajectory remains recoverable."
+        )
+
+    @staticmethod
+    def _resume_component_type(component, *, optimizer=False):
+        component = unwrap_runtime_optimizer(component) if optimizer else getattr(component, "scheduler", component)
+        return f"{type(component).__module__}.{type(component).__qualname__}"
+
     def _load_resume_state_if_present(self):
+        BaseSDTrainProcess._refuse_weights_only_over_existing_trajectory(self)
         if self.resume_mode == "weights_only" or not os.path.exists(self._resume_state_path):
             return
         try:
@@ -638,14 +689,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"{self._resume_state_path} is not a complete raw training checkpoint. "
                 "Use resume_mode: weights_only for an explicit inference/legacy warm start."
             )
-        required = {"schema", "snapshot", "params", "optimizer", "scheduler", "ema", "rng", "data"}
+        required = {"schema", "recipe_identity", "determinism", "snapshot", "params", "optimizer", "scheduler", "ema", "rng", "data"}
         missing = sorted(required - set(state))
         if missing:
             raise ValueError(
                 f"{self._resume_state_path} is incomplete (missing {', '.join(missing)}). "
                 "Use resume_mode: weights_only only when an explicit warm start is intended."
             )
-        if int(state.get("schema", 0)) != 1:
+        if type(state.get("schema")) is not int or state["schema"] != 1:
             raise ValueError(
                 f"Unsupported raw training state schema {state.get('schema')!r}; "
                 "use resume_mode: weights_only for a deliberate reset."
@@ -655,9 +706,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"{self._resume_state_path} has no optimizer/scheduler trajectory state. "
                 "Use resume_mode: weights_only for an explicit warm start."
             )
+        try:
+            if not isinstance(state["recipe_identity"], str) or not state["recipe_identity"]:
+                raise ValueError("invalid recipe identity")
+            determinism = state["determinism"]
+            if not isinstance(determinism, dict) or type(determinism.get("supported")) is not bool:
+                raise ValueError("invalid saved replay scope")
+            if not isinstance(determinism.get("reasons"), list) or not all(
+                isinstance(reason, str) for reason in determinism["reasons"]
+            ):
+                raise ValueError("invalid saved replay-scope reasons")
+            num_processes = state.get("num_processes", 1)
+            if type(num_processes) is not int or num_processes < 1:
+                raise ValueError("invalid checkpoint process count")
+            snapshot = state["snapshot"]
+            for key in ("step", "epoch", "completed_update_id"):
+                if type(snapshot[key]) is not int or snapshot[key] < 0:
+                    raise ValueError(f"invalid snapshot {key}")
+            if snapshot["completed_update_id"] > snapshot["step"]:
+                raise ValueError("completed updates exceed consumed input steps")
+            if not isinstance(state["params"], list) or not all(torch.is_tensor(item) for item in state["params"]):
+                raise ValueError("invalid raw parameter tensors")
+            optimizer = state["optimizer"]
+            if not isinstance(optimizer, dict) or not isinstance(optimizer.get("state"), dict):
+                raise ValueError("invalid optimizer state")
+            groups = optimizer.get("param_groups")
+            if not isinstance(groups, list) or not all(isinstance(group, dict) and isinstance(group.get("params"), list) for group in groups):
+                raise ValueError("invalid optimizer parameter groups")
+            param_ids = [item for group in groups for item in group["params"]]
+            if not all(type(item) is int and item >= 0 for item in param_ids):
+                raise ValueError("invalid optimizer parameter identities")
+            if len(param_ids) != len(state["params"]) or len(set(param_ids)) != len(param_ids):
+                raise ValueError("optimizer/raw parameter layout differs")
+            if set(optimizer["state"]) - set(param_ids):
+                raise ValueError("optimizer state references unknown parameters")
+            if not all(isinstance(value, dict) for value in optimizer["state"].values()):
+                raise ValueError("invalid optimizer parameter state")
+            if not isinstance(state["scheduler"], dict) or not isinstance(state["data"], dict):
+                raise ValueError("invalid scheduler/data state")
+            if set(state["data"]) != {"train", "reg"}:
+                raise ValueError("invalid train/regularization data state")
+            rng = state["rng"]
+            random.Random().setstate(rng["python"])
+            np.random.RandomState().set_state(rng["numpy"])
+            torch.Generator(device="cpu").set_state(rng["torch"])
+            if rng.get("cuda") is not None and not all(torch.is_tensor(item) for item in rng["cuda"]):
+                raise ValueError("invalid CUDA RNG state")
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"Raw checkpoint state is invalid: {exc}. Use resume_mode: weights_only for an explicit reset."
+            ) from exc
         self._resume_state = state
+        if state.get("tread_seed") is not None:
+            self._resume_tread_seed = int(state["tread_seed"])
 
     def _validate_resume_runtime_support(self):
+        self._resume_exact = False
         if self.resume_mode == "weights_only":
             return
         supported, reasons = self._deterministic_resume_supported()
@@ -665,23 +769,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
             raise ValueError(
                 "train.resume_mode=exact requires a single-process CPU run with "
                 "num_workers=0, no buckets, accumulation=1, and compile disabled; "
-                + "; ".join(reasons)
+                + "; ".join(reasons) + ". Use resume_mode: continue for non-deterministic continuation."
             )
-        if self._resume_state is not None:
-            saved_supported = self._resume_state.get("determinism", {}).get("supported", False)
-            if not saved_supported or not supported:
-                details = self._resume_state.get("determinism", {}).get("reasons", reasons)
+        if self._resume_state is None:
+            if self.resume_mode in {"auto", "continue"} and getattr(self.accelerator, "num_processes", 1) != 1:
                 raise ValueError(
-                    "Raw checkpoint exact replay is unsupported for this run "
-                    + ("; ".join(details) if details else "because its deterministic contract is incomplete")
-                    + ". Use resume_mode: weights_only for an explicit reset."
+                    "Raw training continuation requires single-process execution. "
+                    "A distributed auto or continue run cannot restart its own raw trajectory."
                 )
-            saved_identity = self._resume_state.get("recipe_identity")
-            if saved_identity != self._resume_recipe_identity():
-                raise ValueError(
-                    "Raw checkpoint recipe/config identity differs from the current run. "
-                    "Use the original training recipe or choose resume_mode: weights_only explicitly."
-                )
+            self._resume_exact = supported and self.resume_mode != "continue"
+            return
+        saved_distributed = (
+            self._resume_state.get("num_processes", 1) != 1
+            or "distributed/multi-process execution" in self._resume_state["determinism"].get("reasons", ())
+        )
+        if getattr(self.accelerator, "num_processes", 1) != 1 or saved_distributed:
+            raise ValueError(
+                "Raw training continuation does not support distributed/multi-process execution. "
+                "Use resume_mode: weights_only in a new output folder for an explicit reset."
+            )
+        saved_supported = self._resume_state.get("determinism", {}).get("supported", False)
+        if self.resume_mode == "exact" and not saved_supported:
+            raise ValueError(
+                "Raw checkpoint exact replay is unsupported for the saved run. "
+                "Use resume_mode: continue for non-deterministic continuation."
+            )
+        if self._resume_state.get("recipe_identity") != self._resume_recipe_identity():
+            raise ValueError(
+                "Raw checkpoint recipe/config identity differs from the current run. "
+                "Use the original training recipe or choose resume_mode: weights_only explicitly."
+            )
+        if getattr(self.train_config, "merge_network_on_save", False):
+            raise ValueError(
+                "Raw continuation cannot reconstruct a base model mutated by merge_network_on_save. "
+                "Use resume_mode: weights_only in a new output folder for an explicit warm start."
+            )
+        self._resume_exact = supported and saved_supported and self.resume_mode != "continue"
 
     def _restore_resume_optimizer_state(self):
         state = self._resume_state
@@ -698,13 +821,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "Raw checkpoint parameter count differs from the current optimizer; "
                 "use resume_mode: weights_only for a deliberate warm start."
             )
-        for index, (parameter, saved) in enumerate(zip(params, saved_params)):
-            if tuple(parameter.shape) != tuple(saved.shape):
+        saved_identity = state.get("parameter_identity")
+        if saved_identity is not None and saved_identity != self._resume_parameter_identity():
+            raise ValueError("Raw checkpoint parameter identity differs from the current model.")
+        saved_type = state.get("optimizer_type")
+        if saved_type is not None and saved_type != self._resume_component_type(self.optimizer, optimizer=True):
+            raise ValueError("Raw checkpoint optimizer type differs from the current recipe.")
+        saved_groups = state["optimizer"]["param_groups"]
+        if len(saved_groups) != len(self.optimizer.param_groups) or any(
+            len(saved["params"]) != len(current["params"])
+            for saved, current in zip(saved_groups, self.optimizer.param_groups)
+        ):
+            raise ValueError("Raw checkpoint optimizer parameter groups differ from the current recipe.")
+        saved_ids = [item for group in saved_groups for item in group["params"]]
+        for index, (parameter, saved, saved_id) in enumerate(zip(params, saved_params, saved_ids)):
+            if tuple(parameter.shape) != tuple(saved.shape) or parameter.dtype != saved.dtype:
                 raise ValueError(
-                    f"Raw checkpoint parameter {index} shape differs from the current model; "
+                    f"Raw checkpoint parameter {index} shape/dtype differs from the current model; "
                     "use resume_mode: weights_only for a deliberate warm start."
                 )
-            parameter.data.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+            for key, value in state["optimizer"]["state"].get(saved_id, {}).items():
+                if key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq", "momentum_buffer") and torch.is_tensor(value):
+                    if value.shape != parameter.shape:
+                        raise ValueError(f"Raw checkpoint optimizer parameter {index} state {key} shape differs.")
+        with torch.no_grad():
+            for parameter, saved in zip(params, saved_params):
+                parameter.copy_(saved.to(device=parameter.device))
         try:
             self.optimizer.load_state_dict(copy.deepcopy(state["optimizer"]))
         except Exception as exc:
@@ -717,6 +859,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.start_step = self.step_num
         self.epoch_num = int(snapshot["epoch"])
         self.completed_update_id = int(snapshot["completed_update_id"])
+        self._resume_next_step = None
+        self.grad_accumulation_step = 1
         self._pending_resume_ema_state = state["ema"]
         self._pending_resume_scheduler_state = state["scheduler"]
         self._resume_state_restored = True
@@ -724,7 +868,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def _restore_resume_scheduler_state(self):
         if self._resume_state is None:
             return
+        saved_type = self._resume_state.get("scheduler_type")
+        if saved_type is not None and saved_type != self._resume_component_type(self.lr_scheduler):
+            raise ValueError("Raw checkpoint scheduler type differs from the current recipe.")
         try:
+            if set(self._pending_resume_scheduler_state) != set(self.lr_scheduler.state_dict()):
+                raise ValueError("scheduler state layout differs")
             self.lr_scheduler.load_state_dict(copy.deepcopy(self._pending_resume_scheduler_state))
         except Exception as exc:
             raise ValueError(
@@ -748,10 +897,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 raise ValueError("checkpoint train-loader presence differs from the current run")
             if (self.data_loader_reg is None) != (saved_reg is None):
                 raise ValueError("checkpoint regularization-loader presence differs from the current run")
-            if self.data_loader is not None:
-                load_dataloader_state(self.data_loader, saved_train)
-            if self.data_loader_reg is not None:
-                load_dataloader_state(self.data_loader_reg, saved_reg)
+            for loader, saved in ((self.data_loader, saved_train), (self.data_loader_reg, saved_reg)):
+                if loader is None:
+                    continue
+                if self._resume_exact:
+                    load_dataloader_state(loader, saved)
+                    continue
+                current = get_dataloader_state(loader)
+                if not isinstance(saved, dict) or saved.get("schema") != current["schema"]:
+                    raise ValueError("unsupported checkpoint dataloader state schema")
+                if saved.get("num_workers") != current["num_workers"]:
+                    raise ValueError("checkpoint dataloader worker count differs")
+                saved_datasets = saved.get("datasets")
+                if not isinstance(saved_datasets, list) or len(saved_datasets) != len(current["datasets"]):
+                    raise ValueError("checkpoint dataset count differs")
+                for previous, present in zip(saved_datasets, current["datasets"]):
+                    if sorted(previous.get("file_ids", ())) != sorted(present["file_ids"]):
+                        raise ValueError("checkpoint dataset membership differs")
         except Exception as exc:
             raise ValueError(
                 f"Raw checkpoint data order does not match this recipe: {exc}. "
@@ -763,6 +925,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         np.random.set_state(rng["numpy"])
         if torch.cuda.is_available() and rng.get("cuda") is not None:
             torch.cuda.set_rng_state_all([item.cpu() for item in rng["cuda"]])
+        if not self._resume_exact:
+            print_acc(
+                "Continuing raw training state without deterministic data replay: loader traversal, "
+                "prefetch cursor, worker RNG, and augmentation ordering restart."
+            )
         if self.loss_watch is not None and self._resume_state.get("loss_watch") is not None:
             self.loss_watch.load_state_dict(copy.deepcopy(self._resume_state["loss_watch"]))
         if self.category_stop is not None and self._resume_state.get("category_stop") is not None:
@@ -776,7 +943,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # looks like an exact-resume checkpoint.
         if self.optimizer is None or self.lr_scheduler is None:
             return None
-        if self._optimizer_window_active:
+        if self._optimizer_window_active or not getattr(self, "_last_optimizer_update_success", True):
             return None
         params = [
             parameter
@@ -798,8 +965,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "schema": 1,
             "recipe_identity": self._resume_recipe_identity(),
             "determinism": {"supported": supported, "reasons": reasons},
+            "num_processes": int(getattr(self.accelerator, "num_processes", 1)),
             "snapshot": dict(snapshot or self.get_completed_update_snapshot()),
             "params": [parameter.detach().cpu().clone() for parameter in params],
+            "parameter_identity": self._resume_parameter_identity(),
+            "optimizer_type": self._resume_component_type(self.optimizer, optimizer=True),
+            "scheduler_type": self._resume_component_type(self.lr_scheduler),
+            "tread_seed": read_tread_seed(self.sd),
             "optimizer": self._cpu_state(self.optimizer.state_dict()) if self.optimizer is not None else None,
             "scheduler": self._cpu_state(self.lr_scheduler.state_dict()) if self.lr_scheduler is not None else None,
             "ema": self._cpu_state(ema_state),
@@ -816,12 +988,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         }
 
     def _atomic_save_training_state(self, state):
+        BaseSDTrainProcess._refuse_weights_only_over_existing_trajectory(self)
         os.makedirs(self.save_root, exist_ok=True)
         fd, temp_path = tempfile.mkstemp(prefix=".training_state_", suffix=".pt", dir=self.save_root)
         os.close(fd)
         try:
             torch.save(state, temp_path)
             os.replace(temp_path, self._resume_state_path)
+            if getattr(self, "resume_mode", None) == "weights_only":
+                self._weights_only_owns_raw_state = True
         except Exception:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -1116,6 +1291,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
+        BaseSDTrainProcess._refuse_weights_only_over_existing_trajectory(self)
         flush()
         # Capture raw training state before switching the live modules to EMA
         # export weights.  Inference exports and raw trajectory state are
@@ -1123,8 +1299,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         snapshot = self.get_completed_update_snapshot()
-        if self._resume_snapshot_step_override is not None:
-            snapshot["step"] = int(self._resume_snapshot_step_override)
+        if getattr(self, "_resume_next_step", None) is not None:
+            snapshot["step"] = int(self._resume_next_step)
         training_state = self._capture_training_state(snapshot)
         if self.ema is not None:
             # always save params as ema
@@ -1448,6 +1624,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         "use resume_mode: weights_only for an explicit reset."
                     )
                 try:
+                    shadows = self._resume_state["ema"]["shadow_params"]
+                    if len(shadows) != len(params) or any(
+                        not torch.is_tensor(saved) or saved.shape != parameter.shape
+                        for saved, parameter in zip(shadows, params)
+                    ):
+                        raise ValueError("EMA parameter shape/layout differs")
+                    if self.train_config.ema_config.warmup and self._resume_state["ema"]["num_updates"] != self.completed_update_id:
+                        raise ValueError("EMA warmup count differs from completed updates")
                     self.ema.load_state_dict(copy.deepcopy(self._resume_state["ema"]))
                 except Exception as exc:
                     raise ValueError(
@@ -1457,6 +1641,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # expose to the model: models that run an EMA-teacher forward during training
             # (e.g. wan21_pixel self_flow) read it from here
             self.sd.ema = self.ema
+        elif self._resume_state is not None and self._resume_state["ema"] is not None:
+            raise ValueError("Raw checkpoint contains EMA state while EMA is disabled.")
 
     def before_dataset_load(self):
         pass
@@ -1492,6 +1678,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
+        if getattr(self, "_resume_state", None) is not None:
+            # Raw params are authoritative; inference exports may be EMA or
+            # newer than the last complete optimizer boundary.
+            return None
         if name == None:
             name = self.job.name
         # get latest saved step
@@ -1524,6 +1714,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)
         
+        if latest_path is not None and self.resume_mode != "weights_only":
+            raise ValueError(
+                f"Found inference/legacy checkpoint {latest_path} without a complete raw "
+                f"state at {self._resume_state_path}. Use resume_mode: weights_only in a new output folder for an explicit warm start."
+            )
         if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
             if os.path.exists(self.network_config.pretrained_lora_path):
@@ -1535,36 +1730,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         return latest_path
 
-    def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
-        if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
-            # dont load metadata from pretrained lora
-            return
-        meta = None
-        # if path is folder, then it is diffusers
-        if os.path.isdir(path):
-            meta_path = os.path.join(path, 'aitk_meta.yaml')
-            # load it
-            if os.path.exists(meta_path):
-                with open(meta_path, 'r') as f:
-                    meta = yaml.load(f, Loader=yaml.FullLoader)
-        else:
-            meta = load_metadata_from_safetensors(path)
-        # if 'training_info' in Orderdict keys
-        if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
-            self.step_num = meta['training_info']['step']
-            if 'epoch' in meta['training_info']:
-                self.epoch_num = meta['training_info']['epoch']
-            self.start_step = self.step_num
-            if 'tread_seed' in meta['training_info']:
-                self._resume_tread_seed = int(meta['training_info']['tread_seed'])
-            print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
     def load_weights(self, path):
         if self.network is not None:
             extra_weights = self.network.load_weights(path)
-            self.load_training_state_from_metadata(path)
             return extra_weights
         else:
             print_acc("load_weights not implemented for non-network models")
@@ -1591,16 +1760,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             state_dict = load_file(latest_save_path, device=self.device)
             self.sd.unet.load_state_dict(state_dict)
 
-            meta = load_metadata_from_safetensors(latest_save_path)
-            # if 'training_info' in Orderdict keys
-            if 'training_info' in meta and 'step' in meta['training_info']:
-                self.step_num = meta['training_info']['step']
-                if 'epoch' in meta['training_info']:
-                    self.epoch_num = meta['training_info']['epoch']
-                self.start_step = self.step_num
-                if 'tread_seed' in meta['training_info']:
-                    self._resume_tread_seed = int(meta['training_info']['tread_seed'])
-                print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
     # def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
     #     self.sd.noise_scheduler.set_timesteps(1000, device=self.device_torch)
@@ -2243,8 +2402,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     dtype=dtype
                 )
                 self.adapter.load_state_dict(loaded_state_dict)
-        if latest_save_path is not None and self.adapter_config.train:
-            self.load_training_state_from_metadata(latest_save_path)
         # set trainable params
         self.sd.adapter = self.adapter
     
@@ -2421,14 +2578,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             latest_save_path = self.get_latest_save_path(include_pretrained_lora=False)
 
             if latest_save_path is not None:
-                if self.resume_mode != "weights_only" and self._resume_state is None:
-                    raise ValueError(
-                        f"Found inference/legacy checkpoint {latest_save_path} without a complete raw "
-                        f"state at {self._resume_state_path}. Use resume_mode: weights_only for an explicit warm start."
-                    )
                 print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                 model_config_to_load.name_or_path = latest_save_path
-                self.load_training_state_from_metadata(latest_save_path)
 
         ModelClass = get_model_class(self.model_config)
         # if the model class has get_train_scheduler static method
@@ -2455,7 +2606,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             previous_refiner_save = self.get_latest_save_path(self.job.name + '_refiner')
             if previous_refiner_save is not None:
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
-                self.load_training_state_from_metadata(previous_refiner_save)
 
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
@@ -2597,11 +2747,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.snr_gos.scale.data = torch.tensor(json_data['scale'], device=self.device_torch)
                     self.snr_gos.gamma.data = torch.tensor(json_data['gamma'], device=self.device_torch)
 
-        if self.loss_watch is not None:
-            path_to_load = os.path.join(self.save_root, 'loss_watch_state.json')
-            if os.path.exists(path_to_load):
-                with open(path_to_load, 'r') as f:
-                    self.loss_watch.load_state_dict(json.load(f))
 
         self.hook_after_model_load()
         flush()
@@ -2745,11 +2890,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 latest_save_path = self.get_latest_save_path(lora_name)
                 extra_weights = None
                 if latest_save_path is not None and not self.train_config.merge_network_on_save:
-                    if self.resume_mode != "weights_only" and self._resume_state is None:
-                        raise ValueError(
-                            f"Found inference/legacy checkpoint {latest_save_path} without a complete raw "
-                            f"state at {self._resume_state_path}. Use resume_mode: weights_only for an explicit warm start."
-                        )
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
@@ -2780,12 +2920,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # load last saved weights
                 if latest_save_path is not None:
                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
-                    if self.embedding.step > 1:
-                        self.step_num = self.embedding.step
-                        self.start_step = self.step_num
-
-                # self.step_num = self.embedding.step
-                # self.start_step = self.step_num
+                    self.embedding.step = 0
                 params.append({
                     'params': list(self.embedding.get_trainable_params()),
                     'lr': self.train_config.embedding_lr
@@ -2803,7 +2938,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if latest_save_path is not None:
                     state_dict = load_file(latest_save_path)
                     self.decorator.load_state_dict(state_dict)
-                    self.load_training_state_from_metadata(latest_save_path)
                     
                 params.append({
                     'params': list(self.decorator.parameters()),
@@ -2871,7 +3005,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #     else:
         #         self.params.append(param)
 
-        if self.train_config.start_step is not None:
+        if self.resume_mode != "weights_only" and self._resume_state is None and self.train_config.start_step is not None:
             self.step_num = self.train_config.start_step
             self.start_step = self.step_num
 
@@ -2942,7 +3076,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
 
-        lr_scheduler_params = self.train_config.lr_scheduler_params
+        lr_scheduler_params = copy.deepcopy(self.train_config.lr_scheduler_params)
 
         # make sure it had bare minimum
         if 'max_iterations' not in lr_scheduler_params:
@@ -3305,9 +3439,64 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ###################################################################
 
 
+        self._run_training_loop(
+            optimizer, dataloader, dataloader_reg,
+            dataloader_iterator, dataloader_iterator_reg,
+        )
+
+        ##  END TRAIN LOOP
+        ###################################################################
+        self.accelerator.wait_for_everyone()
+        if self.progress_bar is not None:
+            self.progress_bar.close()
+        if self.train_config.free_u:
+            self.sd.pipeline.disable_freeu()
+        if self.accelerator.is_main_process:
+            # Keep a numbered export alongside the final completion marker.
+            self.save(step=self.train_config.steps)
+            self.save()
+        if not self.train_config.disable_sampling:
+            try:
+                self.sample(self.step_num)
+            except Exception as e:
+                print_acc(f"[sample] preview failed at step {self.step_num}, continuing: {e}")
+                traceback.print_exc()
+            self.logger.commit(step=self.step_num)
+        print_acc("")
+        if self.accelerator.is_main_process:
+            self.logger.finish()
+        self.accelerator.end_training()
+
+        if self.accelerator.is_main_process:
+            # push to hub
+            if self.save_config.push_to_hub:
+                if("HF_TOKEN" not in os.environ):
+                    interpreter_login(new_session=False, write_permission=True)
+                self.push_to_hub(
+                    repo_id=self.save_config.hf_repo_id,
+                    private=self.save_config.hf_private
+                )
+        del (
+            self.sd,
+            unet,
+            noise_scheduler,
+            optimizer,
+            self.network,
+            tokenizer,
+            text_encoder,
+        )
+
+        flush()
+        self.done_hook()
+
+    def _run_training_loop(
+        self, optimizer, dataloader, dataloader_reg,
+        dataloader_iterator, dataloader_iterator_reg,
+    ):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
+        pending_interval_save = False
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -3474,6 +3663,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print("\n==== Profile Results ====")
                 print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
+            self._resume_next_step = step + 1
+            if is_save_step or pending_interval_save:
+                pending_interval_save = not self._last_optimizer_update_success
+                is_save_step = not pending_interval_save
 
             # run validation before any possible sampling/logging for this step
             if not did_oom and self.train_config.validation_config is not None:
@@ -3629,6 +3822,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # update various steps
                 self.step_num = step + 1
+                self._resume_next_step = None
                 self.grad_accumulation_step += 1
                 self.end_step_hook()
 
@@ -3651,54 +3845,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if getattr(self, "_optimizer_window_active", False):
             self.is_grad_accumulation_step = False
             self.hook_train_loop([])
-
-        ##  END TRAIN LOOP
-        ###################################################################
-        self.accelerator.wait_for_everyone()
-        if self.progress_bar is not None:
-            self.progress_bar.close()
-        if self.train_config.free_u:
-            self.sd.pipeline.disable_freeu()
-        if self.accelerator.is_main_process:
-            # also write a step-numbered save of the final weights. The no-suffix
-            # file below is the completion marker AND the resume source, so an
-            # extend (raise train.steps, rerun) overwrites it — without this
-            # numbered copy the previous final is unrecoverable.
-            self.save(step=self.train_config.steps)
-            self.save()
-        if not self.train_config.disable_sampling:
-            try:
-                self.sample(self.step_num)
-            except Exception as e:
-                print_acc(f"[sample] preview failed at step {self.step_num}, continuing: {e}")
-                traceback.print_exc()
-            self.logger.commit(step=self.step_num)
-        print_acc("")
-        if self.accelerator.is_main_process:
-            self.logger.finish()
-        self.accelerator.end_training()
-
-        if self.accelerator.is_main_process:
-            # push to hub
-            if self.save_config.push_to_hub:
-                if("HF_TOKEN" not in os.environ):
-                    interpreter_login(new_session=False, write_permission=True)
-                self.push_to_hub(
-                    repo_id=self.save_config.hf_repo_id,
-                    private=self.save_config.hf_private
-                )
-        del (
-            self.sd,
-            unet,
-            noise_scheduler,
-            optimizer,
-            self.network,
-            tokenizer,
-            text_encoder,
-        )
-
-        flush()
-        self.done_hook()
 
     def push_to_hub(
     self,

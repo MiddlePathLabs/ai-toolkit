@@ -101,13 +101,20 @@ H3 latent and condition caches use versioned, provenance-bearing identities. The
 
 Krea guidance is **RAW training recommended / Turbo inference recommended**. Turbo training-adapter and edit roles are fork-specific warnings, not official equivalence claims. Krea full-tune preview/edit CFG, source-target, and CFG-Zero paths remain temporary-gated until real production acceptance evidence; adapter-only CPU state tests do not prove preview quality. H3 audio has precise 24-fps/32-kHz/stereo and 17n+5 frame/hop gates; it is not blanket-blocked, but non-grid durations, missing cached audio, and unsupported standalone-voice combinations remain scoped gates.
 
-Quantized-base loading, FP32 islands, low-precision/AMP, offload, compile, sparse/VSA/TREAD, and distributed modes retain their current experimental labels unless the release report names an exercised tolerance. The current evidence is CPU-only for arithmetic/lifecycle and static/cache contracts; no blanket GPU claim is made. Distributed synchronization, rank-state resume, and exact replay outside controlled `num_workers=0` are **experimental / uncertified**.
+Quantized-base loading, FP32 islands, low-precision/AMP, offload, compile, sparse/VSA/TREAD, and distributed modes retain their current experimental labels unless the release report names an exercised tolerance. CPU arithmetic/lifecycle and static/cache contracts always run; the tiny CUDA continuation regression runs only when CUDA is available. It is not a blanket GPU claim. Distributed synchronization, rank-state resume, and exact replay outside controlled `num_workers=0` are **experimental / uncertified**.
 
-`train.resume_mode` is `auto` by default. A fresh output directory starts normally; `auto` resumes only a complete matching raw `training_state.pt` within the admitted deterministic scope. Legacy or inference-only files require an explicit `weights_only` choice. `exact` restores matched raw parameters, optimizer, scheduler, EMA/count, Python/NumPy/Torch RNG, data order, and `completed_update_id`. Its current admitted scope is CPU, single-process, `num_workers: 0`, no buckets, accumulation 1, and compile off. GPU, bucketed, multiworker, accumulated and compiled exact replay are unavailable, not silently approximated. `weights_only` deliberately resets optimizer/scheduler/EMA/counters/RNG/order and is never called resume.
+`train.resume_mode` is `auto` by default. Fresh outputs start normally. Existing outputs require a complete matching raw `training_state.pt`; inference-only or legacy files require an explicit `weights_only` choice.
 
-Remediation verification (2026-10-04): 321 scoped Python cases and 9 UI policy cases passed; UI/extension typechecks and Ruff's syntax/undefined-name checks passed. The CPU raw-checkpoint smoke resumed update 3 through update 6 with maximum parameter error `0.0`, preserving EMA while keeping raw training weights distinct from the inference export. Isolated production API handlers rejected invalid YAML, incompatible configs, spoofed job metadata, and invalid stored start/queue requests before database mutation.
+- `auto` selects exact replay when both the saved checkpoint and runtime meet the deterministic scope; otherwise it uses single-process continuation.
+- `continue` restores raw parameters, optimizer, scheduler, EMA/count, lifecycle counters, watcher state, and global RNG. GPU, buckets, workers, accumulation, and compile do not imply exact data replay: loader traversal, prefetch, worker RNG, and augmentation ordering restart.
+- `exact` also restores data order. Its admitted scope remains CPU, single-process, `num_workers: 0`, no buckets, accumulation 1, and compile off.
+- `weights_only` loads selected weights and starts at step zero with fresh optimizer/scheduler/EMA/counters/RNG/order. Inference metadata does not restore training clocks. It is refused when the destination folder already contains raw `training_state.pt`; use a new output folder so the previous trajectory remains recoverable.
 
-Deployment evidence is separate: the already-running GUI still returned HTTP 404 for the new `/api/admission` route. It was inspected and closed without saving or launching a job; no service was restarted. Updated-GUI visual acceptance and real Krea/H3 checkpoint/GPU acceptance remain open. Do not treat these CPU/source-handler checks as release approval for those capabilities.
+Recipe identity excludes only `resume_mode`; other configuration or dataset-membership mismatches fail closed. `auto`, `continue`, and `exact` reject `merge_network_on_save` because a merged export cannot reconstruct the original base. Serialized config and visible GPU count do not establish rank count: the accelerator process count is checked at runtime, and distributed raw state cannot continue. Raw restoration never pairs optimizer state with an inference/EMA export.
+
+Earlier remediation verification (2026-10-04, before the stabilization repairs below): 321 scoped Python cases and 9 UI policy cases passed; UI/extension typechecks and Ruff's syntax/undefined-name checks passed. The committed CPU raw-checkpoint regression covers update 3 through update 6. Isolated production API handlers rejected invalid YAML, incompatible configs, spoofed job metadata, and invalid stored start/queue requests before database mutation.
+
+Earlier deployment checks were separate: the already-running GUI returned HTTP 404 for the new `/api/admission` route. No live service was restarted. An isolated GUI/database later exercised Simple-view correction, raw syntax rejection/recovery, named voice-bucket repair, persistence, and stored-job/queue admission; that session is not a committed regression. Deployment of the changed sources and real Krea/H3 checkpoint acceptance remain unverified. Source checks and tiny-model regressions are not release approval for those capabilities.
 
 #### Review repairs (2026-10-04)
 
@@ -123,6 +130,32 @@ Review verification: **342 scoped Python cases passed, 2 skipped; 14 UI cases pa
 
 F25's production shortfall sign was already correct; a live heatmap-confidence descent regression now verifies increased confidence and reduced shortfall. These CPU checks do not certify pretrained ViTPose usefulness, actual Krea/H3 weights, GPU/compile/distributed behavior, or the deployed GUI. No running training/service or live dataset/cache/checkpoint/output was changed.
 
+#### Stabilization repairs
+
+- Configuration repairs are named, rule-specific actions. Enabling voice buckets or changing the loss to MSE preserves dataset/model identities; unknown diagnostics do not offer generic field deletion.
+- Simple and Advanced editors revalidate current edits. Candidate-bound request generations discard stale responses; pending, unavailable, rejected, and runtime-pending validation are distinct.
+- Unconditional image pairs retain their dataset transform; multimodal datasets classify each audio file independently. Full-media fingerprints are skipped without a consuming cache and shared across repeats/flips within a preparation, while fresh preparations and explicit re-keying observe media edits.
+- Gradient noise reaches the optimizer after clipping. Interval/manual saves wait for complete update boundaries and record the next consumed-input cursor.
+
+Verification: the committed resume, admission, and failed-update checkpoint regressions passed, including the GPU-conditional CUDA test when CUDA is available. `testing/test_resume.py` continues default `auto` from interval cursor 3 through update/cursor 6 on a real CUDA linear model and CUDA training tensors, with zero parameter, momentum, scheduler, and EMA error against an uninterrupted constant-input run. Constant inputs isolate trajectory restoration; the test also asserts traversal restarts, so it does not certify deterministic loader replay. `weights_only` can save a fresh trajectory repeatedly and refuses to replace an existing raw file. These checks do not certify real Krea/H3 checkpoint quality, distributed execution, or arbitrary GPU/compiled recipes.
+
+#### Dataset cache cleanup
+
+Cache invalidation leaves old entries on disk. Cleanup is never automatic.
+Stop jobs using the selected dataset before applying a cleanup preview:
+
+```bash
+python -m toolkit.cache_cleanup path/to/dataset
+python -m toolkit.cache_cleanup path/to/dataset --apply PREVIEW_TOKEN
+```
+
+The first command lists files, total bytes, and a token without deleting anything.
+The second requires the exact token from an unchanged preview. The default selection
+is latent and text caches; use repeated `--cache` options to select other supported
+cache types. Only `.safetensors` files inside recognized dataset cache directories
+are selected. Media, checkpoints outside those directories, unknown files, symbolic
+links, and junctions are not deleted. Selected current and old entries are both
+removed and will regenerate; this command does not classify entries as obsolete.
 
 UI validation: run `npm run typecheck` from `ui/`; it checks both the worker and Next.js TypeScript configurations without emitting files or starting services. The worker uses different compiler settings, so checking only `tsconfig.json` does not cover the first stage of `npm run build`.
 

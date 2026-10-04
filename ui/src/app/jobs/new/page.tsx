@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
 import { jobTypeOptions } from './options';
@@ -21,7 +21,15 @@ import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import AdmissionFeedback from '@/components/AdmissionFeedback';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
-import { formatAdmissionError, requestAdmission, type AdmissionResult } from '@/utils/admission';
+import {
+  createAdmissionValidator,
+  formatAdmissionError,
+  getAdmissionCandidateKey,
+  getCurrentAdmissionValidation,
+  type AdmissionResult,
+  type AdmissionValidation,
+  type AdmissionValidator,
+} from '@/utils/admission';
 const isDev = process.env.NODE_ENV === 'development';
 
 export default function TrainingForm() {
@@ -38,24 +46,25 @@ export default function TrainingForm() {
 
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'validating' | 'saving' | 'success' | 'error'>('idle');
-  const [admissionResult, setAdmissionResult] = useState<AdmissionResult | null>(null);
-  const [admissionUnavailable, setAdmissionUnavailable] = useState<string | null>(null);
+  const [admissionValidation, setAdmissionValidation] = useState<AdmissionValidation | null>(null);
+  const [syntaxResult, setSyntaxResult] = useState<AdmissionResult | null>(null);
   const [rawYaml, setRawYaml] = useState<string | undefined>();
   const [rawYamlValid, setRawYamlValid] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const validateCandidate = async (candidate: JobConfig, raw?: string): Promise<AdmissionResult | null> => {
-    setAdmissionUnavailable(null);
-    try {
-      const result = await requestAdmission(candidate, raw);
-      setAdmissionResult(result);
-      return result;
-    } catch (error) {
-      setAdmissionResult(null);
-      setAdmissionUnavailable(formatAdmissionError(error));
-      return null;
-    }
-  };
+  const candidateRawYaml = showAdvancedView ? rawYaml : undefined;
+  const candidateKey = useMemo(() => getAdmissionCandidateKey(jobConfig, candidateRawYaml), [jobConfig, candidateRawYaml]);
+  const candidateKeyRef = useRef(candidateKey);
+  candidateKeyRef.current = candidateKey;
+  const validatorRef = useRef<AdmissionValidator | null>(null);
+  if (!validatorRef.current) validatorRef.current = createAdmissionValidator(setAdmissionValidation);
+  const validator = validatorRef.current;
+  validator.setCandidate(candidateKey);
+  const validateCandidate = validator.validate;
+  const currentValidation = getCurrentAdmissionValidation(admissionValidation, candidateKey);
+  const admissionResult = rawYamlValid ? currentValidation?.result ?? null : syntaxResult;
+  const admissionUnavailable = rawYamlValid ? currentValidation?.unavailable ?? null : null;
+  const admissionStatus = rawYamlValid ? currentValidation?.status ?? 'pending' : 'invalid';
+  const canSave = rawYamlValid && (admissionStatus === 'valid' || admissionStatus === 'runtime_pending');
 
   const handleImportConfig = () => {
     fileInputRef.current?.click();
@@ -66,7 +75,7 @@ export default function TrainingForm() {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = async () => {
+    reader.onload = () => {
       const text = reader.result as string;
       try {
         const parsed =
@@ -76,12 +85,12 @@ export default function TrainingForm() {
         const candidate = migrateJobConfig(parsed as JobConfig);
         setRawYaml(undefined);
         setRawYamlValid(true);
-        await validateCandidate(candidate);
+        setSyntaxResult(null);
         setJobConfig(candidate);
       } catch (error) {
+        validator.invalidate();
         setRawYamlValid(false);
-        setAdmissionUnavailable(null);
-        setAdmissionResult({
+        setSyntaxResult({
           valid: false,
           diagnostics: [
             {
@@ -124,38 +133,42 @@ export default function TrainingForm() {
     }
   }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
 
-  // Clone and edit both run canonical admission before exposing a runnable state.
   useEffect(() => {
     const sourceId = cloneId || runId;
     if (!sourceId) return;
+    let cancelled = false;
     apiClient
       .get(`/api/jobs?id=${sourceId}`)
-      .then(async res => {
+      .then(res => {
+        if (cancelled) return;
         const data = res.data;
         const loaded = migrateJobConfig(JSON.parse(data.job_config) as JobConfig);
         if (cloneId) loaded.config.name = `${loaded.config.name}_copy`;
         setGpuIDs(data.gpu_ids);
         setRawYaml(undefined);
         setRawYamlValid(true);
-        await validateCandidate(loaded);
+        setSyntaxResult(null);
         setJobConfig(loaded);
       })
       .catch(error => {
-        setAdmissionUnavailable(formatAdmissionError(error));
+        if (cancelled) return;
+        setAdmissionValidation({
+          candidateKey: candidateKeyRef.current,
+          status: 'unavailable',
+          result: null,
+          unavailable: formatAdmissionError(error),
+        });
       });
+    return () => { cancelled = true; };
   }, [cloneId, runId]);
 
-  // Advanced view: keep canonical admission in sync with editor edits. Syntax
-  // errors are surfaced locally by onValidationChange; once the document parses
-  // again the config is revalidated (debounced) so a stale previous result can
-  // never linger over the current configuration.
   useEffect(() => {
-    if (!showAdvancedView || !rawYamlValid) return;
+    if (!rawYamlValid || status === 'validating' || status === 'saving') return;
     const handle = setTimeout(() => {
-      void validateCandidate(jobConfig, rawYaml);
+      void validateCandidate(jobConfig, candidateRawYaml);
     }, 500);
     return () => clearTimeout(handle);
-  }, [showAdvancedView, rawYamlValid, jobConfig, rawYaml]);
+  }, [candidateKey, rawYamlValid, status]);
 
   useEffect(() => {
     if (isGPUInfoLoaded) {
@@ -177,9 +190,12 @@ export default function TrainingForm() {
       setStatus('error');
       return;
     }
+    const candidate = jobConfig;
+    const raw = candidateRawYaml;
+    const key = candidateKey;
     setStatus('validating');
-    const result = await validateCandidate(jobConfig, showAdvancedView ? rawYaml : undefined);
-    if (!result || !result.valid) {
+    const result = await validateCandidate(candidate, raw);
+    if (!result || !result.valid || candidateKeyRef.current !== key) {
       setStatus('error');
       setTimeout(() => setStatus('idle'), 2000);
       return;
@@ -189,10 +205,10 @@ export default function TrainingForm() {
     apiClient
       .post('/api/jobs', {
         id: runId,
-        name: jobConfig.config.name,
+        name: candidate.config.name,
         gpu_ids: gpuIDs,
-        job_config: jobConfig,
-        ...(showAdvancedView && rawYaml === undefined ? {} : { raw_yaml: showAdvancedView ? rawYaml : undefined }),
+        job_config: candidate,
+        ...(raw === undefined ? {} : { raw_yaml: raw }),
       })
       .then(res => {
         setStatus('success');
@@ -211,6 +227,19 @@ export default function TrainingForm() {
     e.preventDefault();
     saveJob();
   };
+
+  const admissionFeedback = (
+    <AdmissionFeedback
+      config={jobConfig}
+      result={admissionResult}
+      unavailable={admissionUnavailable}
+      status={admissionStatus}
+      onRemediate={next => {
+        setRawYaml(undefined);
+        setJobConfig(next);
+      }}
+    />
+  );
 
   return (
     <>
@@ -280,7 +309,10 @@ export default function TrainingForm() {
         <div className="pr-1 sm:pr-2 flex-shrink-0">
           <Button
             className="text-gray-200 bg-gray-800 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
-            onClick={() => setShowAdvancedView(!showAdvancedView)}
+            onClick={() => {
+              setRawYaml(undefined);
+              setShowAdvancedView(!showAdvancedView);
+            }}
           >
             <span className="sm:hidden">{showAdvancedView ? 'Simple' : 'Advanced'}</span>
             <span className="hidden sm:inline">{showAdvancedView ? 'Show Simple' : 'Show Advanced'}</span>
@@ -290,7 +322,7 @@ export default function TrainingForm() {
           <Button
             className="text-white bg-green-600 hover:bg-green-700 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
             onClick={() => saveJob()}
-            disabled={status === 'saving' || status === 'validating' || !rawYamlValid || admissionResult?.valid === false}
+            disabled={status === 'saving' || status === 'validating' || !canSave}
           >
             {status === 'saving' ? (
               'Saving...'
@@ -313,19 +345,12 @@ export default function TrainingForm() {
         style={{ display: 'none' }}
         onChange={handleFileSelected}
       />
-      <AdmissionFeedback
-        config={jobConfig}
-        result={admissionResult}
-        unavailable={admissionUnavailable}
-        onRemove={next => {
-          setJobConfig(next);
-          void validateCandidate(next);
-        }}
-      />
 
 
       {showAdvancedView ? (
-        <div className="pt-[48px] absolute top-0 left-0 w-full h-full overflow-auto">
+        <div className="absolute top-12 bottom-0 left-0 w-full overflow-y-auto">
+          <div className="pb-3">{admissionFeedback}</div>
+          <div className="h-[calc(100vh-3rem)] min-h-96">
           <AdvancedConfigEditor
             config={jobConfig}
             setConfig={setJobConfig}
@@ -333,8 +358,8 @@ export default function TrainingForm() {
             onValidationChange={(valid, message, line) => {
               setRawYamlValid(valid);
               if (!valid) {
-                setAdmissionUnavailable(null);
-                setAdmissionResult({
+                validator.invalidate();
+                setSyntaxResult({
                   valid: false,
                   diagnostics: [
                     {
@@ -350,23 +375,13 @@ export default function TrainingForm() {
                   source: 'ui',
                 });
               } else {
-                // Syntax recovery: drop the locally generated syntax error at
-                // once so it cannot linger over a now-valid document. Canonical
-                // admission for the recovered config is refreshed by the
-                // advanced-view validation effect below.
-                setAdmissionResult(prev =>
-                  prev?.source === 'ui' &&
-                  prev.diagnostics.some(d => d.rule_id === 'admission.raw_yaml_invalid')
-                    ? null
-                    : prev
-                );
+                setSyntaxResult(null);
               }
             }}
             transformOnParse={(parsed: any) => {
               try {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';
                 parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-                parsed.config.process[0].device = 'cuda';
                 parsed.config.process[0].performance_log_every = 10;
               } catch (e) {
                 console.warn(e);
@@ -374,9 +389,11 @@ export default function TrainingForm() {
               return migrateJobConfig(parsed);
             }}
           />
+          </div>
         </div>
       ) : (
         <MainContent>
+          {admissionFeedback}
           <ErrorBoundary
             fallback={
               <div className="flex items-center justify-center h-64 text-lg text-red-600 font-medium bg-red-100 dark:bg-red-900/20 dark:text-red-400 border border-red-300 dark:border-red-700 rounded-lg">
@@ -395,14 +412,6 @@ export default function TrainingForm() {
               gpuList={gpuList}
               datasetOptions={datasetOptions}
               isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
-              onAdmissionResult={result => {
-                setAdmissionUnavailable(null);
-                setAdmissionResult(result);
-              }}
-              onAdmissionUnavailable={message => {
-                setAdmissionResult(null);
-                setAdmissionUnavailable(message);
-              }}
             />
           </ErrorBoundary>
 

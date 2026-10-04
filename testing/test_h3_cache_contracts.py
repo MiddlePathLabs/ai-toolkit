@@ -242,6 +242,235 @@ def test_file_item_skips_latent_checkpoint_identity_without_latent_cache(tmp_pat
     assert item._latent_model_identity == "latent-cache-disabled"
 
 
+@pytest.mark.parametrize("cache_text", [False, True])
+def test_dataset_without_media_cache_never_hashes_source(tmp_path, monkeypatch, cache_text):
+    import toolkit.dataloader_mixins as mixins
+    from PIL import Image
+    from toolkit.config_modules import DatasetConfig
+    from toolkit.data_loader import AiToolkitDataset
+
+    source = tmp_path / "image.png"
+    Image.new("RGB", (8, 8), (64, 96, 128)).save(source)
+    calls = []
+    original = mixins.content_fingerprint
+
+    def fingerprint(path):
+        calls.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(mixins, "content_fingerprint", fingerprint)
+    config = DatasetConfig(
+        dataset_path=str(tmp_path), resolution=8, buckets=False,
+        cache_text_embeddings=cache_text, default_caption="caption only",
+        num_repeats=3, flip_x=True, flip_y=True,
+    )
+    model = _FrozenToyEncoderModel()
+    dataset = AiToolkitDataset(config, sd=model)
+    model.restore_device_state()
+    assert len(dataset.file_list) == 12
+    for index in range(len(dataset)):
+        item = dataset[index]
+        assert item.tensor.shape == (3, 8, 8)
+        if cache_text:
+            torch.testing.assert_close(
+                item.prompt_embeds.text_embeds, _toy_prompt_tensor("caption only"),
+                rtol=0, atol=0,
+            )
+    assert calls == []
+
+
+def test_bucketed_image_pair_fetch_uses_dataset_transform(tmp_path):
+    from PIL import Image
+    from toolkit.config_modules import DatasetConfig
+    from toolkit.data_loader import get_dataloader_from_datasets
+
+    images = tmp_path / "images"
+    unconditional = tmp_path / "unconditional"
+    images.mkdir()
+    unconditional.mkdir()
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(images / "pair.png")
+    Image.new("RGB", (8, 8), (0, 0, 255)).save(unconditional / "pair.png")
+    config = DatasetConfig(
+        dataset_path=str(images), unconditional_path=str(unconditional),
+        resolution=8, buckets=True, num_workers=0,
+    )
+    loader = get_dataloader_from_datasets(
+        [config], batch_size=1, sd=_FrozenToyEncoderModel()
+    )
+    batch = next(iter(loader))
+    assert batch.file_items[0].has_unconditional
+    torch.testing.assert_close(
+        batch.tensor,
+        torch.tensor([1.0, -1.0, -1.0]).reshape(1, 3, 1, 1).expand(1, 3, 8, 8),
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        batch.unconditional_tensor,
+        torch.tensor([-1.0, -1.0, 1.0]).reshape(1, 3, 1, 1).expand(1, 3, 8, 8),
+        rtol=0, atol=0,
+    )
+
+
+@pytest.mark.parametrize("extension", [".wav", ".WAV"])
+def test_multimodal_dataset_retains_audio_and_image_items(tmp_path, extension):
+    import wave
+    from PIL import Image
+    from toolkit.config_modules import DatasetConfig
+    from toolkit.data_loader import AiToolkitDataset
+
+    source = tmp_path / f"voice{extension}"
+    sample_rate = 16000
+    with wave.open(str(source), "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(sample_rate)
+        recording.writeframes(b"\x00\x10" * sample_rate)
+    image = tmp_path / "image.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    model = _FrozenToyEncoderModel()
+    model.is_multimodal_llm = True
+    model.sample_rate = sample_rate
+    dataset = AiToolkitDataset(
+        DatasetConfig(dataset_path=str(tmp_path), resolution=8, buckets=True),
+        sd=model,
+    )
+    items = {item.path: item for item in dataset.file_list}
+    assert set(items) == {str(source), str(image)}
+    audio_item = items[str(source)]
+    assert audio_item.is_audio_model and not audio_item.is_audio_only
+    assert (audio_item.width, audio_item.height) == (1000, 1)
+    assert audio_item.sample_rate == sample_rate
+    assert not items[str(image)].is_audio_model
+    audio_index = dataset.file_list.index(audio_item)
+    assert dataset.buckets["1000ms"].file_list_idx == [audio_index]
+    image_batch_index = next(
+        index for index, batch in enumerate(dataset.batch_indices)
+        if audio_index not in batch
+    )
+    image_item = dataset[image_batch_index][0]
+    assert image_item.path == str(image)
+    assert image_item.tensor.shape == (3, 8, 8)
+
+
+def test_latent_preparation_hashes_repeated_source_once_and_rekeys_fresh_content(
+    tmp_path, monkeypatch
+):
+    import toolkit.dataloader_mixins as mixins
+    from PIL import Image
+    from torchvision.transforms import functional as TF
+    from toolkit.config_modules import DatasetConfig
+    from toolkit.data_loader import AiToolkitDataset
+
+    class _LatentModel(_FrozenToyEncoderModel):
+        @staticmethod
+        def encode_images(images):
+            return torch.nn.functional.avg_pool2d(images, 2)
+
+    source = tmp_path / "image.png"
+    image = Image.new("RGB", (8, 8), (255, 0, 0))
+    image.paste((0, 0, 255), (0, 0, 4, 8))
+    image.save(source, compress_level=0)
+    config = DatasetConfig(
+        dataset_path=str(tmp_path), resolution=8, buckets=False,
+        cache_latents_to_disk=True, cache_latents_num_workers=1,
+        num_repeats=2, flip_x=True, flip_y=True,
+    )
+    calls = []
+    original = mixins.content_fingerprint
+
+    def fingerprint(path):
+        calls.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(mixins, "content_fingerprint", fingerprint)
+    model = _LatentModel()
+    first = AiToolkitDataset(config, sd=model)
+    first_paths = [item.get_latent_path() for item in first.file_list]
+    assert len(first_paths) == 8
+    assert len(set(first_paths)) == 4
+    assert first_paths[:2] == [first_paths[0]] * 2
+    assert calls == [str(source)]
+    assert all(os.path.isfile(path) for path in first_paths)
+    assert "_preparation_source_fingerprints" not in first.__dict__
+    expected = torch.nn.functional.avg_pool2d((TF.to_tensor(image) * 2 - 1), 2)
+    torch.testing.assert_close(first[0].get_latent().tensor, expected, rtol=0, atol=0)
+
+    second = AiToolkitDataset(config, sd=model)
+    assert [item.get_latent_path() for item in second.file_list] == first_paths
+    assert calls == [str(source)] * 2
+    torch.testing.assert_close(second[0].get_latent().tensor, expected, rtol=0, atol=0)
+
+    original_stat = source.stat()
+    edited = Image.new("RGB", (8, 8), (0, 255, 0))
+    edited.save(source, compress_level=0)
+    assert source.stat().st_size == original_stat.st_size
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    third = AiToolkitDataset(config, sd=model)
+    third_paths = [item.get_latent_path() for item in third.file_list]
+    assert set(third_paths).isdisjoint(first_paths)
+    assert calls == [str(source)] * 3
+    expected_edited = torch.nn.functional.avg_pool2d((TF.to_tensor(edited) * 2 - 1), 2)
+    torch.testing.assert_close(
+        third[0].get_latent().tensor, expected_edited, rtol=0, atol=0,
+    )
+    assert first.file_list[0].get_latent_path(recalculate=True) == third_paths[0]
+    assert calls == [str(source)] * 4
+
+
+def test_visual_text_preparation_reuses_source_digest_but_refreshes_on_repair(
+    tmp_path, monkeypatch
+):
+    import toolkit.dataloader_mixins as mixins
+    from PIL import Image
+    from toolkit.config_modules import DatasetConfig
+    from toolkit.data_loader import AiToolkitDataset
+
+    source = tmp_path / "image.png"
+    Image.new("RGB", (8, 8), "red").save(source, compress_level=0)
+    calls = []
+    original = mixins.content_fingerprint
+
+    def fingerprint(path):
+        calls.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(mixins, "content_fingerprint", fingerprint)
+    config = DatasetConfig(
+        dataset_path=str(tmp_path), resolution=8, buckets=False,
+        cache_text_embeddings=True, default_caption="portrait",
+        num_repeats=2, flip_x=True, flip_y=True,
+    )
+    model = _FrozenToyEncoderModel(encode_control=True)
+    model.dopsd_self_ref = True
+    dataset = AiToolkitDataset(config, sd=model)
+    model.restore_device_state()
+    first_paths = [item.get_dopsd_text_embedding_path() for item in dataset.file_list]
+    assert len(set(first_paths)) == 4
+    assert calls == [str(source)]
+    torch.testing.assert_close(
+        dataset[0].dopsd_prompt_embeds.text_embeds,
+        _toy_prompt_tensor("<Picture 1> portrait", torch.tensor([1.0, 0.0, 0.0])),
+        rtol=0, atol=0,
+    )
+    dataset._regenerate_text_embeddings(dataset.file_list)
+    assert [item.get_dopsd_text_embedding_path() for item in dataset.file_list] == first_paths
+    assert calls == [str(source)] * 2
+
+    original_stat = source.stat()
+    Image.new("RGB", (8, 8), "blue").save(source, compress_level=0)
+    assert source.stat().st_size == original_stat.st_size
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    dataset._regenerate_text_embeddings(dataset.file_list)
+    refreshed_paths = [item.get_dopsd_text_embedding_path() for item in dataset.file_list]
+    assert set(refreshed_paths).isdisjoint(first_paths)
+    assert calls == [str(source)] * 3
+    torch.testing.assert_close(
+        dataset[0].dopsd_prompt_embeds.text_embeds,
+        _toy_prompt_tensor("<Picture 1> portrait", torch.tensor([0.0, 0.0, 1.0])),
+        rtol=0, atol=0,
+    )
+
+
 @pytest.mark.parametrize("source_size", [(8, 4), (20, 14), (14, 20)])
 def test_subject_mask_transform_matches_nonbucket_training_geometry(tmp_path, source_size):
     from PIL import Image

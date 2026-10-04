@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+import pytest
 import yaml
 
 from toolkit.admission import (
@@ -383,3 +384,80 @@ def test_exact_resume_admits_only_the_proven_deterministic_scope():
         "config.process[0].device" in diagnostic["fields"]
         for diagnostic in result["diagnostics"]
     )
+
+
+def test_gpu_continuation_defers_rank_count_instead_of_reading_unserialized_keys():
+    for mode in (None, "auto", "continue"):
+        train = {"optimizer": "adamw", "gradient_accumulation": 2}
+        if mode is not None:
+            train["resume_mode"] = mode
+        process = _process(
+            device="cuda:0",
+            train=train,
+            datasets=[{"dataset_path": "not-present", "num_workers": 2, "buckets": True}],
+        )
+        result = collect_admission_diagnostics({"process": [process]})
+        assert result["valid"], result["diagnostics"]
+        assert RULE_RESUME_DETERMINISM not in _ids(result)
+        deferred = [item for item in result["deferred"] if item["rule_id"] == RULE_RESUME_DETERMINISM]
+        assert any("rank count" in item["reason"] for item in deferred)
+        assert any("output folder" in item["remedy"] for item in deferred)
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "continue", "exact"])
+def test_resumable_modes_reject_merged_network_saves(mode):
+    train = {"optimizer": "adamw", "merge_network_on_save": True}
+    datasets = [{"dataset_path": "not-present", "buckets": True}]
+    device = "cuda:0"
+    if mode == "exact":
+        device = "cpu"
+        datasets = [{"dataset_path": "not-present", "num_workers": 0, "buckets": False}]
+    if mode is not None:
+        train["resume_mode"] = mode
+    result = collect_admission_diagnostics({"process": [_process(device=device, train=train, datasets=datasets)]})
+    assert not result["valid"]
+    assert RULE_RESUME_DETERMINISM in _ids(result)
+    assert any("merge_network_on_save" in " ".join(item["fields"]) for item in result["diagnostics"])
+    assert any("new, separate output folder" in item["remedy"] for item in result["diagnostics"])
+
+
+def test_weights_only_merged_export_is_statically_admitted_and_destination_is_deferred():
+    process = _process(train={
+        "optimizer": "adamw",
+        "resume_mode": "weights_only",
+        "merge_network_on_save": True,
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert result["valid"], result["diagnostics"]
+    assert RULE_RESUME_DETERMINISM not in _ids(result)
+    deferred = [item for item in result["deferred"] if item["rule_id"] == RULE_RESUME_DETERMINISM]
+    assert any("new, separate output folder" in item["remedy"] for item in deferred)
+
+
+def test_ignored_audio_extension_does_not_trigger_voice_restrictions(tmp_path):
+    (tmp_path / "unused.opus").write_bytes(b"not enumerated by the loader")
+    process = _process(datasets=[{
+        "dataset_path": str(tmp_path), "do_audio": True,
+        "buckets": False, "caption_dropout_rate": 0.1,
+    }])
+    assert collect_admission_diagnostics({"process": [process]})["valid"]
+    (tmp_path / "voice.WAV").write_bytes(b"runtime decoding is deferred")
+    result = collect_admission_diagnostics({"process": [process]})
+    assert not result["valid"]
+    assert RULE_H3_AUDIO in _ids(result)
+
+
+@pytest.mark.parametrize("options", [
+    {"dopsd_ref_mode": "other"},
+    {"dopsd_ref_mode": "unknown"},
+    {"dopsd_group_by": "class"},
+    {"dopsd_identity_first": True},
+])
+def test_dormant_teacher_options_reject_known_runtime_failures(options):
+    process = _process(model={
+        "arch": "minimax_h3_ref2va", "name_or_path": "base",
+        "model_kwargs": {"dopsd": False, **options},
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert not result["valid"]
+    assert RULE_DOPSD_VARIANT in _ids(result)

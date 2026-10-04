@@ -61,9 +61,7 @@ RULE_UNCERTIFIED_RUNTIME = "admission.runtime_deferred"
 RULE_RESUME_DETERMINISM = "admission.resume_determinism"
 
 
-_AUDIO_EXTENSIONS = {
-    ".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".alac"
-}
+_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 _H3_FRAME_CHUNK = 17
 _H3_FRAME_REMAINDER = 5
 _H3_FPS = 24
@@ -365,12 +363,12 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
     krea = _is_krea(base)
     flow = _is_flow(base, train)
     resume_mode = train.get("resume_mode", "auto")
-    if resume_mode not in {"auto", "exact", "weights_only"}:
+    if resume_mode not in {"auto", "continue", "exact", "weights_only"}:
         collector.add(
             RULE_RESUME_DETERMINISM,
             [f"{p}.train.resume_mode"],
             f"Unknown resume mode {resume_mode!r}.",
-            "Use train.resume_mode: auto, exact, or weights_only.",
+            "Use train.resume_mode: auto, continue, exact, or weights_only.",
         )
     elif resume_mode == "exact":
         if str(process.get("device", "cuda")).split(":")[0] != "cpu":
@@ -378,7 +376,7 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                 RULE_RESUME_DETERMINISM,
                 [f"{p}.device", f"{p}.train.resume_mode"],
                 "Exact replay is currently admitted only for the exercised CPU state-machine contract.",
-                "Use device: cpu for exact replay or choose weights_only for an explicit GPU warm start.",
+                "Use device: cpu for exact replay or choose continue for non-exact GPU continuation.",
             )
         worker_fields = []
         has_buckets = False
@@ -392,43 +390,63 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                 RULE_RESUME_DETERMINISM,
                 worker_fields,
                 "Exact resume replay is only proven with a main-process, zero-worker loader; worker prefetch and worker RNG state are not captured.",
-                "Set num_workers: 0 on every dataset or use resume_mode: weights_only.",
+                "Set num_workers: 0 on every dataset or use resume_mode: continue for non-exact continuation.",
             )
         if has_buckets:
             collector.add(
                 RULE_RESUME_DETERMINISM,
                 [f"{p}.datasets[{index}].buckets" for index, dataset in enumerate(datasets) if _bool(dataset.get("buckets"))],
                 "Exact replay does not yet prove bucket reshuffle and bucket-local augmentation state.",
-                "Disable buckets for exact resume or use resume_mode: weights_only.",
+                "Disable buckets for exact resume or use resume_mode: continue for non-exact continuation.",
             )
         if _integer(train.get("gradient_accumulation", 1), 1) != 1:
             collector.add(
                 RULE_RESUME_DETERMINISM,
                 [f"{p}.train.gradient_accumulation"],
                 "Exact completed-update snapshots do not capture an in-flight accumulation window.",
-                "Use gradient_accumulation: 1 for exact resume or use weights_only.",
+                "Use gradient_accumulation: 1 for exact resume or use continue at a completed update boundary.",
             )
         if _integer(train.get("gradient_accumulation_steps", 1), 1) != 1:
             collector.add(
                 RULE_RESUME_DETERMINISM,
                 [f"{p}.train.gradient_accumulation_steps"],
                 "Exact completed-update snapshots do not capture legacy accumulation windows.",
-                "Use gradient_accumulation_steps: 1 for exact resume or use weights_only.",
+                "Use gradient_accumulation_steps: 1 for exact resume or use continue at a completed update boundary.",
             )
         if _bool(model.get("compile")) or _bool(model.get("block_compile")):
             collector.add(
                 RULE_RESUME_DETERMINISM,
                 [f"{p}.model.compile", f"{p}.model.block_compile"],
                 "Exact resume has only been proved with compilation disabled.",
-                "Set compile and block_compile false or use resume_mode: weights_only.",
+                "Set compile and block_compile false or use resume_mode: continue for non-exact continuation.",
             )
-        if any(_bool(train.get(name)) for name in ("distributed", "multi_gpu")) or _integer(train.get("num_processes", 1), 1) != 1:
-            collector.add(
-                RULE_RESUME_DETERMINISM,
-                [f"{p}.train.distributed", f"{p}.train.multi_gpu", f"{p}.train.num_processes"],
-                "Exact resume has only been proved for one process; rank-local sampler/RNG state is not captured.",
-                "Use one process for exact resume or use resume_mode: weights_only.",
-            )
+    if resume_mode in {"auto", "continue", "exact"}:
+        collector.defer(
+            RULE_RESUME_DETERMINISM,
+            [f"{p}.train.resume_mode"],
+            "Single-process topology for raw-state continuation is checked against the accelerator at runtime; serialized config and visible GPU count do not establish rank count.",
+            "Launch one process for resumable output; use weights_only in a separate output folder for a deliberate reset.",
+        )
+        collector.defer(
+            RULE_RESUME_DETERMINISM,
+            [f"{p}.train.resume_mode"],
+            "Existing output checkpoint state, recipe compatibility, and restoration safety are checked at runtime.",
+            "Keep compatible raw training state for continuation; use explicit weights_only in a new output folder for a warm start.",
+        )
+    elif resume_mode == "weights_only":
+        collector.defer(
+            RULE_RESUME_DETERMINISM,
+            [f"{p}.train.resume_mode"],
+            "Weights-only destination safety is checked at runtime; resetting in an output folder containing raw training state is not safe.",
+            "Use a new, separate output folder for a weights-only warm start, including merged exports.",
+        )
+    if resume_mode in {"auto", "continue", "exact"} and _bool(train.get("merge_network_on_save")):
+        collector.add(
+            RULE_RESUME_DETERMINISM,
+            [f"{p}.train.merge_network_on_save", f"{p}.train.resume_mode"],
+            "Merged network exports do not preserve the original base needed for matched raw-state restoration.",
+            "Disable merge_network_on_save for resumable output or choose explicit weights_only in a new, separate output folder.",
+        )
 
     # Match BaseSDTrainProcess.is_fine_tuning: a configured network, embedding,
     # decorator, or trained adapter makes this an adapter-role process even when
@@ -772,6 +790,29 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
 
     # D-OPSD static subset; loaded model/version and concrete optimizer checks stay final.
     dopsd = _bool(model_kwargs.get("dopsd"))
+    ref_mode = str(model_kwargs.get("dopsd_ref_mode", "self") or "self").strip().lower()
+    group_by = str(model_kwargs.get("dopsd_group_by", "folder") or "folder").strip().lower()
+    if (h3 or dopsd) and ref_mode not in {"self", "other"}:
+        collector.add(
+            RULE_DOPSD_VARIANT,
+            [f"{p}.model.model_kwargs.dopsd_ref_mode"],
+            f"Unsupported D-OPSD reference mode {ref_mode!r}.",
+            "Set dopsd_ref_mode to self or other.",
+        )
+    if (h3 or dopsd) and group_by != "folder":
+        collector.add(
+            RULE_DOPSD_VARIANT,
+            [f"{p}.model.model_kwargs.dopsd_group_by"],
+            f"Unsupported D-OPSD grouping mode {group_by!r}.",
+            "Set dopsd_group_by: folder.",
+        )
+    if h3 and not dopsd and (ref_mode == "other" or _bool(model_kwargs.get("dopsd_identity_first"))):
+        collector.add(
+            RULE_DOPSD_VARIANT,
+            [f"{p}.model.model_kwargs.dopsd", f"{p}.model.model_kwargs.dopsd_ref_mode", f"{p}.model.model_kwargs.dopsd_identity_first"],
+            "Other-photo and identity-first options require model_kwargs.dopsd: true.",
+            "Enable D-OPSD on a supported Ref2VA model, or set dopsd_ref_mode: self and dopsd_identity_first: false.",
+        )
     if dopsd:
         ref_role = "ref2va" in base or "ref2va" in variant or str(model_kwargs.get("partition", "")).lower().startswith("ref2va")
         if not h3 or not ref_role:
@@ -790,22 +831,6 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             )
         teacher_min = _number(model_kwargs.get("dopsd_teacher_sigma_min", 0.0), 0.0)
         teacher_max = _number(model_kwargs.get("dopsd_teacher_sigma_max", 1.0), 1.0)
-        ref_mode = str(model_kwargs.get("dopsd_ref_mode", "self") or "self").lower()
-        if ref_mode not in {"self", "other"}:
-            collector.add(
-                RULE_DOPSD_VARIANT,
-                [f"{p}.model.model_kwargs.dopsd_ref_mode"],
-                f"Unsupported D-OPSD reference mode {ref_mode!r}.",
-                "Set dopsd_ref_mode to self or other.",
-            )
-        group_by = str(model_kwargs.get("dopsd_group_by", "folder") or "folder").lower()
-        if group_by != "folder":
-            collector.add(
-                RULE_DOPSD_VARIANT,
-                [f"{p}.model.model_kwargs.dopsd_group_by"],
-                f"Unsupported D-OPSD grouping mode {group_by!r}.",
-                "Set dopsd_group_by: folder.",
-            )
         if _integer(model_kwargs.get("dopsd_ref_count", 1), 1) < 1:
             collector.add(
                 RULE_DOPSD_BATCH,

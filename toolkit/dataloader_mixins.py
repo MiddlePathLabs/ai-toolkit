@@ -2202,12 +2202,7 @@ class LatentCachingFileItemDTOMixin:
         self.is_caching_to_disk = False
         self.is_caching_to_memory = False
         self.latent_load_device = 'cpu'
-        # Preparation-time provenance. Flipped/repeated DTOs retain this exact
-        # digest, while a newly prepared path is hashed again.
-        path = getattr(self, "path", None)
-        self.source_content_fingerprint = (
-            content_fingerprint(path) if path and os.path.isfile(path) else str(path or "")
-        )
+        self._source_content_fingerprint = None
         dataset_config = kwargs.get("dataset_config")
         cache_text = bool(
             getattr(dataset_config, "cache_text_embeddings", False)
@@ -2216,6 +2211,20 @@ class LatentCachingFileItemDTOMixin:
             getattr(dataset_config, "cache_latents", False)
             or getattr(dataset_config, "cache_latents_to_disk", False)
         )
+        self._text_cache_uses_source = bool(
+            getattr(self, "dopsd_self_ref", False)
+            or getattr(self, "dopsd_other_ref", False)
+            or (
+                getattr(self, "encode_first_frame_in_text_embeddings", False)
+                and getattr(dataset_config, "do_i2v", False)
+                and getattr(self, "is_video", False)
+                and not getattr(self, "control_video_paths", None)
+            )
+        )
+        if cache_latents or (cache_text and self._text_cache_uses_source):
+            self.refresh_source_cache_provenance(
+                kwargs.get("source_fingerprint_cache")
+            )
         self._cache_model_identity = (
             _cache_model_identity(kwargs.get("sd"))
             if cache_text else "text-cache-disabled"
@@ -2227,11 +2236,26 @@ class LatentCachingFileItemDTOMixin:
         # v2 changes the cache namespace: source content and transform/control
         # provenance are now part of the latent identity.
         self.latent_version = 2
-    def refresh_source_cache_provenance(self: 'FileItemDTO'):
-        """Refresh the preparation fingerprint before an explicit re-key."""
-        path = getattr(self, "path", None)
-        if path and os.path.isfile(path):
-            self.source_content_fingerprint = content_fingerprint(path)
+    @property
+    def source_content_fingerprint(self: 'FileItemDTO'):
+        if self._source_content_fingerprint is None:
+            self.refresh_source_cache_provenance()
+        return self._source_content_fingerprint
+
+    def refresh_source_cache_provenance(
+        self: 'FileItemDTO', fingerprint_cache=None,
+    ):
+        """Re-key against fresh content, sharing only a preparation-local memo."""
+        path = self.path
+        if fingerprint_cache is not None and path in fingerprint_cache:
+            self._source_content_fingerprint = fingerprint_cache[path]
+        else:
+            self._source_content_fingerprint = (
+                content_fingerprint(path)
+                if path and os.path.isfile(path) else str(path or "")
+            )
+            if fingerprint_cache is not None:
+                fingerprint_cache[path] = self._source_content_fingerprint
         self._latent_path = None
 
     def get_latent_info_dict(self: 'FileItemDTO'):
@@ -2672,13 +2696,20 @@ class LatentCachingMixin:
             # thread pool so the next items are ready while the current one is encoding.
             # the in-flight window is bounded so decoded videos don't pile up in RAM.
             num_workers = max(1, self.dataset_config.cache_latents_num_workers)
+            source_fingerprints = getattr(
+                self, "_preparation_source_fingerprints", None
+            )
+            if source_fingerprints is None:
+                source_fingerprints = {}
+            for file_item in self.file_list:
+                file_item.refresh_source_cache_provenance(source_fingerprints)
 
             def _prep(prep_item: 'FileItemDTO'):
                 prep_item.is_caching_to_disk = to_disk
                 prep_item.is_caching_to_memory = to_memory
                 prep_item.latent_load_device = self.sd.device
 
-                prep_latent_path = prep_item.get_latent_path(recalculate=True)
+                prep_latent_path = prep_item.get_latent_path()
                 try:
                     if os.path.exists(prep_latent_path):
                         cached_state_dict = load_file(prep_latent_path, device='cpu') if to_memory else None
@@ -3258,12 +3289,18 @@ class TextEmbeddingCachingMixin:
             print_acc(" - Saving text embeddings to disk")
             
             did_move = False
+            source_fingerprints = getattr(
+                self, "_preparation_source_fingerprints", None
+            )
+            if source_fingerprints is None:
+                source_fingerprints = {}
 
             # Resolve JSON/short-caption authority before any text key is
             # computed. This also lets a changed caption re-key without
             # deleting the previous orphan cache file.
             for file_item in tqdm(items):
-                file_item.refresh_source_cache_provenance()
+                if file_item._text_cache_uses_source:
+                    file_item.refresh_source_cache_provenance(source_fingerprints)
                 file_item.load_caption(
                     getattr(self, "caption_dict", None),
                     force=True,

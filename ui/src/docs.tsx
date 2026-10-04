@@ -947,16 +947,22 @@ const docs: { [key: string]: ConfigDoc } = {
   },
   'train.resume_mode': {
     title: 'Resume Mode',
-    summary: 'Choose exact raw-state resume or an explicit weights-only warm start.',
+    summary: 'Continue matched raw state, request exact replay, or start fresh from weights.',
     description: (
       <>
-        <code>auto</code> (default) resumes only a complete matching raw <code>training_state.pt</code>; it does not
-        guess from inference-only or legacy files. <code>exact</code> requires a matched completed-update snapshot,
-        single-process CPU, <code>num_workers: 0</code>, no buckets, accumulation 1, and compile off, with parameters,
-        optimizer, scheduler, EMA/count, Python/NumPy/Torch RNG and data order restored together.
-        GPU/bucketed/compiled exact replay is unavailable. <code>weights_only</code> deliberately resets optimizer/scheduler/EMA,
-        counters, RNG and data order. Mismatches fail with an actionable remedy instead of silently starting a fake
-        resume.
+        <code>auto</code> (default) starts fresh outputs normally and restores only a complete matching raw
+        <code> training_state.pt</code> for existing outputs. It selects exact replay in the supported deterministic
+        scope; otherwise it uses single-process <code>continue</code>. Continuation restores raw weights, optimizer,
+        scheduler, EMA/count, counters and global RNG, but restarts loader traversal, worker RNG, prefetch and
+        augmentation ordering; it does not promise identical future results.
+        <br />
+        <code>exact</code> also restores data order and requires CPU, <code>num_workers: 0</code>, no buckets,
+        accumulation 1 and compile off. <code>auto</code>, <code>continue</code>, and <code>exact</code> reject merged-network
+        saves. Rank count is checked from the accelerator at runtime, not from visible GPU count.
+        <code> weights_only</code> loads weights but resets optimizer/scheduler/EMA, counters, RNG and data order;
+        inference metadata never restores its clocks. It must use a new output folder when the current folder contains
+        raw training state. Recipe mismatches fail closed rather than pairing raw
+        optimizer state with an inference/EMA export.
       </>
     ),
   },

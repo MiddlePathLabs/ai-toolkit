@@ -5426,6 +5426,9 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(
                             self.params, self.train_config.max_grad_norm
                         )
+                elif hasattr(self.accelerator, "unscale_gradients"):
+                    self.accelerator.unscale_gradients(self.optimizer)
+                self._inject_gradient_noise()
                 prepare_optimizer_step(self.optimizer)
                 with self.timer('optimizer_step'):
                     self.optimizer.step()

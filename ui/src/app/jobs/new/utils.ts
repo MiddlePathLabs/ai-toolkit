@@ -1,8 +1,7 @@
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { JobConfig } from '@/types';
 import { ModelArch } from './options';
 import { objectCopy } from '@/utils/basic';
 import { setNestedValue } from '@/utils/hooks';
-import { requestAdmission, type AdmissionResult } from '@/utils/admission';
 
 const expandDatasetDefaults = (
   defaults: { [key: string]: any },
@@ -29,9 +28,8 @@ export const buildModelArchChange = (
   newArchName: string,
   jobConfig: JobConfig,
 ): JobConfig | null => {
-  const currentArch = modelArchs.find(a => a.name === currentArchName);
   const newArch = modelArchs.find(model => model.name === newArchName);
-  if (!currentArch || !newArch || currentArch.name === newArchName) return null;
+  if (!newArch || currentArchName === newArchName) return null;
 
   const numDatasets = jobConfig.config.process[0].datasets.length;
   const newDefaults = expandDatasetDefaults(newArch.defaults || {}, numDatasets);
@@ -40,8 +38,7 @@ export const buildModelArchChange = (
     candidate = setNestedValue(candidate, value, key);
   };
 
-  // Preserve every value from the previous model. Presentation cards may hide
-  // unsupported sections, but only the explicit conflict action may remove them.
+  // Hidden settings stay stored until the user applies a named repair or edits them.
   setValue(newArchName, 'config.process[0].model.arch');
   for (let index = 0; index < numDatasets; index += 1) {
     setValue(newArch.controls ?? [], `config.process[0].datasets[${index}].controls`);
@@ -53,18 +50,3 @@ export const buildModelArchChange = (
   return candidate;
 };
 
-export const handleModelArchChange = async (
-  modelArchs: ModelArch[],
-  currentArchName: string,
-  newArchName: string,
-  jobConfig: JobConfig,
-  setJobConfig: (value: unknown, key?: string) => void,
-  onValidated?: (result: AdmissionResult, candidate: JobConfig) => void,
-): Promise<AdmissionResult | null> => {
-  const candidate = buildModelArchChange(modelArchs, currentArchName, newArchName, jobConfig);
-  if (!candidate) return null;
-  const result = await requestAdmission(candidate);
-  onValidated?.(result, candidate);
-  setJobConfig(candidate);
-  return result;
-};

@@ -1,22 +1,25 @@
 'use client';
 
-import { AlertTriangle, CircleAlert, Trash2 } from 'lucide-react';
+import { AlertTriangle, CircleAlert, Wrench } from 'lucide-react';
 import type { JobConfig } from '@/types';
 import {
-  getIncompatibleSettings,
-  removeIncompatibleSettings,
+  getAdmissionRemediations,
+  applyAdmissionRemediation,
   type AdmissionDiagnostic,
   type AdmissionResult,
+  type AdmissionValidationStatus,
 } from '@/utils/admission';
 
 interface Props {
   config: JobConfig;
   result: AdmissionResult | null;
   unavailable?: string | null;
-  onRemove?: (config: JobConfig) => void;
+  status?: AdmissionValidationStatus;
+  onRemediate?: (config: JobConfig) => void;
 }
 
 const renderValue = (value: unknown): string => {
+  if (value === undefined) return '(not set)';
   if (typeof value === 'string') return value;
   try {
     return JSON.stringify(value);
@@ -36,12 +39,17 @@ const Diagnostic = ({ diagnostic }: { diagnostic: AdmissionDiagnostic }) => (
   </li>
 );
 
-export default function AdmissionFeedback({ config, result, unavailable, onRemove }: Props) {
-  if (!result && !unavailable) return null;
+export default function AdmissionFeedback({ config, result, unavailable, status, onRemediate }: Props) {
+  if (!result && !unavailable && status !== 'pending') return null;
   const errors = result?.diagnostics.filter(item => item.severity === 'error') ?? [];
   const warnings = result?.diagnostics.filter(item => item.severity === 'warning') ?? [];
   const deferred = result?.deferred ?? [];
-  const settings = result ? getIncompatibleSettings(config, result) : [];
+  const actions = result ? getAdmissionRemediations(config, result) : [];
+  const pending = status === 'pending';
+  const title = pending ? 'Validating current configuration' :
+    unavailable ? 'Validation unavailable' :
+    errors.length > 0 ? 'Configuration cannot run' :
+    deferred.length > 0 ? 'Static validation passed; runtime checks pending' : 'Configuration accepted';
 
   return (
     <section
@@ -50,9 +58,10 @@ export default function AdmissionFeedback({ config, result, unavailable, onRemov
     >
       <div className="flex items-center gap-2 font-semibold">
         {unavailable || errors.length > 0 ? <CircleAlert className="h-4 w-4 text-red-400" /> : <AlertTriangle className="h-4 w-4 text-amber-300" />}
-        <span>{unavailable ? 'Validation unavailable' : errors.length > 0 ? 'Configuration cannot run' : 'Validation status'}</span>
+        <span>{title}</span>
       </div>
-      {unavailable && <p className="mt-2 text-red-200">{unavailable} Save and Start stay disabled until validation is available.</p>}
+      {pending && <p className="mt-2 text-gray-300">The current edits have not been validated yet. Save will be available after validation passes.</p>}
+      {unavailable && <p className="mt-2 text-red-200">{unavailable} Save is disabled until this configuration can be validated.</p>}
       {errors.length > 0 && (
         <ul className="mt-2 space-y-2 text-red-100">
           {errors.map((diagnostic, index) => <Diagnostic diagnostic={diagnostic} key={`${diagnostic.rule_id}-${index}`} />)}
@@ -66,29 +75,34 @@ export default function AdmissionFeedback({ config, result, unavailable, onRemov
       )}
       {deferred.length > 0 && (
         <div className="mt-3 border-t border-gray-700 pt-2">
-          <div className="font-medium text-amber-200">Deferred runtime checks</div>
+          <div className="font-medium text-amber-200">Runtime checks pending</div>
+          {result?.valid && <p className="mt-1 text-xs text-gray-300">Static validation passed, so this configuration can be saved. These checks must pass when training loads the model and data.</p>}
           <ul className="mt-1 space-y-2 text-amber-100">{deferred.map((diagnostic, index) => <Diagnostic diagnostic={diagnostic} key={`${diagnostic.rule_id}-${index}`} />)}</ul>
         </div>
       )}
-      {settings.length > 0 && result && onRemove && (
+      {errors.length > 0 && result && onRemediate && (
         <div className="mt-3 border-t border-gray-700 pt-3">
-          <div className="font-medium">Incompatible values remain stored</div>
-          <p className="mt-1 text-xs text-gray-300">Nothing is removed automatically when a model card hides a field. Review these values and explicitly remove them if they are no longer wanted.</p>
-          <ul className="mt-2 space-y-1 text-xs text-gray-200">
-            {settings.map(setting => (
-              <li className="font-mono" key={setting.path}>
-                {setting.path} = {renderValue(setting.value)}
-              </li>
-            ))}
-          </ul>
-          <button
-            type="button"
-            className="mt-3 inline-flex items-center gap-2 rounded bg-red-700 px-3 py-1.5 text-xs font-medium hover:bg-red-600"
-            onClick={() => onRemove(removeIncompatibleSettings(config, result))}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            Remove listed incompatible settings
-          </button>
+          <div className="font-medium">Stored values are unchanged</div>
+          <p className="mt-1 text-xs text-gray-300">Apply a named repair below or edit the configuration. Hidden fields are not removed automatically. Repairs never remove dataset paths or model identities.</p>
+          {actions.length > 0 && (
+            <ul className="mt-2 space-y-3 text-xs text-gray-200">
+              {actions.map(action => (
+                <li key={action.id}>
+                  <div className="font-mono">
+                    {action.path}: {renderValue(action.currentValue)} → {action.value === undefined ? '(remove setting)' : renderValue(action.value)}
+                  </div>
+                  <button
+                    type="button"
+                    className="mt-1 inline-flex items-center gap-2 rounded bg-gray-700 px-3 py-1.5 text-xs font-medium hover:bg-gray-600"
+                    onClick={() => onRemediate(applyAdmissionRemediation(config, result, action.id))}
+                  >
+                    <Wrench className="h-3.5 w-3.5" />
+                    {action.label}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </section>

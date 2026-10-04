@@ -190,13 +190,13 @@ class DiffusionTrainer(SDTrainer):
     def maybe_save(self):
         if not self.is_ui_trainer:
             return
+        if self._optimizer_window_active or not self._last_optimizer_update_success:
+            return
         if self.should_save():
             self.update_db_key("save_now", 0)
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSaving at step {self.step_num}")
-            # clear any grads
-            self.optimizer.zero_grad()
             self.save(self.step_num)
             self.ensure_params_requires_grad()
             flush()

@@ -678,16 +678,25 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'temporal_compression_ratio'):
                 temporal_compression = self.sd.unet.config.temporal_compression_ratio
         
+        self._preparation_source_fingerprints = {}
         bad_count = 0
         for file in tqdm(file_list):
             try:
                 file_item = FileItemDTO(
                     dataset_config=dataset_config,
-                    is_audio_model=self.is_audio_model,
+                    is_audio_model=(
+                        self.is_audio_model
+                        or (
+                            self.is_multimodal_llm
+                            and os.path.splitext(file)[1].lower() in audio_extensions
+                        )
+                    ),
                     sd=self.sd,
                     path=file,
                     caption_source_path=self.caption_source_path,
                     cache_owner_token=self.cache_owner_token,
+                    dataloader_transforms=self.transform,
+                    source_fingerprint_cache=self._preparation_source_fingerprints,
                     size_database=self.size_database,
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
@@ -789,7 +798,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         if settings is not None and getattr(settings, "other_ref", False):
             assign_other_photo_pairs(self.file_list, settings)
 
-        self.setup_epoch()
+        try:
+            self.setup_epoch()
+        finally:
+            del self._preparation_source_fingerprints
 
     def setup_epoch(self):
         if self.epoch_num == 0:
