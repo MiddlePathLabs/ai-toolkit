@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import { isMac } from '@/helpers/basic';
+import { resetProcessNameTags } from '@/helpers/nameTag';
 import { cached } from '@/server/apiCache';
 import { parseRawYaml, runAdmission, shouldRunTrainingAdmission, AdmissionUnavailableError } from '@/server/admission';
 
@@ -86,6 +87,11 @@ export async function POST(request: Request) {
       if (!parsed.valid) return invalidRawYamlResponse(parsed.message, parsed.line);
       configToPersist = parsed.value;
     }
+
+    // Store process names as the '[name]' tag (substituted with config.name at
+    // trainer load) so a renamed clone/edit/import cannot carry a stale process
+    // name that redirects trainer output into the source job's folder.
+    configToPersist = resetProcessNameTags(configToPersist);
 
     if (shouldRunTrainingAdmission(configToPersist)) {
       const admission = await runAdmission(configToPersist, 'api');

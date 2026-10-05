@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
+import { resetProcessNameTags } from '@/helpers/nameTag';
 import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
@@ -82,7 +83,7 @@ export default function TrainingForm() {
           file.name.endsWith('.json') || file.name.endsWith('.jsonc')
             ? JSON.parse(text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''))
             : YAML.parse(text);
-        const candidate = migrateJobConfig(parsed as JobConfig);
+        const candidate = resetProcessNameTags(migrateJobConfig(parsed as JobConfig));
         setRawYaml(undefined);
         setRawYamlValid(true);
         setSyntaxResult(null);
@@ -142,7 +143,7 @@ export default function TrainingForm() {
       .then(res => {
         if (cancelled) return;
         const data = res.data;
-        const loaded = migrateJobConfig(JSON.parse(data.job_config) as JobConfig);
+        const loaded = resetProcessNameTags(migrateJobConfig(JSON.parse(data.job_config) as JobConfig));
         if (cloneId) loaded.config.name = `${loaded.config.name}_copy`;
         setGpuIDs(data.gpu_ids);
         setRawYaml(undefined);
