@@ -313,7 +313,7 @@ def _gate_holder(tmp_path, resume_mode, *, state=None, supported=True):
         model_config=SimpleNamespace(compile=False, block_compile=False),
         train_config=SimpleNamespace(gradient_accumulation=1, gradient_accumulation_steps=1),
         dataset_configs=dataset_configs,
-        _resume_recipe_identity=lambda: "RID",
+        _resume_recipe_identity=lambda *args, **kwargs: "RID",
         optimizer=None,
         lr_scheduler=None,
         step_num=0,
@@ -693,14 +693,150 @@ def test_raw_checkpoint_invalid_components_fail_closed(tmp_path, field, value):
     assert host._resume_state is None
 
 
-def test_recipe_identity_excludes_only_resume_mode(tmp_path):
+def test_recipe_identity_excludes_resume_mode_and_horizon_fields(tmp_path):
     model, optimizer, scheduler, loader = _new_run(tmp_path, 713)
     host = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="auto")
+    host.config["train"]["steps"] = 2000
+    host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
     identity = host._resume_recipe_identity()
+    legacy_identity = host._resume_recipe_identity(legacy=True)
+    assert legacy_identity != identity  # horizon fields were part of the old digest
+
+    # resume_mode, run horizon and retention-only fields keep the identity
     host.config["train"]["resume_mode"] = "continue"
+    host.config["train"]["steps"] = 3000
+    host.config["save"] = {"save_every": 50, "max_step_saves_to_keep": 5}
     assert host._resume_recipe_identity() == identity
+
+    # the legacy digest still binds the horizon: it only matched unchanged
+    host.config["train"]["steps"] = 2000
+    host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
+    assert host._resume_recipe_identity(legacy=True) == legacy_identity
+    host.config["train"]["steps"] = 3000
+    assert host._resume_recipe_identity(legacy=True) != legacy_identity
+    host.config["train"]["steps"] = 2000
+
+    # trajectory-relevant fields re-key both digests
     host.config["train"]["gradient_accumulation"] = 2
     assert host._resume_recipe_identity() != identity
+    assert host._resume_recipe_identity(legacy=True) != legacy_identity
+    host.config["train"]["gradient_accumulation"] = 1
+    host.config["train"]["lr"] = 5e-4
+    assert host._resume_recipe_identity() != identity
+    host.config["train"]["optimizer"] = "adamw"
+    assert host._resume_recipe_identity() != identity
+    host.config["datasets"] = [{"folder": "elsewhere"}]
+    assert host._resume_recipe_identity() != identity
+    host.config["sample"] = {"sample_every": 5}
+    assert host._resume_recipe_identity() != identity
+
+
+def test_resume_with_raised_steps_extends_completed_run(tmp_path):
+    seed = 811
+    full_model, full_opt, full_scheduler, full_loader = _new_run(tmp_path / "full_loop", seed)
+    full = _loop_host(tmp_path / "full_loop", full_model, full_opt, full_scheduler, full_loader, resume_mode="auto")
+    _run_loop(full)
+
+    # a run that completes at steps=3 leaves a raw state at that boundary
+    part_model, part_opt, part_scheduler, part_loader = _new_run(tmp_path / "part_loop", seed)
+    part = _loop_host(tmp_path / "part_loop", part_model, part_opt, part_scheduler, part_loader, resume_mode="auto")
+    part.train_config.steps = 3
+    part.config["train"]["steps"] = 3
+    part.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
+    _run_loop(part)
+    part.save(step=part.step_num)
+    state = torch.load(part._resume_state_path, weights_only=False)
+    assert state["snapshot"]["step"] == 3
+    assert state["recipe_identity"] == part._resume_recipe_identity()
+
+    # relaunching the same folder with a raised horizon (and looser retention)
+    # resumes from the snapshot boundary and finishes the longer run
+    resumed_model, resumed_opt, resumed_scheduler, resumed_loader = _new_run(tmp_path / "part_loop", seed + 21)
+    resumed = _loop_host(
+        tmp_path / "part_loop", resumed_model, resumed_opt, resumed_scheduler, resumed_loader, resume_mode="auto"
+    )
+    resumed.train_config.steps = 6
+    resumed.config["train"]["steps"] = 6
+    resumed.config["save"] = {"save_every": 4, "max_step_saves_to_keep": 1}
+    _restore(resumed)  # no raise
+    assert resumed.step_num == resumed.completed_update_id == 3
+    _run_loop(resumed)
+    assert resumed.step_num == resumed.completed_update_id == full.completed_update_id == 6
+    torch.testing.assert_close(resumed_model.weight, full_model.weight, rtol=0, atol=0)
+    torch.testing.assert_close(
+        resumed_opt.state[resumed_model.weight]["momentum_buffer"],
+        full_opt.state[full_model.weight]["momentum_buffer"], rtol=0, atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda config: config["train"].update(lr=1e-2),
+        lambda config: config["train"].update(optimizer="adamw"),
+        lambda config: config.update(datasets=[{"folder": "elsewhere"}]),
+        lambda config: config.update(sample={"sample_every": 5}),
+    ],
+)
+def test_resume_still_rejects_trajectory_relevant_config_changes(tmp_path, mutation):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 41)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 42)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 20  # the raised horizon alone must pass
+    mutation(resumed.config)
+    with pytest.raises(ValueError, match="recipe/config identity differs"):
+        _restore(resumed)
+    assert resumed._resume_state_restored is False
+
+
+def test_legacy_full_config_identity_state_still_resumes_and_migrates(tmp_path):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 53)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    previous.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+    # rewrite the digest the pre-exclusion code would have stored
+    legacy = previous._resume_recipe_identity(legacy=True)
+    state = torch.load(previous._resume_state_path, weights_only=False)
+    assert state["recipe_identity"] != legacy
+    state["recipe_identity"] = legacy
+    torch.save(state, previous._resume_state_path)
+
+    # an unchanged config still resumes through the legacy digest
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 54)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 10
+    resumed.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
+    _restore(resumed)  # no raise
+    assert resumed.step_num == resumed.completed_update_id == 1
+
+    # the legacy digest binds the horizon, so raising steps on an unmigrated
+    # legacy state still refuses
+    model3, optimizer3, scheduler3, loader3 = _new_run(tmp_path, 55)
+    extend = _host(tmp_path, model3, optimizer3, scheduler3, loader3, resume_mode="continue")
+    extend.config["train"]["steps"] = 20
+    extend.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
+    with pytest.raises(ValueError, match="recipe/config identity differs"):
+        _restore(extend)
+
+    # one re-save after a successful legacy resume migrates the digest, and
+    # the raised horizon then passes
+    resumed.save(step=1)
+    assert torch.load(resumed._resume_state_path, weights_only=False)["recipe_identity"] == (
+        resumed._resume_recipe_identity()
+    )
+    model4, optimizer4, scheduler4, loader4 = _new_run(tmp_path, 56)
+    extended = _host(tmp_path, model4, optimizer4, scheduler4, loader4, resume_mode="continue")
+    extended.config["train"]["steps"] = 20
+    extended.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
+    _restore(extended)  # no raise
+    assert extended.step_num == extended.completed_update_id == 1
 
 
 @pytest.mark.parametrize("mode", ["auto", "continue", "exact"])

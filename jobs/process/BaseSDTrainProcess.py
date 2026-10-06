@@ -597,11 +597,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return tuple(BaseSDTrainProcess._cpu_state(item) for item in value)
         return copy.deepcopy(value)
 
-    def _resume_recipe_identity(self) -> str:
+    def _resume_recipe_identity(self, *, legacy: bool = False) -> str:
+        # train.steps is a stop condition, not trajectory math — the raw
+        # snapshot sits on a completed-update boundary, so relaunching with a
+        # higher horizon must stay resumable. save_every /
+        # max_step_saves_to_keep are retention-only. Everything else (lr,
+        # optimizer, datasets, resolution, sample/* — sampling consumes RNG)
+        # stays in the hash. legacy=True reproduces the old full-config
+        # digest so raw states saved before these exclusions keep matching
+        # until they are re-saved with the new identity.
+        excluded = {
+            "train": ("resume_mode",) if legacy else ("resume_mode", "steps"),
+            "save": () if legacy else ("save_every", "max_step_saves_to_keep"),
+        }
         recipe = copy.deepcopy(self.config)
-        train = recipe.get("train") if isinstance(recipe, dict) else None
-        if isinstance(train, dict):
-            train.pop("resume_mode", None)
+        if isinstance(recipe, dict):
+            for section, fields in excluded.items():
+                part = recipe.get(section)
+                if isinstance(part, dict):
+                    for field in fields:
+                        part.pop(field, None)
         encoded = json.dumps(recipe, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -794,7 +809,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "Raw checkpoint exact replay is unsupported for the saved run. "
                 "Use resume_mode: continue for non-deterministic continuation."
             )
-        if self._resume_state.get("recipe_identity") != self._resume_recipe_identity():
+        # accept the pre-exclusion digest too: states already on disk were
+        # saved with the full-config hash and stay resumable until re-saved
+        saved_identity = self._resume_state.get("recipe_identity")
+        if saved_identity not in {
+            self._resume_recipe_identity(),
+            self._resume_recipe_identity(legacy=True),
+        }:
             raise ValueError(
                 "Raw checkpoint recipe/config identity differs from the current run. "
                 "Use the original training recipe or choose resume_mode: weights_only explicitly."
