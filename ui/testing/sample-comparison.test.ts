@@ -245,6 +245,25 @@ test('a later exact sample fills an empty synced pane and does not fill an unsyn
   assert.equal(reconcileCrossJobSelection(selection, leftRows, before, false).right.rowKey, null);
 });
 
+test('a missing saved row is dropped, and sync refills only from a surviving step', () => {
+  const stale = { left: { rowKey: 'gone-left', column: 2 }, right: { rowKey: 'gone-right', column: 3 } };
+  const leftRows = [row([atStep(1400, 0, 1)], '1400:1400')];
+  const rightRows = [row([atStep(1400, 0, 1)], '1400:9000'), row([atStep(2000, 0, 1)], '2000:2000')];
+  const unsynced = reconcileCrossJobSelection(stale, leftRows, rightRows, false);
+  assert.equal(unsynced.left.rowKey, null);
+  assert.equal(unsynced.right.rowKey, null);
+  assert.equal(unsynced.left.column, 2);
+  const synced = reconcileCrossJobSelection(
+    { left: { rowKey: '1400:1400', column: 1 }, right: { rowKey: 'missing', column: 4 } },
+    leftRows,
+    rightRows,
+    true,
+  );
+  assert.equal(synced.right.rowKey, '1400:9000');
+  assert.equal(synced.left.column, 1);
+  assert.equal(selectCrossJobRow(stale, 'left', 'missing', leftRows, rightRows, true), stale);
+});
+
 test('step and training-pace notices name the mismatch and stay quiet when the runs align', () => {
   assert.equal(
     getCrossJobStepNotice(1400, null, 'alpha', 'beta'),
@@ -266,7 +285,20 @@ test('step and training-pace notices name the mismatch and stay quiet when the r
       '',
     /Gradient accumulation differs/,
   );
-  assert.match(getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['E:/data/b']))) ?? '', /^Datasets differ/);
+  assert.match(
+    getTrainingPaceNotice(
+      getTrainingPace(
+        JSON.stringify({ config: { process: [{ train: { gradient_accumulation_steps: 4 }, datasets: [] }] } }),
+      ),
+      getTrainingPace(JSON.stringify({ config: { process: [{ train: { gradient_accumulation: 4 }, datasets: [] }] } })),
+    ) ?? '',
+    /Legacy gradient_accumulation_steps counts every batch as a step/,
+  );
+  assert.equal(
+    getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['E:/data/a'], { gradient_accumulation_steps: 1 }))),
+    null,
+  );
+  assert.equal(getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['e:/DATA/a']))), null);
   assert.equal(getTrainingPaceNotice(null, same), 'Training settings cannot be compared.');
   assert.equal(readComparisonJob(paceConfig(1, 1, ['E:/data/a'])).hasEma, true);
   assert.equal(readComparisonJob('{"config":{"process":[{"train":{"ema_config":{"use_ema":false}}}]}}').hasEma, false);

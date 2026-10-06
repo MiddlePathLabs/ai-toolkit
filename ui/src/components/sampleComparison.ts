@@ -338,15 +338,7 @@ export function getCrossJobStepNotice(
 }
 
 export function getTrainingPace(jobConfigText: string | null | undefined): TrainingPace | null {
-  const process = readProcess(jobConfigText);
-  if (!process?.train) return null;
-  const train = process.train as typeof process.train & { gradient_accumulation_steps?: number };
-  return {
-    batchSize: finiteNumber(train.batch_size),
-    gradientAccumulation: finiteNumber(train.gradient_accumulation ?? 1),
-    legacyAccumulation: finiteNumber(train.gradient_accumulation_steps ?? 1),
-    datasets: (process.datasets ?? []).map(datasetIdentity).sort(),
-  };
+  return paceFromProcess(readProcess(jobConfigText));
 }
 
 function readProcess(jobConfigText: string | null | undefined): JobConfig['config']['process'][number] | null {
@@ -359,6 +351,17 @@ function readProcess(jobConfigText: string | null | undefined): JobConfig['confi
   }
 }
 
+function paceFromProcess(process: JobConfig['config']['process'][number] | null): TrainingPace | null {
+  if (!process?.train) return null;
+  const train = process.train as typeof process.train & { gradient_accumulation_steps?: number };
+  return {
+    batchSize: finiteNumber(train.batch_size),
+    gradientAccumulation: finiteNumber(train.gradient_accumulation ?? 1),
+    legacyAccumulation: finiteNumber(train.gradient_accumulation_steps ?? 1),
+    datasets: (process.datasets ?? []).map(datasetIdentity).sort(),
+  };
+}
+
 function finiteNumber(value: unknown): number | null {
   if (typeof value === 'boolean' || value === null || value === undefined || value === '') return null;
   const number = Number(value);
@@ -366,8 +369,10 @@ function finiteNumber(value: unknown): number | null {
 }
 
 function datasetIdentity(dataset: { folder_path?: string; batch_size?: number; num_repeats?: number }): string {
-  const folder = (dataset.folder_path ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
-  return `${folder}|${dataset.batch_size ?? ''}|${dataset.num_repeats ?? ''}`;
+  const raw = dataset.folder_path ?? '';
+  const folder = raw.replace(/\\/g, '/').replace(/\/+$/, '');
+  const key = /^[a-zA-Z]:[\\/]/.test(raw) || raw.includes('\\') ? folder.toLowerCase() : folder;
+  return `${key}|${dataset.batch_size ?? ''}|${dataset.num_repeats ?? ''}`;
 }
 
 export function getTrainingPaceNotice(left: TrainingPace | null, right: TrainingPace | null): string | null {
@@ -375,7 +380,18 @@ export function getTrainingPaceNotice(left: TrainingPace | null, right: Training
   const differences = paceDifferences(left, right);
   if (!differences.length) return null;
   const label = joinDifferences(differences);
-  return `${label} ${differences.length === 1 ? 'differs' : 'differ'}, so the same step is not the same amount of training.`;
+  const sentence = `${label} ${differences.length === 1 ? 'differs' : 'differ'}, so the same step is not the same amount of training.`;
+  return crossKeyAccumulation(left, right)
+    ? `${sentence} Legacy gradient_accumulation_steps counts every batch as a step; gradient_accumulation counts a step after those batches.`
+    : sentence;
+}
+
+function crossKeyAccumulation(left: TrainingPace, right: TrainingPace): boolean {
+  const leftModern = left.gradientAccumulation !== 1 && left.legacyAccumulation === 1;
+  const rightModern = right.gradientAccumulation !== 1 && right.legacyAccumulation === 1;
+  const leftLegacy = left.legacyAccumulation !== 1 && left.gradientAccumulation === 1;
+  const rightLegacy = right.legacyAccumulation !== 1 && right.gradientAccumulation === 1;
+  return (leftModern && rightLegacy) || (leftLegacy && rightModern);
 }
 
 function paceDifferences(left: TrainingPace, right: TrainingPace): string[] {
@@ -393,8 +409,9 @@ function paceDifferences(left: TrainingPace, right: TrainingPace): string[] {
 
 function joinDifferences(differences: string[]): string {
   if (differences.length === 1) return differences[0];
-  if (differences.length === 2) return `${differences[0]} and ${differences[1]}`;
-  return `${differences.slice(0, -1).join(', ')}, and ${differences[differences.length - 1]}`;
+  return differences.length === 2
+    ? `${differences[0]} and ${differences[1]}`
+    : `${differences.slice(0, -1).join(', ')}, and ${differences[differences.length - 1]}`;
 }
 
 export function readComparisonJob(jobConfigText: string | null | undefined): {
@@ -406,6 +423,6 @@ export function readComparisonJob(jobConfigText: string | null | undefined): {
   return {
     sampleConfig: process?.sample ?? null,
     hasEma: Boolean(process?.train?.ema_config?.use_ema),
-    pace: getTrainingPace(jobConfigText),
+    pace: paceFromProcess(process),
   };
 }

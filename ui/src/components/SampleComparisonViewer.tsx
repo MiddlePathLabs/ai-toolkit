@@ -662,7 +662,7 @@ export default function SampleComparisonViewer({
                             id={`${id}-${side}-step`}
                             value={rowKey ?? ''}
                             onChange={event => changeCrossRow(side === 'Left' ? 'left' : 'right', event.target.value)}
-                            disabled={side === 'Right' && !otherReady}
+                            disabled={crossSelection === null || (side === 'Right' && !otherReady)}
                             className={FIELD_CLASS}
                           >
                             {rowKey === null && (
@@ -693,7 +693,10 @@ export default function SampleComparisonViewer({
                         id={`${id}-${side}`}
                         value={columnValues[paneIndex]}
                         onChange={event => changeColumn(paneIndex as 0 | 1, Number(event.target.value))}
-                        disabled={!columnSets[paneIndex].length || (crossJob && paneIndex === 1 && !otherReady)}
+                        disabled={
+                          !columnSets[paneIndex].length ||
+                          (crossJob && (crossSelection === null || (paneIndex === 1 && !otherReady)))
+                        }
                         className={FIELD_CLASS}
                       >
                         <option value={-1}>Not available</option>
