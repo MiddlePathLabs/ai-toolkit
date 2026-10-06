@@ -3,11 +3,25 @@ import test from 'node:test';
 import type { SampleConfig, SampleItem } from '../src/types';
 import type { SampleRow } from '../src/utils/sampleImages';
 import {
+  applyNearestCrossJobStep,
+  createCrossJobSelection,
+  findExactStepRow,
+  findNearestStepRow,
   getComparisonColumns,
   getComparisonNotice,
   getComparisonRowLabels,
   getComparisonWeightLabel,
+  getCrossJobStepNotice,
   getDefaultComparisonColumns,
+  getDefaultTrainedColumn,
+  getTrainingPace,
+  getTrainingPaceNotice,
+  matchComparisonColumn,
+  nearestStepOffer,
+  readComparisonJob,
+  reconcileCrossJobSelection,
+  selectCrossJobColumn,
+  selectCrossJobRow,
 } from '../src/components/sampleComparison';
 import { createComparisonPlayback } from '../src/components/sampleComparisonPlayback';
 import type { ComparisonPlaybackState, ComparisonVideo } from '../src/components/sampleComparisonPlayback';
@@ -98,6 +112,164 @@ test('training row labels distinguish reruns and retain the identity of fully mi
   assert.match(labels[1], /Run 2.*2000/);
   assert.match(labels[2], /Run 3.*3000/);
   assert.equal(new Set(labels).size, 3);
+});
+const atStep = (step: number, index: number, seed: number, raw = false, timestamp = step * 10) =>
+  `${raw ? 'RAW_' : ''}${timestamp}__${String(step).padStart(9, '0')}_${index}_seed-${seed}_steps-20.mp4`;
+const paceConfig = (
+  batch: number | null,
+  accumulation: number | null,
+  folders: string[],
+  extras: Record<string, unknown> = {},
+) =>
+  JSON.stringify({
+    config: {
+      process: [
+        {
+          train: {
+            batch_size: batch,
+            gradient_accumulation: accumulation,
+            ema_config: { use_ema: true },
+            ...extras,
+          },
+          datasets: folders.map(folder_path => ({ folder_path })),
+          sample: { samples: [{ prompt: 'a forest' }, { prompt: 'a forest', raw_weights: true }] },
+        },
+      ],
+    },
+  });
+
+test('an exact step match uses the latest run and never substitutes a nearby step', () => {
+  const rows = [
+    row([atStep(1000, 0, 1)], '1000:1000'),
+    row([atStep(1400, 0, 1, false, 1401)], '1400:1401'),
+    row([atStep(1400, 0, 1, false, 1402)], '1400:1402'),
+    row([atStep(2000, 0, 1)], '2000:2000'),
+  ];
+  assert.equal(findExactStepRow(rows, 1400)?.key, '1400:1402');
+  assert.equal(findExactStepRow(rows, 1500), null);
+});
+
+test('the nearest step prefers the closer sample, then the later step, then the latest run', () => {
+  const rows = [
+    row([atStep(1000, 0, 1)], '1000:1000'),
+    row([atStep(2000, 0, 1, false, 2001)], '2000:2001'),
+    row([atStep(2000, 0, 1, false, 2002)], '2000:2002'),
+    row([atStep(3000, 0, 1)], '3000:3000'),
+  ];
+  assert.equal(findNearestStepRow(rows, 1600)?.key, '2000:2002');
+  assert.equal(findNearestStepRow(rows, 1500)?.key, '2000:2002');
+  assert.equal(findNearestStepRow([], 1500), null);
+});
+
+test('prompt matching prefers the same weight type and seed and rejects a different prompt', () => {
+  const settings = config([
+    { prompt: 'a forest', raw_weights: true },
+    { prompt: 'a forest' },
+    { prompt: 'a forest' },
+    { prompt: 'a lake' },
+  ]);
+  const columns = getComparisonColumns(
+    row([atStep(1400, 0, 1, true), atStep(1400, 1, 2), atStep(1400, 2, 1), atStep(1400, 3, 1)]),
+    settings,
+  );
+  assert.equal(matchComparisonColumn(columns, columns[2]), 2);
+  assert.equal(matchComparisonColumn(columns, columns[0]), 0);
+  assert.equal(matchComparisonColumn(columns, { ...columns[1], metadata: { ...columns[1].metadata, seed: 9 } }), 1);
+  assert.equal(matchComparisonColumn(columns, { ...columns[3], prompt: 'a mountain' }), null);
+  const missingPrompt = getComparisonColumns(
+    row([null, atStep(1400, 1, 1)]),
+    config([{ prompt: 'a forest' }, { prompt: 'a lake' }]),
+  );
+  assert.equal(matchComparisonColumn(missingPrompt, missingPrompt[0]), 0);
+  assert.equal(getDefaultTrainedColumn(columns), 1);
+});
+
+test('a cross-job pair starts on trained weights and leaves a missing step empty', () => {
+  const leftSettings = config([{ prompt: 'a forest', raw_weights: true }, { prompt: 'a forest' }]);
+  const rightSettings = config([{ prompt: 'a lake' }, { prompt: 'a forest' }]);
+  const leftRows = [row([atStep(1400, 0, 4, true), atStep(1400, 1, 4)], '1400:1400')];
+  const rightRows = [row([atStep(1000, 0, 4), atStep(1000, 1, 4)], '1000:1000')];
+  const selection = createCrossJobSelection(leftRows, leftSettings, rightRows, rightSettings, '1400:1400');
+  assert.deepEqual(selection, {
+    left: { rowKey: '1400:1400', column: 1 },
+    right: { rowKey: null, column: 1 },
+  });
+  assert.equal(selectCrossJobRow(selection, 'left', '1400:1400', leftRows, rightRows, true).right.rowKey, null);
+});
+
+test('syncing steps never snaps, and the nearest action names both steps', () => {
+  const leftRows = [row([atStep(1400, 0, 1)], '1400:1400'), row([atStep(2000, 0, 1)], '2000:2000')];
+  const rightRows = [row([atStep(1000, 0, 1)], '1000:1000'), row([atStep(2000, 0, 1)], '2000:2000')];
+  const selection = {
+    left: { rowKey: '1400:1400', column: 0 },
+    right: { rowKey: '2000:2000', column: 0 },
+  };
+  const synced = selectCrossJobRow(selection, 'left', '1400:1400', leftRows, rightRows, true);
+  assert.equal(synced.right.rowKey, null);
+  assert.equal(selectCrossJobRow(selection, 'left', '1400:1400', leftRows, rightRows, false).right.rowKey, '2000:2000');
+  const offer = nearestStepOffer(synced, leftRows, rightRows);
+  assert.deepEqual(offer, { side: 'right', selectedStep: 1400, nearestStep: 1000, rowKey: '1000:1000' });
+  assert.equal(applyNearestCrossJobStep(synced, leftRows, rightRows)?.right.rowKey, '1000:1000');
+  assert.equal(applyNearestCrossJobStep(synced, leftRows, rightRows)?.left.rowKey, '1400:1400');
+});
+
+test('matching prompts updates the other pane and a prompt miss leaves it alone', () => {
+  const leftColumns = getComparisonColumns(
+    row([atStep(1400, 0, 1), atStep(1400, 1, 1)]),
+    config([{ prompt: 'a forest' }, { prompt: 'a lake' }]),
+  );
+  const rightColumns = getComparisonColumns(
+    row([atStep(1400, 0, 1), atStep(1400, 1, 1)]),
+    config([{ prompt: 'a lake' }, { prompt: 'a forest' }]),
+  );
+  const selection = { left: { rowKey: '1400:1400', column: 0 }, right: { rowKey: '1400:1400', column: 0 } };
+  assert.equal(selectCrossJobColumn(selection, 'left', 0, leftColumns, rightColumns, true).right.column, 1);
+  assert.equal(selectCrossJobColumn(selection, 'left', 0, leftColumns, rightColumns, false).right.column, 0);
+  const unmatched = selectCrossJobColumn(
+    selection,
+    'left',
+    0,
+    leftColumns,
+    getComparisonColumns(row([atStep(1400, 0, 1)]), config([{ prompt: 'a mountain' }])),
+    true,
+  );
+  assert.equal(unmatched.right.column, 0);
+});
+
+test('a later exact sample fills an empty synced pane and does not fill an unsynced pane', () => {
+  const before = [row([atStep(1000, 0, 1)], '1000:1000')];
+  const after = [...before, row([atStep(1400, 0, 1)], '1400:1400')];
+  const selection = { left: { rowKey: '1400:1400', column: 0 }, right: { rowKey: null, column: 0 } };
+  const leftRows = [row([atStep(1400, 0, 1)], '1400:1400')];
+  assert.equal(reconcileCrossJobSelection(selection, leftRows, after, true).right.rowKey, '1400:1400');
+  assert.equal(reconcileCrossJobSelection(selection, leftRows, before, false).right.rowKey, null);
+});
+
+test('step and training-pace notices name the mismatch and stay quiet when the runs align', () => {
+  assert.equal(
+    getCrossJobStepNotice(1400, null, 'alpha', 'beta'),
+    `beta has no sample at step ${Number(1400).toLocaleString()}.`,
+  );
+  assert.equal(
+    getCrossJobStepNotice(1400, 1500, 'alpha', 'beta'),
+    `Training steps differ (${Number(1400).toLocaleString()} vs ${Number(1500).toLocaleString()}).`,
+  );
+  assert.equal(getCrossJobStepNotice(1400, 1400, 'alpha', 'beta'), null);
+  const same = getTrainingPace(paceConfig(1, 1, ['E:/data/a']));
+  assert.equal(getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['E:\\data\\a\\']))), null);
+  assert.match(
+    getTrainingPaceNotice(same, getTrainingPace(paceConfig(2, 1, ['E:/data/a']))) ?? '',
+    /^Batch size differs/,
+  );
+  assert.match(
+    getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['E:/data/a'], { gradient_accumulation_steps: 4 }))) ??
+      '',
+    /Gradient accumulation differs/,
+  );
+  assert.match(getTrainingPaceNotice(same, getTrainingPace(paceConfig(1, 1, ['E:/data/b']))) ?? '', /^Datasets differ/);
+  assert.equal(getTrainingPaceNotice(null, same), 'Training settings cannot be compared.');
+  assert.equal(readComparisonJob(paceConfig(1, 1, ['E:/data/a'])).hasEma, true);
+  assert.equal(readComparisonJob('{"config":{"process":[{"train":{"ema_config":{"use_ema":false}}}]}}').hasEma, false);
 });
 
 class FakeVideo extends EventTarget implements ComparisonVideo {

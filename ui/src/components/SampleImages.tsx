@@ -386,7 +386,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
         </form>
         <button
           type="button"
-          disabled={sortedSampleImages.length < 2}
+          disabled={!rows.some(row => row.paths.some(Boolean))}
           onClick={() => setComparisonOpen(true)}
           className={`${controlClass} disabled:opacity-50`}
         >
@@ -538,7 +538,10 @@ export default function SampleImages({ job }: SampleImagesProps) {
       <SampleComparisonViewer
         open={comparisonOpen}
         onClose={() => setComparisonOpen(false)}
-        rows={visibleRows}
+        jobId={job.id}
+        jobName={job.name}
+        jobConfig={job.job_config}
+        rows={rows}
         sampleConfig={sampleConfig}
         showMetadata={showMetadata}
         hasEma={hasEma}

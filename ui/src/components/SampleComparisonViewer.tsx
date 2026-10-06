@@ -4,23 +4,59 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react';
 import { Dialog, DialogBackdrop, DialogDescription, DialogPanel, DialogTitle } from '@headlessui/react';
 import type { SampleConfig } from '@/types';
-import type { SampleRow } from '@/utils/sampleImages';
+import { apiClient } from '@/utils/api';
 import { encodeFilePathForUrl, isAudio, isText, isVideo } from '@/utils/basic';
+import { buildSampleMatrix, getSampleItems } from '@/utils/sampleImages';
+import type { SampleRow } from '@/utils/sampleImages';
+import usePollLoop from '@/hooks/usePollLoop';
 import SampleMetadataOverlay from './SampleMetadataOverlay';
 import {
+  applyNearestCrossJobStep,
+  createCrossJobSelection,
   getComparisonColumns,
   getComparisonNotice,
   getComparisonRowLabels,
+  getComparisonRowStep,
   getComparisonWeightLabel,
+  getCrossJobStepNotice,
   getDefaultComparisonColumns,
+  getTrainingPace,
+  getTrainingPaceNotice,
+  nearestStepOffer,
+  readComparisonJob,
+  reconcileCrossJobSelection,
+  selectCrossJobColumn,
+  selectCrossJobRow,
 } from './sampleComparison';
-import type { ComparisonColumn } from './sampleComparison';
+import type { ComparisonColumn, CrossJobSelection } from './sampleComparison';
 import { createComparisonPlayback, EMPTY_COMPARISON_PLAYBACK } from './sampleComparisonPlayback';
 import type { ComparisonPlayback, ComparisonPlaybackState } from './sampleComparisonPlayback';
+
+interface ListedJob {
+  id: string;
+  name: string;
+  status: string;
+  job_config: string;
+}
+
+interface SampleEvidence {
+  samples: string[];
+  plannedSamples?: string[];
+  deletedSamples?: string[];
+}
+
+interface OtherLoad {
+  jobId: string;
+  status: 'loading' | 'error' | 'success';
+  evidence: SampleEvidence | null;
+}
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  jobId: string;
+  jobName: string;
+  jobConfig: string;
   rows: SampleRow[];
   sampleConfig: SampleConfig | null;
   showMetadata: boolean;
@@ -47,6 +83,8 @@ interface PaneProps {
   videoRef: RefObject<HTMLVideoElement | null>;
   onVideoMount: () => void;
   missing?: SampleRow['missing'][number];
+  jobLabel?: string;
+  emptyMessage?: string;
 }
 
 function ComparisonPane({
@@ -59,6 +97,8 @@ function ComparisonPane({
   videoRef,
   onVideoMount,
   missing,
+  jobLabel,
+  emptyMessage,
 }: PaneProps) {
   const path = column?.path ?? null;
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -100,11 +140,12 @@ function ComparisonPane({
   }, [path, src]);
 
   const unavailableReason =
-    missing === 'deleted'
+    emptyMessage ??
+    (missing === 'deleted'
       ? 'This sample was deleted.'
       : missing === 'not-generated'
         ? 'This planned sample has not been generated.'
-        : 'No media is available for this sample in the selected training row.';
+        : 'No media is available for this sample in the selected training row.');
 
   return (
     <section
@@ -112,10 +153,7 @@ function ComparisonPane({
       className="min-w-0 overflow-hidden rounded-md border border-gray-700"
     >
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-700 bg-gray-900 px-3 py-2 text-sm">
-        <span>
-          {side}
-          {column ? ` · Sample #${column.index + 1}` : ''}
-        </span>
+        <span>{jobLabel ?? `${side}${column ? ` · Sample #${column.index + 1}` : ''}`}</span>
         {column && <span className="text-gray-300">{getComparisonWeightLabel(column, hasEma)}</span>}
       </div>
       <div className="relative flex min-h-64 items-center justify-center bg-black sm:min-h-80">
@@ -185,28 +223,177 @@ function ComparisonPane({
   );
 }
 
-export default function SampleComparisonViewer({ open, onClose, rows, sampleConfig, showMetadata, hasEma }: Props) {
+function comparisonPaneLabel(side: string, name: string, step: number | null, sampleNumber: number | null): string {
+  const parts = [side, name, step === null ? 'No step' : `Step ${step.toLocaleString()}`];
+  if (sampleNumber !== null) parts.push(`Sample #${sampleNumber}`);
+  return parts.join(' · ');
+}
+
+export default function SampleComparisonViewer({
+  open,
+  onClose,
+  jobId,
+  jobName,
+  jobConfig,
+  rows,
+  sampleConfig,
+  showMetadata,
+  hasEma,
+}: Props) {
   const id = useId();
   const [selection, setSelection] = useState<{ rowKey: string | null; columns: [number, number] }>({
     rowKey: null,
     columns: [-1, -1],
   });
+  const [rightJobId, setRightJobId] = useState(jobId);
+  const [trainJobs, setTrainJobs] = useState<ListedJob[]>([]);
+  const [jobsStatus, setJobsStatus] = useState<'idle' | 'loading' | 'error' | 'success'>('idle');
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  const [otherLoad, setOtherLoad] = useState<OtherLoad | null>(null);
+  const [syncSteps, setSyncSteps] = useState(true);
+  const [matchPrompt, setMatchPrompt] = useState(true);
+  const [crossSelection, setCrossSelection] = useState<CrossJobSelection | null>(null);
   const [playback, setPlayback] = useState<ComparisonPlaybackState>(EMPTY_COMPARISON_PLAYBACK);
   const leftVideo = useRef<HTMLVideoElement | null>(null);
   const rightVideo = useRef<HTMLVideoElement | null>(null);
   const playbackRef = useRef<ComparisonPlayback | null>(null);
+  const initializedJob = useRef<string | null>(null);
+  const seenRightJob = useRef(rightJobId);
+  const preferredLeftRow = useRef<string | null>(null);
+  const activeRightJob = useRef(rightJobId);
+  activeRightJob.current = rightJobId;
   const [videoMountRevision, setVideoMountRevision] = useState(0);
   const onVideoMount = useCallback(() => setVideoMountRevision(revision => revision + 1), []);
+  const crossJob = rightJobId !== jobId;
+  const currentPace = useMemo(() => getTrainingPace(jobConfig), [jobConfig]);
+  const otherJob = trainJobs.find(job => job.id === rightJobId);
+  const otherParsed = useMemo(() => readComparisonJob(otherJob?.job_config), [otherJob?.job_config]);
+  const otherReady = otherLoad?.jobId === rightJobId && otherLoad.status === 'success' && otherLoad.evidence !== null;
+  const otherRows = useMemo(() => {
+    if (!otherReady || !otherLoad?.evidence) return [];
+    const items = getSampleItems(otherParsed.sampleConfig);
+    return buildSampleMatrix(otherLoad.evidence.samples ?? [], otherParsed.sampleConfig, Math.max(items.length, 1), {
+      plannedSamples: otherLoad.evidence.plannedSamples ?? [],
+      deletedSamples: otherLoad.evidence.deletedSamples ?? [],
+    });
+  }, [otherReady, otherLoad, otherParsed.sampleConfig]);
   const rowLabels = useMemo(() => getComparisonRowLabels(rows), [rows]);
-  const row = rows.find(candidate => candidate.key === selection.rowKey) ?? rows[rows.length - 1];
-  const columns = useMemo(() => (row ? getComparisonColumns(row, sampleConfig) : []), [row, sampleConfig]);
-  const selectedColumns = row?.key === selection.rowKey ? selection.columns : getDefaultComparisonColumns(columns);
-  const left = columns[selectedColumns[0]];
-  const right = columns[selectedColumns[1]];
+  const otherRowLabels = useMemo(() => getComparisonRowLabels(otherRows), [otherRows]);
+  const sameRow = rows.find(candidate => candidate.key === selection.rowKey) ?? rows[rows.length - 1];
+  const sameColumns = useMemo(
+    () => (sameRow ? getComparisonColumns(sameRow, sampleConfig) : []),
+    [sameRow, sampleConfig],
+  );
+  const sameSelected = sameRow?.key === selection.rowKey ? selection.columns : getDefaultComparisonColumns(sameColumns);
+  const leftCrossRow = rows.find(row => row.key === crossSelection?.left.rowKey) ?? null;
+  const rightCrossRow = otherRows.find(row => row.key === crossSelection?.right.rowKey) ?? null;
+  const leftCrossColumns = useMemo(
+    () => getComparisonColumns(leftCrossRow ?? { key: 'missing', paths: [] }, sampleConfig),
+    [leftCrossRow, sampleConfig],
+  );
+  const rightCrossColumns = useMemo(
+    () => getComparisonColumns(rightCrossRow ?? { key: 'missing', paths: [] }, otherParsed.sampleConfig),
+    [rightCrossRow, otherParsed.sampleConfig],
+  );
+  const left = crossJob ? leftCrossColumns[crossSelection?.left.column ?? -1] : sameColumns[sameSelected[0]];
+  const right = crossJob ? rightCrossColumns[crossSelection?.right.column ?? -1] : sameColumns[sameSelected[1]];
   const leftPath = left?.path ?? null;
   const rightPath = right?.path ?? null;
   const synchronized = Boolean(leftPath && rightPath && isVideo(leftPath) && isVideo(rightPath));
-  const notice = getComparisonNotice(left, right);
+  const leftStep = leftCrossRow ? getComparisonRowStep(leftCrossRow) : null;
+  const rightStep = rightCrossRow ? getComparisonRowStep(rightCrossRow) : null;
+  const otherName = otherJob?.name ?? 'The other job';
+  const otherFailed = crossJob && otherLoad?.jobId === rightJobId && otherLoad.status === 'error';
+  const stepNotice =
+    !crossJob || !otherReady
+      ? null
+      : otherRows.length === 0
+        ? `${otherName} has no samples.`
+        : getCrossJobStepNotice(leftStep, rightStep, jobName, otherName);
+  const paceNotice = crossJob && otherReady ? getTrainingPaceNotice(currentPace, otherParsed.pace) : null;
+  const baseNotice =
+    !crossJob || (otherReady && leftCrossRow && rightCrossRow) ? getComparisonNotice(left, right) : null;
+  const notice = [baseNotice, stepNotice, paceNotice].filter(Boolean).join(' ');
+  const offer = crossJob && otherReady && crossSelection ? nearestStepOffer(crossSelection, rows, otherRows) : null;
+  const crossPending = crossJob && !otherFailed && (!otherReady || crossSelection === null);
+  const rightEmptyMessage = !crossJob
+    ? undefined
+    : otherFailed
+      ? 'Could not load samples for this job.'
+      : crossPending
+        ? 'Loading samples…'
+        : rightCrossRow
+          ? undefined
+          : otherRows.length === 0
+            ? `${otherName} has no samples.`
+            : leftStep !== null
+              ? `No sample at step ${leftStep.toLocaleString()}.`
+              : 'No step selected.';
+  const leftEmptyMessage =
+    !crossJob || leftCrossRow
+      ? undefined
+      : crossPending
+        ? 'Loading samples…'
+        : rightStep !== null
+          ? `No sample at step ${rightStep.toLocaleString()}.`
+          : 'No step selected.';
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setJobsStatus('loading');
+    apiClient
+      .get('/api/jobs', { params: { job_type: 'train' } })
+      .then(response => {
+        if (cancelled) return;
+        setTrainJobs(response.data.jobs ?? []);
+        setJobsError(null);
+        setJobsStatus('success');
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setJobsError('Could not load other jobs.');
+        setJobsStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  useEffect(() => {
+    setRightJobId(jobId);
+  }, [jobId]);
+
+  useEffect(() => {
+    if (seenRightJob.current === rightJobId) return;
+    seenRightJob.current = rightJobId;
+    setSyncSteps(true);
+    setMatchPrompt(true);
+  }, [rightJobId]);
+
+  useEffect(() => {
+    const key = crossJob ? crossSelection?.left.rowKey : selection.rowKey;
+    if (key) preferredLeftRow.current = key;
+  }, [crossJob, crossSelection?.left.rowKey, selection.rowKey]);
+
+  usePollLoop(
+    () => {
+      if (!open || rightJobId === jobId) return;
+      const requestedId = rightJobId;
+      return apiClient
+        .get(`/api/jobs/${encodeURIComponent(requestedId)}/samples`)
+        .then(response => {
+          if (activeRightJob.current !== requestedId) return;
+          setOtherLoad({ jobId: requestedId, status: 'success', evidence: response.data });
+        })
+        .catch(() => {
+          if (activeRightJob.current !== requestedId) return;
+          setOtherLoad({ jobId: requestedId, status: 'error', evidence: null });
+        });
+    },
+    open && crossJob ? 5000 : null,
+    [open, crossJob, rightJobId, jobId],
+  );
 
   useEffect(() => {
     if (!open || !rows.length || rows.some(candidate => candidate.key === selection.rowKey)) return;
@@ -223,6 +410,33 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
       columns: getDefaultComparisonColumns(getComparisonColumns(initialRow, sampleConfig)),
     });
   }, [open, rows, sampleConfig, selection.rowKey]);
+
+  useEffect(() => {
+    const jobsSettled = Boolean(otherJob) || jobsStatus === 'success' || jobsStatus === 'error';
+    if (!open || !crossJob || !otherReady || !jobsSettled) return;
+    const token = `${rightJobId}:${otherJob?.job_config ?? ''}`;
+    if (initializedJob.current === token) return;
+    initializedJob.current = token;
+    setCrossSelection(
+      createCrossJobSelection(rows, sampleConfig, otherRows, otherParsed.sampleConfig, preferredLeftRow.current),
+    );
+  }, [
+    open,
+    crossJob,
+    otherReady,
+    jobsStatus,
+    otherJob,
+    rightJobId,
+    rows,
+    sampleConfig,
+    otherRows,
+    otherParsed.sampleConfig,
+  ]);
+
+  useEffect(() => {
+    if (!crossJob || !otherReady || initializedJob.current !== `${rightJobId}:${otherJob?.job_config ?? ''}`) return;
+    setCrossSelection(current => (current ? reconcileCrossJobSelection(current, rows, otherRows, syncSteps) : current));
+  }, [crossJob, otherReady, rightJobId, otherJob?.job_config, rows, otherRows, syncSteps]);
 
   useEffect(() => {
     setPlayback(EMPTY_COMPARISON_PLAYBACK);
@@ -250,12 +464,79 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
   }
 
   function changeColumn(side: 0 | 1, index: number) {
-    if (!row) return;
     playbackRef.current?.pause();
-    const next: [number, number] = [...selectedColumns];
-    next[side] = index;
-    setSelection({ rowKey: row.key, columns: next });
+    if (!crossJob) {
+      if (!sameRow) return;
+      const next: [number, number] = [...sameSelected];
+      next[side] = index;
+      setSelection({ rowKey: sameRow.key, columns: next });
+      return;
+    }
+    setCrossSelection(current =>
+      current
+        ? selectCrossJobColumn(
+            current,
+            side === 0 ? 'left' : 'right',
+            index,
+            leftCrossColumns,
+            rightCrossColumns,
+            matchPrompt,
+          )
+        : current,
+    );
   }
+
+  function changeCrossRow(side: 'left' | 'right', key: string) {
+    if (!key) return;
+    playbackRef.current?.pause();
+    setCrossSelection(current =>
+      current ? selectCrossJobRow(current, side, key, rows, otherRows, syncSteps) : current,
+    );
+  }
+
+  function changeRightJob(id: string) {
+    playbackRef.current?.pause();
+    setRightJobId(id);
+  }
+
+  function enableSync(on: boolean) {
+    setSyncSteps(on);
+    if (!on) return;
+    playbackRef.current?.pause();
+    setCrossSelection(current => {
+      if (!current) return current;
+      if (current.left.rowKey) return selectCrossJobRow(current, 'left', current.left.rowKey, rows, otherRows, true);
+      if (current.right.rowKey) return selectCrossJobRow(current, 'right', current.right.rowKey, rows, otherRows, true);
+      return current;
+    });
+  }
+
+  function enableMatchPrompt(on: boolean) {
+    setMatchPrompt(on);
+    if (!on) return;
+    playbackRef.current?.pause();
+    setCrossSelection(current =>
+      current
+        ? selectCrossJobColumn(current, 'left', current.left.column, leftCrossColumns, rightCrossColumns, true)
+        : current,
+    );
+  }
+
+  function useNearest() {
+    if (!crossSelection) return;
+    const next = applyNearestCrossJobStep(crossSelection, rows, otherRows);
+    if (!next) return;
+    playbackRef.current?.pause();
+    setSyncSteps(false);
+    setCrossSelection(next);
+  }
+
+  const columnValues: [number, number] = crossJob
+    ? [crossSelection?.left.column ?? -1, crossSelection?.right.column ?? -1]
+    : sameSelected;
+  const columnSets = crossJob ? [leftCrossColumns, rightCrossColumns] : [sameColumns, sameColumns];
+  const paneHasEma = crossJob ? [hasEma, otherParsed.hasEma] : [hasEma, hasEma];
+  const nearestName = offer?.side === 'left' ? jobName : otherName;
 
   return (
     <Dialog open={open} onClose={close} className="relative z-30">
@@ -267,7 +548,9 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
               <div>
                 <DialogTitle className="text-lg font-semibold">Compare samples</DialogTitle>
                 <DialogDescription className="mt-1 text-sm text-gray-400">
-                  Choose two samples from the same training run.
+                  {crossJob
+                    ? 'Compare this job with another run at a training step. A step that was not sampled stays empty.'
+                    : 'Choose two samples from this training run, or pick another job on the right.'}
                 </DialogDescription>
               </div>
               <button type="button" onClick={close} className={BUTTON_CLASS} data-autofocus>
@@ -276,25 +559,130 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
             </div>
             {open && (
               <div className="space-y-4 p-4">
-                <div>
-                  <label htmlFor={`${id}-row`} className="mb-2 block text-sm font-medium">
-                    Training row
-                  </label>
-                  <select
-                    id={`${id}-row`}
-                    value={row?.key ?? ''}
-                    onChange={event => changeRow(event.target.value)}
-                    disabled={!rows.length}
-                    className={FIELD_CLASS}
-                  >
-                    {!rows.length && <option value="">No training rows available</option>}
-                    {rows.map((candidate, index) => (
-                      <option key={candidate.key} value={candidate.key}>
-                        {rowLabels[index]}
-                      </option>
-                    ))}
-                  </select>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <div className="min-w-0">
+                    <span className="mb-2 block text-sm font-medium">Left job</span>
+                    <p className={FIELD_CLASS}>{jobName}</p>
+                  </div>
+                  <div className="min-w-0">
+                    <label htmlFor={`${id}-job`} className="mb-2 block text-sm font-medium">
+                      Right job
+                    </label>
+                    <select
+                      id={`${id}-job`}
+                      value={rightJobId}
+                      onChange={event => changeRightJob(event.target.value)}
+                      className={FIELD_CLASS}
+                    >
+                      <option value={jobId}>{jobName} (this job)</option>
+                      {rightJobId !== jobId && !trainJobs.some(job => job.id === rightJobId) && (
+                        <option value={rightJobId}>{otherName}</option>
+                      )}
+                      {trainJobs
+                        .filter(job => job.id !== jobId)
+                        .map(job => (
+                          <option key={job.id} value={job.id}>
+                            {job.name}
+                            {job.status === 'running' ? ' · running' : ''}
+                          </option>
+                        ))}
+                    </select>
+                    {jobsError && (
+                      <p role="alert" className="mt-2 text-sm text-red-300">
+                        {jobsError}
+                      </p>
+                    )}
+                  </div>
                 </div>
+                {crossJob && (
+                  <div className="flex flex-wrap gap-x-6 gap-y-2">
+                    <label
+                      className="flex min-h-11 items-center gap-2 text-sm"
+                      title="Keep both panes on the same training step. A missing step stays empty."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={syncSteps}
+                        onChange={event => enableSync(event.target.checked)}
+                        className="h-4 w-4 accent-blue-500"
+                      />
+                      Sync steps
+                    </label>
+                    <label
+                      className="flex min-h-11 items-center gap-2 text-sm"
+                      title="Selecting a sample also selects the same prompt on the other job."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={matchPrompt}
+                        onChange={event => enableMatchPrompt(event.target.checked)}
+                        className="h-4 w-4 accent-blue-500"
+                      />
+                      Match prompt
+                    </label>
+                  </div>
+                )}
+                {!crossJob && (
+                  <div>
+                    <label htmlFor={`${id}-row`} className="mb-2 block text-sm font-medium">
+                      Training row
+                    </label>
+                    <select
+                      id={`${id}-row`}
+                      value={sameRow?.key ?? ''}
+                      onChange={event => changeRow(event.target.value)}
+                      disabled={!rows.length}
+                      className={FIELD_CLASS}
+                    >
+                      {!rows.length && <option value="">No training rows available</option>}
+                      {rows.map((candidate, index) => (
+                        <option key={candidate.key} value={candidate.key}>
+                          {rowLabels[index]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {crossJob && (
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    {(['Left', 'Right'] as const).map(side => {
+                      const paneRows = side === 'Left' ? rows : otherRows;
+                      const labels = side === 'Left' ? rowLabels : otherRowLabels;
+                      const rowKey =
+                        side === 'Left'
+                          ? (crossSelection?.left.rowKey ?? null)
+                          : (crossSelection?.right.rowKey ?? null);
+                      const requestedStep = side === 'Left' ? rightStep : leftStep;
+                      return (
+                        <div key={side} className="min-w-0">
+                          <label htmlFor={`${id}-${side}-step`} className="mb-2 block text-sm font-medium">
+                            {side} training step
+                          </label>
+                          <select
+                            id={`${id}-${side}-step`}
+                            value={rowKey ?? ''}
+                            onChange={event => changeCrossRow(side === 'Left' ? 'left' : 'right', event.target.value)}
+                            disabled={side === 'Right' && !otherReady}
+                            className={FIELD_CLASS}
+                          >
+                            {rowKey === null && (
+                              <option value="">
+                                {syncSteps && requestedStep !== null
+                                  ? `Step ${requestedStep.toLocaleString()} · Not sampled`
+                                  : 'No step selected'}
+                              </option>
+                            )}
+                            {paneRows.map((candidate, index) => (
+                              <option key={candidate.key} value={candidate.key}>
+                                {labels[index]}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                   {(['Left', 'Right'] as const).map((side, paneIndex) => (
                     <div key={side} className="min-w-0">
@@ -303,15 +691,15 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
                       </label>
                       <select
                         id={`${id}-${side}`}
-                        value={selectedColumns[paneIndex]}
+                        value={columnValues[paneIndex]}
                         onChange={event => changeColumn(paneIndex as 0 | 1, Number(event.target.value))}
-                        disabled={!columns.length}
+                        disabled={!columnSets[paneIndex].length || (crossJob && paneIndex === 1 && !otherReady)}
                         className={FIELD_CLASS}
                       >
                         <option value={-1}>Not available</option>
-                        {columns.map(column => (
+                        {columnSets[paneIndex].map(column => (
                           <option key={column.index} value={column.index}>
-                            {`Sample #${column.index + 1} · ${getComparisonWeightLabel(column, hasEma)} · ${column.prompt ?? 'Prompt unavailable'}${column.path ? '' : ' · Not available'}`}
+                            {`Sample #${column.index + 1} · ${getComparisonWeightLabel(column, paneHasEma[paneIndex])} · ${column.prompt ?? 'Prompt unavailable'}${column.path ? '' : ' · Not available'}`}
                           </option>
                         ))}
                       </select>
@@ -323,30 +711,52 @@ export default function SampleComparisonViewer({ open, onClose, rows, sampleConf
                     {notice}
                   </p>
                 )}
+                {offer && (
+                  <button type="button" className={BUTTON_CLASS} onClick={useNearest}>
+                    {`Show nearest step on ${nearestName} (${offer.nearestStep.toLocaleString()}, selected step is ${offer.selectedStep.toLocaleString()})`}
+                  </button>
+                )}
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                   <ComparisonPane
-                    key={`left:${leftPath ?? `missing-${selectedColumns[0]}`}`}
+                    key={`left:${leftPath ?? `missing-${columnValues[0]}`}`}
                     side="Left"
                     column={left}
-                    hasEma={hasEma}
+                    hasEma={paneHasEma[0]}
                     showMetadata={showMetadata}
                     synchronized={synchronized}
                     synchronizedPlaying={playback.playing}
                     videoRef={leftVideo}
                     onVideoMount={onVideoMount}
-                    missing={row?.missing[selectedColumns[0]]}
+                    missing={crossJob ? leftCrossRow?.missing[columnValues[0]] : sameRow?.missing[sameSelected[0]]}
+                    jobLabel={
+                      crossJob
+                        ? comparisonPaneLabel('Left', jobName, leftStep, left ? left.index + 1 : null)
+                        : undefined
+                    }
+                    emptyMessage={leftEmptyMessage}
                   />
                   <ComparisonPane
-                    key={`right:${rightPath ?? `missing-${selectedColumns[1]}`}`}
+                    key={`right:${rightJobId}:${rightPath ?? `missing-${columnValues[1]}`}`}
                     side="Right"
-                    column={right}
-                    hasEma={hasEma}
+                    column={crossJob && !otherReady ? undefined : right}
+                    hasEma={paneHasEma[1]}
                     showMetadata={showMetadata}
                     synchronized={synchronized}
                     synchronizedPlaying={playback.playing}
                     videoRef={rightVideo}
                     onVideoMount={onVideoMount}
-                    missing={row?.missing[selectedColumns[1]]}
+                    missing={crossJob ? rightCrossRow?.missing[columnValues[1]] : sameRow?.missing[sameSelected[1]]}
+                    jobLabel={
+                      crossJob
+                        ? comparisonPaneLabel(
+                            'Right',
+                            otherName,
+                            rightStep,
+                            otherReady && right ? right.index + 1 : null,
+                          )
+                        : undefined
+                    }
+                    emptyMessage={rightEmptyMessage}
                   />
                 </div>
                 {synchronized && (
