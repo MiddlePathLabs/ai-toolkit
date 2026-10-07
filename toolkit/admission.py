@@ -51,6 +51,8 @@ RULE_DOPSD_BATCH = "admission.dopsd_batch"
 RULE_DOPSD_OPTIMIZER = "admission.dopsd_optimizer"
 RULE_KREA_CONFLICT = "admission.krea_conflict"
 RULE_KREA_LOW_VRAM_AUX = "admission.krea_low_vram_auxiliary"
+RULE_QWEN_LOW_VRAM_AUX = "admission.qwen_low_vram_auxiliary"
+RULE_QWEN_RGBA_ANCHOR = "admission.qwen_rgba_vae_anchor"
 RULE_TEXT_CACHE_MIX = "admission.mixed_text_cache"
 RULE_LATENT_CACHE_AUGMENT = "admission.latent_cache_augmentation"
 RULE_VAE_ANCHOR = "admission.vae_anchor_backend"
@@ -233,6 +235,10 @@ def _is_krea(base: str) -> bool:
     return base.startswith("krea2") or base.startswith("krea_2")
 
 
+def _is_qwen21(base: str) -> bool:
+    return base.startswith("qwen_image_2")
+
+
 def _is_flow(base: str, train: Mapping[str, Any]) -> bool:
     scheduler = str(train.get("noise_scheduler") or "").lower()
     return _is_h3(base) or _is_krea(base) or scheduler in {"flowmatch", "flow_matching", "flow"}
@@ -361,6 +367,7 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
     raw_arch, base, variant, model_kwargs = _arch_info(model)
     h3 = _is_h3(base)
     krea = _is_krea(base)
+    qwen21 = _is_qwen21(base)
     flow = _is_flow(base, train)
     resume_mode = train.get("resume_mode", "auto")
     if resume_mode not in {"auto", "continue", "exact", "weights_only"}:
@@ -621,15 +628,29 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             "Differentiable Krea image auxiliaries are incompatible with low_vram tiled decode.",
             "Disable model.low_vram for the auxiliary path, or disable the auxiliary explicitly.",
         )
+    if qwen21 and _bool(model.get("low_vram")) and (process_aux or dataset_aux):
+        collector.add(
+            RULE_QWEN_LOW_VRAM_AUX,
+            [f"{p}.model.low_vram"] + process_aux + [field for _, values in dataset_aux for field in values],
+            "Qwen-Image 2.1 VAE decode tiles above 1 MP and always under low_vram; tiled decode cannot carry the differentiable image auxiliaries.",
+            "Disable model.low_vram and keep the auxiliary datasets at 1024 resolution or lower, or disable the auxiliary explicitly.",
+        )
 
     # VAE anchor is intentionally fail-closed: this is a local, read-only
     # implementation/checkpoint availability check.
     vae_raw = _mapping(process.get("vae_anchor"))
-    if krea and (process.get("vae_anchor") is not None or any("vae_anchor_loss_weight" in ds for ds in datasets)):
+    if (krea or qwen21) and (process.get("vae_anchor") is not None or any("vae_anchor_loss_weight" in ds for ds in datasets)):
         effective_vae = _positive(vae_raw.get("loss_weight", 0.0)) or any(
             _positive(ds.get("vae_anchor_loss_weight", vae_raw.get("loss_weight", 0.0))) for ds in datasets
         )
         if effective_vae:
+            if qwen21 and _bool(model_kwargs.get("rgba")):
+                collector.add(
+                    RULE_QWEN_RGBA_ANCHOR,
+                    [f"{p}.model.model_kwargs.rgba", f"{p}.vae_anchor.loss_weight"],
+                    "The VAE anchor decodes the predicted x0 through the training VAE and re-encodes it with a 3-channel frozen Flux 2 encoder; RGBA decoding hands it 4 channels.",
+                    "Turn off model.model_kwargs.rgba or set the effective VAE-anchor weight to 0.",
+                )
             vae_path = vae_raw.get("vae_model_path")
             # The canonical loader verifies checkpoint keys and shapes before
             # caching. Static admission checks local implementation availability.

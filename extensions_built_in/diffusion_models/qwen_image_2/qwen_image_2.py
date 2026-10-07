@@ -304,9 +304,32 @@ class QwenImage2Model(BaseModel):
             images = images[:, :3]
         return images
 
+    def get_differentiable_decode_pixel_limit(self) -> int:
+        """Above this many decoded pixels the VAE tiles, and tiled decode
+        cannot carry the perceptual aux losses' decode gradient (see
+        ``_decode_rgba``)."""
+        return TILE_DECODE_ABOVE_PIXELS
+
     def _decode_rgba(self, latents: torch.Tensor, device=None, dtype=None):
         device = device or self.vae_device_torch
         dtype = dtype or self.vae_torch_dtype
+
+        # A one-shot decode of this VAE's 16x upsample stack is heavy: 2048x2048
+        # -- the resolution Qwen recommends -- needs more than a 32 GB card has.
+        # Tile above 1 MP, and whenever low_vram is set.
+        pixels = latents.shape[-2] * latents.shape[-1] * self.vae_scale_factor**2
+        tiled = self.model_config.low_vram or pixels > TILE_DECODE_ABOVE_PIXELS
+        if tiled and torch.is_grad_enabled() and latents.requires_grad:
+            # The differentiable aux anchors (vae_anchor and friends) decode
+            # the predicted x0 under gradient; tiling is not a valid path for
+            # them (seams, and the krea2 aux contract already rejects it).
+            raise ValueError(
+                f"Qwen-Image 2.1 tiled VAE decode cannot carry gradient "
+                f"({pixels} pixels exceeds the {TILE_DECODE_ABOVE_PIXELS}-pixel "
+                "one-shot limit, or model.low_vram is set). The perceptual aux "
+                "losses need an untiled decode: lower the dataset resolution, "
+                "disable model.low_vram, or disable the aux anchor."
+            )
 
         if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
@@ -315,11 +338,6 @@ class QwenImage2Model(BaseModel):
         mean, std = self._latent_stats(latents.device, latents.dtype)
         latents = latents * std + mean
 
-        # A one-shot decode of this VAE's 16x upsample stack is heavy: 2048x2048
-        # -- the resolution Qwen recommends -- needs more than a 32 GB card has.
-        # Tile above 1 MP, and whenever low_vram is set.
-        pixels = latents.shape[-2] * latents.shape[-1] * self.vae_scale_factor**2
-        tiled = self.model_config.low_vram or pixels > TILE_DECODE_ABOVE_PIXELS
         if tiled:
             self.vae.enable_tiling(
                 tile_sample_min_height=1024,

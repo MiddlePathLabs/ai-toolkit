@@ -366,6 +366,8 @@ def preflight_vae_anchor(
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[VAEAnchorConfig]:
     _dataset_va_active = any(
         vae_anchor_active_for_dataset(vae_anchor_config, dc) for dc in dataset_configs
@@ -380,6 +382,43 @@ def preflight_vae_anchor(
         return config
     if arch == 'krea2' and low_vram:
         raise ValueError('VAE-anchor loss for Krea 2 requires model.low_vram: false.')
+    if arch == 'qwen_image_2':
+        # The Qwen-Image 2.1 VAE decode tiles above the pixel limit and always
+        # under low_vram, and tiled decode cannot carry the anchor's decode
+        # gradient -- the live loss needs an untiled one-shot decode.
+        if low_vram:
+            raise ValueError(
+                'VAE-anchor loss for Qwen-Image 2.1 requires model.low_vram: false '
+                '(low_vram forces tiled VAE decode, which cannot carry the '
+                "anchor's gradient)."
+            )
+        if decode_pixel_limit is not None:
+            if max_active_bucket_pixels is not None:
+                if max_active_bucket_pixels > decode_pixel_limit:
+                    raise ValueError(
+                        'VAE-anchor loss for Qwen-Image 2.1 requires an untiled '
+                        f'differentiable decode, but a vae-anchor dataset has a '
+                        f'{max_active_bucket_pixels}-pixel bucket, above the '
+                        f'{decode_pixel_limit}-pixel tile threshold. Lower the '
+                        'dataset resolution (buckets at 1024x1024 or below stay '
+                        'untiled) or disable the anchor on that dataset '
+                        '(vae_anchor_loss_weight: 0).'
+                    )
+            else:
+                for dc in dataset_configs:
+                    if not vae_anchor_active_for_dataset(config, dc):
+                        continue
+                    resolution = int(getattr(dc, 'resolution', 0) or 0)
+                    if resolution > 0 and resolution * resolution > decode_pixel_limit:
+                        raise ValueError(
+                            'VAE-anchor loss for Qwen-Image 2.1 requires an untiled '
+                            f'differentiable decode, but a vae-anchor dataset runs '
+                            f'at resolution {resolution}, above the '
+                            f'{decode_pixel_limit}-pixel tile threshold. Lower the '
+                            'resolution (1024 or below stays untiled) or disable '
+                            'the anchor on that dataset '
+                            '(vae_anchor_loss_weight: 0).'
+                        )
     return config
 
 
@@ -2174,6 +2213,13 @@ class SDTrainer(BaseSDTrainProcess):
         if next(self.sd.vae.parameters()).device != self.device_torch:
             self.sd.vae.to(self.device_torch)
         decoded = self.sd.decode_latents(x0, device=self.device_torch, dtype=self.sd.vae_torch_dtype)
+        if decoded.shape[1] != 3:
+            raise ValueError(
+                f"VAE-anchor loss decoded {decoded.shape[1]} channels through the "
+                "training VAE; the frozen Flux 2 anchor encoder requires 3-channel "
+                "RGB. Disable model.model_kwargs.rgba (Qwen-Image 2.1 decodes 4 "
+                "channels when on) or set the VAE-anchor weight to 0."
+            )
         pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
 
         idx_map = [i for i in range(B) if valid[i]]
@@ -2247,11 +2293,32 @@ class SDTrainer(BaseSDTrainProcess):
         )
         if self._body_shape_should_cache():
             self._cache_body_shape_gt_pass()
-        # VAE-anchor preflight + GT caching pass.
+        # VAE-anchor preflight + GT caching pass. For archs that expose a
+        # differentiable-decode pixel limit (qwen_image_2 tiles above it),
+        # preflight the exact bucket geometry the loaders already built.
+        _va_pixel_limit = getattr(
+            self.sd, 'get_differentiable_decode_pixel_limit', lambda: None
+        )()
+        _va_max_bucket_pixels = None
+        if _va_pixel_limit is not None:
+            for loader in (self.data_loader, self.data_loader_reg):
+                if loader is None:
+                    continue
+                for dataset in get_dataloader_datasets(loader):
+                    if not vae_anchor_active_for_dataset(
+                        self.vae_anchor_config, dataset.dataset_config
+                    ):
+                        continue
+                    for bucket in getattr(dataset, 'buckets', {}).values():
+                        pixels = bucket.width * bucket.height
+                        if _va_max_bucket_pixels is None or pixels > _va_max_bucket_pixels:
+                            _va_max_bucket_pixels = pixels
         self.vae_anchor_config = preflight_vae_anchor(
             self.vae_anchor_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _va_pixel_limit,
+            _va_max_bucket_pixels,
         )
         if self._vae_anchor_should_cache():
             self._cache_vae_anchor_gt_pass()

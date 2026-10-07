@@ -18,6 +18,8 @@ from toolkit.admission import (
     RULE_H3_IMAGE_AUXILIARY,
     RULE_KREA_CONFLICT,
     RULE_KREA_LOW_VRAM_AUX,
+    RULE_QWEN_LOW_VRAM_AUX,
+    RULE_QWEN_RGBA_ANCHOR,
     RULE_LATENT_CACHE_AUGMENT,
     RULE_TEMPORARY_SAFETY,
     RULE_LEGACY_ACCUMULATION,
@@ -205,6 +207,53 @@ def test_krea_conflicts_cache_augmentation_low_vram_and_vae_anchor():
     }
     ids = _ids(collect_admission_diagnostics({"process": [process]}))
     assert {RULE_KREA_CONFLICT, RULE_KREA_LOW_VRAM_AUX, RULE_LATENT_CACHE_AUGMENT, RULE_VAE_ANCHOR} <= ids
+
+
+def test_qwen_vae_anchor_backend_low_vram_and_rgba_rules(tmp_path):
+    # Qwen-Image 2.1 now gets the same fail-closed VAE-anchor backend check as
+    # Krea 2, plus its own low_vram (tiled decode) and RGBA (4-channel decode
+    # vs the 3-channel Flux 2 encoder) incompatibilities.
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "low_vram": True,
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "datasets": [{"dataset_path": "images"}],
+        "vae_anchor": {"loss_weight": 0.1, "vae_model_path": "missing.safetensors"},
+    }
+    ids = _ids(collect_admission_diagnostics({"process": [process]}))
+    assert {RULE_VAE_ANCHOR, RULE_QWEN_LOW_VRAM_AUX, RULE_QWEN_RGBA_ANCHOR} <= ids
+
+    # clean job: low_vram off, rgba off, existing local checkpoint -> the
+    # backend rule defers its load-time contract instead of erroring
+    ckpt = tmp_path / "ae.safetensors"
+    ckpt.write_bytes(b"x")
+    process["model"]["low_vram"] = False
+    process["model"]["model_kwargs"] = {}
+    process["vae_anchor"]["vae_model_path"] = str(ckpt)
+    result = collect_admission_diagnostics({"process": [process]})
+    clean_ids = _ids(result)
+    assert {RULE_VAE_ANCHOR, RULE_QWEN_LOW_VRAM_AUX, RULE_QWEN_RGBA_ANCHOR}.isdisjoint(clean_ids)
+    assert any(item["rule_id"] == RULE_VAE_ANCHOR for item in result["deferred"])
+
+
+def test_qwen_rgba_without_vae_anchor_is_not_blocked():
+    # RGBA on its own (transparency training) stays valid; only the anchor
+    # combination is rejected.
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "datasets": [{"dataset_path": "images"}],
+    }
+    ids = _ids(collect_admission_diagnostics({"process": [process]}))
+    assert RULE_QWEN_RGBA_ANCHOR not in ids
 
 
 def test_temporary_safety_blocks_are_scoped_to_enabled_paths():

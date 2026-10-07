@@ -2190,13 +2190,27 @@ export default function SimpleJob({
                             max={1}
                             step={0.01}
                           />
+                          <TextInput
+                            label="Flux 2 VAE Checkpoint Path"
+                            className="pt-2"
+                            docKey={'vae_anchor.vae_model_path'}
+                            value={vaeAnchorConfig?.vae_model_path ?? ''}
+                            onChange={(value: string | undefined) => {
+                              setJobConfig(value ?? '', 'config.process[0].vae_anchor.vae_model_path');
+                            }}
+                            placeholder="path/to/flux2/ae.safetensors"
+                          />
                           <div className="text-xs text-gray-400 pt-2">
                             Cross-VAE perceptual anchor: decodes the predicted x0 through the training
                             model's VAE, then encodes those pixels with a SEPARATE frozen Flux 2 VAE and
                             matches multi-scale features against cached GT (cosine). The Flux 2 VAE
-                            downloads from Hugging Face on first enable. Anchors to the Flux 2 VAE feature
-                            space, which is independent of Krea 2's VAE. Like the other anchors it decodes
-                            x0 under gradient, so Low VRAM is disabled while it is active.
+                            encoder is loaded from the local licensed checkpoint above — nothing is
+                            downloaded, and the job is rejected at validation without a valid path.
+                            Anchors to the Flux 2 VAE feature space, which is independent of the
+                            training model's VAE. Like the other anchors it decodes x0 under gradient,
+                            so Low VRAM is disabled while it is active. On Qwen-Image 2.1, also keep
+                            Transparency (RGBA) off and anchor datasets at 1024 resolution or lower —
+                            the anchor needs an untiled differentiable decode.
                           </div>
                         </>
                       )}

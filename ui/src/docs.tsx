@@ -882,6 +882,18 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Maximum Timestep',
     description: <>The VAE anchor only applies on steps whose timestep ratio is at most this (0 to 1). Defaults to 0.5 (low-noise region where structure is set).</>,
   },
+  'vae_anchor.vae_model_path': {
+    title: 'Flux 2 VAE Checkpoint Path',
+    description: (
+      <>
+        Local path to a licensed Flux 2 <code>ae.safetensors</code> checkpoint in the matching BFL
+        layout. The frozen anchor encoder is loaded from it and nothing is downloaded — no path, no
+        anchor (validation rejects the job before caching). On Qwen-Image 2.1 the anchor additionally
+        requires <code>low_vram</code> off, RGBA off, and anchor datasets at 1024 resolution or
+        lower (untiled differentiable decode).
+      </>
+    ),
+  },
   'train.optimizer.rose': {
     title: 'Rose Optimizer',
     description: (
