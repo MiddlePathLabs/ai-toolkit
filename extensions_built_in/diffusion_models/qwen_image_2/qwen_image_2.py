@@ -126,6 +126,8 @@ class QwenImage2Model(BaseModel):
         self.target_lora_modules = ["QwenImage21Transformer2DModel"]
         self.vae_scale_factor = VAE_SCALE_FACTOR
         self.prompt_encoder: Optional[QwenImage21PromptEncoder] = None
+        self.preview_turbo = None
+        self._turbo_cfg_notice = False
 
         # Editing is not a separate model here, it is what happens when the
         # dataset has a control path: reference images ride into the text
@@ -140,6 +142,26 @@ class QwenImage2Model(BaseModel):
     @staticmethod
     def get_train_scheduler():
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+
+    def get_sampling_scheduler(self):
+        """Scheduler for sample events. The turbo preview recipe requires the
+        base config's shift_terminal (0.02) to be off — it wrecks the last
+        step; plain sampling keeps the train behavior."""
+        if self.preview_turbo is not None:
+            config = dict(scheduler_config)
+            config["shift_terminal"] = None
+            return CustomFlowMatchEulerDiscreteScheduler(**config)
+        return self.get_train_scheduler()
+
+    def get_sampling_sigmas(self, num_inference_steps: int):
+        """Raw sigmas for sampling, or None for the default linspace. Turbo
+        previews need the Viggle sigma schedule; the pipeline still applies
+        its resolution-dependent shift on top."""
+        if self.preview_turbo is not None:
+            from .preview_lora import turbo_sigma_grid
+
+            return np.array(turbo_sigma_grid(num_inference_steps))
+        return None
 
     def get_bucket_divisibility(self):
         # 16 for the VAE, 2 more because the DiT groups target latent tokens
@@ -173,6 +195,9 @@ class QwenImage2Model(BaseModel):
         )
         flush()
 
+        if self.model_config.preview_lora_path is not None:
+            self.load_preview_turbo(transformer)
+
         self.print_and_status_update("Loading text encoder")
         processor = QwenImage21TextEncoder.load_processor(base_model_path)
         text_encoder = QwenImage21TextEncoder.load_model(
@@ -203,6 +228,40 @@ class QwenImage2Model(BaseModel):
         self.prompt_encoder = QwenImage21PromptEncoder(text_encoder, processor)
         self.pipeline = QwenImage21Pipeline(self)
         self.print_and_status_update("Model Loaded")
+
+    def load_preview_turbo(self, transformer: QwenImage21Transformer2DModel):
+        """Frozen sampling-only Turbo LoRA. Inactive and CPU-parked until previews."""
+        from toolkit.paths import MODELS_PATH
+
+        from .preview_lora import load_preview_lora, resolve_preview_lora_path
+
+        self.print_and_status_update("Loading preview Turbo LoRA")
+        lora_path = resolve_preview_lora_path(
+            self.model_config.preview_lora_path, MODELS_PATH
+        )
+        self.model_config.preview_lora_path = lora_path
+        turbo = load_preview_lora(
+            transformer,
+            lora_path,
+            self.model_config.preview_lora_strength,
+            target_lin_modules=self.target_lora_modules,
+        )
+        self.print_and_status_update(turbo.report.summary())
+        self.preview_turbo = turbo
+
+    def _enter_generate_adapters(self):
+        super()._enter_generate_adapters()
+        if self.preview_turbo is not None:
+            self.print_and_status_update("Loading preview Turbo LoRA")
+            self.preview_turbo.activate(
+                self.model, self.device_torch, self.torch_dtype
+            )
+
+    def _exit_generate_adapters(self):
+        if self.preview_turbo is not None:
+            self.print_and_status_update("Unloading preview Turbo LoRA")
+            self.preview_turbo.deactivate()
+        super()._exit_generate_adapters()
 
     # ------------------------------------------------------------------
     # VAE. The latents are RGBA. Images without alpha get an opaque one on
@@ -576,13 +635,25 @@ class QwenImage2Model(BaseModel):
                 target_pixels=self._target_pixels((gen_config.width, gen_config.height)),
             )
 
+        # the turbo recipe is distilled without CFG (model card: true_cfg 1.0,
+        # no negative prompt); a guided preview double-counts and looks wrong
+        guidance_scale = gen_config.guidance_scale
+        if self.preview_turbo is not None and guidance_scale > 1.0:
+            if not self._turbo_cfg_notice:
+                self.print_and_status_update(
+                    "[qwen-preview-lora] turbo previews run without CFG; "
+                    "forcing guidance_scale to 1.0"
+                )
+                self._turbo_cfg_notice = True
+            guidance_scale = 1.0
+
         return pipeline(
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
             height=gen_config.height,
             width=gen_config.width,
             num_inference_steps=gen_config.num_inference_steps,
-            guidance_scale=gen_config.guidance_scale,
+            guidance_scale=guidance_scale,
             latents=gen_config.latents,
             generator=generator,
             condition_images=condition_images,

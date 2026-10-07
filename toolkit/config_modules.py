@@ -1124,24 +1124,40 @@ class ModelConfig:
             else:
                 self.arch = 'sd1'
         if self.preview_lora_path is not None:
-            if self.arch != "minimax_h3":
+            if self.arch not in ("minimax_h3", "qwen_image_2"):
                 raise ValueError(
-                    "preview_lora_path is MiniMax-H3 only (model.arch=minimax_h3); "
+                    "preview_lora_path is only supported for model.arch "
+                    "'minimax_h3' and 'qwen_image_2' (turbo preview adapters); "
                     f"got arch={self.arch!r}."
                 )
             if self.inference_lora_path is not None:
                 raise ValueError(
                     "preview_lora_path and inference_lora_path cannot both be set. "
-                    "Use preview_lora_path for H3 Turbo previews."
+                    "Use preview_lora_path for turbo previews."
                 )
             strength = self.preview_lora_strength
             if strength != strength or abs(strength) == float("inf"):
                 raise ValueError(
                     f"preview_lora_strength must be a finite number, got {strength}"
                 )
-        elif self.arch == "minimax_h3" and self.inference_lora_path is not None:
+        elif self.inference_lora_path is not None:
+            if self.arch == "minimax_h3":
+                raise ValueError(
+                    "Use preview_lora_path for H3 Turbo previews, not inference_lora_path."
+                )
+            if self.arch != "flux":
+                raise ValueError(
+                    "inference_lora_path is only supported for Flux models "
+                    f"(got arch={self.arch!r}). On minimax_h3 and qwen_image_2 "
+                    "use preview_lora_path for turbo previews."
+                )
+        if (
+            self.assistant_lora_path is not None
+            and self.arch not in ("flux", "minimax_h3")
+        ):
             raise ValueError(
-                "Use preview_lora_path for H3 Turbo previews, not inference_lora_path."
+                "assistant_lora_path is only supported for Flux and MiniMax-H3 "
+                f"(got arch={self.arch!r})."
             )
 
         

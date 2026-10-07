@@ -917,19 +917,28 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                 "Retain bind_tread/validate_tread_span and fail closed before the first batch.",
             )
 
-    if h3 and _nonempty(model.get("preview_lora_path")):
+    if (h3 or base.startswith("qwen_image_2")) and _nonempty(model.get("preview_lora_path")):
         collector.defer(
             RULE_PREVIEW_LORA,
             [f"{p}.model.preview_lora_path"],
-            "H3 preview LoRA checkpoint state and compatibility cannot be established from fields alone.",
+            "Preview LoRA checkpoint state and compatibility cannot be established from fields alone.",
             "The final model loader must validate the local/managed checkpoint without silently downloading or merging it.",
         )
     if _nonempty(model.get("preview_lora_path")) and _nonempty(model.get("inference_lora_path")):
         collector.add(
             RULE_PREVIEW_LORA,
             [f"{p}.model.preview_lora_path", f"{p}.model.inference_lora_path"],
-            "H3 preview_lora_path and inference_lora_path are mutually exclusive roles.",
-            "Keep preview_lora_path for H3 sampling or use inference_lora_path for the other supported model path, not both.",
+            "preview_lora_path and inference_lora_path are mutually exclusive roles.",
+            "Keep preview_lora_path for turbo previews or inference_lora_path for the Flux assistant role, not both.",
+        )
+    if _nonempty(model.get("inference_lora_path")) and base != "flux":
+        collector.add(
+            RULE_PREVIEW_LORA,
+            [f"{p}.model.inference_lora_path", f"{p}.model.arch"],
+            f"inference_lora_path is Flux-only; on arch {base!r} the adapter never "
+            "loads and sampling crashes on the missing network.",
+            "Remove inference_lora_path, or use preview_lora_path on "
+            "minimax_h3/qwen_image_2 for turbo previews.",
         )
 
     # Runtime facts that must never be represented as a static pass.

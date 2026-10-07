@@ -367,8 +367,10 @@ class QwenImage21Pipeline:
             )
         latents = latents.to(device, dtype=dtype)
 
-        scheduler = model.get_train_scheduler()
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        scheduler = model.get_sampling_scheduler()
+        sigmas = model.get_sampling_sigmas(num_inference_steps)
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             latent_height * latent_width,
             scheduler.config.get("base_image_seq_len", 256),
