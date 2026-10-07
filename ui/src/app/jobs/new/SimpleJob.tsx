@@ -2291,21 +2291,24 @@ export default function SimpleJob({
                           placeholder="1.0 (inherit)"
                           min={0}
                         />
-                        <Checkbox
-                          label="Restrict Perceptual Anchors to Body"
-                          className="pt-2"
-                          docKey={'subject_mask.perceptual_restrict_to_body'}
-                          checked={subjectMaskConfig?.perceptual_restrict_to_body ?? false}
-                          onChange={value =>
-                            setJobConfig(value, 'config.process[0].subject_mask.perceptual_restrict_to_body')
-                          }
-                        />
+                        {modelArch?.additionalSections?.includes('normal_id') && (
+                          <Checkbox
+                            label="Restrict Perceptual Anchors to Body"
+                            className="pt-2"
+                            docKey={'subject_mask.perceptual_restrict_to_body'}
+                            checked={subjectMaskConfig?.perceptual_restrict_to_body ?? false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].subject_mask.perceptual_restrict_to_body')
+                            }
+                          />
+                        )}
                         <div className="text-xs text-gray-400 pt-2">
                           Extracts per-image person/body/clothing masks via YOLO + SAM 2 + SegFormer
                           (preflight, non-differentiable). The loss weights above region-weight the
-                          diffusion loss multiplicatively. Enable Depth Mask Source (in Perceptual
-                          Anchors) to restrict the depth anchor to the subject/body. Models download
-                          lazily from Hugging Face / ultralytics on first enable.
+                          diffusion loss multiplicatively. On archs with the depth/normal anchors
+                          (Krea 2), those anchors can additionally be restricted to the
+                          subject/body. Models download lazily from Hugging Face / ultralytics on
+                          first enable.
                         </div>
                       </>
                     )}

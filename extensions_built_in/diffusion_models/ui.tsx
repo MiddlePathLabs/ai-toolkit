@@ -594,6 +594,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "sample.multi_ctrl_imgs",
       "model.low_vram",
       "model.layer_offloading",
+      "subject_mask",
       "vae_anchor",
     ],
     customModelSelectOptions: [
