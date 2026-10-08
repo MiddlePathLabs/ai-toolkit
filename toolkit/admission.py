@@ -952,12 +952,12 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             "preview_lora_path and inference_lora_path are mutually exclusive roles.",
             "Keep preview_lora_path for turbo previews or inference_lora_path for the Flux assistant role, not both.",
         )
-    if _nonempty(model.get("inference_lora_path")) and base != "flux":
+    if _nonempty(model.get("inference_lora_path")) and base != "flux" and not _is_krea(base):
         collector.add(
             RULE_PREVIEW_LORA,
             [f"{p}.model.inference_lora_path", f"{p}.model.arch"],
-            f"inference_lora_path is Flux-only; on arch {base!r} the adapter never "
-            "loads and sampling crashes on the missing network.",
+            f"inference_lora_path is only supported on flux/krea2; config "
+            f"validation rejects arch {base!r} before the model loads.",
             "Remove inference_lora_path, or use preview_lora_path on "
             "minimax_h3/qwen_image_2 for turbo previews.",
         )

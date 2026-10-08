@@ -49,7 +49,7 @@ def test_preview_lora_config_default_off_and_h3_only():
     cfg = _cfg()
     assert cfg.preview_lora_path is None
     assert cfg.preview_lora_strength == pytest.approx(1.0)
-    with pytest.raises(ValueError, match="MiniMax-H3 only"):
+    with pytest.raises(ValueError, match="turbo preview adapters"):
         _cfg(arch="flux", preview_lora_path="turbo.safetensors")
     with pytest.raises(ValueError, match="not inference_lora_path"):
         _cfg(inference_lora_path="turbo.safetensors")

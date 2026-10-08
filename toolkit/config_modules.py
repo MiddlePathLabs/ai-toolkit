@@ -1145,11 +1145,11 @@ class ModelConfig:
                 raise ValueError(
                     "Use preview_lora_path for H3 Turbo previews, not inference_lora_path."
                 )
-            if self.arch != "flux":
+            if self.arch not in ("flux", "krea2"):
                 raise ValueError(
-                    "inference_lora_path is only supported for Flux models "
-                    f"(got arch={self.arch!r}). On minimax_h3 and qwen_image_2 "
-                    "use preview_lora_path for turbo previews."
+                    "inference_lora_path is only supported for Flux and Krea 2 "
+                    f"models (got arch={self.arch!r}). On minimax_h3 and "
+                    "qwen_image_2 use preview_lora_path for turbo previews."
                 )
         if (
             self.assistant_lora_path is not None
