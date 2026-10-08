@@ -234,7 +234,6 @@ export default function TrainingForm() {
       config={jobConfig}
       result={admissionResult}
       unavailable={admissionUnavailable}
-      status={admissionStatus}
       onRemediate={next => {
         setRawYaml(undefined);
         setJobConfig(next);

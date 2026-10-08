@@ -7,14 +7,12 @@ import {
   applyAdmissionRemediation,
   type AdmissionDiagnostic,
   type AdmissionResult,
-  type AdmissionValidationStatus,
 } from '@/utils/admission';
 
 interface Props {
   config: JobConfig;
   result: AdmissionResult | null;
   unavailable?: string | null;
-  status?: AdmissionValidationStatus;
   onRemediate?: (config: JobConfig) => void;
 }
 
@@ -39,28 +37,25 @@ const Diagnostic = ({ diagnostic }: { diagnostic: AdmissionDiagnostic }) => (
   </li>
 );
 
-export default function AdmissionFeedback({ config, result, unavailable, status, onRemediate }: Props) {
-  if (!result && !unavailable && status !== 'pending') return null;
+export default function AdmissionFeedback({ config, result, unavailable, onRemediate }: Props) {
   const errors = result?.diagnostics.filter(item => item.severity === 'error') ?? [];
   const warnings = result?.diagnostics.filter(item => item.severity === 'warning') ?? [];
-  const deferred = result?.deferred ?? [];
   const actions = result ? getAdmissionRemediations(config, result) : [];
-  const pending = status === 'pending';
-  const title = pending ? 'Validating current configuration' :
-    unavailable ? 'Validation unavailable' :
-    errors.length > 0 ? 'Configuration cannot run' :
-    deferred.length > 0 ? 'Static validation passed; runtime checks pending' : 'Configuration accepted';
+  if (errors.length === 0 && warnings.length === 0 && !unavailable) return null;
+  const blocking = Boolean(unavailable) || errors.length > 0;
+  const title = unavailable ? 'Validation unavailable' : errors.length > 0 ? 'Configuration cannot run' : 'Warnings';
 
   return (
     <section
       aria-live="polite"
-      className="mx-4 mt-3 rounded-md border border-amber-500/50 bg-gray-900/80 p-3 text-sm text-gray-100"
+      className={`mx-4 mt-3 rounded-md border p-3 text-sm text-gray-100 ${
+        blocking ? 'border-red-500/50 bg-gray-900/80' : 'border-amber-500/50 bg-gray-900/80'
+      }`}
     >
       <div className="flex items-center gap-2 font-semibold">
-        {unavailable || errors.length > 0 ? <CircleAlert className="h-4 w-4 text-red-400" /> : <AlertTriangle className="h-4 w-4 text-amber-300" />}
+        {blocking ? <CircleAlert className="h-4 w-4 text-red-400" /> : <AlertTriangle className="h-4 w-4 text-amber-300" />}
         <span>{title}</span>
       </div>
-      {pending && <p className="mt-2 text-gray-300">The current edits have not been validated yet. Save will be available after validation passes.</p>}
       {unavailable && <p className="mt-2 text-red-200">{unavailable} Save is disabled until this configuration can be validated.</p>}
       {errors.length > 0 && (
         <ul className="mt-2 space-y-2 text-red-100">
@@ -71,13 +66,6 @@ export default function AdmissionFeedback({ config, result, unavailable, status,
         <div className="mt-3 border-t border-gray-700 pt-2">
           <div className="font-medium text-amber-200">Warnings</div>
           <ul className="mt-1 space-y-2 text-amber-100">{warnings.map((diagnostic, index) => <Diagnostic diagnostic={diagnostic} key={`${diagnostic.rule_id}-${index}`} />)}</ul>
-        </div>
-      )}
-      {deferred.length > 0 && (
-        <div className="mt-3 border-t border-gray-700 pt-2">
-          <div className="font-medium text-amber-200">Runtime checks pending</div>
-          {result?.valid && <p className="mt-1 text-xs text-gray-300">Static validation passed, so this configuration can be saved. These checks must pass when training loads the model and data.</p>}
-          <ul className="mt-1 space-y-2 text-amber-100">{deferred.map((diagnostic, index) => <Diagnostic diagnostic={diagnostic} key={`${diagnostic.rule_id}-${index}`} />)}</ul>
         </div>
       )}
       {errors.length > 0 && result && onRemediate && (
