@@ -552,6 +552,28 @@ class SDTrainer(BaseSDTrainProcess):
         # parity so previews render on DEPTH steps regardless of preview_every
         # being even/odd (see _depth_preview_due). Reset in hook_before_train_loop.
         self._depth_step_count = 0
+        # Gradient-cosine diagnostic (perceptual-fork parity): norms of the
+        # depth-only and everything-else-only gradients at the trainable
+        # params, plus their cosine. Populated by the dual-grad block in
+        # `train_single_accumulation` only when
+        # `train_config.gradient_cosine_log_every > 0` and the step matches.
+        # Both sides come from autograd.grad (pre-backward), so both are
+        # UNSCALED (autograd.grad bypasses the AMP grad scaler); the cosine is
+        # exact and the norm ratio is preserved.
+        self._last_grad_norm_diffusion: Optional[float] = None
+        self._last_grad_norm_depth: Optional[float] = None
+        self._last_grad_cos_diff_depth: Optional[float] = None
+        # Cross-microbatch aggregate for one optimizer step (mean of the
+        # firing microbatches' values; see _log_grad_cosine).
+        self._grad_cos_acc: Optional[dict] = None
+        # Set by `calculate_loss` to the depth-applied loss tensor (pre-detach)
+        # whenever the depth loss contributes a graph this microbatch; reset to
+        # None every microbatch. Read by the dual-grad block.
+        self._dc_applied_for_grad = None
+        # True on a microbatch whose returned loss saturated max_loss (the
+        # scalar clamp zeroes the optimizer gradient, so the gradient-cosine
+        # diagnostic must not fire — see calculate_loss).
+        self._last_loss_clamped = False
 
         _normal_raw = self.get_conf('normal_id', None)
         if _normal_raw is not None:
@@ -3141,6 +3163,10 @@ class SDTrainer(BaseSDTrainProcess):
         is_reg = any(_is_reg_list)
         additional_loss = 0.0
         additional_objective_eligible = False
+        # Reset every microbatch so a step where depth doesn't contribute
+        # leaves the gradient-cosine dual-grad block with nothing to act on.
+        self._dc_applied_for_grad = None
+        self._last_loss_clamped = False
         # Depth-anchor sample gating (Task 5b). Fully inert when depth is off:
         # _depth_gates stays None, so no depth code is reachable and the loss
         # path below is byte-for-byte the original.
@@ -4045,9 +4071,15 @@ class SDTrainer(BaseSDTrainProcess):
         # band, positive weight, not reg, not an alternating sample on a
         # diffusion step). Inert when depth is off (_depth_gates is None).
         if _depth_gates is not None:
-            loss = loss + self._compute_depth_anchor_loss(
+            _dc_applied = self._compute_depth_anchor_loss(
                 noise_pred, noisy_latents, timesteps, batch, _depth_gates,
             )
+            loss = loss + _dc_applied
+            # Stash the pre-detach depth contribution for the gradient-cosine
+            # dual-backward. Graph-less returns (preview-only, or no sample
+            # qualified) leave it unset.
+            if torch.is_tensor(_dc_applied) and _dc_applied.requires_grad:
+                self._dc_applied_for_grad = _dc_applied
 
         # Normal-anchor loss: fires on its own timestep-window samples,
         # independent of the diffusion/depth loss_split. Inert when normal is off.
@@ -4112,6 +4144,12 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc(f"timesteps: {timesteps}")
 
         if self.train_config.max_loss is not None:
+            # A saturated scalar clamp has zero backward: the optimizer
+            # gradient dies while the stashed depth tensor still
+            # differentiates. Flag it so the gradient-cosine diagnostic
+            # (which would otherwise fabricate a cosine of -1) stays off
+            # for this microbatch.
+            self._last_loss_clamped = bool(loss.item() > self.train_config.max_loss)
             loss = torch.clamp(loss, max=self.train_config.max_loss)
         
         return loss
@@ -5420,6 +5458,69 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
+
+                    # Gradient-cosine diagnostic (display-only, perceptual-fork
+                    # parity). BOTH gradient sides are captured via
+                    # autograd.grad BEFORE the real backward:
+                    #   g_depth = d(depth_applied)/dw
+                    #   g_full  = d(total loss the backward consumes)/dw
+                    #   g_diff  = g_full - g_depth
+                    # Reading p.grad after the backward is not safe here:
+                    # optimizer post-accumulate hooks (stochastic _accum_grad
+                    # accumulation on non-fp32 params, automagic2's fused
+                    # per-param step) move or clear p.grad, and offloaded
+                    # params stage grads as async D2H copies into pinned
+                    # tensors. autograd.grad bypasses all of that;
+                    # sync_grad_transfers() joins any staged tensors it
+                    # returns (no-op when offloading is inactive). Both sides
+                    # are unscaled (autograd.grad skips the AMP grad scaler),
+                    # so the cosine is exact under fp16 too and the norm ratio
+                    # is preserved. Cost: two extra passes through the
+                    # retained graph per firing step.
+                    _dc_grads_snapshot = None
+                    _full_grads_snapshot = None
+                    _trainable_params_snapshot = None
+                    if self._grad_cosine_should_fire():
+                        try:
+                            _trainable_params_snapshot = [
+                                p for p in self._iter_trainable_params()
+                                if p.requires_grad
+                            ]
+                            if _trainable_params_snapshot:
+                                # differentiate the exact expression the
+                                # backward below consumes, so g_full matches
+                                # the optimizer's gradient (modulo the grad
+                                # scaler, which cancels in the cosine)
+                                _backward_loss = (
+                                    loss * accum_scale if accum_scale != 1.0 else loss
+                                )
+                                _full_grads_snapshot = torch.autograd.grad(
+                                    _backward_loss,
+                                    _trainable_params_snapshot,
+                                    retain_graph=True,
+                                    allow_unused=True,
+                                )
+                                _dc_grads_snapshot = torch.autograd.grad(
+                                    self._dc_applied_for_grad * accum_scale,
+                                    _trainable_params_snapshot,
+                                    retain_graph=True,
+                                    allow_unused=True,
+                                )
+                                # Join async D2H grad staging (offloaded params)
+                                # BEFORE reading either result.
+                                sync_grad_transfers()
+                                self._record_grad_cosine(
+                                    _full_grads_snapshot, _dc_grads_snapshot,
+                                )
+                                self._log_grad_cosine()
+                        except Exception as _gc_err:  # noqa: BLE001
+                            print_acc(
+                                f"  gradient cosine: autograd.grad capture failed: {_gc_err}"
+                            )
+                            _dc_grads_snapshot = None
+                            _full_grads_snapshot = None
+                            _trainable_params_snapshot = None
+
                     runtime = getattr(self, 'optimizer_runtime', None)
                     opened_fused_window = self._open_optimizer_runtime_window(
                         phase="backward", batch=batch
@@ -5434,6 +5535,115 @@ class SDTrainer(BaseSDTrainProcess):
 
         return loss.detach()
         # flush()
+
+    def _iter_trainable_params(self):
+        """Yield the flat list of trainable parameter tensors.
+
+        ``self.params`` is either a flat list of tensors or a list of
+        param-group dicts (each with a ``'params'`` list). Yields only
+        tensors so callers can call ``.grad`` / ``autograd.grad`` directly.
+        """
+        params = getattr(self, 'params', None)
+        if not params:
+            return
+        for entry in params:
+            if isinstance(entry, dict):
+                for p in entry.get('params', []):
+                    yield p
+            else:
+                yield entry
+
+    def _grad_cosine_should_fire(self) -> bool:
+        """Firing gate for the gradient-cosine diagnostic.
+
+        Fires only on matching steps where the depth loss contributed a real
+        graph AND the returned loss was not max_loss-clamped (a saturated
+        scalar clamp zeroes the optimizer gradient while the depth tensor
+        still differentiates, which would fabricate a cosine of -1).
+        """
+        _grad_cos_every = int(getattr(
+            self.train_config, 'gradient_cosine_log_every', 0,
+        ) or 0)
+        return (
+            _grad_cos_every > 0
+            and self._dc_applied_for_grad is not None
+            and not self._last_loss_clamped
+            and (self.step_num % _grad_cos_every == 0)
+        )
+
+    def _record_grad_cosine(self, full_grads, dc_grads) -> None:
+        """Compute per-loss gradient norms + cosine and stash on `_last_*`.
+
+        Both arguments are per-microbatch autograd.grad results over the same
+        param list: ``full_grads`` differentiates the exact total-loss tensor
+        the optimizer backward consumes, ``dc_grads`` the depth-applied term
+        alone; the diffusion side is recovered by linearity
+        (g_diff = g_full - g_dc, "diffusion" meaning everything-except-depth).
+        Because neither side reads ``p.grad``, this is immune to optimizer
+        post-accumulate hooks (stochastic ``_accum_grad`` accumulation,
+        automagic2's fused per-param step) that move or clear grads by the
+        time a post-backward read would run. Display-only; never touches
+        ``p.grad``.
+        """
+        norm_dc_sq = 0.0
+        norm_diff_sq = 0.0
+        dot = 0.0
+        for g_full, g_dc in zip(full_grads, dc_grads):
+            g_full_f = g_full.detach().float() if g_full is not None else None
+            g_dc_f = g_dc.detach().float() if g_dc is not None else None
+            if g_full_f is None and g_dc_f is None:
+                continue
+            if g_dc_f is None:
+                # depth didn't use this param: whole grad is diffusion-side
+                norm_diff_sq += float((g_full_f * g_full_f).sum())
+                continue
+            if g_full_f is None:
+                # defensive: cannot happen while depth is a summand of the
+                # total loss (any depth-touched param is total-touched).
+                # Never infer a zero full grad from a missing tensor.
+                continue
+            gdiff = g_full_f - g_dc_f
+            norm_dc_sq += float((g_dc_f * g_dc_f).sum())
+            norm_diff_sq += float((gdiff * gdiff).sum())
+            dot += float((gdiff * g_dc_f).sum())
+
+        norm_dc = norm_dc_sq ** 0.5
+        norm_diff = norm_diff_sq ** 0.5
+        denom = norm_dc * norm_diff
+        cos = (dot / denom) if denom > 1e-12 else 0.0
+        self._last_grad_norm_diffusion = norm_diff
+        self._last_grad_norm_depth = norm_dc
+        self._last_grad_cos_diff_depth = cos
+
+    def _log_grad_cosine(self) -> None:
+        """Aggregate firing microbatches within one optimizer step, then log.
+
+        ``logger.log`` commits per-key last-write-wins inside a step, and
+        ``step_num`` is constant across a gradient-accumulation window, so a
+        naive per-microbatch log keeps only the LAST microbatch's values.
+        Instead every firing microbatch logs the running cross-microbatch
+        MEAN; the step's final write is the complete aggregate (matches the
+        perceptual fork's metric-buffer display semantics).
+        """
+        acc = self._grad_cos_acc
+        if acc is None or acc['step'] != self.step_num:
+            acc = {'step': self.step_num, 'n': 0, 'cos': 0.0, 'ndc': 0.0, 'ndiff': 0.0}
+            self._grad_cos_acc = acc
+        acc['n'] += 1
+        acc['cos'] += self._last_grad_cos_diff_depth
+        acc['ndc'] += self._last_grad_norm_depth
+        acc['ndiff'] += self._last_grad_norm_diffusion
+        n = acc['n']
+        # Canonical perceptual-fork telemetry names, logged directly so each
+        # value is committed at the step that computed it (same convention as
+        # depth/*; bypasses the log-time loss/ prefix).
+        logger = getattr(self, 'logger', None)
+        if logger is not None:
+            logger.log({
+                'grad/norm/diffusion': acc['ndiff'] / n,
+                'grad/norm/depth': acc['ndc'] / n,
+                'grad/cos/diff_depth': acc['cos'] / n,
+            })
 
     def _iter_lora_params_with_grad(self):
         """Yield tagged LoRA parameters whose gradients are populated."""
