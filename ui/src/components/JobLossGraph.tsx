@@ -139,11 +139,16 @@ function dulledColor(rgba: string): string {
 }
 
 // Keys plotted by default. Subsystem-canonical keys (the perceptual-fork
-// `depth/*` family) only exist when that loss actually ran, so enabling them
-// by default costs nothing on jobs that never used them. Add future
-// subsystems here as they land.
+// `depth/*` and `grad/*` families) only exist when those losses actually ran,
+// so enabling them by default costs nothing on jobs that never used them. Add
+// future subsystems here as they land.
 function isDefaultEnabled(key: string): boolean {
-  return key === 'loss/loss' || key === 'val/loss' || key.startsWith('depth/');
+  return (
+    key === 'loss/loss' ||
+    key === 'val/loss' ||
+    key.startsWith('depth/') ||
+    key.startsWith('grad/')
+  );
 }
 
 export default function JobLossGraph({ job }: Props) {
