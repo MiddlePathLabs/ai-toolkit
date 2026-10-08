@@ -474,7 +474,45 @@ class SDTrainer(BaseSDTrainProcess):
         return int(getattr(self, "completed_update_id", 0))
 
 
+    @staticmethod
+    def _disable_donated_buffers_if_grad_cosine(config) -> bool:
+        """Turn off inductor donated buffers when the grad-cosine runs.
+
+        The diagnostic needs ``autograd.grad(..., retain_graph=True)``, which
+        is incompatible with donated buffers: a compiled backward frees its
+        inputs, and torch requires ``retain_graph=False`` for those graphs.
+        The flag is only read when inductor compiles the backward, so this is
+        inert on eager runs. Must run BEFORE model build (first compiled
+        forward). Returns True when the flag was flipped.
+        """
+        try:
+            gc_every = int(
+                ((config.get('train') or {}).get('gradient_cosine_log_every', 0)) or 0
+            )
+        except (TypeError, ValueError, AttributeError):
+            return False
+        if gc_every <= 0:
+            return False
+        try:
+            import torch._functorch.config as functorch_config
+            if getattr(functorch_config, 'donated_buffer', False):
+                functorch_config.donated_buffer = False
+                return True
+        except Exception:  # noqa: BLE001 - best-effort, torch-version dependent
+            pass
+        return False
+
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
+        # Before super().__init__ (model build + any compile wrapping): make
+        # compiled backwards retain_graph-compatible when the gradient-cosine
+        # diagnostic is enabled. First live DOP-style run fired the
+        # "non-empty donated buffers requires retain_graph=False" error on
+        # every firing step instead.
+        if self._disable_donated_buffers_if_grad_cosine(config):
+            print_acc(
+                "gradient cosine: inductor donated_buffer disabled "
+                "(retain_graph autograd.grad requires it)"
+            )
         super().__init__(process_id, job, config, **kwargs)
         self.assistant_adapter: Union['T2IAdapter', 'ControlNetModel', None]
         self.do_prior_prediction = False
@@ -566,6 +604,14 @@ class SDTrainer(BaseSDTrainProcess):
         # Cross-microbatch aggregate for one optimizer step (mean of the
         # firing microbatches' values; see _log_grad_cosine).
         self._grad_cos_acc: Optional[dict] = None
+        # Cadence counter for _grad_cosine_should_fire: number of
+        # depth-contributing microbatches seen since trainer start.
+        self._grad_cos_depth_count = 0
+        # Persistent capture failures (e.g. an unfixable compiled-graph
+        # constraint) auto-disable the diagnostic after this many in a row
+        # so it logs ONE loud line instead of spamming every firing step.
+        self._grad_cos_fail_streak = 0
+        self._grad_cos_disabled_by_failures = False
         # Set by `calculate_loss` to the depth-applied loss tensor (pre-detach)
         # whenever the depth loss contributes a graph this microbatch; reset to
         # None every microbatch. Read by the dual-grad block.
@@ -5513,10 +5559,20 @@ class SDTrainer(BaseSDTrainProcess):
                                     _full_grads_snapshot, _dc_grads_snapshot,
                                 )
                                 self._log_grad_cosine()
+                                self._grad_cos_fail_streak = 0
                         except Exception as _gc_err:  # noqa: BLE001
-                            print_acc(
-                                f"  gradient cosine: autograd.grad capture failed: {_gc_err}"
-                            )
+                            self._grad_cos_fail_streak += 1
+                            if self._grad_cos_fail_streak >= 3:
+                                self._grad_cos_disabled_by_failures = True
+                                print_acc(
+                                    f"  gradient cosine: disabled for this run after "
+                                    f"{self._grad_cos_fail_streak} capture failures "
+                                    f"(last: {_gc_err})"
+                                )
+                            else:
+                                print_acc(
+                                    f"  gradient cosine: autograd.grad capture failed: {_gc_err}"
+                                )
                             _dc_grads_snapshot = None
                             _full_grads_snapshot = None
                             _trainable_params_snapshot = None
@@ -5556,20 +5612,28 @@ class SDTrainer(BaseSDTrainProcess):
     def _grad_cosine_should_fire(self) -> bool:
         """Firing gate for the gradient-cosine diagnostic.
 
-        Fires only on matching steps where the depth loss contributed a real
+        Eligible only on microbatches where the depth loss contributed a real
         graph AND the returned loss was not max_loss-clamped (a saturated
         scalar clamp zeroes the optimizer gradient while the depth tensor
         still differentiates, which would fabricate a cosine of -1).
+
+        Cadence counts DEPTH-CONTRIBUTING microbatches, not raw step parity:
+        under diffusion_depth alternation depth only lands on odd steps, so
+        an even `every` on raw step parity would never fire at all (the same
+        even-cadence collision the depth-preview cadence fix removed).
+        Side effect: each eligible call advances `_grad_cos_depth_count`.
         """
         _grad_cos_every = int(getattr(
             self.train_config, 'gradient_cosine_log_every', 0,
         ) or 0)
-        return (
-            _grad_cos_every > 0
-            and self._dc_applied_for_grad is not None
-            and not self._last_loss_clamped
-            and (self.step_num % _grad_cos_every == 0)
-        )
+        if _grad_cos_every <= 0:
+            return False
+        if getattr(self, '_grad_cos_disabled_by_failures', False):
+            return False
+        if self._dc_applied_for_grad is None or self._last_loss_clamped:
+            return False
+        self._grad_cos_depth_count += 1
+        return self._grad_cos_depth_count % _grad_cos_every == 0
 
     def _record_grad_cosine(self, full_grads, dc_grads) -> None:
         """Compute per-loss gradient norms + cosine and stash on `_last_*`.

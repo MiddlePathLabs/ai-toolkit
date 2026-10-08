@@ -523,11 +523,12 @@ class TrainConfig:
         self.weight_noise = WeightNoiseConfig(**(kwargs.get('weight_noise', {}) or {}))
         self.gradient_noise = GradientNoiseConfig(**(kwargs.get('gradient_noise', {}) or {}))
         # Gradient-cosine diagnostic cadence (perceptual-fork parity). Every N
-        # optimizer steps where the depth loss contributes, compute the
-        # depth-only gradient via autograd.grad and log grad/norm/depth,
-        # grad/norm/diffusion, grad/cos/diff_depth. 0 disables (default).
-        # Costs one extra backward pass through the retained graph on firing
-        # steps only.
+        # depth-contributing microbatches, compute the depth-only gradient via
+        # autograd.grad and log grad/norm/depth, grad/norm/diffusion,
+        # grad/cos/diff_depth. 0 disables (default). Costs two extra passes
+        # through the retained graph per firing step; on compiled runs it
+        # automatically disables inductor donated buffers (retain_graph
+        # compatibility, slightly higher memory).
         self.gradient_cosine_log_every: int = int(kwargs.get('gradient_cosine_log_every', 0))
         self.lr_scheduler = kwargs.get('lr_scheduler', 'constant')
         self.lr_scheduler_params = kwargs.get('lr_scheduler_params', {})

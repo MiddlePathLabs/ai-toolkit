@@ -46,6 +46,9 @@ def _bind(tr):
     tr._last_grad_norm_depth = None
     tr._last_grad_cos_diff_depth = None
     tr._grad_cos_acc = None
+    tr._grad_cos_depth_count = 0
+    tr._grad_cos_fail_streak = 0
+    tr._grad_cos_disabled_by_failures = False
     tr._dc_applied_for_grad = None
     tr._last_loss_clamped = False
     tr._iter_trainable_params = SDTrainer._iter_trainable_params.__get__(tr)
@@ -190,33 +193,86 @@ def test_record_grad_cosine_zero_depth_grad_reports_zero_cos():
 
 
 def test_grad_cosine_should_fire_gate():
-    # fires on matching parity with a stashed depth graph and no clamp
+    # Cadence counts DEPTH-CONTRIBUTING microbatches, not raw step parity:
+    # under diffusion_depth alternation depth lands only on odd steps, so an
+    # even `every` on raw parity never fires (regression: the first DOP-style
+    # run with every=10 produced zero grad/* keys).
     tr = _bind(_FakeTrainer())
-    tr.train_config = _FakeTrainConfig(50)
+    tr.train_config = _FakeTrainConfig(2)
     tr._dc_applied_for_grad = torch.tensor(1.0)
-    tr.step_num = 100
-    assert tr._grad_cosine_should_fire() is True
 
-    # off-parity step
-    tr.step_num = 101
-    assert tr._grad_cosine_should_fire() is False
+    assert tr._grad_cosine_should_fire() is False   # depth count 1
+    assert tr._grad_cosine_should_fire() is True    # depth count 2
+    assert tr._grad_cosine_should_fire() is False   # depth count 3
+    assert tr._grad_cosine_should_fire() is True    # depth count 4
 
-    # depth did not contribute this microbatch
-    tr.step_num = 100
-    tr._dc_applied_for_grad = None
-    assert tr._grad_cosine_should_fire() is False
+    # an even `every` works identically to an odd one (parity-immune)
+    tr2 = _bind(_FakeTrainer())
+    tr2.train_config = _FakeTrainConfig(10)
+    tr2._dc_applied_for_grad = torch.tensor(1.0)
+    fires = [tr2._grad_cosine_should_fire() for _ in range(20)]
+    assert fires.count(True) == 2 and fires[9] is True and fires[19] is True
 
-    # max_loss-saturated microbatch: clamp zeroes the optimizer gradient,
-    # so the diagnostic must not fire (review 🟡)
-    tr._dc_applied_for_grad = torch.tensor(1.0)
-    tr._last_loss_clamped = True
-    assert tr._grad_cosine_should_fire() is False
-    tr._last_loss_clamped = False
-    assert tr._grad_cosine_should_fire() is True
+    # depth did not contribute this microbatch: no fire, cadence not consumed
+    tr2._dc_applied_for_grad = None
+    assert tr2._grad_cosine_should_fire() is False
+    assert tr2._grad_cos_depth_count == 20
+
+    # max_loss-saturated microbatch: no fire, cadence not consumed
+    tr2._dc_applied_for_grad = torch.tensor(1.0)
+    tr2._last_loss_clamped = True
+    assert tr2._grad_cosine_should_fire() is False
+    assert tr2._grad_cos_depth_count == 20
+    tr2._last_loss_clamped = False
 
     # disabled
-    tr.train_config = _FakeTrainConfig(0)
+    tr2.train_config = _FakeTrainConfig(0)
+    assert tr2._grad_cosine_should_fire() is False
+
+
+def test_grad_cosine_should_fire_disabled_by_failures():
+    tr = _bind(_FakeTrainer())
+    tr.train_config = _FakeTrainConfig(2)
+    tr._dc_applied_for_grad = torch.tensor(1.0)
+    assert tr._grad_cosine_should_fire() is False  # count 1
+
+    # persistent capture failures tripped the auto-disable: gate stays shut
+    tr._grad_cos_disabled_by_failures = True
     assert tr._grad_cosine_should_fire() is False
+    assert tr._grad_cos_depth_count == 1  # eligible calls stop advancing too
+
+
+def test_disable_donated_buffers_helper():
+    import torch._functorch.config as functorch_config
+
+    prev = functorch_config.donated_buffer
+    try:
+        functorch_config.donated_buffer = True
+
+        # diagnostic off: flag untouched
+        assert SDTrainer._disable_donated_buffers_if_grad_cosine(
+            {'train': {'gradient_cosine_log_every': 0}}
+        ) is False
+        assert functorch_config.donated_buffer is True
+
+        # diagnostic on: flag flipped
+        assert SDTrainer._disable_donated_buffers_if_grad_cosine(
+            {'train': {'gradient_cosine_log_every': 10}}
+        ) is True
+        assert functorch_config.donated_buffer is False
+
+        # already off: no-op, returns False
+        assert SDTrainer._disable_donated_buffers_if_grad_cosine(
+            {'train': {'gradient_cosine_log_every': 10}}
+        ) is False
+
+        # malformed config: never raises
+        assert SDTrainer._disable_donated_buffers_if_grad_cosine(
+            {'train': None}
+        ) is False
+        assert SDTrainer._disable_donated_buffers_if_grad_cosine({}) is False
+    finally:
+        functorch_config.donated_buffer = prev
 
 
 def test_log_grad_cosine_accumulates_across_microbatches():
