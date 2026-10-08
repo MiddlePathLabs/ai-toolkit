@@ -90,11 +90,21 @@ test('Python resolver honors override, embedded, virtualenv, and system preceden
 });
 
 test('UI admission runs canonical Python against shared accepted and rejected fixtures', async () => {
-  const acceptedFixtures = ['accepted_h3_character.yaml', 'accepted_krea_lora.yaml'];
-  for (const fixture of acceptedFixtures) {
+  // Accepted fixtures may carry non-blocking warnings; pin the exact set (same
+  // expectation as testing/test_admission.py). The H3 recipe uses automagic3,
+  // whose fused backward never applies the default max_grad_norm.
+  const acceptedFixtures: [string, string[]][] = [
+    ['accepted_h3_character.yaml', ['admission.fused_backward_clip_noop']],
+    ['accepted_krea_lora.yaml', []],
+  ];
+  for (const [fixture, expectedWarnings] of acceptedFixtures) {
     const result = await runAdmission(readFixture(path.join(sharedAdmissionFixtures, fixture)), 'ui-fixture');
     assert.equal(result.valid, true, fixture);
-    assert.deepEqual(result.diagnostics, [], fixture);
+    assert.deepEqual(
+      result.diagnostics.map(diagnostic => [diagnostic.rule_id, diagnostic.severity]),
+      expectedWarnings.map(ruleId => [ruleId, 'warning']),
+      fixture,
+    );
   }
 
   const rejected = await runAdmission(

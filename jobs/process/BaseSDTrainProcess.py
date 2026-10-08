@@ -91,6 +91,7 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
     DecoratorConfig
 from toolkit.admission import raise_for_process_admission
+from toolkit.perceptual_config_compat import normalize_perceptual_config
 from toolkit import force_hf_hub_progress_bars
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
@@ -120,6 +121,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # progress policy only for the actual training runtime.
         force_hf_hub_progress_bars()
         super().__init__(process_id, job, config)
+        # Perceptual-fork configs keep every anchor under face_id; translate
+        # before any section is parsed so those losses are not silently dropped.
+        _compat = normalize_perceptual_config(self.config)
+        for _msg in _compat.messages():
+            print(f"[perceptual config] {_msg}")
+        if _compat.conflicts:
+            raise ValueError("; ".join(
+                f"face_id.{k}={legacy!r} conflicts with {dst}={existing!r}"
+                for k, dst, legacy, existing in _compat.conflicts
+            ))
+        self.config = _compat.process
         self.accelerator: Accelerator = get_accelerator()
         if self.accelerator.is_local_main_process:
             transformers.utils.logging.set_verbosity_warning()

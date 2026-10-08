@@ -1817,6 +1817,55 @@ class SDTrainer(BaseSDTrainProcess):
 
         _cache_loader(self.data_loader)
         _cache_loader(self.data_loader_reg)
+        self._build_identity_reference_tables()
+
+    def _build_identity_reference_tables(self):
+        """Per-dataset average / pool embeddings for the identity reference modes.
+
+        The perceptual fork rewrote each file item's embedding in place; here
+        embeddings load lazily in dataloader workers, so the tables live on the
+        trainer and the reference is chosen at loss time instead.
+        """
+        from toolkit.face_id_loss import (
+            build_identity_reference_tables, identity_dataset_key, identity_reference_modes_active,
+        )
+        cfg = self.face_id_config
+        self._identity_avg_embeds, self._identity_embed_pools = {}, {}
+        if cfg is None or not identity_reference_modes_active(cfg):
+            return
+        embeds_by_key = {}
+        for loader in (self.data_loader, self.data_loader_reg):
+            if loader is None:
+                continue
+            for dataset in get_dataloader_datasets(loader):
+                if not face_identity_active_for_dataset(cfg, dataset.dataset_config):
+                    continue
+                key = identity_dataset_key(dataset.dataset_config)
+                bucket = embeds_by_key.setdefault(key, [])
+                for fi in dataset.file_list:
+                    emb = fi.identity_embedding
+                    if emb is None and getattr(fi, 'is_face_identity_cached', False):
+                        emb = fi._read_face_key(fi._face_cache_path, fi._face_cache_key)
+                    if emb is not None:
+                        bucket.append(emb)
+        self._identity_avg_embeds, self._identity_embed_pools = build_identity_reference_tables(
+            embeds_by_key, use_average=bool(cfg.identity_loss_use_average),
+        )
+        mode = (
+            'dataset average' if cfg.identity_loss_use_average
+            else f'average blend {cfg.identity_loss_average_blend}' if cfg.identity_loss_average_blend > 0
+            else 'per-image'
+        )
+        extras = []
+        if cfg.identity_loss_use_random:
+            extras.append('random ref')
+        if cfg.identity_loss_num_refs > 0:
+            extras.append(f'best of {cfg.identity_loss_num_refs} refs')
+        for key, pool in self._identity_embed_pools.items():
+            print_acc(
+                f"  [identity] {key}: {mode}{' + ' + ', '.join(extras) if extras else ''} "
+                f"({pool.shape[0]} pool embeddings)"
+            )
 
     def _compute_face_identity_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
         """Run the unified live decode + ArcFace forward + bias-corrected cosine loss.
@@ -1826,7 +1875,9 @@ class SDTrainer(BaseSDTrainProcess):
         a detected face. The SCRFD quality gate skips generated blobs that ArcFace
         would otherwise score spuriously. Returns the weighted-mean contribution.
         """
-        from toolkit.face_id_loss import compute_identity_loss, bias_corrected_cosine
+        from toolkit.face_id_loss import (
+            identity_dataset_key, identity_reference_cosine, map_face_bbox_to_training_frame, UNKNOWN_FRAME,
+        )
 
         cfg = self.face_id_config
         ref_emb = getattr(batch, 'identity_embedding', None)
@@ -1854,6 +1905,9 @@ class SDTrainer(BaseSDTrainProcess):
         B = noise_pred.shape[0]
         weights = []
         valid = torch.zeros(B, dtype=torch.bool, device=self.device_torch)
+        # Face bbox as fractions of the training frame (after flip/scale/crop);
+        # None -> full decoded frame.
+        frame_bboxes = [None] * B
         for i in range(B):
             w = per_ds_w[i] if (has_per_ds and per_ds_w[i] is not None) else global_w
             weights.append(float(w or 0.0))
@@ -1866,6 +1920,21 @@ class SDTrainer(BaseSDTrainProcess):
             tr = float(t_ratio[i].item())
             if not (lo <= tr <= hi):
                 continue
+            nb = face_bboxes[i] if (face_bboxes is not None and i < len(face_bboxes)) else None
+            if nb is not None and nb.abs().sum().item() > 0:
+                mapped = map_face_bbox_to_training_frame(nb, batch.file_items[i])
+                if mapped is None:
+                    # The bucket crop removed the face: nothing to anchor.
+                    continue
+                if mapped == UNKNOWN_FRAME:
+                    if not getattr(self, '_warned_identity_random_crop', False):
+                        print_acc(
+                            "  [identity] non-bucket random_crop: face position unknown, "
+                            "using the full frame for ArcFace. Use buckets for identity loss."
+                        )
+                        self._warned_identity_random_crop = True
+                else:
+                    frame_bboxes[i] = mapped
             valid[i] = True
 
         if not valid.any():
@@ -1894,22 +1963,12 @@ class SDTrainer(BaseSDTrainProcess):
         )
         pixels = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
 
-        # Scale cached normalized bboxes to x0_pixels coords; None where no face.
+        # Training-frame fractions -> x0_pixels coords; None -> full frame.
         _, _, px_h, px_w = pixels.shape
-        scaled_bboxes = []
-        for i in range(B):
-            if valid[i] and face_bboxes is not None and i < len(face_bboxes) and face_bboxes[i] is not None:
-                nb = face_bboxes[i]
-                # zero bbox (all zeros) means no face
-                if nb.abs().sum().item() > 0:
-                    scaled_bboxes.append([
-                        float(nb[0]) * px_w, float(nb[1]) * px_h,
-                        float(nb[2]) * px_w, float(nb[3]) * px_h,
-                    ])
-                else:
-                    scaled_bboxes.append(None)
-            else:
-                scaled_bboxes.append(None)
+        scaled_bboxes = [
+            None if fb is None else [fb[0] * px_w, fb[1] * px_h, fb[2] * px_w, fb[3] * px_h]
+            for fb in frame_bboxes
+        ]
 
         idx_map = [i for i in range(B) if valid[i]]
         gen_emb, arcface_crops = encoder(pixels[idx_map], bboxes=[scaled_bboxes[i] for i in idx_map], return_crops=True)
@@ -1927,7 +1986,14 @@ class SDTrainer(BaseSDTrainProcess):
                     if len(faces) == 0:
                         face_detected[ci] = False
 
-        cos_sim = bias_corrected_cosine(gen_emb, ref_subset, mean_emb)
+        # Reference mode (per-image / average / blend / random / multi-ref).
+        ref_keys = [identity_dataset_key(batch.file_items[i].dataset_config) for i in idx_map]
+        cos_sim, clean_cos = identity_reference_cosine(
+            gen_emb, ref_subset, ref_keys, cfg,
+            getattr(self, '_identity_avg_embeds', None) or {},
+            getattr(self, '_identity_embed_pools', None) or {},
+            mean_emb,
+        )
 
         # Build the per-index mask in idx_map order.
         ref_valid = ref_subset.abs().sum(dim=-1) > 0
@@ -1939,7 +2005,13 @@ class SDTrainer(BaseSDTrainProcess):
         loss_mask = ref_valid & (cos_sim.detach() > cos_threshold) & face_detected
         id_weight = t_ratio[idx_map]
 
-        per_sample_loss = (1.0 - cos_sim) * id_weight * loss_mask.float()
+        if clean_cos is not None:
+            # Average mode: normalized shortfall vs this image's own clean
+            # similarity to the dataset average (0 at target, 1 at cos = 0).
+            shortfall = torch.clamp(1.0 - cos_sim / clean_cos.to(cos_sim.device), min=0.0)
+        else:
+            shortfall = 1.0 - cos_sim
+        per_sample_loss = shortfall * id_weight * loss_mask.float()
         w_tensor = torch.tensor(
             [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
         )
@@ -2158,7 +2230,13 @@ class SDTrainer(BaseSDTrainProcess):
 
         idx_map = [i for i in range(B) if valid[i]]
         ref_subset = ref_bs[idx_map].to(pixels.device, dtype=torch.float32)
-        gen_betas = encoder(pixels[idx_map])  # (V, 10)
+        # Full-frame bbox so the live crop matches the cached GT, which is
+        # encoded from the whole image (encode(None) -> full frame, squared
+        # by resize). forward(None) would center-square crop instead and cut
+        # a portrait's head/feet that the GT betas were measured with.
+        _, _, px_h, px_w = pixels.shape
+        full_frame = [[0.0, 0.0, float(px_w), float(px_h)]] * len(idx_map)
+        gen_betas = encoder(pixels[idx_map], person_bboxes=full_frame)  # (V, 10)
         l1, cos = compute_body_shape_loss(gen_betas, ref_subset)
 
         cos_threshold = torch.tensor(
@@ -5576,7 +5654,10 @@ class SDTrainer(BaseSDTrainProcess):
                         for parameter in group.get("params", ()):
                             if parameter.grad is not None:
                                 parameter.grad.div_(total_samples)
-                if self.train_config.optimizer != 'adafactor':
+                # max_grad_norm <= 0 disables clipping; clip_grad_norm_ with a
+                # zero max_norm would scale every gradient to zero instead.
+                clip_enabled = float(self.train_config.max_grad_norm or 0.0) > 0.0
+                if self.train_config.optimizer != 'adafactor' and clip_enabled:
                     if isinstance(self.params[0], dict):
                         # Accelerate's clip helper unscales internally. Use
                         # one explicit unscale with the native torch clip for

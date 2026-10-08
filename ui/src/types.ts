@@ -249,6 +249,10 @@ export interface FaceIDConfig {
   identity_loss_min_cos: number;
   face_model: string;
   identity_loss_decoded_det_threshold: number;
+  identity_loss_use_average?: boolean;
+  identity_loss_average_blend?: number;
+  identity_loss_use_random?: boolean;
+  identity_loss_num_refs?: number;
 }
 
 export interface SubjectMaskConfig {

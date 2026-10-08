@@ -1217,6 +1217,9 @@ class DepthConsistencyConfig:
         self.mask_source: str = kwargs.get('mask_source', 'none')
         self.grad_checkpoint: bool = bool(kwargs.get('grad_checkpoint', True))
         self.preview_every: int = int(kwargs.get('preview_every', 100))
+        # Diagnostic mode: previews only, no depth loss for ANY sample (even
+        # weighted ones). The perceptual fork's preview_only instead added
+        # zero-weight previews alongside normal training; admission warns.
         self.preview_only: bool = bool(kwargs.get('preview_only', False))
         self.preview_max_keep: int = int(kwargs.get('preview_max_keep', 500))
 
@@ -1316,6 +1319,18 @@ class FaceIDConfig:
     install documented in requirements_perceptual.txt (insightface + onnx2torch +
     onnxruntime-gpu with the CPU-shadowing fix). Does NOT participate in
     diffusion/depth ``loss_split``.
+
+    Reference modes (ported from the perceptual fork, per dataset):
+      * per-image (default): each sample matches its own cached embedding.
+      * ``identity_loss_use_average``: match the dataset-average embedding; the
+        loss is the shortfall relative to each image's own clean similarity to
+        that average, ``max(0, 1 - cos / clean_cos)``. The fork's default.
+      * ``identity_loss_average_blend``: per-image ref linearly blended toward
+        the dataset average, then renormalized; ignored with use_average.
+      * ``identity_loss_use_random``: replace the ref with a random embedding
+        from the same dataset.
+      * ``identity_loss_num_refs``: best cosine over the ref plus N-1 random
+        dataset embeddings.
     """
 
     def __init__(self, **kwargs):
@@ -1331,7 +1346,19 @@ class FaceIDConfig:
         self.identity_loss_decoded_det_threshold: float = float(
             kwargs.get('identity_loss_decoded_det_threshold', 0.5)
         )
+        # Default stays per-image so existing recipes reproduce; the perceptual
+        # fork defaulted to True (admission warns when this is left implicit).
+        self.identity_loss_use_average: bool = bool(kwargs.get('identity_loss_use_average', False))
+        self.identity_loss_average_blend: float = float(kwargs.get('identity_loss_average_blend', 0.0))
+        self.identity_loss_use_random: bool = bool(kwargs.get('identity_loss_use_random', False))
+        self.identity_loss_num_refs: int = int(kwargs.get('identity_loss_num_refs', 0))
 
+        if not 0.0 <= self.identity_loss_average_blend <= 1.0:
+            raise ValueError(
+                f"identity_loss_average_blend must be in [0, 1], got {self.identity_loss_average_blend}"
+            )
+        if self.identity_loss_num_refs < 0:
+            raise ValueError(f"identity_loss_num_refs must be >= 0, got {self.identity_loss_num_refs}")
         if self.identity_loss_min_t < 0.0:
             raise ValueError(f"identity_loss_min_t must be >= 0, got {self.identity_loss_min_t}")
         if self.identity_loss_max_t > 1.0:

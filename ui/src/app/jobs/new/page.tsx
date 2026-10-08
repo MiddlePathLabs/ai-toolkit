@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
+import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig, pruneUntouchedLossBlocks } from './jobConfig';
 import { resetProcessNameTags } from '@/helpers/nameTag';
 import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
@@ -53,7 +53,18 @@ export default function TrainingForm() {
   const [rawYamlValid, setRawYamlValid] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const candidateRawYaml = showAdvancedView ? rawYaml : undefined;
-  const candidateKey = useMemo(() => getAdmissionCandidateKey(jobConfig, candidateRawYaml), [jobConfig, candidateRawYaml]);
+  // Form saves strip loss/noising blocks still at their untouched disabled
+  // defaults (the trainer treats a missing block as off; migrateJobConfig
+  // re-merges them on load). The pruned form is what admission validates and
+  // what is saved, so the two never diverge. Raw YAML edits are kept verbatim.
+  const candidateConfig = useMemo(
+    () => (candidateRawYaml === undefined ? pruneUntouchedLossBlocks(jobConfig) : jobConfig),
+    [jobConfig, candidateRawYaml],
+  );
+  const candidateKey = useMemo(
+    () => getAdmissionCandidateKey(candidateConfig, candidateRawYaml),
+    [candidateConfig, candidateRawYaml],
+  );
   const candidateKeyRef = useRef(candidateKey);
   candidateKeyRef.current = candidateKey;
   const validatorRef = useRef<AdmissionValidator | null>(null);
@@ -166,7 +177,7 @@ export default function TrainingForm() {
   useEffect(() => {
     if (!rawYamlValid || status === 'validating' || status === 'saving') return;
     const handle = setTimeout(() => {
-      void validateCandidate(jobConfig, candidateRawYaml);
+      void validateCandidate(candidateConfig, candidateRawYaml);
     }, 500);
     return () => clearTimeout(handle);
   }, [candidateKey, rawYamlValid, status]);
@@ -191,7 +202,7 @@ export default function TrainingForm() {
       setStatus('error');
       return;
     }
-    const candidate = jobConfig;
+    const candidate = candidateConfig;
     const raw = candidateRawYaml;
     const key = candidateKey;
     setStatus('validating');

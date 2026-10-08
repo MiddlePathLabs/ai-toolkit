@@ -2054,6 +2054,53 @@ export default function SimpleJob({
                             min={-1}
                             max={1}
                           />
+                          <SelectInput
+                            label="Reference"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_use_average'}
+                            value={faceIdConfig?.identity_loss_use_average ? 'average' : 'per_image'}
+                            onChange={value =>
+                              setJobConfig(value === 'average', 'config.process[0].face_id.identity_loss_use_average')
+                            }
+                            options={[
+                              { value: 'per_image', label: 'Per image' },
+                              { value: 'average', label: 'Dataset average' },
+                            ]}
+                          />
+                          {!faceIdConfig?.identity_loss_use_average && (
+                            <NumberInput
+                              label="Average Blend"
+                              className="pt-2"
+                              docKey={'face_id.identity_loss_average_blend'}
+                              value={faceIdConfig?.identity_loss_average_blend ?? 0}
+                              onChange={value =>
+                                setJobConfig(value, 'config.process[0].face_id.identity_loss_average_blend')
+                              }
+                              placeholder="eg. 0.3"
+                              min={0}
+                              max={1}
+                            />
+                          )}
+                          <Checkbox
+                            label="Random Reference"
+                            docKey={'face_id.identity_loss_use_random'}
+                            className="pt-2"
+                            checked={faceIdConfig?.identity_loss_use_random ?? false}
+                            onChange={checked =>
+                              setJobConfig(checked, 'config.process[0].face_id.identity_loss_use_random')
+                            }
+                          />
+                          <NumberInput
+                            label="Best-of References"
+                            className="pt-2"
+                            docKey={'face_id.identity_loss_num_refs'}
+                            value={faceIdConfig?.identity_loss_num_refs ?? 0}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].face_id.identity_loss_num_refs')
+                            }
+                            placeholder="eg. 0"
+                            min={0}
+                          />
                           <div className="text-xs text-gray-400 pt-2">
                             Uses a frozen ArcFace (w600k_r50, InsightFace buffalo_l) to match the identity
                             of the decoded face against the cached GT embedding via bias-corrected cosine

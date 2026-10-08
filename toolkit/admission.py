@@ -29,6 +29,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
+from toolkit.perceptual_config_compat import (
+    DEPTH_PREVIEW_ONLY_MESSAGE,
+    IDENTITY_MODE_MESSAGE,
+    normalize_perceptual_config,
+)
+
 
 # Stable IDs consumed by the future UI/API adapter.
 RULE_LEGACY_ACCUMULATION = "admission.legacy_accumulation"
@@ -58,6 +64,12 @@ RULE_TEXT_CACHE_MIX = "admission.mixed_text_cache"
 RULE_LATENT_CACHE_AUGMENT = "admission.latent_cache_augmentation"
 RULE_VAE_ANCHOR = "admission.vae_anchor_backend"
 RULE_PREVIEW_LORA = "admission.preview_lora"
+RULE_LEGACY_FACE_ID = "admission.legacy_face_id_keys"
+RULE_LEGACY_FACE_ID_CONFLICT = "admission.legacy_face_id_conflict"
+RULE_UNSUPPORTED_PERCEPTUAL_KEYS = "admission.unsupported_perceptual_keys"
+RULE_DEPTH_FORK_DEFAULTS = "admission.depth_fork_defaults"
+RULE_DEPTH_PREVIEW_ONLY_WEIGHT = "admission.depth_preview_only_weight"
+RULE_IDENTITY_MODE_IMPLICIT = "admission.identity_mode_implicit"
 RULE_TEMPORARY_SAFETY = "admission.temporary_safety_block"
 RULE_TURBO_WARNING = "admission.krea_turbo_warning"
 RULE_UNCERTIFIED_RUNTIME = "admission.runtime_deferred"
@@ -354,8 +366,70 @@ def _auxiliary_fields(
     return process_fields, dataset_fields
 
 
+def _validate_perceptual_compat(process: Mapping[str, Any], p: str, collector: _Collector) -> Mapping[str, Any]:
+    """Flag perceptual-fork config layout; return the translated process."""
+    report = normalize_perceptual_config(process)
+    if report.moved:
+        collector.add(
+            RULE_LEGACY_FACE_ID,
+            [f"{p}.face_id.{key}" for key, _, _ in report.moved],
+            "Perceptual-fork face_id keys are translated to their own sections: "
+            + ", ".join(f"face_id.{key} -> {dst}" for key, dst, _ in report.moved) + ".",
+            "Move these keys into the named sections to silence this warning.",
+            severity="warning",
+        )
+    for key, dst, legacy, existing in report.conflicts:
+        collector.add(
+            RULE_LEGACY_FACE_ID_CONFLICT,
+            [f"{p}.face_id.{key}", f"{p}.{dst}"],
+            f"face_id.{key}={legacy!r} conflicts with {dst}={existing!r}.",
+            f"Remove face_id.{key} and keep {dst}.",
+        )
+    if report.ignored_face_id or report.ignored_dataset or report.ignored_sections:
+        fields = (
+            [f"{p}.face_id.{key}" for key in sorted(report.ignored_face_id)]
+            + [f"{p}.datasets[{i}].{key}" for i, key in report.ignored_dataset]
+            + [f"{p}.{name}" for name in sorted(report.ignored_sections)]
+        )
+        collector.add(
+            RULE_UNSUPPORTED_PERCEPTUAL_KEYS,
+            fields,
+            "These perceptual-fork settings are not supported by this fork and will be ignored.",
+            "Remove them, or expect training to run without those features.",
+            severity="warning",
+        )
+    if report.depth_default_keys:
+        collector.add(
+            RULE_DEPTH_FORK_DEFAULTS,
+            [f"{p}.depth_consistency"],
+            "depth_consistency omits " + ", ".join(report.depth_default_keys)
+            + "; this fork defaults to loss_weight 0.0 and mask_source 'none' "
+            "(the perceptual fork defaulted to 0.1 and 'subject').",
+            "Set depth_consistency.loss_weight and mask_source explicitly.",
+            severity="warning",
+        )
+    if report.depth_preview_only_blocks_weight:
+        collector.add(
+            RULE_DEPTH_PREVIEW_ONLY_WEIGHT,
+            [f"{p}.depth_consistency.preview_only", f"{p}.depth_consistency.loss_weight"],
+            DEPTH_PREVIEW_ONLY_MESSAGE,
+            "Set depth_consistency.preview_only: false to train depth, or the depth weight to 0 for a preview-only run.",
+            severity="warning",
+        )
+    if report.identity_mode_implicit:
+        collector.add(
+            RULE_IDENTITY_MODE_IMPLICIT,
+            [f"{p}.face_id.identity_loss_use_average"],
+            IDENTITY_MODE_MESSAGE,
+            "Set face_id.identity_loss_use_average: false (per-image) or true (dataset average).",
+            severity="warning",
+        )
+    return report.process
+
+
 def _validate_process(process: Mapping[str, Any], process_index: int, collector: _Collector) -> dict[str, Any]:
     p = f"config.process[{process_index}]"
+    process = _validate_perceptual_compat(process, p, collector)
     train = _mapping(process.get("train"))
     model = _mapping(process.get("model"))
     network_raw = process.get("network")
@@ -557,7 +631,7 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             RULE_FUSED_CLIP_NOOP,
             [f"{p}.train.max_grad_norm", f"{p}.train.optimizer"],
             "The selected fused-backward optimizer applies its update inside backward, where train.max_grad_norm clipping never runs (including its default value of 1.0).",
-            "Remove max_grad_norm (or set 0); rely on the optimizer's internal trust-region clipping.",
+            "Set train.max_grad_norm: 0 (clipping off) to acknowledge; removing the key keeps the 1.0 default. The optimizer's internal trust-region clipping applies either way.",
             severity="warning",
         )
 

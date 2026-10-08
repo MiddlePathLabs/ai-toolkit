@@ -586,6 +586,12 @@ const docs: { [key: string]: ConfigDoc } = {
         Loads the perceptor and writes previews, but never adds the anchor loss or suppresses diffusion. Useful for
         inspection. Preview evaluation runs without autograd and only at the configured Preview Every cadence within
         the timestep window.
+        <br />
+        <br />
+        This disables depth training for every sample, even when Loss Weight or a dataset depth weight is above 0.
+        This differs from the perceptual fork, where preview_only only added previews for zero-weight samples and
+        weighted samples still trained. The config checker warns when Preview Only is combined with a positive
+        depth weight.
       </>
     ),
   },
@@ -774,6 +780,49 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         Floor (bias-corrected cosine) below which the loss does not push. Prevents pushing on generated
         regions that score weakly against the reference identity (hallucinated or low-quality faces).
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_average': {
+    title: 'Identity Reference',
+    description: (
+      <>
+        <b>Per image</b> (default): each sample is matched against its own cached face embedding.
+        <br />
+        <br />
+        <b>Dataset average</b>: each sample is matched against the average face embedding of its dataset, and the
+        loss is the shortfall relative to that image&apos;s own similarity to the average (a profile shot that
+        only scores 0.7 against the average is not pushed past 0.7). More robust on varied training sets. This
+        was the default in the perceptual fork; here it must be selected explicitly, and the config checker warns
+        when identity loss is on but the reference mode is not set.
+      </>
+    ),
+  },
+  'face_id.identity_loss_average_blend': {
+    title: 'Average Blend',
+    description: (
+      <>
+        Per-image mode only. Blends each image&apos;s embedding toward the dataset average (0 = pure per-image, 1 =
+        pure average direction) before matching, without the clean-target normalization of Dataset average mode.
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_random': {
+    title: 'Random Reference',
+    description: (
+      <>
+        Replace each sample&apos;s reference with a random face embedding from the same dataset every step. Has no
+        effect in Dataset average mode (every pool entry is the average).
+      </>
+    ),
+  },
+  'face_id.identity_loss_num_refs': {
+    title: 'Best-of References',
+    description: (
+      <>
+        When above 0, compares against the reference plus N-1 random embeddings from the same dataset and keeps
+        the best match, so the generation only has to resemble one of the dataset&apos;s faces. 0 disables. No
+        effect in Dataset average mode.
       </>
     ),
   },
