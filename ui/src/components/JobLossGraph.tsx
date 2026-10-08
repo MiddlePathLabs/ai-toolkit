@@ -138,6 +138,14 @@ function dulledColor(rgba: string): string {
   return `rgba(${r},${g},${b},1)`;
 }
 
+// Keys plotted by default. Subsystem-canonical keys (the perceptual-fork
+// `depth/*` family) only exist when that loss actually ran, so enabling them
+// by default costs nothing on jobs that never used them. Add future
+// subsystems here as they land.
+function isDefaultEnabled(key: string): boolean {
+  return key === 'loss/loss' || key === 'val/loss' || key.startsWith('depth/');
+}
+
 export default function JobLossGraph({ job }: Props) {
   const { series, lossKeys, status, refreshLoss, deleteRange } = useJobLossLog(job.id, 2000);
 
@@ -213,9 +221,7 @@ export default function JobLossGraph({ job }: Props) {
     }
   }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled]);
 
-  // keep enabled map in sync with discovered keys. "loss/loss" and "val/loss"
-  // are on by default; every other metric starts deactivated (user can toggle
-  // it on).
+// keep enabled map in sync with discovered keys.
   useEffect(() => {
     // Nothing discovered yet — don't prune, or we'd wipe a restored selection
     // before the keys have loaded.
@@ -224,7 +230,7 @@ export default function JobLossGraph({ job }: Props) {
       const next = { ...prev };
       for (const k of lossKeys) {
         if (next[k] === undefined)
-          next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
+          next[k] = persistedEnabledRef.current?.[k] ?? isDefaultEnabled(k);
       }
       for (const k of Object.keys(next)) {
         if (!lossKeys.includes(k)) delete next[k];

@@ -11,6 +11,7 @@ from toolkit.admission import (
     RULE_DOPSD_BATCH,
     RULE_DOPSD_VARIANT,
     RULE_FUSED_BACKWARD,
+    RULE_FUSED_CLIP_NOOP,
     RULE_H3_AUDIO,
     RULE_H3_FAST_CONDITIONING,
     RULE_H3_FRAME_GEOMETRY,
@@ -60,7 +61,10 @@ def test_scrubbed_accepted_h3_recipe_is_admitted_without_runtime_claims():
     raw = yaml.safe_load(FIXTURE.read_text(encoding="utf-8"))
     result = collect_admission_diagnostics(raw, source="fixture")
     assert result["valid"]
-    assert not result["diagnostics"]
+    # no error diagnostics; the fused automagic3 recipe does carry the (truthful)
+    # clip-noop warning -- grad-norm clipping never runs under fused backward
+    assert not [d for d in result["diagnostics"] if d["severity"] == "error"]
+    assert {d["rule_id"] for d in result["diagnostics"]} == {RULE_FUSED_CLIP_NOOP}
     assert result["resolved"][0]["variant"] == "minimax_h3_ref2va"
     assert any(item["rule_id"] == "admission.h3_audio_duration_runtime" for item in result["deferred"])
     assert any(item["rule_id"] == "admission.runtime_deferred" for item in result["deferred"])
@@ -110,6 +114,28 @@ def test_diagnostics_are_side_effect_free_and_cover_every_process():
     assert fused and any("config.process[1].train.gradient_accumulation" in fused[0]["fields"] for _ in [0])
     assert result["resolved"][0]["process_index"] == 0
     assert result["resolved"][1]["process_index"] == 1
+
+
+def test_fused_backward_clip_noop_warns_even_on_implicit_default():
+    # the runtime default (max_grad_norm=1.0) also never clips under fused
+    # backward, and the UI never writes the key -- key presence alone would
+    # miss every UI job
+    raw = {"config": {"process": [_process(train={"optimizer": "automagic2"})]}}
+    assert RULE_FUSED_CLIP_NOOP in _ids(collect_admission_diagnostics(raw))
+
+    raw = {"config": {"process": [_process(train={"optimizer": "automagic2", "max_grad_norm": 1.0})]}}
+    result = collect_admission_diagnostics(raw)
+    assert RULE_FUSED_CLIP_NOOP in _ids(result)
+    warn = [d for d in result["diagnostics"] if d["rule_id"] == RULE_FUSED_CLIP_NOOP][0]
+    assert warn["severity"] == "warning"
+
+
+def test_fused_backward_clip_noop_silent_when_disabled_or_step_time():
+    raw = {"config": {"process": [_process(train={"optimizer": "automagic2", "max_grad_norm": 0})]}}
+    assert RULE_FUSED_CLIP_NOOP not in _ids(collect_admission_diagnostics(raw))
+
+    raw = {"config": {"process": [_process(train={"optimizer": "adamw8bit", "max_grad_norm": 1.0})]}}
+    assert RULE_FUSED_CLIP_NOOP not in _ids(collect_admission_diagnostics(raw))
 
 
 def test_permanent_accumulation_mean_flow_and_target_collision_rules():

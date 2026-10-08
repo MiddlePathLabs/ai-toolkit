@@ -147,6 +147,54 @@ def test_qwen_resolution_fallback_passes_at_limit():
     assert result is cfg
 
 
+def test_qwen_reg_dataset_above_limit_is_not_checked():
+    # reg rows are skipped by the live anchor loss before the decode, so a
+    # high-res reg set must not trip the pixel limit (inherits the global
+    # weight here -- still exempt)
+    cfg = VAEAnchorConfig(loss_weight=0.05, vae_model_path='x.safetensors')
+    datasets = [
+        _ds(resolution=1024),
+        _ds(is_reg=True, resolution=2048),
+    ]
+    result = preflight_vae_anchor(
+        cfg, datasets, arch='qwen_image_2', low_vram=False,
+        decode_pixel_limit=LIMIT,
+    )
+    assert result is cfg
+
+
+def test_qwen_reg_dataset_explicit_override_still_not_checked():
+    # even a positive per-dataset override on a reg set changes nothing: reg
+    # rows never reach the differentiable decode regardless of weight
+    cfg = VAEAnchorConfig(loss_weight=0.0, vae_model_path='x.safetensors')
+    datasets = [
+        _ds(resolution=512),
+        _ds(is_reg=True, vae_anchor_loss_weight=0.1, resolution=2048),
+    ]
+    result = preflight_vae_anchor(
+        cfg, datasets, arch='qwen_image_2', low_vram=False,
+        decode_pixel_limit=LIMIT,
+    )
+    assert result is cfg
+
+
+def test_reg_only_activation_is_fully_inert_under_low_vram():
+    # reg rows never decode, so a reg-ONLY dataset override must not activate
+    # the anchor at all -- not even the qwen low_vram rejection or the
+    # active-bucket pixel scan (vae_anchor_active_for_dataset returns False
+    # for reg datasets)
+    cfg = VAEAnchorConfig(loss_weight=0.0, vae_model_path='x.safetensors')
+    datasets = [
+        _ds(resolution=512),
+        _ds(is_reg=True, resolution=2048, vae_anchor_loss_weight=0.05),
+    ]
+    result = preflight_vae_anchor(
+        cfg, datasets, arch='qwen_image_2', low_vram=True,
+        decode_pixel_limit=LIMIT,
+    )
+    assert result is cfg
+
+
 def test_qwen_limit_not_set_skips_resolution_check():
     # no pixel limit exposed (non-qwen wrapper or older call sites): the old
     # behavior -- no resolution restriction -- is preserved

@@ -1,5 +1,5 @@
 'use client';
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import {
   ModelArch,
   quantizationOptions,
@@ -101,6 +101,22 @@ export default function SimpleJob({
   const bodyShapeEnabled = (bodyShapeConfig?.loss_weight ?? 0) > 0;
   const vaeAnchorConfig = jobConfig.config.process[0].vae_anchor;
   const vaeAnchorEnabled = (vaeAnchorConfig?.loss_weight ?? 0) > 0;
+  // a positive per-dataset override activates the anchor on its own, and then
+  // the Flux 2 checkpoint path is required even with the global weight at 0
+  const anyDatasetVaeAnchorWeight = jobConfig.config.process[0].datasets.some(
+    dataset => (dataset.vae_anchor_loss_weight ?? 0) > 0,
+  );
+  // any activation path (not just the Enable checkbox) requires Low VRAM off;
+  // dataset-only activation would otherwise submit low_vram: true and die in
+  // trainer preflight
+  useEffect(() => {
+    if (vaeAnchorEnabled || anyDatasetVaeAnchorWeight) {
+      if (jobConfig.config.process[0].model.low_vram) {
+        setJobConfig(false, 'config.process[0].model.low_vram');
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vaeAnchorEnabled, anyDatasetVaeAnchorWeight]);
   const globalLossSplit = jobConfig.config.process[0].train.loss_split;
   const globalSplitUi =
     globalLossSplit === undefined ? 'auto' : globalLossSplit === null ? 'off' : 'diffusion_depth';
@@ -1457,9 +1473,9 @@ export default function SimpleJob({
                         label="Noise Sigma"
                         className="pt-2"
                         docKey={'train.weight_noise.sigma'}
-                        value={weightNoise.sigma ?? 0.00125}
+                        value={weightNoise.sigma ?? 0.0125}
                         onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.sigma')}
-                        placeholder="eg. 0.00125"
+                        placeholder="eg. 0.0125"
                         min={0}
                       />
                       <Checkbox
@@ -2190,6 +2206,10 @@ export default function SimpleJob({
                             max={1}
                             step={0.01}
                           />
+                        </>
+                      )}
+                      {(vaeAnchorEnabled || anyDatasetVaeAnchorWeight) && (
+                        <>
                           <TextInput
                             label="Flux 2 VAE Checkpoint Path"
                             className="pt-2"
@@ -2205,12 +2225,13 @@ export default function SimpleJob({
                             model's VAE, then encodes those pixels with a SEPARATE frozen Flux 2 VAE and
                             matches multi-scale features against cached GT (cosine). The Flux 2 VAE
                             encoder is loaded from the local licensed checkpoint above — nothing is
-                            downloaded, and the job is rejected at validation without a valid path.
-                            Anchors to the Flux 2 VAE feature space, which is independent of the
-                            training model's VAE. Like the other anchors it decodes x0 under gradient,
-                            so Low VRAM is disabled while it is active. On Qwen-Image 2.1, also keep
-                            Transparency (RGBA) off and anchor datasets at 1024 resolution or lower —
-                            the anchor needs an untiled differentiable decode.
+                            downloaded, and the job is rejected at validation without a valid path
+                            (required whenever the anchor is active, including per-dataset-only
+                            activation). Anchors to the Flux 2 VAE feature space, which is independent
+                            of the training model's VAE. Like the other anchors it decodes x0 under
+                            gradient, so Low VRAM is disabled while it is active. On Qwen-Image 2.1,
+                            also keep Transparency (RGBA) off and anchor datasets at 1024 resolution or
+                            lower — the anchor needs an untiled differentiable decode.
                           </div>
                         </>
                       )}

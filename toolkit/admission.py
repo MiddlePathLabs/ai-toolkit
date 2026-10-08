@@ -33,6 +33,7 @@ from typing import Any, Optional
 # Stable IDs consumed by the future UI/API adapter.
 RULE_LEGACY_ACCUMULATION = "admission.legacy_accumulation"
 RULE_FUSED_BACKWARD = "admission.fused_backward_multi_backward"
+RULE_FUSED_CLIP_NOOP = "admission.fused_backward_clip_noop"
 RULE_MEAN_FLOW = "admission.mean_flow"
 RULE_TARGET_COLLISION = "admission.target_collision"
 RULE_FLOW_UNAUGMENTED = "admission.flow_unaugmented_target"
@@ -547,6 +548,17 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             fields,
             "The selected fused-backward optimizer updates parameters inside backward and cannot preserve a multi-backward update window.",
             "Use one backward per update, disable single_item_batching/extra accumulation, or select a step-time optimizer. This gate is independent of adaptive-LR mode.",
+        )
+
+    # the runtime default (1.0) also never clips under fused backward, so key
+    # presence alone would miss every UI job (the UI never writes the key)
+    if _known_fused_backward(train) and _number(train.get("max_grad_norm", 1.0), 1.0) > 0:
+        collector.add(
+            RULE_FUSED_CLIP_NOOP,
+            [f"{p}.train.max_grad_norm", f"{p}.train.optimizer"],
+            "The selected fused-backward optimizer applies its update inside backward, where train.max_grad_norm clipping never runs (including its default value of 1.0).",
+            "Remove max_grad_norm (or set 0); rely on the optimizer's internal trust-region clipping.",
+            severity="warning",
         )
 
     loss_type = str(train.get("loss_type", "mse") or "mse").lower()

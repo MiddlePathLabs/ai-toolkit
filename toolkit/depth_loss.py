@@ -147,12 +147,11 @@ def compute_depth_consistency_loss(
 
 
 def render_depth_preview(pred_pil, ref_pil, d_pred, d_gt, mask=None):
-    """Render a four-panel ``[GT RGB | GT depth | Pred RGB | Pred depth]`` strip.
+    """Render a ``[GT RGB | GT depth | Pred RGB | Pred depth]`` strip.
 
     Depth maps are percentile-normalized (p2-p98) to grayscale, then color
     inverted so nearer surfaces appear brighter. With a mask a fifth ``Mask``
-    panel is appended (white = included). Phase 2 ships mask_source 'none', so
-    the mask panel is not produced on the live path.
+    panel is appended (white = included).
     """
     import numpy as np
     from PIL import Image, ImageDraw

@@ -18,6 +18,7 @@ The live LoRA-param-moves smoke (item 7) is Task 7 (user GPU) -- not here.
 """
 import os
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -106,6 +107,16 @@ class _FakeEncoder:
         return torch.full((b, 8, 8), 0.5)
 
 
+class _RecordingLogger:
+    """Captures logger.log dicts; stands in for the UILogger/wandb logger."""
+
+    def __init__(self):
+        self.calls = []
+
+    def log(self, log_dict):
+        self.calls.append(dict(log_dict))
+
+
 class _FakeFileItem:
     def __init__(self, path):
         self.path = path
@@ -144,6 +155,7 @@ def _make_trainer(loss_weight=0.001, train_loss_split=None, explicit=False,
     tr.dataset_configs = []
     tr._depth_perceptor = _FakeEncoder()
     tr.save_root = None  # previews disabled in gating tests
+    tr.logger = _RecordingLogger()
     tr._depth_step_count = 0  # mirrors SDTrainer.__init__
     # Bind the cadence helper so _compute_depth_anchor_loss can call it as
     # self._depth_preview_due(cfg) just like a real SDTrainer instance would.
@@ -361,6 +373,44 @@ def test_depth_anchor_loss_processes_only_in_window_objective_samples():
     assert float(out) > 0.0
     # only the in-window sample reached the perceptor
     assert tr._depth_perceptor.calls == 1
+    # canonical depth telemetry is logged DIRECTLY (true-step stamps; the
+    # commit at end of step flushes it); applied == raw * weight (0.001)
+    assert len(tr.logger.calls) == 1
+    logged = tr.logger.calls[0]
+    assert set(logged) == {
+        "depth/loss_raw", "depth/loss_applied", "depth/ssi", "depth/grad",
+    }
+    assert logged["depth/loss_raw"] > 0.0
+    assert logged["depth/loss_applied"] == pytest.approx(
+        logged["depth/loss_raw"] * 0.001, rel=1e-5,
+    )
+    assert logged["depth/ssi"] >= 0.0
+    assert logged["depth/grad"] >= 0.0
+
+
+def test_depth_anchor_gated_step_logs_no_stale_telemetry():
+    # a depth step logs telemetry; the NEXT (gated, diffusion) step must not
+    # re-emit or leave stale values behind for a log tick to stamp wrongly
+    tr = _make_trainer(loss_weight=0.001, step_num=1)
+    batch = _FakeBatch(1, loss_split_list=[None])
+    ts = torch.tensor([500.0])
+    noise_pred = torch.zeros(1, 16, 4, 4)
+    noisy = torch.zeros(1, 16, 4, 4)
+
+    g = _gates(tr, batch, ts)
+    assert bool(g["depth_objective"][0]) is True
+    SDTrainer._compute_depth_anchor_loss(tr, noise_pred, noisy, ts, batch, g)
+    assert len(tr.logger.calls) == 1
+
+    # diffusion step (even step_num): every sample gated out -> early return
+    tr.step_num = 2
+    g2 = _gates(tr, batch, ts)
+    assert bool(g2["depth_objective"][0]) is False
+    tr.logger.calls.clear()
+    out = SDTrainer._compute_depth_anchor_loss(tr, noise_pred, noisy, ts, batch, g2)
+    assert float(out) == 0.0
+    assert tr.logger.calls == []
+    assert tr._depth_perceptor.calls == 1  # no extra perceptor work either
 
 
 def test_depth_anchor_loss_skips_split_samples_on_diffusion_step():

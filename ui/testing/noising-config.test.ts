@@ -27,7 +27,7 @@ test('legacy train config receives complete disabled noising defaults without ad
   assert.deepEqual(train.weight_noise, {
     enabled: false,
     mode: 'relative',
-    sigma: 0.00125,
+    sigma: 0.0125,
     bound_norm: false,
     log_every: 50,
   });

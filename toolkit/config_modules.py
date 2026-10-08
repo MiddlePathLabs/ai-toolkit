@@ -391,7 +391,7 @@ class WeightNoiseConfig:
     def __init__(self, **kwargs):
         self.enabled: bool = bool(kwargs.get('enabled', False))
         self.mode: str = str(kwargs.get('mode', 'relative'))
-        self.sigma: float = float(kwargs.get('sigma', 0.00125))
+        self.sigma: float = float(kwargs.get('sigma', 0.0125))
         self.bound_norm: bool = bool(kwargs.get('bound_norm', False))
         self.log_every: int = int(kwargs.get('log_every', 50))
         if self.mode not in ('absolute', 'relative'):

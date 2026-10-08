@@ -27,7 +27,7 @@ def test_train_config_defaults_keep_noising_disabled():
 
     assert config.weight_noise.enabled is False
     assert config.weight_noise.mode == "relative"
-    assert config.weight_noise.sigma == pytest.approx(0.00125)
+    assert config.weight_noise.sigma == pytest.approx(0.0125)
     assert config.weight_noise.bound_norm is False
     assert config.weight_noise.log_every == 50
     assert config.gradient_noise.enabled is False

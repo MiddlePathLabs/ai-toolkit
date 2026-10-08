@@ -441,8 +441,8 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Weight Noise Sigma',
     description: (
       <>
-        The noise scale. The conservative starting value is 0.00125; tune it only after comparing the logged noise norm
-        with the clipped gradient norm on your model.
+        The noise scale. The conservative starting value is 0.0125 (validated range 0.01–0.017); tune it only after
+        comparing the logged noise norm with the clipped gradient norm on your model.
       </>
     ),
   },

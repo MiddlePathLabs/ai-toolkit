@@ -9,7 +9,7 @@ type NoisingTrainConfig = {
 export const defaultWeightNoiseConfig: WeightNoiseConfig = {
   enabled: false,
   mode: 'relative',
-  sigma: 0.00125,
+  sigma: 0.0125,
   bound_norm: false,
   log_every: 50,
 };

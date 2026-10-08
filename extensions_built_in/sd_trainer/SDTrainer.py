@@ -353,12 +353,55 @@ def vae_anchor_active_for_dataset(
     vae_anchor_config: Optional[VAEAnchorConfig],
     dataset_config,
 ) -> bool:
+    # reg rows never reach the differentiable decode (the live loss skips
+    # them), so a reg dataset can never activate -- or be counted against
+    # limits by -- the anchor.
+    if getattr(dataset_config, 'is_reg', False):
+        return False
     dataset_weight = getattr(dataset_config, 'vae_anchor_loss_weight', None)
     if dataset_weight is None:
         dataset_weight = (
             vae_anchor_config.loss_weight if vae_anchor_config is not None else 0.0
         )
     return float(dataset_weight or 0.0) > 0.0
+
+
+def enabled_image_only_perceptual_features(trainer) -> List[str]:
+    """Names of the enabled perceptual features that only support images.
+
+    Their GT caches ``Image.open`` every file item and their losses assume 4D
+    latents; a video item anywhere in the loaders makes them crash or silently
+    deactivate. Config/dataset-level predicates only -- safe to call before
+    preflight, unlike batch-level gates.
+    """
+    features: List[str] = []
+    smc = getattr(trainer, 'subject_mask_config', None)
+    if smc is not None and smc.enabled:
+        features.append('subject_mask')
+    if trainer._depth_loss_active():
+        features.append('depth_consistency')
+    if trainer._normal_loss_active():
+        features.append('normal')
+    if trainer._body_proportion_loss_active():
+        features.append('body_proportion')
+    if trainer._face_identity_loss_active():
+        features.append('face_identity')
+    if trainer._body_shape_loss_active():
+        features.append('body_shape')
+    if trainer._vae_anchor_loss_active():
+        features.append('vae_anchor')
+    return features
+
+
+def dataloader_has_video_items(loaders) -> bool:
+    from toolkit.data_transfer_object.data_loader import video_extensions
+    return any(
+        os.path.splitext(str(item.path))[1].lower() in video_extensions
+        for loader in loaders
+        if loader is not None
+        for dataset in get_dataloader_datasets(loader)
+        for item in dataset.file_list
+    )
 
 
 def preflight_vae_anchor(
@@ -1173,6 +1216,7 @@ class SDTrainer(BaseSDTrainProcess):
         if not process_objective.any():
             self._last_depth_processed_indices = processed
             self._last_depth_consistency_loss = 0.0
+            self._last_depth_consistency_loss_applied = 0.0
             return 0.0
 
         # Advance the processing-step counter after the objective gate. Normal
@@ -1183,6 +1227,7 @@ class SDTrainer(BaseSDTrainProcess):
         if preview_only and not preview_due:
             self._last_depth_processed_indices = processed
             self._last_depth_consistency_loss = 0.0
+            self._last_depth_consistency_loss_applied = 0.0
             return 0.0
 
         # Preview-only evaluates the decode and perceptor without constructing
@@ -1285,6 +1330,7 @@ class SDTrainer(BaseSDTrainProcess):
                         pred_pil, ref_pil,
                         dpred_i.squeeze(0) if dpred_i.dim() == 3 else dpred_i,
                         dgt_i.squeeze(0) if dgt_i.dim() == 3 else dgt_i,
+                        mask=_dc_mask_t,
                     )
                     dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
                     os.makedirs(dc_preview_dir, exist_ok=True)
@@ -1306,11 +1352,27 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_depth_processed_indices = processed
         if n == 0:
             self._last_depth_consistency_loss = 0.0
+            self._last_depth_consistency_loss_applied = 0.0
             return 0.0
         applied = weighted_total / n
         self._last_depth_consistency_loss = (total / n).detach().item()
+        self._last_depth_consistency_loss_applied = applied.detach().item()
         self._last_depth_consistency_ssi = ssi_sum / n
         self._last_depth_consistency_grad = grad_sum / n
+        # Canonical perceptual-fork telemetry names, logged directly so each
+        # value is committed at the step that computed it. Going through
+        # additional_logs would stamp gated (diffusion) log ticks with the
+        # previous depth step's values, and log_every parity can align every
+        # drain with gated steps entirely. Preview-only steps log too: the
+        # values are real (no-grad) diagnostics and often the only signal.
+        logger = getattr(self, 'logger', None)
+        if logger is not None:
+            logger.log({
+                'depth/loss_raw': self._last_depth_consistency_loss,
+                'depth/loss_applied': self._last_depth_consistency_loss_applied,
+                'depth/ssi': self._last_depth_consistency_ssi,
+                'depth/grad': self._last_depth_consistency_grad,
+            })
         return applied
 
     # ------------------------------------------------------------------
@@ -1916,6 +1978,11 @@ class SDTrainer(BaseSDTrainProcess):
             return None
 
         B = len(batch.file_items)
+        if len(latent_shape) != 4:
+            raise ValueError(
+                f"subject_mask auto-masking supports 4D image latents only; got a "
+                f"{len(latent_shape)}-D latent shape. Disable subject_mask for video jobs."
+            )
         _, C, lat_h, lat_w = latent_shape
         device = self.device_torch
 
@@ -2242,6 +2309,19 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+        # Video items are incompatible with every image-only perceptual
+        # feature (their GT caches Image.open each item and would crash first,
+        # after loading DA2/Sapiens/etc.). Reject before any preflight or
+        # cache pass can touch the file.
+        _video_features = enabled_image_only_perceptual_features(self)
+        if _video_features and dataloader_has_video_items(
+            (self.data_loader, self.data_loader_reg)
+        ):
+            raise ValueError(
+                f"{', '.join(_video_features)} support image datasets only, but "
+                "video items are present in the training or reg datasets. "
+                "Remove the video datasets or disable these features."
+            )
         self.depth_consistency_config = preflight_depth_consistency(
             self.depth_consistency_config,
             self.dataset_configs,
@@ -3031,6 +3111,25 @@ class SDTrainer(BaseSDTrainProcess):
             and getattr(batch, 'vae_anchor_features', None)
             and len(noise_pred.shape) == 4
         )
+
+        # Non-4D (video) latents silently deactivate every anchor above.
+        # Surface that once instead of letting the losses quietly vanish.
+        # Built from config-level activation (not this batch's GT), so the
+        # first 5D batch reports every disabled anchor, not just the ones
+        # whose GT happened to be present.
+        if len(noise_pred.shape) != 4 and not getattr(self, '_warned_perceptual_5d', False):
+            _dead_anchors = [
+                f for f in enabled_image_only_perceptual_features(self)
+                if f != 'subject_mask'
+            ]
+            if _dead_anchors:
+                self._warned_perceptual_5d = True
+                print_acc(
+                    f"Warning: perceptual anchors ({', '.join(_dead_anchors)}) support "
+                    f"4D image latents only; this model produces "
+                    f"{len(noise_pred.shape)}-D latents, so these losses are disabled "
+                    "for the whole run."
+                )
 
         prior_mask_multiplier = None
         target_mask_multiplier = None
