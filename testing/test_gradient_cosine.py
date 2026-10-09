@@ -51,8 +51,12 @@ def _bind(tr):
     tr._grad_cos_disabled_by_failures = False
     tr._dc_applied_for_grad = None
     tr._last_loss_clamped = False
+    tr._grad_cos_degenerate_noted = False
     tr._iter_trainable_params = SDTrainer._iter_trainable_params.__get__(tr)
     tr._record_grad_cosine = SDTrainer._record_grad_cosine.__get__(tr)
+    tr._note_grad_cosine_degenerate = SDTrainer._note_grad_cosine_degenerate.__get__(tr)
+    tr._grad_cos_cf_noted = False
+    tr._note_grad_cosine_counterfactual = SDTrainer._note_grad_cosine_counterfactual.__get__(tr)
     tr._log_grad_cosine = SDTrainer._log_grad_cosine.__get__(tr)
     tr._grad_cosine_should_fire = SDTrainer._grad_cosine_should_fire.__get__(tr)
     return tr
@@ -76,13 +80,13 @@ def _oracle(g_depth, g_diff):
 
 
 def _capture_and_record(tr, params, total, depth):
-    """Production order: full-loss grad, depth-only grad, join, record."""
-    full_grads = torch.autograd.grad(total, params, retain_graph=True,
+    """Production order: (total - depth) grad, depth-only grad, join, record."""
+    diff_grads = torch.autograd.grad(total - depth, params, retain_graph=True,
                                      allow_unused=True)
     dc_grads = torch.autograd.grad(depth, params, retain_graph=True,
                                    allow_unused=True)
-    tr._record_grad_cosine(full_grads, dc_grads)
-    return full_grads, dc_grads
+    tr._record_grad_cosine(diff_grads, dc_grads)
+    return diff_grads, dc_grads
 
 
 def test_record_grad_cosine_matches_independent_oracle():
@@ -130,7 +134,7 @@ def test_record_grad_cosine_immune_to_grad_clearing_hooks():
     handles = [p.register_post_accumulate_grad_hook(_stash_and_delete) for p in params]
 
     tr = _bind(_FakeTrainer())
-    full_grads, dc_grads = _capture_and_record(tr, params, total, depth_loss)
+    diff_grads, dc_grads = _capture_and_record(tr, params, total, depth_loss)
     expected = (tr._last_grad_norm_depth, tr._last_grad_norm_diffusion,
                 tr._last_grad_cos_diff_depth)
 
@@ -142,7 +146,7 @@ def test_record_grad_cosine_immune_to_grad_clearing_hooks():
     # re-record from the SAME pre-backward captures: identical — the reducer
     # is a pure function of the captured lists and never consults p.grad
     tr2 = _bind(_FakeTrainer())
-    tr2._record_grad_cosine(full_grads, dc_grads)
+    tr2._record_grad_cosine(diff_grads, dc_grads)
     assert tr2._last_grad_norm_depth == pytest.approx(expected[0], rel=1e-6)
     assert tr2._last_grad_norm_diffusion == pytest.approx(expected[1], rel=1e-6)
     assert tr2._last_grad_cos_diff_depth == pytest.approx(expected[2], rel=1e-6)
@@ -190,6 +194,94 @@ def test_record_grad_cosine_zero_depth_grad_reports_zero_cos():
     assert tr._last_grad_norm_depth == 0.0
     assert tr._last_grad_norm_diffusion > 0.0
     assert tr._last_grad_cos_diff_depth == 0.0
+
+
+def test_record_grad_cosine_pure_depth_step_is_exactly_degenerate(capsys):
+    # Regression (DOP_5 anomaly): on a pure depth step the diffusion term is
+    # `loss_per_sample.sum() * 0.0` (_apply_diffusion_split_mask, all samples
+    # dropped). The old reducer recovered g_diff = g_full - g_dc from two
+    # separate traversals; under a compiled bf16 backend each traversal
+    # carries its own rounding noise, amplified through the deep backward,
+    # so the subtraction reported a "diffusion" norm ~40% of depth and
+    # cos ~ -0.2 for a gradient that is identically zero. Differentiating
+    # (total - depth) directly cancels the depth path inside autograd: the
+    # diffusion side is exact zero, and the step is reported as degenerate.
+    torch.manual_seed(3)
+    w1 = torch.nn.Parameter(torch.randn(4))
+    w2 = torch.nn.Parameter(torch.randn(4))
+    params = [w1, w2]
+    h = torch.tanh(w1 * 3.0) * w2
+    loss_per_sample = (h - 1.0).pow(2).mean().reshape(1)
+    diffusion = loss_per_sample.sum() * 0.0
+    depth = 0.001 * (h * h).sum()
+    total = diffusion + depth
+
+    tr = _bind(_FakeTrainer())
+    diff_grads = torch.autograd.grad(total - depth, params, retain_graph=True,
+                                     allow_unused=True)
+    dc_grads = torch.autograd.grad(depth, params, retain_graph=True,
+                                   allow_unused=True)
+    for g in diff_grads:
+        assert g is None or bool((g == 0).all())
+
+    assert tr._record_grad_cosine(diff_grads, dc_grads) is False
+    assert tr._last_grad_norm_diffusion == 0.0
+    assert tr._last_grad_norm_depth > 0.0
+    assert tr._last_grad_cos_diff_depth == 0.0
+
+    # one-time notice, never repeated
+    tr._note_grad_cosine_degenerate()
+    tr._note_grad_cosine_degenerate()
+    assert capsys.readouterr().out.count("nothing to compare") == 1
+
+
+def test_counterfactual_diffusion_side_on_alternation_depth_step(capsys):
+    # loss_split alternation: on a depth step the diffusion term is masked to
+    # `sum() * 0.0`, so calculate_loss stashes the UNMASKED same-sample
+    # diffusion mean and the diagnostic differentiates it as the diffusion
+    # side. It must match an independent oracle AND leave the optimizer's
+    # gradient (the masked total) equal to the depth gradient alone.
+    torch.manual_seed(5)
+    w1 = torch.nn.Parameter(torch.randn(4))
+    w2 = torch.nn.Parameter(torch.randn(4))
+    params = [w1, w2]
+    h = torch.tanh(w1 * 2.0) * w2
+    loss_per_sample = (h - 0.5).pow(2).mean().reshape(1)
+    counterfactual = loss_per_sample.mean()          # the stash
+    depth = 0.01 * (h * w1).sum()
+    total = loss_per_sample.sum() * 0.0 + depth      # what the optimizer sees
+
+    tr = _bind(_FakeTrainer())
+    diff_grads = torch.autograd.grad(counterfactual, params, retain_graph=True)
+    dc_grads = torch.autograd.grad(depth, params, retain_graph=True)
+    assert tr._record_grad_cosine(diff_grads, dc_grads) is True
+
+    norm_dc, norm_diff, cos = _oracle(dc_grads, diff_grads)
+    assert tr._last_grad_norm_depth == pytest.approx(norm_dc, rel=1e-5)
+    assert tr._last_grad_norm_diffusion == pytest.approx(norm_diff, rel=1e-5)
+    assert tr._last_grad_cos_diff_depth == pytest.approx(cos, rel=1e-5)
+
+    # training unaffected: the masked total's gradient is the depth gradient
+    g_total = torch.autograd.grad(total, params)
+    for gt, gd in zip(g_total, dc_grads):
+        assert torch.allclose(gt, gd)
+
+    tr._note_grad_cosine_counterfactual()
+    tr._note_grad_cosine_counterfactual()
+    assert capsys.readouterr().out.count("counterfactual") == 1
+
+
+def test_record_grad_cosine_reports_meaningful_when_both_sides_present():
+    torch.manual_seed(4)
+    w1 = torch.nn.Parameter(torch.randn(4))
+    params = [w1]
+    diff_loss = w1.pow(2).sum()
+    depth_loss = 0.1 * w1.sum()
+
+    tr = _bind(_FakeTrainer())
+    diff_grads = torch.autograd.grad(diff_loss, params, retain_graph=True)
+    dc_grads = torch.autograd.grad(depth_loss, params, retain_graph=True)
+    assert tr._record_grad_cosine(diff_grads, dc_grads) is True
 
 
 def test_grad_cosine_should_fire_gate():

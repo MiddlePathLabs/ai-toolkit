@@ -612,10 +612,18 @@ class SDTrainer(BaseSDTrainProcess):
         # so it logs ONE loud line instead of spamming every firing step.
         self._grad_cos_fail_streak = 0
         self._grad_cos_disabled_by_failures = False
+        # One-time notices: "nothing to compare" and "counterfactual side".
+        self._grad_cos_degenerate_noted = False
+        self._grad_cos_cf_noted = False
         # Set by `calculate_loss` to the depth-applied loss tensor (pre-detach)
         # whenever the depth loss contributes a graph this microbatch; reset to
         # None every microbatch. Read by the dual-grad block.
         self._dc_applied_for_grad = None
+        # Set by `calculate_loss` on a pure depth step (every sample's
+        # diffusion term masked by loss_split alternation) to the UNMASKED
+        # diffusion mean, display-only: the gradient-cosine block
+        # differentiates it as the counterfactual diffusion side.
+        self._diff_counterfactual_for_grad = None
         # True on a microbatch whose returned loss saturated max_loss (the
         # scalar clamp zeroes the optimizer gradient, so the gradient-cosine
         # diagnostic must not fire — see calculate_loss).
@@ -3212,6 +3220,7 @@ class SDTrainer(BaseSDTrainProcess):
         # Reset every microbatch so a step where depth doesn't contribute
         # leaves the gradient-cosine dual-grad block with nothing to act on.
         self._dc_applied_for_grad = None
+        self._diff_counterfactual_for_grad = None
         self._last_loss_clamped = False
         # Depth-anchor sample gating (Task 5b). Fully inert when depth is off:
         # _depth_gates stays None, so no depth code is reachable and the loss
@@ -4070,10 +4079,19 @@ class SDTrainer(BaseSDTrainProcess):
         # of the diffusion mean. With no split active (or depth off) this is the
         # original plain .mean().
         if _depth_gates is not None and _depth_gates['diffusion_zero'].any():
+            # Gradient-cosine diagnostic only: on a pure depth step the
+            # diffusion term is masked to zero, so stash the UNMASKED
+            # per-sample diffusion mean (same sample, same timestep) for a
+            # display-only counterfactual diffusion gradient. Never enters
+            # the loss the optimizer backward consumes.
+            if (int(getattr(self.train_config, 'gradient_cosine_log_every', 0) or 0) > 0
+                    and bool(_depth_gates['diffusion_zero'].all())
+                    and torch.is_tensor(loss) and loss.requires_grad):
+                self._diff_counterfactual_for_grad = loss.mean()
             loss = self._apply_diffusion_split_mask(loss, _depth_gates['diffusion_zero'])
         else:
             loss = loss.mean()
-        
+
         audio_per_sample, audio_valid = self._audio_loss_per_sample(
             audio_pred, audio_target, audio_mask, loss_multiplier
         )
@@ -5509,8 +5527,16 @@ class SDTrainer(BaseSDTrainProcess):
                     # parity). BOTH gradient sides are captured via
                     # autograd.grad BEFORE the real backward:
                     #   g_depth = d(depth_applied)/dw
-                    #   g_full  = d(total loss the backward consumes)/dw
-                    #   g_diff  = g_full - g_depth
+                    #   g_diff  = d(backward loss - depth_applied)/dw
+                    # g_diff is differentiated directly, never recovered as
+                    # g_full - g_depth: each autograd.grad traversal carries
+                    # its own backend rounding noise (amplified ~40% at the
+                    # early blocks of a deep bf16 DiT under some compiled
+                    # backends), so the subtraction of two near-equal vectors
+                    # turned a pure-depth step's exact-zero diffusion side
+                    # into pure noise (DOP_5: norm 40% of depth, cos -0.2).
+                    # Differentiated directly, the depth path's +1/-1 cancel
+                    # inside autograd and a pure-depth step yields exact 0.
                     # Reading p.grad after the backward is not safe here:
                     # optimizer post-accumulate hooks (stochastic _accum_grad
                     # accumulation on non-fp32 params, automagic2's fused
@@ -5524,7 +5550,7 @@ class SDTrainer(BaseSDTrainProcess):
                     # is preserved. Cost: two extra passes through the
                     # retained graph per firing step.
                     _dc_grads_snapshot = None
-                    _full_grads_snapshot = None
+                    _diff_grads_snapshot = None
                     _trainable_params_snapshot = None
                     if self._grad_cosine_should_fire():
                         try:
@@ -5534,20 +5560,34 @@ class SDTrainer(BaseSDTrainProcess):
                             ]
                             if _trainable_params_snapshot:
                                 # differentiate the exact expression the
-                                # backward below consumes, so g_full matches
-                                # the optimizer's gradient (modulo the grad
-                                # scaler, which cancels in the cosine)
+                                # backward below consumes, so g_diff + g_dc
+                                # is the optimizer's gradient (modulo the
+                                # grad scaler, which cancels in the cosine)
                                 _backward_loss = (
                                     loss * accum_scale if accum_scale != 1.0 else loss
                                 )
-                                _full_grads_snapshot = torch.autograd.grad(
-                                    _backward_loss,
+                                _dc_scaled = self._dc_applied_for_grad * accum_scale
+                                # Pure depth step under alternation: the real
+                                # diffusion side is identically zero, so use
+                                # the unmasked same-sample diffusion loss as a
+                                # counterfactual ("would they agree if summed
+                                # here?"). Display-only; the backward below
+                                # still consumes the masked loss.
+                                _diff_cf = self._diff_counterfactual_for_grad
+                                if _diff_cf is not None:
+                                    self._note_grad_cosine_counterfactual()
+                                _diff_target = (
+                                    _diff_cf * accum_scale if _diff_cf is not None
+                                    else _backward_loss - _dc_scaled
+                                )
+                                _diff_grads_snapshot = torch.autograd.grad(
+                                    _diff_target,
                                     _trainable_params_snapshot,
                                     retain_graph=True,
                                     allow_unused=True,
                                 )
                                 _dc_grads_snapshot = torch.autograd.grad(
-                                    self._dc_applied_for_grad * accum_scale,
+                                    _dc_scaled,
                                     _trainable_params_snapshot,
                                     retain_graph=True,
                                     allow_unused=True,
@@ -5555,10 +5595,12 @@ class SDTrainer(BaseSDTrainProcess):
                                 # Join async D2H grad staging (offloaded params)
                                 # BEFORE reading either result.
                                 sync_grad_transfers()
-                                self._record_grad_cosine(
-                                    _full_grads_snapshot, _dc_grads_snapshot,
-                                )
-                                self._log_grad_cosine()
+                                if self._record_grad_cosine(
+                                    _diff_grads_snapshot, _dc_grads_snapshot,
+                                ):
+                                    self._log_grad_cosine()
+                                else:
+                                    self._note_grad_cosine_degenerate()
                                 self._grad_cos_fail_streak = 0
                         except Exception as _gc_err:  # noqa: BLE001
                             self._grad_cos_fail_streak += 1
@@ -5574,7 +5616,7 @@ class SDTrainer(BaseSDTrainProcess):
                                     f"  gradient cosine: autograd.grad capture failed: {_gc_err}"
                                 )
                             _dc_grads_snapshot = None
-                            _full_grads_snapshot = None
+                            _diff_grads_snapshot = None
                             _trainable_params_snapshot = None
 
                     runtime = getattr(self, 'optimizer_runtime', None)
@@ -5635,41 +5677,38 @@ class SDTrainer(BaseSDTrainProcess):
         self._grad_cos_depth_count += 1
         return self._grad_cos_depth_count % _grad_cos_every == 0
 
-    def _record_grad_cosine(self, full_grads, dc_grads) -> None:
+    def _record_grad_cosine(self, diff_grads, dc_grads) -> bool:
         """Compute per-loss gradient norms + cosine and stash on `_last_*`.
 
         Both arguments are per-microbatch autograd.grad results over the same
-        param list: ``full_grads`` differentiates the exact total-loss tensor
-        the optimizer backward consumes, ``dc_grads`` the depth-applied term
-        alone; the diffusion side is recovered by linearity
-        (g_diff = g_full - g_dc, "diffusion" meaning everything-except-depth).
-        Because neither side reads ``p.grad``, this is immune to optimizer
-        post-accumulate hooks (stochastic ``_accum_grad`` accumulation,
-        automagic2's fused per-param step) that move or clear grads by the
-        time a post-backward read would run. Display-only; never touches
-        ``p.grad``.
+        param list: ``diff_grads`` differentiates (backward loss - depth
+        term), i.e. "diffusion" meaning everything-except-depth -- or, on a
+        pure depth step under loss_split alternation, the unmasked
+        same-sample diffusion loss (counterfactual: what diffusion would
+        have pushed had it been summed on this sample) -- and
+        ``dc_grads`` the depth-applied term alone. A ``None`` entry is a
+        param that side never touched (zero contribution). Because neither
+        side reads ``p.grad``, this is immune to optimizer post-accumulate
+        hooks (stochastic ``_accum_grad`` accumulation, automagic2's fused
+        per-param step) that move or clear grads by the time a post-backward
+        read would run. Display-only; never touches ``p.grad``.
+
+        Returns False when the diffusion side is exactly zero (no diffusion
+        gradient and no counterfactual stash): there is no second gradient to
+        compare, so the caller logs nothing.
         """
         norm_dc_sq = 0.0
         norm_diff_sq = 0.0
         dot = 0.0
-        for g_full, g_dc in zip(full_grads, dc_grads):
-            g_full_f = g_full.detach().float() if g_full is not None else None
+        for g_diff, g_dc in zip(diff_grads, dc_grads):
+            g_diff_f = g_diff.detach().float() if g_diff is not None else None
             g_dc_f = g_dc.detach().float() if g_dc is not None else None
-            if g_full_f is None and g_dc_f is None:
-                continue
-            if g_dc_f is None:
-                # depth didn't use this param: whole grad is diffusion-side
-                norm_diff_sq += float((g_full_f * g_full_f).sum())
-                continue
-            if g_full_f is None:
-                # defensive: cannot happen while depth is a summand of the
-                # total loss (any depth-touched param is total-touched).
-                # Never infer a zero full grad from a missing tensor.
-                continue
-            gdiff = g_full_f - g_dc_f
-            norm_dc_sq += float((g_dc_f * g_dc_f).sum())
-            norm_diff_sq += float((gdiff * gdiff).sum())
-            dot += float((gdiff * g_dc_f).sum())
+            if g_diff_f is not None:
+                norm_diff_sq += float((g_diff_f * g_diff_f).sum())
+            if g_dc_f is not None:
+                norm_dc_sq += float((g_dc_f * g_dc_f).sum())
+            if g_diff_f is not None and g_dc_f is not None:
+                dot += float((g_diff_f * g_dc_f).sum())
 
         norm_dc = norm_dc_sq ** 0.5
         norm_diff = norm_diff_sq ** 0.5
@@ -5678,6 +5717,31 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_grad_norm_diffusion = norm_diff
         self._last_grad_norm_depth = norm_dc
         self._last_grad_cos_diff_depth = cos
+        return norm_diff_sq > 0.0
+
+    def _note_grad_cosine_degenerate(self) -> None:
+        """One-time notice for a firing microbatch with no diffusion gradient."""
+        if getattr(self, '_grad_cos_degenerate_noted', False):
+            return
+        self._grad_cos_degenerate_noted = True
+        print_acc(
+            "  gradient cosine: firing microbatch has no diffusion-side "
+            "gradient, so there is nothing to compare and no grad/* row is "
+            "logged for it."
+        )
+
+    def _note_grad_cosine_counterfactual(self) -> None:
+        """One-time notice: alternation steps use the counterfactual diffusion side."""
+        if getattr(self, '_grad_cos_cf_noted', False):
+            return
+        self._grad_cos_cf_noted = True
+        print_acc(
+            "  gradient cosine: loss_split alternation -- on depth steps the "
+            "diffusion side is the same sample's unmasked diffusion loss "
+            "(display-only counterfactual; training still uses the masked "
+            "loss). grad/cos/diff_depth = would depth and diffusion agree on "
+            "this sample if they were summed."
+        )
 
     def _log_grad_cosine(self) -> None:
         """Aggregate firing microbatches within one optimizer step, then log.
