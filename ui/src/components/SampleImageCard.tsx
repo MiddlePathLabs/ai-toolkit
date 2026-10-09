@@ -165,7 +165,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
         }}
       >
         <div
-          className={`absolute rounded-t-lg shadow-md bg-gray-900 overflow-hidden transition-all duration-200 [container-type:inline-size] ${
+          className={`absolute rounded-t-lg shadow-md bg-gray-900 overflow-hidden transition-all duration-200 [container-type:inline-size] group/sample ${
             selected ? 'inset-2' : 'inset-0'
           } ${isVisible && !isItAudio && !loaded ? 'animate-pulse' : ''}`}
         >
