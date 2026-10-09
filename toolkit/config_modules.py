@@ -14,6 +14,21 @@ ImgExt = Literal['jpg', 'png', 'webp']
 
 SaveFormat = Literal['safetensors', 'diffusers']
 
+# Archs whose model loader attaches assistant_lora_path as self.assistant_lora;
+# on any other arch the first sample crashes on the missing network.
+# toolkit/admission.py keeps a stdlib-only copy of this tuple.
+ASSISTANT_LORA_ARCHS = (
+    "flux",
+    "minimax_h3",
+    "minimax_h3_ref2va",
+    "minimax_h3_vsa",
+    "qwen_image_2",
+    "zimage",
+    "zimage_l2p",
+    "ming_image",
+    "krea2",
+)
+
 if TYPE_CHECKING:
     from toolkit.guidance import GuidanceType
     from toolkit.logging_aitk import EmptyLogger
@@ -1171,11 +1186,11 @@ class ModelConfig:
                 )
         if (
             self.assistant_lora_path is not None
-            and self.arch not in ("flux", "minimax_h3", "qwen_image_2")
+            and self.arch not in ASSISTANT_LORA_ARCHS
         ):
             raise ValueError(
-                "assistant_lora_path is only supported for Flux, MiniMax-H3 and "
-                f"Qwen-Image 2.1 (got arch={self.arch!r})."
+                "assistant_lora_path is only supported for model.arch "
+                f"{', '.join(ASSISTANT_LORA_ARCHS)} (got arch={self.arch!r})."
             )
 
         

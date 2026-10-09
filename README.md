@@ -181,7 +181,7 @@ Measured behaviour from [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musu
 
 ### Other additions
 
-- `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples. `assistant_lora_path` is limited to Flux, MiniMax-H3 and Qwen-Image 2.1.
+- `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples. `assistant_lora_path` is limited to Flux, MiniMax-H3 (incl. Ref2VA and VSA), Qwen-Image 2.1, Z-Image (incl. L2P), Ming-Image and Krea 2.
 - A preview that runs out of GPU memory no longer ends the run: previews turn off for the rest of it (logged) and training continues. Any failed preview now always puts the raw training weights back from under the EMA ones (before, a failure left the EMA weights in the trained params, and the next sample rolled training back to a stale snapshot).
 - UI settings **offline mode** — starts jobs with `HF_HUB_OFFLINE=1`.
 - Env-gated CUDA memory diagnostics (`KREA2_MEM_DIAG`) in the SD trainer.

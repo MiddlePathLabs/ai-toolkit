@@ -76,6 +76,20 @@ RULE_UNCERTIFIED_RUNTIME = "admission.runtime_deferred"
 RULE_RESUME_DETERMINISM = "admission.resume_determinism"
 
 
+# Mirror of toolkit.config_modules.ASSISTANT_LORA_ARCHS (this module must stay
+# stdlib-only, so it cannot import it).
+_ASSISTANT_LORA_ARCHS = frozenset({
+    "flux",
+    "minimax_h3",
+    "minimax_h3_ref2va",
+    "minimax_h3_vsa",
+    "qwen_image_2",
+    "zimage",
+    "zimage_l2p",
+    "ming_image",
+    "krea2",
+})
+
 _AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 _H3_FRAME_CHUNK = 17
 _H3_FRAME_REMAINDER = 5
@@ -1046,6 +1060,22 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             f"validation rejects arch {base!r} before the model loads.",
             "Remove inference_lora_path, or use preview_lora_path on "
             "minimax_h3/qwen_image_2 for turbo previews.",
+        )
+    # flex1 is renamed to flux before config validation; an empty base is
+    # inferred later from name_or_path, so leave that to config validation.
+    if (
+        _nonempty(model.get("assistant_lora_path"))
+        and base
+        and base not in _ASSISTANT_LORA_ARCHS
+        and base != "flex1"
+    ):
+        collector.add(
+            RULE_PREVIEW_LORA,
+            [f"{p}.model.assistant_lora_path", f"{p}.model.arch"],
+            f"assistant_lora_path has no loader on arch {base!r}; config "
+            "validation rejects it before the model loads.",
+            "Remove assistant_lora_path, or use an arch whose loader supports it: "
+            + ", ".join(sorted(_ASSISTANT_LORA_ARCHS)) + ".",
         )
 
     # Runtime facts that must never be represented as a static pass.
