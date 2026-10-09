@@ -42,6 +42,7 @@ from toolkit.h3_dopsd import (
     unweighted_errors,
 )
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
+from extensions_built_in.sd_trainer.metric_buffer import MetricBuffer
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
@@ -661,6 +662,16 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_identity_loss: Optional[float] = None
         self._last_identity_loss_applied: Optional[float] = None
         self._last_id_sim: Optional[float] = None
+        self._last_id_clean_target: Optional[float] = None
+        self._last_id_clean_delta: Optional[float] = None
+        # id_sim t-bins accumulate across microbatches; flushed per optimizer
+        # step in hook_train_loop (see _canonical_telemetry_payload).
+        self._id_sim_bins: dict = {}
+        self._depth_loss_bins: dict = {}
+        self._bsh_sim_bins: dict = {}
+        self._diffusion_loss_bins: dict = {}
+        # GA-safe scalar means for the canonical payload (display-only).
+        self._metric_buffer = MetricBuffer()
 
         _subject_mask_raw = self.get_conf('subject_mask', None)
         if _subject_mask_raw is not None:
@@ -1386,6 +1397,13 @@ class SDTrainer(BaseSDTrainProcess):
                 grad_sum += float(grad_i)
                 n += 1
             processed.append(i)
+            # t-binned depth loss (canonical depth/loss/tNN); flushed per
+            # optimizer step in hook_train_loop.
+            _d_bins = getattr(self, '_depth_loss_bins', None)
+            if _d_bins is not None:
+                _tv = float(t[i].item())
+                _bs = int(_tv * 10) / 10.0
+                self._bin_update(_d_bins, f'depth_loss_t{int(_bs * 100):02d}', float(loss_i.detach()))
 
             # Preview: four-panel Krea tile every preview_every DEPTH steps.
             # Cadence keys off _depth_step_count (advanced above), not raw step
@@ -1943,6 +1961,64 @@ class SDTrainer(BaseSDTrainProcess):
                 f"({pool.shape[0]} pool embeddings)"
             )
 
+    @staticmethod
+    def _bin_update(bins: dict, bin_key: str, value: float) -> None:
+        slot = bins.get(bin_key)
+        if slot is None:
+            bins[bin_key] = {'sum': float(value), 'count': 1}
+        else:
+            slot['sum'] += float(value)
+            slot['count'] += 1
+
+    @staticmethod
+    def _bin_finalize(bins: Optional[dict]) -> dict:
+        if not bins:
+            return {}
+        out = {}
+        for k, slot in bins.items():
+            cnt = slot.get('count', 0) if isinstance(slot, dict) else 0
+            if cnt > 0:
+                out[k] = slot['sum'] / cnt
+        return out
+
+    @staticmethod
+    def _canonical_telemetry_payload(loss_dict: dict, buf_means: Optional[dict], bins_map: Optional[dict]) -> dict:
+        """Canonical perceptual-fork telemetry for one optimizer step.
+
+        Scalars prefer the GA-safe buffer mean (gradient accumulation
+        reports a real mean, not the last microbatch), falling back to the
+        drained loss_dict value. Bins map a legacy prefix to a canonical
+        subsystem path, e.g. id_sim_t40 -> identity/sim/t40. Emitted through
+        the direct logger so keys land unprefixed, like depth/*.
+        """
+        scalar_renames = {
+            'id_sim': 'identity/sim',
+            'identity_loss': 'identity/loss_raw',
+            'identity_loss_applied': 'identity/loss_applied',
+            'id_clean_target': 'identity/clean_target',
+            'id_clean_delta': 'identity/clean_delta',
+            'body_shape_gated_pct': 'body_shape/gated_pct',
+            'weight_norm': 'core/weight_norm',
+            'fisher_trace': 'grad/fisher',
+        }
+        payload = {}
+        for leg, canon in scalar_renames.items():
+            if leg in (buf_means or {}):
+                payload[canon] = buf_means[leg]
+            elif leg in loss_dict:
+                payload[canon] = loss_dict[leg]
+        bin_prefixes = {
+            'id_sim': 'identity/sim',
+            'depth_loss': 'depth/loss',
+            'bsh_sim': 'body_shape/sim',
+            'diffusion_loss': 'diffusion/loss',
+        }
+        for prefix, canon_prefix in bin_prefixes.items():
+            bins = (bins_map or {}).get(prefix)
+            for k, v in SDTrainer._bin_finalize(bins).items():
+                payload[f'{canon_prefix}/t{k[len(prefix) + 2:]}'] = v
+        return payload
+
     def _compute_face_identity_anchor_loss(self, noise_pred, noisy_latents, timesteps, batch):
         """Run the unified live decode + ArcFace forward + bias-corrected cosine loss.
 
@@ -2092,11 +2168,45 @@ class SDTrainer(BaseSDTrainProcess):
             [weights[i] for i in idx_map], device=pixels.device, dtype=torch.float32,
         )
         if loss_mask.any():
-            applied = (per_sample_loss * w_tensor).sum() / max(int(loss_mask.sum().item()), 1)
+            denom = max(int(loss_mask.sum().item()), 1)
+            applied = (per_sample_loss * w_tensor).sum() / denom
             self._last_identity_loss_applied = float(applied.detach().item())
             with torch.no_grad():
-                self._last_id_sim = float((cos_sim * loss_mask.float()).sum().item() / max(int(loss_mask.sum().item()), 1))
-                self._last_identity_loss = float(((1.0 - cos_sim) * loss_mask.float()).sum().item() / max(int(loss_mask.sum().item()), 1))
+                lm = loss_mask.float()
+                self._last_id_sim = float((cos_sim * lm).sum().item() / denom)
+                self._last_identity_loss = float(((1.0 - cos_sim) * lm).sum().item() / denom)
+                # Clean-target diagnostics (average mode only): what the
+                # dataset-mean embedding scores against each ref, and how far
+                # the live pull sits past that bias-corrected baseline.
+                if clean_cos is not None:
+                    cc = clean_cos.to(cos_sim.device)
+                    self._last_id_clean_target = float((cc * lm).sum().item() / denom)
+                    self._last_id_clean_delta = float(((cos_sim - cc) * lm).sum().item() / denom)
+                for j in range(cos_sim.shape[0]):
+                    if loss_mask[j]:
+                        t_val = float(t_ratio[idx_map[j]].item())
+                        bin_start = int(t_val * 10) / 10.0
+                        # getattr: tests drive this method on bare instances
+                        # built via __new__ (no __init__ attribute state).
+                        _bins = getattr(self, '_id_sim_bins', None)
+                        if _bins is not None:
+                            self._bin_update(
+                                _bins,
+                                f'id_sim_t{int(bin_start * 100):02d}',
+                                float(cos_sim[j].item()),
+                            )
+                # GA-safe means for the canonical flush (display-only).
+                _mb = getattr(self, '_metric_buffer', None)
+                if _mb is not None:
+                    _mb.add_scalar('id_sim', self._last_id_sim, weight=denom)
+                    _mb.add_scalar('identity_loss', self._last_identity_loss, weight=denom)
+                    _mb.add_scalar('identity_loss_applied', self._last_identity_loss_applied, weight=denom)
+                    _ct = getattr(self, '_last_id_clean_target', None)
+                    _cd = getattr(self, '_last_id_clean_delta', None)
+                    if _ct is not None:
+                        _mb.add_scalar('id_clean_target', _ct, weight=denom)
+                    if _cd is not None:
+                        _mb.add_scalar('id_clean_delta', _cd, weight=denom)
             return applied
         self._last_identity_loss = 0.0
         return 0.0
@@ -2332,6 +2442,15 @@ class SDTrainer(BaseSDTrainProcess):
         with torch.no_grad():
             self._last_body_shape_cos = float((cos * gate.float()).sum().item() / n_valid)
             self._last_body_shape_loss = float((l1 * gate.float()).sum().item() / n_valid)
+            self._last_body_shape_gated_pct = float(gate.float().mean().item())
+            # t-binned body-shape cosine (canonical body_shape/sim/tNN).
+            _bsh_bins = getattr(self, '_bsh_sim_bins', None)
+            if _bsh_bins is not None:
+                for j in range(cos.shape[0]):
+                    if gate[j]:
+                        _tv = float(t_ratio[idx_map[j]].item())
+                        _bs = int(_tv * 10) / 10.0
+                        self._bin_update(_bsh_bins, f'bsh_sim_t{int(_bs * 100):02d}', float(cos[j].item()))
         return applied
 
     # ------------------------------------------------------------------
@@ -2459,6 +2578,12 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_vae_anchor_loss_applied = float(applied.detach().item())
         with torch.no_grad():
             self._last_vae_anchor_loss = float(loss_per_sample.mean().item())
+            # Per-level decomposition (canonical vae_anchor/level/*), logged
+            # directly like depth/* so each value commits at its own step.
+            if _per_level:
+                _va_logger = getattr(self, 'logger', None)
+                if _va_logger is not None:
+                    _va_logger.log({f'vae_anchor/level/{lv}': float(v) for lv, v in _per_level.items()})
         return applied
 
     def hook_before_train_loop(self):
@@ -4088,9 +4213,25 @@ class SDTrainer(BaseSDTrainProcess):
                     and bool(_depth_gates['diffusion_zero'].all())
                     and torch.is_tensor(loss) and loss.requires_grad):
                 self._diff_counterfactual_for_grad = loss.mean()
+            # Canonical diffusion/* telemetry: weighted = pre-split
+            # per-sample mean (counterfactual on depth-alternation steps).
+            _diff_weighted = float(loss.detach().mean().item()) if torch.is_tensor(loss) else None
+            _diff_per_sample = loss.detach() if torch.is_tensor(loss) else None
             loss = self._apply_diffusion_split_mask(loss, _depth_gates['diffusion_zero'])
         else:
+            _diff_weighted = None
+            _diff_per_sample = loss.detach() if torch.is_tensor(loss) else None
             loss = loss.mean()
+
+        # t-binned diffusion loss (canonical diffusion/loss/tNN) from the
+        # pre-mean per-sample weighted losses.
+        _db = getattr(self, '_diffusion_loss_bins', None)
+        if _db is not None and _diff_per_sample is not None and _diff_per_sample.dim() > 0:
+            _numt = self.sd.noise_scheduler.config.num_train_timesteps
+            for j in range(_diff_per_sample.shape[0]):
+                _tv = float((timesteps[j].float() / _numt).item())
+                _bs = int(_tv * 10) / 10.0
+                self._bin_update(_db, f'diffusion_loss_t{int(_bs * 100):02d}', float(_diff_per_sample[j].item()))
 
         audio_per_sample, audio_valid = self._audio_loss_per_sample(
             audio_pred, audio_target, audio_mask, loss_multiplier
@@ -4102,6 +4243,11 @@ class SDTrainer(BaseSDTrainProcess):
             audio_loss = audio_loss * self.sd.dopsd_settings.preservation_weight
         objective_eligible = objective_eligible | audio_valid
         self.additional_logs['loss/img'] = loss.detach().item()
+        # Canonical diffusion/* scalars: applied = what enters the objective
+        # (identical to loss/img), weighted = the un-split counterfactual.
+        self.additional_logs['diffusion/loss_applied'] = loss.detach().item()
+        if _diff_weighted is not None:
+            self.additional_logs['diffusion/loss_weighted'] = _diff_weighted
         if audio_pred is not None and audio_target is not None:
             self.additional_logs['loss/audio'] = audio_loss.detach().item()
             loss = loss + audio_loss
@@ -6091,9 +6237,12 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_identity_loss',
             '_last_identity_loss_applied',
             '_last_id_sim',
+            '_last_id_clean_target',
+            '_last_id_clean_delta',
             '_last_body_shape_loss',
             '_last_body_shape_loss_applied',
             '_last_body_shape_cos',
+            '_last_body_shape_gated_pct',
             '_last_vae_anchor_loss',
             '_last_vae_anchor_loss_applied',
             '_last_lr_scheduled',
@@ -6107,6 +6256,25 @@ class SDTrainer(BaseSDTrainProcess):
             if metric_value is not None:
                 loss_dict[metric_name.removeprefix('_last_')] = metric_value
                 setattr(self, metric_name, None)
+
+        # Canonical telemetry flush (perceptual-fork namespace), committed at
+        # this step via the direct logger (unprefixed, like depth/*).
+        _mb = getattr(self, '_metric_buffer', None)
+        _buf_means = _mb.flush_scalars() if _mb is not None else {}
+        _t_payload = self._canonical_telemetry_payload(loss_dict, _buf_means, {
+            'id_sim': self._id_sim_bins,
+            'depth_loss': getattr(self, '_depth_loss_bins', None),
+            'bsh_sim': getattr(self, '_bsh_sim_bins', None),
+            'diffusion_loss': getattr(self, '_diffusion_loss_bins', None),
+        })
+        self._id_sim_bins = {}
+        self._depth_loss_bins = {}
+        self._bsh_sim_bins = {}
+        self._diffusion_loss_bins = {}
+        if _t_payload:
+            _t_logger = getattr(self, 'logger', None)
+            if _t_logger is not None:
+                _t_logger.log(_t_payload)
 
         self.end_of_training_loop()
 
