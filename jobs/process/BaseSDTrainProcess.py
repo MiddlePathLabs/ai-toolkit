@@ -77,7 +77,7 @@ from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adap
 
 from toolkit.scheduler import get_lr_scheduler
 from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
-from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
+from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork, PreviewStateRestorationError
 
 from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, add_base_model_info_to_meta, \
@@ -384,6 +384,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
+        python_rng_state = random.getstate()
+        try:
+            return self._sample(step=step, is_first=is_first)
+        finally:
+            random.setstate(python_rng_state)
+
+    def _sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
         if getattr(self, '_previews_disabled_by_oom', False):
@@ -562,6 +569,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     try:
                         self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
                     except Exception as e:
+                        if isinstance(e, PreviewStateRestorationError):
+                            raise
                         if _is_out_of_memory(e):
                             self._disable_previews_after_oom(step, e)
                         else:
@@ -1823,6 +1832,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_train_loop(self, batch):
         # return loss
         return 0.0
+
+    def hook_train_loop_oom(self):
+        """Discard trainer-specific pending state from an aborted optimizer window."""
+
     
     def hook_after_sd_init_before_load(self):
         pass
@@ -3776,6 +3789,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
+                self.hook_train_loop_oom()
                 self._adaptive_lr_members = {}
                 if self.optimizer_runtime is not None:
                     self.optimizer_runtime.end_window(self.optimizer)

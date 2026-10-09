@@ -3,12 +3,14 @@
 import ast
 import json
 import os
+import random
 import re
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,14 +36,19 @@ def _load_methods(path, class_name, method_names, namespace):
     return {name: namespace[name] for name in method_names}
 
 
-def _sample_process(tmp_path, *, ema=True, first=False, postprocess=None, fail=False):
+def _sample_process(
+    tmp_path, *, ema=True, first=False, postprocess=None, fail=False,
+    python_rng=None, prompt_count=12,
+):
     clock = iter(1234.5 + index for index in range(12))
     namespace = {
         "os": os,
         "json": json,
         "re": re,
         "tempfile": tempfile,
-        "random": SimpleNamespace(randint=lambda *_: 24680),
+        "random": python_rng or SimpleNamespace(
+            randint=lambda *_: 24680, getstate=random.getstate, setstate=random.setstate,
+        ),
         "time": SimpleNamespace(time=lambda: next(clock)),
         "ImgExt": "png",
     }
@@ -53,16 +60,19 @@ def _sample_process(tmp_path, *, ema=True, first=False, postprocess=None, fail=F
     image_config = type("GenerateImageConfig", (), config_methods)
     namespace.update({
         "GenerateImageConfig": image_config,
+        "torch": torch,
         "flush": lambda: None,
         "print_acc": lambda *_: None,
         "_is_out_of_memory": lambda error: "out of memory" in str(error).lower(),
         "ClipVisionAdapter": type("ClipVisionAdapter", (), {}),
         "CustomAdapter": type("CustomAdapter", (), {}),
+        "PreviewStateRestorationError": type("PreviewStateRestorationError", (RuntimeError,), {}),
     })
-    sample = _load_methods(
-        "jobs/process/BaseSDTrainProcess.py", "BaseSDTrainProcess", {"sample"}, namespace,
-    )["sample"]
-    prompts = ["a sample" for _ in range(12)]
+    sample_methods = _load_methods(
+        "jobs/process/BaseSDTrainProcess.py", "BaseSDTrainProcess",
+        {"sample", "_sample"}, namespace,
+    )
+    prompts = ["a sample" for _ in range(prompt_count)]
     prompts[1] = "raw override --seed 77 --steps 9"
     prompts[2] = "normal override --d 88 --s 11"
     samples = [
@@ -103,6 +113,7 @@ def _sample_process(tmp_path, *, ema=True, first=False, postprocess=None, fail=F
 
     process = SimpleNamespace(
         accelerator=SimpleNamespace(is_main_process=True), save_root=str(tmp_path),
+        device_torch=torch.device("cpu"),
         sample_config=SimpleNamespace(ext="png") if first else config,
         first_sample_config=config, adapter_config=None, embedding=None,
         adapter=None, trigger_word=None, logger=None,
@@ -110,7 +121,8 @@ def _sample_process(tmp_path, *, ema=True, first=False, postprocess=None, fail=F
         sd=SimpleNamespace(generate_images=generate_images),
         post_process_generate_image_config_list=postprocess or (lambda configs: configs),
     )
-    sample(process, step=42, is_first=first)
+    process._sample = MethodType(sample_methods["_sample"], process)
+    sample_methods["sample"](process, step=42, is_first=first)
     return generated, modes
 
 
@@ -188,3 +200,41 @@ def test_failed_generation_leaves_complete_plan_without_media(tmp_path):
     assert len(plan["samples"]) == 12
     assert not any((tmp_path / "samples" / item["filename"]).exists() for item in plan["samples"])
     assert not list(plan_path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("prompt_count", [3, 12])
+@pytest.mark.parametrize("failure", [None, "configuration", "generation"])
+def test_random_seed_preview_preserves_training_python_rng(
+    tmp_path, first, prompt_count, failure,
+):
+    state = random.getstate()
+    random.seed(1937)
+    expected_state = random.getstate()
+    expected_draws = [random.random() for _ in range(5)]
+    random.setstate(expected_state)
+
+    def postprocess(configs):
+        random.random()
+        if failure == "configuration":
+            raise ValueError("configuration failed")
+        return configs
+
+    try:
+        if failure is None:
+            _sample_process(
+                tmp_path, first=first, prompt_count=prompt_count,
+                python_rng=random, postprocess=postprocess,
+            )
+        else:
+            error = ValueError if failure == "configuration" else RuntimeError
+            with pytest.raises(error, match=f"{failure} failed"):
+                _sample_process(
+                    tmp_path, first=first, prompt_count=prompt_count,
+                    python_rng=random, postprocess=postprocess,
+                    fail=failure == "generation",
+                )
+        assert random.getstate() == expected_state
+        assert [random.random() for _ in range(5)] == expected_draws
+    finally:
+        random.setstate(state)

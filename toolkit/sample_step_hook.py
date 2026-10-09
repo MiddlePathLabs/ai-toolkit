@@ -26,48 +26,57 @@ def install_sample_step_hooks(holder, pipeline) -> Callable[[], None]:
         if cand is not None and hasattr(cand, "step") and all(cand is not s for s in schedulers):
             schedulers.append(cand)
     unwraps = []
-    for scheduler in schedulers:
-        current = scheduler.step
-        orig = getattr(current, "_aitk_orig_step", None) or current
+    try:
+        for scheduler in schedulers:
+            current = scheduler.step
+            orig = getattr(current, "_aitk_orig_step", None) or current
 
-        def make(orig, scheduler):
-            def step(*args, **kwargs):
-                # capture the pre-step state: x0 is derived from (model_output,
-                # timestep, sample) with the sigma/alpha of THIS step, which
-                # the scheduler advances past inside orig()
-                model_output = args[0] if len(args) > 0 else kwargs.get("model_output")
-                timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
-                sample_in = args[2] if len(args) > 2 else kwargs.get("sample")
-                coeffs = _x0_coefficients(scheduler, timestep)
-                out = orig(*args, **kwargs)
-                if isinstance(out, tuple):
-                    prev_sample = out[0]
-                    pred_x0 = None
+            def make(orig, scheduler):
+                def step(*args, **kwargs):
+                    # capture the pre-step state: x0 is derived from (model_output,
+                    # timestep, sample) with the sigma/alpha of THIS step, which
+                    # the scheduler advances past inside orig()
+                    model_output = args[0] if len(args) > 0 else kwargs.get("model_output")
+                    timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
+                    sample_in = args[2] if len(args) > 2 else kwargs.get("sample")
+                    coeffs = _x0_coefficients(scheduler, timestep)
+                    out = orig(*args, **kwargs)
+                    if isinstance(out, tuple):
+                        prev_sample = out[0]
+                        pred_x0 = None
+                    else:
+                        prev_sample = getattr(out, "prev_sample", None)
+                        pred_x0 = getattr(out, "pred_original_sample", None)
+                    hook = getattr(holder, "sample_step_hook", None)
+                    if hook is not None and prev_sample is not None:
+                        if pred_x0 is None:
+                            pred_x0 = _predict_x0(coeffs, model_output, sample_in)
+                        timesteps = getattr(scheduler, "timesteps", None)
+                        num_steps = len(timesteps) if timesteps is not None else None
+                        idx = getattr(holder, "_sample_step_index", 0)
+                        holder._sample_step_index = idx + 1
+                        hook(idx, num_steps, pred_x0 if pred_x0 is not None else prev_sample)
+                    return out
+
+                step._aitk_orig_step = orig
+                return step
+
+            had_override = "step" in scheduler.__dict__
+            previous = scheduler.__dict__.get("step")
+
+            def unwrap(scheduler=scheduler, had_override=had_override, previous=previous):
+                if had_override:
+                    scheduler.step = previous
                 else:
-                    prev_sample = getattr(out, "prev_sample", None)
-                    pred_x0 = getattr(out, "pred_original_sample", None)
-                hook = getattr(holder, "sample_step_hook", None)
-                if hook is not None and prev_sample is not None:
-                    if pred_x0 is None:
-                        pred_x0 = _predict_x0(coeffs, model_output, sample_in)
-                    timesteps = getattr(scheduler, "timesteps", None)
-                    num_steps = len(timesteps) if timesteps is not None else None
-                    idx = getattr(holder, "_sample_step_index", 0)
-                    holder._sample_step_index = idx + 1
-                    hook(idx, num_steps, pred_x0 if pred_x0 is not None else prev_sample)
-                return out
+                    scheduler.__dict__.pop("step", None)
 
-            step._aitk_orig_step = orig
-            return step
-
-        scheduler.step = make(orig, scheduler)
-
-        def unwrap(scheduler=scheduler):
-            if "step" in scheduler.__dict__:
-                del scheduler.__dict__["step"]
-
-        unwraps.append(unwrap)
-    return lambda: [u() for u in unwraps]
+            unwraps.append(unwrap)
+            scheduler.step = make(orig, scheduler)
+    except BaseException:
+        for unwrap in reversed(unwraps):
+            unwrap()
+        raise
+    return lambda: [u() for u in reversed(unwraps)]
 
 
 def _x0_coefficients(scheduler, timestep):

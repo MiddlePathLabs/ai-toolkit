@@ -6037,6 +6037,57 @@ class SDTrainer(BaseSDTrainProcess):
             self._last_weight_noise_norm = noise_sq ** 0.5
             self._last_weight_norm = weight_sq ** 0.5
 
+    def _drain_loss_metrics(self) -> dict:
+        metrics = {}
+        for metric_name in (
+            '_last_grad_noise_norm',
+            '_last_grad_noise_snr',
+            '_last_weight_noise_norm',
+            '_last_weight_norm',
+            '_last_fisher_trace',
+            '_last_normal_loss',
+            '_last_normal_loss_applied',
+            '_last_normal_cos',
+            '_last_body_proportion_loss',
+            '_last_body_proportion_loss_applied',
+            '_last_identity_loss',
+            '_last_identity_loss_applied',
+            '_last_id_sim',
+            '_last_id_clean_target',
+            '_last_id_clean_delta',
+            '_last_body_shape_loss',
+            '_last_body_shape_loss_applied',
+            '_last_body_shape_cos',
+            '_last_body_shape_gated_pct',
+            '_last_vae_anchor_loss',
+            '_last_vae_anchor_loss_applied',
+            '_last_lr_scheduled',
+            '_last_lr_window_scale',
+            '_last_lr_effective',
+            '_last_lr_member_count',
+            '_last_dopsd_teacher_err',
+            '_last_dopsd_photo_err',
+        ):
+            metric_value = getattr(self, metric_name, None)
+            if metric_value is not None:
+                metrics[metric_name.removeprefix('_last_')] = metric_value
+                setattr(self, metric_name, None)
+        return metrics
+
+    def hook_train_loop_oom(self):
+        self._drain_loss_metrics()
+        metric_buffer = getattr(self, '_metric_buffer', None)
+        if metric_buffer is not None:
+            metric_buffer.reset()
+        self._id_sim_bins = {}
+        self._depth_loss_bins = {}
+        self._bsh_sim_bins = {}
+        self._diffusion_loss_bins = {}
+        self._grad_cos_acc = None
+        self._last_grad_norm_diffusion = None
+        self._last_grad_norm_depth = None
+        self._last_grad_cos_diff_depth = None
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = [item for item in batch if item is not None]
@@ -6223,39 +6274,7 @@ class SDTrainer(BaseSDTrainProcess):
         })
 
 
-        for metric_name in (
-            '_last_grad_noise_norm',
-            '_last_grad_noise_snr',
-            '_last_weight_noise_norm',
-            '_last_weight_norm',
-            '_last_fisher_trace',
-            '_last_normal_loss',
-            '_last_normal_loss_applied',
-            '_last_normal_cos',
-            '_last_body_proportion_loss',
-            '_last_body_proportion_loss_applied',
-            '_last_identity_loss',
-            '_last_identity_loss_applied',
-            '_last_id_sim',
-            '_last_id_clean_target',
-            '_last_id_clean_delta',
-            '_last_body_shape_loss',
-            '_last_body_shape_loss_applied',
-            '_last_body_shape_cos',
-            '_last_body_shape_gated_pct',
-            '_last_vae_anchor_loss',
-            '_last_vae_anchor_loss_applied',
-            '_last_lr_scheduled',
-            '_last_lr_window_scale',
-            '_last_lr_effective',
-            '_last_lr_member_count',
-            '_last_dopsd_teacher_err',
-            '_last_dopsd_photo_err',
-        ):
-            metric_value = getattr(self, metric_name, None)
-            if metric_value is not None:
-                loss_dict[metric_name.removeprefix('_last_')] = metric_value
-                setattr(self, metric_name, None)
+        loss_dict.update(self._drain_loss_metrics())
 
         # Canonical telemetry flush (perceptual-fork namespace), committed at
         # this step via the direct logger (unprefixed, like depth/*).

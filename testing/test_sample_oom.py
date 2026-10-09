@@ -1,6 +1,7 @@
 """A preview that runs out of GPU memory: training continues, the raw
 training weights come back from under the EMA ones, and later previews are
 skipped instead of hitting the same wall every sample_every steps."""
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess, _is_out_of_memory
 from toolkit.config_modules import SampleConfig
 from toolkit.ema import ExponentialMovingAverage
+from toolkit.stable_diffusion_model import PreviewStateRestorationError
 
 
 class _FakeSD:
@@ -111,3 +113,41 @@ def test_is_out_of_memory():
     assert _is_out_of_memory(RuntimeError("CUDA out of memory. Tried to allocate"))
     assert not _is_out_of_memory(RuntimeError("shape mismatch"))
     assert not _is_out_of_memory(ValueError("out of memory"))
+
+
+@pytest.mark.parametrize("error", [None, torch.cuda.OutOfMemoryError("CUDA out of memory")])
+def test_random_seed_preview_preserves_python_rng_on_generation_oom(tmp_path, error):
+    param = _trained_param()
+    host = _host(tmp_path, _FakeSD(error), param)
+    host.sample_config = SampleConfig(prompts=["first", "second"], seed=-1)
+    host.first_sample_config = host.sample_config
+    generate = host.sd.generate_images
+
+    def generate_with_python_rng(configs, sampler=None):
+        random.seed(configs[0].seed)
+        random.random()
+        generate(configs, sampler=sampler)
+
+    host.sd.generate_images = generate_with_python_rng
+    state = random.getstate()
+    try:
+        host.sample(0, is_first=True)
+        assert random.getstate() == state
+    finally:
+        random.setstate(state)
+
+
+@pytest.mark.parametrize("raw_weights", [False, True])
+def test_preview_restoration_failure_aborts_even_raw_weight_sampling(tmp_path, raw_weights):
+    param = _trained_param()
+    error = PreviewStateRestorationError("Preview training-state restoration failed")
+    host = _host(tmp_path, _FakeSD(error), param)
+    host.sample_config.samples[0].raw_weights = raw_weights
+    _diverge(host, param)
+    raw = param.detach().clone()
+
+    with pytest.raises(PreviewStateRestorationError) as raised:
+        host.sample(0, is_first=True)
+    assert raised.value is error
+    assert torch.equal(param.detach(), raw)
+    assert not getattr(host, "_previews_disabled_by_oom", False)

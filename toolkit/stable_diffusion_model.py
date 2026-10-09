@@ -75,6 +75,7 @@ from toolkit.network_mixins import network_base_is_quantized
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
+    from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 
 # tell it to shut up
 diffusers.logging.set_verbosity(diffusers.logging.ERROR)
@@ -140,6 +141,10 @@ def _adopt_v2(module):
     except (ImportError, TypeError):
         return module
 
+
+
+class PreviewStateRestorationError(RuntimeError):
+    pass
 
 
 class BlankNetwork:
@@ -1248,452 +1253,466 @@ class StableDiffusion:
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline, StableDiffusionXLPipeline] = None,
     ):
-        network = unwrap_model(self.network)
+        from contextlib import ExitStack
+    
+        training_network = unwrap_model(self.network)
+        network_state = None if training_network is None else (
+            training_network.training, training_network.multiplier, training_network.is_active,
+            training_network.is_merged_in,
+        )
+        assistant = self.assistant_lora if (
+            self.model_config.assistant_lora_path is not None
+            or self.model_config.inference_lora_path is not None
+        ) else None
+        assistant_state = None
+        if assistant is not None:
+            parameter = next(assistant.parameters())
+            assistant_state = (assistant.is_active, parameter.device, parameter.dtype)
+        previous_device_state = self.device_state
+        generation_device_state = None
         merge_multiplier = 1.0
-        flush()
-        # if using assistant, unfuse it
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Unloading assistant lora")
-            if self.invert_assistant_lora:
+        unet_dtype = self.unet.dtype
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        unwrap_step_hooks = None
+        refiner_pipeline = None
+        missing = object()
+        sample_step_index = getattr(self, '_sample_step_index', missing)
+        adapter_state = {} if self.adapter is None else {
+            name: getattr(self.adapter, name, missing)
+            for name in ('noise_scheduler', 'num_images', 'is_unconditional_run')
+        }
+        state_modules = [
+            self.unet, self.adapter, self.refiner_unet,
+            *(self.text_encoder if isinstance(self.text_encoder, list) else [self.text_encoder]),
+        ]
+        gradient_state = [
+            (parameter, parameter.requires_grad)
+            for module in state_modules if module is not None
+            for parameter in module.parameters()
+        ]
+        try:
+            self.save_device_state()
+            generation_device_state = self.device_state
+            network = training_network
+            flush()
+            # if using assistant, unfuse it
+            if self.model_config.assistant_lora_path is not None:
+                print_acc("Unloading assistant lora")
+                if self.invert_assistant_lora:
+                    self.assistant_lora.is_active = True
+                    # move weights on to the device
+                    self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+                else:
+                    self.assistant_lora.is_active = False
+                    
+            if self.model_config.inference_lora_path is not None:
+                print_acc("Loading inference lora")
                 self.assistant_lora.is_active = True
                 # move weights on to the device
                 self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+    
+            if network is not None:
+                network.eval()
+                # check if we have the same network weight for all samples. If we do, we can merge in th
+                # the network to drastically speed up inference (never into a
+                # quantized base, see network_base_is_quantized)
+                unique_network_weights = set([x.network_multiplier for x in image_configs])
+                if (
+                    len(unique_network_weights) == 1
+                    and network.can_merge_in
+                    and not network.is_merged_in
+                    and not network_base_is_quantized(network)
+                ):
+                    # make sure it is on device before merging. 
+                    self.unet.to(self.device_torch)
+                    merge_multiplier = unique_network_weights.pop()
+                    network.merge_in(merge_weight=merge_multiplier)
             else:
-                self.assistant_lora.is_active = False
-                
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Loading inference lora")
-            self.assistant_lora.is_active = True
-            # move weights on to the device
-            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
-
-        if network is not None:
-            network.eval()
-            # check if we have the same network weight for all samples. If we do, we can merge in th
-            # the network to drastically speed up inference (never into a
-            # quantized base, see network_base_is_quantized)
-            unique_network_weights = set([x.network_multiplier for x in image_configs])
-            if (
-                len(unique_network_weights) == 1
-                and network.can_merge_in
-                and not network_base_is_quantized(network)
-            ):
-                # make sure it is on device before merging. 
-                self.unet.to(self.device_torch)
-                can_merge_in = True
-                merge_multiplier = unique_network_weights.pop()
-                network.merge_in(merge_weight=merge_multiplier)
-        else:
-            network = BlankNetwork()
-
-        self.save_device_state()
-        self.set_device_state_preset('generate')
-
-        # save current seed state for training
-        rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-
-        if pipeline is None:
-            noise_scheduler = self.noise_scheduler
-            if sampler is not None:
-                if sampler.startswith("sample_"):  # sample_dpmpp_2m
-                    # using ksampler
-                    noise_scheduler = get_sampler(
-                        'lms', {
-                            "prediction_type": self.prediction_type,
-                        })
-                else:
-                    arch = 'sd'
-                    if self.is_pixart:
-                        arch = 'pixart'
-                    if self.is_flux:
-                        arch = 'flux'
-                    if self.is_lumina2:
-                        arch = 'lumina2'
-                    noise_scheduler = get_sampler(
-                        sampler,
-                        {
-                            "prediction_type": self.prediction_type,
-                        },
-                        arch=arch
-                    )
-
-                try:
-                    noise_scheduler = noise_scheduler.to(self.device_torch, self.torch_dtype)
-                except:
-                    pass
-
-            if self.is_xl:
-                Pipe = StableDiffusionXLPipeline
-            elif self.is_v3:
-                Pipe = StableDiffusion3Pipeline
-            else:
-                Pipe = StableDiffusionPipeline
-
-            extra_args = {}
-            if self.adapter is not None:
-                if isinstance(self.adapter, T2IAdapter):
-                    if self.is_xl:
-                        Pipe = StableDiffusionXLAdapterPipeline
+                network = BlankNetwork()
+    
+            self.set_device_state_preset('generate')
+    
+            if pipeline is None:
+                noise_scheduler = self.noise_scheduler
+                if sampler is not None:
+                    if sampler.startswith("sample_"):  # sample_dpmpp_2m
+                        # using ksampler
+                        noise_scheduler = get_sampler(
+                            'lms', {
+                                "prediction_type": self.prediction_type,
+                            })
                     else:
-                        Pipe = StableDiffusionAdapterPipeline
-                    extra_args['adapter'] = self.adapter
-                elif isinstance(self.adapter, ControlNetModel):
-                    if self.is_xl:
-                        Pipe = StableDiffusionXLControlNetPipeline
+                        arch = 'sd'
+                        if self.is_pixart:
+                            arch = 'pixart'
+                        if self.is_flux:
+                            arch = 'flux'
+                        if self.is_lumina2:
+                            arch = 'lumina2'
+                        noise_scheduler = get_sampler(
+                            sampler,
+                            {
+                                "prediction_type": self.prediction_type,
+                            },
+                            arch=arch
+                        )
+    
+                    try:
+                        noise_scheduler = noise_scheduler.to(self.device_torch, self.torch_dtype)
+                    except:
+                        pass
+    
+                if self.is_xl:
+                    Pipe = StableDiffusionXLPipeline
+                elif self.is_v3:
+                    Pipe = StableDiffusion3Pipeline
+                else:
+                    Pipe = StableDiffusionPipeline
+    
+                extra_args = {}
+                if self.adapter is not None:
+                    if isinstance(self.adapter, T2IAdapter):
+                        if self.is_xl:
+                            Pipe = StableDiffusionXLAdapterPipeline
+                        else:
+                            Pipe = StableDiffusionAdapterPipeline
+                        extra_args['adapter'] = self.adapter
+                    elif isinstance(self.adapter, ControlNetModel):
+                        if self.is_xl:
+                            Pipe = StableDiffusionXLControlNetPipeline
+                        else:
+                            Pipe = StableDiffusionControlNetPipeline
+                        extra_args['controlnet'] = self.adapter
+                    elif isinstance(self.adapter, ReferenceAdapter):
+                        # pass the noise scheduler to the adapter
+                        self.adapter.noise_scheduler = noise_scheduler
                     else:
-                        Pipe = StableDiffusionControlNetPipeline
-                    extra_args['controlnet'] = self.adapter
-                elif isinstance(self.adapter, ReferenceAdapter):
-                    # pass the noise scheduler to the adapter
-                    self.adapter.noise_scheduler = noise_scheduler
-                else:
-                    if self.is_xl:
-                        extra_args['add_watermarker'] = False
-
-            # TODO add clip skip
-            if self.is_xl:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    unet=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
-                    tokenizer=self.tokenizer[0],
-                    tokenizer_2=self.tokenizer[1],
-                    scheduler=noise_scheduler,
-                    **extra_args
-                ).to(self.device_torch)
-                pipeline.watermark = None
-            elif self.is_flux:
-                if self.model_config.use_flux_cfg:
-                    pipeline = FluxWithCFGPipeline(
-                        vae=self.vae,
-                        transformer=unwrap_model(self.unet),
-                        text_encoder=unwrap_model(self.text_encoder[0]),
-                        text_encoder_2=unwrap_model(self.text_encoder[1]),
-                        tokenizer=self.tokenizer[0],
-                        tokenizer_2=self.tokenizer[1],
-                        scheduler=noise_scheduler,
-                        **extra_args
-                    )
-
-                else:
-                    Pipe = FluxPipeline
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                        # see if it is a control lora
-                        if self.adapter.control_lora is not None:
-                            Pipe = FluxAdvancedControlPipeline
-                            extra_args['do_inpainting'] = self.adapter.config.has_inpainting_input
-                            extra_args['num_controls'] = self.adapter.config.num_control_images
-                    
+                        if self.is_xl:
+                            extra_args['add_watermarker'] = False
+    
+                # TODO add clip skip
+                if self.is_xl:
                     pipeline = Pipe(
                         vae=self.vae,
-                        transformer=unwrap_model(self.unet),
-                        text_encoder=unwrap_model(self.text_encoder[0]),
-                        text_encoder_2=unwrap_model(self.text_encoder[1]),
+                        unet=self.unet,
+                        text_encoder=self.text_encoder[0],
+                        text_encoder_2=self.text_encoder[1],
                         tokenizer=self.tokenizer[0],
                         tokenizer_2=self.tokenizer[1],
                         scheduler=noise_scheduler,
                         **extra_args
+                    ).to(self.device_torch)
+                    pipeline.watermark = None
+                elif self.is_flux:
+                    if self.model_config.use_flux_cfg:
+                        pipeline = FluxWithCFGPipeline(
+                            vae=self.vae,
+                            transformer=unwrap_model(self.unet),
+                            text_encoder=unwrap_model(self.text_encoder[0]),
+                            text_encoder_2=unwrap_model(self.text_encoder[1]),
+                            tokenizer=self.tokenizer[0],
+                            tokenizer_2=self.tokenizer[1],
+                            scheduler=noise_scheduler,
+                            **extra_args
+                        )
+    
+                    else:
+                        Pipe = FluxPipeline
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                            # see if it is a control lora
+                            if self.adapter.control_lora is not None:
+                                Pipe = FluxAdvancedControlPipeline
+                                extra_args['do_inpainting'] = self.adapter.config.has_inpainting_input
+                                extra_args['num_controls'] = self.adapter.config.num_control_images
+                        
+                        pipeline = Pipe(
+                            vae=self.vae,
+                            transformer=unwrap_model(self.unet),
+                            text_encoder=unwrap_model(self.text_encoder[0]),
+                            text_encoder_2=unwrap_model(self.text_encoder[1]),
+                            tokenizer=self.tokenizer[0],
+                            tokenizer_2=self.tokenizer[1],
+                            scheduler=noise_scheduler,
+                            **extra_args
+                        )
+                        
+                    pipeline.watermark = None
+                elif self.is_lumina2:
+                    pipeline = Lumina2Pipeline(
+                        vae=self.vae,
+                        transformer=self.unet,
+                        text_encoder=self.text_encoder,
+                        tokenizer=self.tokenizer,
+                        scheduler=noise_scheduler,
+                        **extra_args
                     )
-                    
-                pipeline.watermark = None
-            elif self.is_lumina2:
-                pipeline = Lumina2Pipeline(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
-            elif self.is_v3:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
-                    text_encoder_3=self.text_encoder[2],
-                    tokenizer=self.tokenizer[0],
-                    tokenizer_2=self.tokenizer[1],
-                    tokenizer_3=self.tokenizer[2],
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
-            elif self.is_pixart:
-                pipeline = PixArtSigmaPipeline(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
-
-            elif self.is_auraflow:
-                pipeline = AuraFlowPipeline(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
-
-            else:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    unet=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    safety_checker=None,
-                    feature_extractor=None,
-                    requires_safety_checker=False,
-                    **extra_args
-                )
-            flush()
-            # disable progress bar
-            pipeline.set_progress_bar_config(disable=True)
-
-        from toolkit.sample_step_hook import install_sample_step_hooks
-
-        unwrap_step_hooks = install_sample_step_hooks(self, pipeline)
-
-        refiner_pipeline = None
-        if self.refiner_unet:
-            # build refiner pipeline
-            refiner_pipeline = StableDiffusionXLImg2ImgPipeline(
-                vae=pipeline.vae,
-                unet=self.refiner_unet,
-                text_encoder=None,
-                text_encoder_2=pipeline.text_encoder_2,
-                tokenizer=None,
-                tokenizer_2=pipeline.tokenizer_2,
-                scheduler=pipeline.scheduler,
-                add_watermarker=False,
-                requires_aesthetics_score=True,
-            ).to(self.device_torch)
-            # refiner_pipeline.register_to_config(requires_aesthetics_score=False)
-            refiner_pipeline.watermark = None
-            refiner_pipeline.set_progress_bar_config(disable=True)
-            flush()
-
-        start_multiplier = 1.0
-        if network is not None:
-            start_multiplier = network.multiplier
-
-        # pipeline.to(self.device_torch)
-
-        with network:
-            with torch.no_grad():
-                if network is not None:
-                    assert network.is_active
-
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
-                    gen_config = image_configs[i]
-
-                    extra = {}
-                    validation_image = None
-                    if self.adapter is not None and gen_config.adapter_image_path is not None:
-                        validation_image = Image.open(gen_config.adapter_image_path)
-                        # if the name doesnt have .inpainting. in it, make sure it is rgb
-                        if ".inpaint." not in gen_config.adapter_image_path:
-                            validation_image = validation_image.convert("RGB")
-                        else:
-                            # make sure it has an alpha
-                            if validation_image.mode != "RGBA":
-                                raise ValueError("Inpainting images must have an alpha channel")
-                        if isinstance(self.adapter, T2IAdapter):
-                            # not sure why this is double??
-                            validation_image = validation_image.resize((gen_config.width * 2, gen_config.height * 2))
-                            extra['image'] = validation_image
-                            extra['adapter_conditioning_scale'] = gen_config.adapter_conditioning_scale
-                        if isinstance(self.adapter, ControlNetModel):
-                            validation_image = validation_image.resize((gen_config.width, gen_config.height))
-                            extra['image'] = validation_image
-                            extra['controlnet_conditioning_scale'] = gen_config.adapter_conditioning_scale
-                        if isinstance(self.adapter, CustomAdapter) and self.adapter.control_lora is not None:
-                            validation_image = validation_image.resize((gen_config.width, gen_config.height))
-                            extra['control_image'] = validation_image
-                            extra['control_image_idx'] = gen_config.ctrl_idx
-                        if isinstance(self.adapter, IPAdapter) or isinstance(self.adapter, ClipVisionAdapter):
-                            transform = transforms.Compose([
-                                transforms.ToTensor(),
-                            ])
-                            validation_image = transform(validation_image)
-                        if isinstance(self.adapter, CustomAdapter):
-                            # todo allow loading multiple
-                            transform = transforms.Compose([
-                                transforms.ToTensor(),
-                            ])
-                            validation_image = transform(validation_image)
-                            self.adapter.num_images = 1
-                        if isinstance(self.adapter, ReferenceAdapter):
-                            # need -1 to 1
-                            validation_image = transforms.ToTensor()(validation_image)
-                            validation_image = validation_image * 2.0 - 1.0
-                            validation_image = validation_image.unsqueeze(0)
-                            self.adapter.set_reference_images(validation_image)
-
+                elif self.is_v3:
+                    pipeline = Pipe(
+                        vae=self.vae,
+                        transformer=self.unet,
+                        text_encoder=self.text_encoder[0],
+                        text_encoder_2=self.text_encoder[1],
+                        text_encoder_3=self.text_encoder[2],
+                        tokenizer=self.tokenizer[0],
+                        tokenizer_2=self.tokenizer[1],
+                        tokenizer_3=self.tokenizer[2],
+                        scheduler=noise_scheduler,
+                        **extra_args
+                    )
+                elif self.is_pixart:
+                    pipeline = PixArtSigmaPipeline(
+                        vae=self.vae,
+                        transformer=self.unet,
+                        text_encoder=self.text_encoder,
+                        tokenizer=self.tokenizer,
+                        scheduler=noise_scheduler,
+                        **extra_args
+                    )
+    
+                elif self.is_auraflow:
+                    pipeline = AuraFlowPipeline(
+                        vae=self.vae,
+                        transformer=self.unet,
+                        text_encoder=self.text_encoder,
+                        tokenizer=self.tokenizer,
+                        scheduler=noise_scheduler,
+                        **extra_args
+                    )
+    
+                else:
+                    pipeline = Pipe(
+                        vae=self.vae,
+                        unet=self.unet,
+                        text_encoder=self.text_encoder,
+                        tokenizer=self.tokenizer,
+                        scheduler=noise_scheduler,
+                        safety_checker=None,
+                        feature_extractor=None,
+                        requires_safety_checker=False,
+                        **extra_args
+                    )
+                flush()
+                # disable progress bar
+                pipeline.set_progress_bar_config(disable=True)
+    
+            from toolkit.sample_step_hook import install_sample_step_hooks
+    
+            unwrap_step_hooks = install_sample_step_hooks(self, pipeline)
+    
+            refiner_pipeline = None
+            if self.refiner_unet:
+                # build refiner pipeline
+                refiner_pipeline = StableDiffusionXLImg2ImgPipeline(
+                    vae=pipeline.vae,
+                    unet=self.refiner_unet,
+                    text_encoder=None,
+                    text_encoder_2=pipeline.text_encoder_2,
+                    tokenizer=None,
+                    tokenizer_2=pipeline.tokenizer_2,
+                    scheduler=pipeline.scheduler,
+                    add_watermarker=False,
+                    requires_aesthetics_score=True,
+                ).to(self.device_torch)
+                # refiner_pipeline.register_to_config(requires_aesthetics_score=False)
+                refiner_pipeline.watermark = None
+                refiner_pipeline.set_progress_bar_config(disable=True)
+                flush()
+    
+            with network:
+                with torch.no_grad():
                     if network is not None:
-                        network.multiplier = gen_config.network_multiplier
-                    self._sample_step_index = 0
-                    torch.manual_seed(gen_config.seed)
-                    torch.cuda.manual_seed(gen_config.seed)
-                    
-                    generator = torch.manual_seed(gen_config.seed)
-
-                    if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
-                            and gen_config.adapter_image_path is not None:
-                        # run through the adapter to saturate the embeds
-                        conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
-                        self.adapter(conditional_clip_embeds)
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                        # handle condition the prompts
-                        gen_config.prompt = self.adapter.condition_prompt(
-                            gen_config.prompt,
-                            is_unconditional=False,
+                        assert network.is_active
+    
+                    for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
+                        gen_config = image_configs[i]
+    
+                        extra = {}
+                        validation_image = None
+                        if self.adapter is not None and gen_config.adapter_image_path is not None:
+                            validation_image = Image.open(gen_config.adapter_image_path)
+                            # if the name doesnt have .inpainting. in it, make sure it is rgb
+                            if ".inpaint." not in gen_config.adapter_image_path:
+                                validation_image = validation_image.convert("RGB")
+                            else:
+                                # make sure it has an alpha
+                                if validation_image.mode != "RGBA":
+                                    raise ValueError("Inpainting images must have an alpha channel")
+                            if isinstance(self.adapter, T2IAdapter):
+                                # not sure why this is double??
+                                validation_image = validation_image.resize((gen_config.width * 2, gen_config.height * 2))
+                                extra['image'] = validation_image
+                                extra['adapter_conditioning_scale'] = gen_config.adapter_conditioning_scale
+                            if isinstance(self.adapter, ControlNetModel):
+                                validation_image = validation_image.resize((gen_config.width, gen_config.height))
+                                extra['image'] = validation_image
+                                extra['controlnet_conditioning_scale'] = gen_config.adapter_conditioning_scale
+                            if isinstance(self.adapter, CustomAdapter) and self.adapter.control_lora is not None:
+                                validation_image = validation_image.resize((gen_config.width, gen_config.height))
+                                extra['control_image'] = validation_image
+                                extra['control_image_idx'] = gen_config.ctrl_idx
+                            if isinstance(self.adapter, IPAdapter) or isinstance(self.adapter, ClipVisionAdapter):
+                                transform = transforms.Compose([
+                                    transforms.ToTensor(),
+                                ])
+                                validation_image = transform(validation_image)
+                            if isinstance(self.adapter, CustomAdapter):
+                                # todo allow loading multiple
+                                transform = transforms.Compose([
+                                    transforms.ToTensor(),
+                                ])
+                                validation_image = transform(validation_image)
+                                self.adapter.num_images = 1
+                            if isinstance(self.adapter, ReferenceAdapter):
+                                # need -1 to 1
+                                validation_image = transforms.ToTensor()(validation_image)
+                                validation_image = validation_image * 2.0 - 1.0
+                                validation_image = validation_image.unsqueeze(0)
+                                self.adapter.set_reference_images(validation_image)
+    
+                        if network is not None:
+                            network.multiplier = gen_config.network_multiplier
+                        self._sample_step_index = 0
+                        torch.manual_seed(gen_config.seed)
+                        torch.cuda.manual_seed(gen_config.seed)
+                        
+                        generator = torch.manual_seed(gen_config.seed)
+    
+                        if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
+                                and gen_config.adapter_image_path is not None:
+                            # run through the adapter to saturate the embeds
+                            conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
+                            self.adapter(conditional_clip_embeds)
+    
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                            # handle condition the prompts
+                            gen_config.prompt = self.adapter.condition_prompt(
+                                gen_config.prompt,
+                                is_unconditional=False,
+                            )
+                            gen_config.prompt_2 = gen_config.prompt
+                            gen_config.negative_prompt = self.adapter.condition_prompt(
+                                gen_config.negative_prompt,
+                                is_unconditional=True,
+                            )
+                            gen_config.negative_prompt_2 = gen_config.negative_prompt
+    
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and validation_image is not None:
+                            self.adapter.trigger_pre_te(
+                                tensors_0_1=validation_image,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                quad_count=4
+                            )
+    
+                        if self.sample_prompts_cache is not None:
+                            conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
+                            unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
+                        else: 
+                            # encode the prompt ourselves so we can do fun stuff with embeddings
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = False
+                            conditional_embeds = self.encode_prompt(gen_config.prompt, gen_config.prompt_2, force_all=True)
+    
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = True
+                            unconditional_embeds = self.encode_prompt(
+                                gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
+                            )
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = False
+    
+                        # allow any manipulations to take place to embeddings
+                        gen_config.post_process_embeddings(
+                            conditional_embeds,
+                            unconditional_embeds,
                         )
-                        gen_config.prompt_2 = gen_config.prompt
-                        gen_config.negative_prompt = self.adapter.condition_prompt(
-                            gen_config.negative_prompt,
-                            is_unconditional=True,
-                        )
-                        gen_config.negative_prompt_2 = gen_config.negative_prompt
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and validation_image is not None:
-                        self.adapter.trigger_pre_te(
-                            tensors_0_1=validation_image,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            quad_count=4
-                        )
-
-                    if self.sample_prompts_cache is not None:
-                        conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
-                        unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
-                    else: 
-                        # encode the prompt ourselves so we can do fun stuff with embeddings
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = False
-                        conditional_embeds = self.encode_prompt(gen_config.prompt, gen_config.prompt_2, force_all=True)
-
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = True
-                        unconditional_embeds = self.encode_prompt(
-                            gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
-                        )
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = False
-
-                    # allow any manipulations to take place to embeddings
-                    gen_config.post_process_embeddings(
-                        conditional_embeds,
-                        unconditional_embeds,
-                    )
-                    
-                    if self.decorator is not None:
-                        # apply the decorator to the embeddings
-                        conditional_embeds.text_embeds = self.decorator(conditional_embeds.text_embeds)
-                        unconditional_embeds.text_embeds = self.decorator(unconditional_embeds.text_embeds, is_unconditional=True)
-
-                    if self.adapter is not None and isinstance(self.adapter, IPAdapter) \
-                            and gen_config.adapter_image_path is not None:
-                        # apply the image projection
-                        conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
-                        unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image,
-                                                                                                    True)
-                        conditional_embeds = self.adapter(conditional_embeds, conditional_clip_embeds, is_unconditional=False)
-                        unconditional_embeds = self.adapter(unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                        conditional_embeds = self.adapter.condition_encoded_embeds(
-                            tensors_0_1=validation_image,
-                            prompt_embeds=conditional_embeds,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            is_generating_samples=True,
-                        )
-                        unconditional_embeds = self.adapter.condition_encoded_embeds(
-                            tensors_0_1=validation_image,
-                            prompt_embeds=unconditional_embeds,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            is_unconditional=True,
-                            is_generating_samples=True,
-                        )
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and len(
-                            gen_config.extra_values) > 0:
-                        extra_values = torch.tensor([gen_config.extra_values], device=self.device_torch,
-                                                    dtype=self.torch_dtype)
-                        # apply extra values to the embeddings
-                        self.adapter.add_extra_values(extra_values, is_unconditional=False)
-                        self.adapter.add_extra_values(torch.zeros_like(extra_values), is_unconditional=True)
-                        pass  # todo remove, for debugging
-
-                    if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
-                        # if we have a refiner loaded, set the denoising end at the refiner start
-                        extra['denoising_end'] = gen_config.refiner_start_at
-                        extra['output_type'] = 'latent'
-                        if not self.is_xl:
-                            raise ValueError("Refiner is only supported for XL models")
-
-                    conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
-                    unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
-
-                    if self.is_xl:
-                        # fix guidance rescale for sdxl
-                        # was trained on 0.7 (I believe)
-
-                        grs = gen_config.guidance_rescale
-                        # if grs is None or grs < 0.00001:
-                        #     grs = 0.7
-                        # grs = 0.0
-
-                        if sampler.startswith("sample_"):
-                            extra['use_karras_sigmas'] = True
-                            extra = {
-                                **extra,
-                                **gen_config.extra_kwargs,
-                            }
-
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            # negative_prompt_2=gen_config.negative_prompt_2,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
-                    elif self.is_v3:
-                        img = pipeline(
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
-                    elif self.is_flux:
-                        if self.model_config.use_flux_cfg:
+                        
+                        if self.decorator is not None:
+                            # apply the decorator to the embeddings
+                            conditional_embeds.text_embeds = self.decorator(conditional_embeds.text_embeds)
+                            unconditional_embeds.text_embeds = self.decorator(unconditional_embeds.text_embeds, is_unconditional=True)
+    
+                        if self.adapter is not None and isinstance(self.adapter, IPAdapter) \
+                                and gen_config.adapter_image_path is not None:
+                            # apply the image projection
+                            conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
+                            unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image,
+                                                                                                        True)
+                            conditional_embeds = self.adapter(conditional_embeds, conditional_clip_embeds, is_unconditional=False)
+                            unconditional_embeds = self.adapter(unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
+    
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                            conditional_embeds = self.adapter.condition_encoded_embeds(
+                                tensors_0_1=validation_image,
+                                prompt_embeds=conditional_embeds,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                is_generating_samples=True,
+                            )
+                            unconditional_embeds = self.adapter.condition_encoded_embeds(
+                                tensors_0_1=validation_image,
+                                prompt_embeds=unconditional_embeds,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                is_unconditional=True,
+                                is_generating_samples=True,
+                            )
+    
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and len(
+                                gen_config.extra_values) > 0:
+                            extra_values = torch.tensor([gen_config.extra_values], device=self.device_torch,
+                                                        dtype=self.torch_dtype)
+                            # apply extra values to the embeddings
+                            self.adapter.add_extra_values(extra_values, is_unconditional=False)
+                            self.adapter.add_extra_values(torch.zeros_like(extra_values), is_unconditional=True)
+                            pass  # todo remove, for debugging
+    
+                        if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
+                            # if we have a refiner loaded, set the denoising end at the refiner start
+                            extra['denoising_end'] = gen_config.refiner_start_at
+                            extra['output_type'] = 'latent'
+                            if not self.is_xl:
+                                raise ValueError("Refiner is only supported for XL models")
+    
+                        conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
+                        unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
+    
+                        if self.is_xl:
+                            # fix guidance rescale for sdxl
+                            # was trained on 0.7 (I believe)
+    
+                            grs = gen_config.guidance_rescale
+                            # if grs is None or grs < 0.00001:
+                            #     grs = 0.7
+                            # grs = 0.0
+    
+                            if sampler.startswith("sample_"):
+                                extra['use_karras_sigmas'] = True
+                                extra = {
+                                    **extra,
+                                    **gen_config.extra_kwargs,
+                                }
+    
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                # prompt_2=gen_config.prompt_2,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                # negative_prompt_2=gen_config.negative_prompt_2,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                guidance_rescale=grs,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        elif self.is_v3:
                             img = pipeline(
                                 prompt_embeds=conditional_embeds.text_embeds,
                                 pooled_prompt_embeds=conditional_embeds.pooled_embeds,
@@ -1707,174 +1726,189 @@ class StableDiffusion:
                                 generator=generator,
                                 **extra
                             ).images[0]
-                        else:
-                            # Fix a bug in diffusers/torch
-                            def callback_on_step_end(pipe, i, t, callback_kwargs):
-                                latents = callback_kwargs["latents"]
-                                if latents.dtype != self.unet.dtype:
-                                    latents = latents.to(self.unet.dtype)
-                                return {"latents": latents}
+                        elif self.is_flux:
+                            if self.model_config.use_flux_cfg:
+                                img = pipeline(
+                                    prompt_embeds=conditional_embeds.text_embeds,
+                                    pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                    negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                    negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                    height=gen_config.height,
+                                    width=gen_config.width,
+                                    num_inference_steps=gen_config.num_inference_steps,
+                                    guidance_scale=gen_config.guidance_scale,
+                                    latents=gen_config.latents,
+                                    generator=generator,
+                                    **extra
+                                ).images[0]
+                            else:
+                                # Fix a bug in diffusers/torch
+                                def callback_on_step_end(pipe, i, t, callback_kwargs):
+                                    latents = callback_kwargs["latents"]
+                                    if latents.dtype != self.unet.dtype:
+                                        latents = latents.to(self.unet.dtype)
+                                    return {"latents": latents}
+                                img = pipeline(
+                                    prompt_embeds=conditional_embeds.text_embeds,
+                                    pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                    # negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                    # negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                    height=gen_config.height,
+                                    width=gen_config.width,
+                                    num_inference_steps=gen_config.num_inference_steps,
+                                    guidance_scale=gen_config.guidance_scale,
+                                    latents=gen_config.latents,
+                                    generator=generator,
+                                    callback_on_step_end=callback_on_step_end,
+                                    **extra
+                                ).images[0]
+                        elif self.is_lumina2:
+                            pipeline: Lumina2Pipeline = pipeline
+    
                             img = pipeline(
                                 prompt_embeds=conditional_embeds.text_embeds,
-                                pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                                # negative_prompt_embeds=unconditional_embeds.text_embeds,
-                                # negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch, dtype=torch.int64),
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch, dtype=torch.int64),
                                 height=gen_config.height,
                                 width=gen_config.width,
                                 num_inference_steps=gen_config.num_inference_steps,
                                 guidance_scale=gen_config.guidance_scale,
                                 latents=gen_config.latents,
                                 generator=generator,
-                                callback_on_step_end=callback_on_step_end,
                                 **extra
                             ).images[0]
-                    elif self.is_lumina2:
-                        pipeline: Lumina2Pipeline = pipeline
-
-                        img = pipeline(
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch, dtype=torch.int64),
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch, dtype=torch.int64),
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
-                    elif self.is_pixart:
-                        # needs attention masks for some reason
-                        img = pipeline(
-                            prompt=None,
-                            prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
-                            prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
-                                                                                                  dtype=self.unet.dtype),
-                            negative_prompt=None,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
-                    elif self.is_auraflow:
-                        pipeline: AuraFlowPipeline = pipeline
-
-                        img = pipeline(
-                            prompt=None,
-                            prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
-                            prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
-                                                                                                  dtype=self.unet.dtype),
-                            negative_prompt=None,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
+                        elif self.is_pixart:
+                            # needs attention masks for some reason
+                            img = pipeline(
+                                prompt=None,
+                                prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
+                                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
+                                                                                           dtype=self.unet.dtype),
+                                negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
+                                                                                           dtype=self.unet.dtype),
+                                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
+                                                                                                      dtype=self.unet.dtype),
+                                negative_prompt=None,
+                                # negative_prompt=gen_config.negative_prompt,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        elif self.is_auraflow:
+                            pipeline: AuraFlowPipeline = pipeline
+    
+                            img = pipeline(
+                                prompt=None,
+                                prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
+                                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
+                                                                                           dtype=self.unet.dtype),
+                                negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
+                                                                                           dtype=self.unet.dtype),
+                                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
+                                                                                                      dtype=self.unet.dtype),
+                                negative_prompt=None,
+                                # negative_prompt=gen_config.negative_prompt,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        else:
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+    
+                        if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
+                            # slide off just the last 1280 on the last dim as refiner does not use first text encoder
+                            # todo, should we just use the Text encoder for the refiner? Fine tuned versions will differ
+                            refiner_text_embeds = conditional_embeds.text_embeds[:, :, -1280:]
+                            refiner_unconditional_text_embeds = unconditional_embeds.text_embeds[:, :, -1280:]
+                            # run through refiner
+                            img = refiner_pipeline(
+                                # prompt=gen_config.prompt,
+                                # prompt_2=gen_config.prompt_2,
+    
+                                # slice these as it does not use both text encoders
+                                # height=gen_config.height,
+                                # width=gen_config.width,
+                                prompt_embeds=refiner_text_embeds,
+                                pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                negative_prompt_embeds=refiner_unconditional_text_embeds,
+                                negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                guidance_rescale=grs,
+                                denoising_start=gen_config.refiner_start_at,
+                                denoising_end=gen_config.num_inference_steps,
+                                image=img.unsqueeze(0),
+                                generator=generator,
+                            ).images[0]
+    
+                        gen_config.save_image_atomic(img, i)
+                        gen_config.log_image(img, i)
+                        self._after_sample_image(i, len(image_configs))
+                        flush()
+        finally:
+            pipeline = None
+            refiner_pipeline = None
+            try:
+                with ExitStack() as cleanup:
+                    cleanup.callback(flush)
+                    for parameter, requires_grad in gradient_state:
+                        cleanup.callback(parameter.requires_grad_, requires_grad)
+                    cleanup.callback(torch.set_rng_state, rng_state)
+                    if cuda_rng_state is not None:
+                        cleanup.callback(torch.cuda.set_rng_state_all, cuda_rng_state)
+                    cleanup.callback(setattr, self, 'device_state', previous_device_state)
+                    if sample_step_index is missing:
+                        if hasattr(self, '_sample_step_index'):
+                            cleanup.callback(delattr, self, '_sample_step_index')
                     else:
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
-
-                    if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
-                        # slide off just the last 1280 on the last dim as refiner does not use first text encoder
-                        # todo, should we just use the Text encoder for the refiner? Fine tuned versions will differ
-                        refiner_text_embeds = conditional_embeds.text_embeds[:, :, -1280:]
-                        refiner_unconditional_text_embeds = unconditional_embeds.text_embeds[:, :, -1280:]
-                        # run through refiner
-                        img = refiner_pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-
-                            # slice these as it does not use both text encoders
-                            # height=gen_config.height,
-                            # width=gen_config.width,
-                            prompt_embeds=refiner_text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=refiner_unconditional_text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            denoising_start=gen_config.refiner_start_at,
-                            denoising_end=gen_config.num_inference_steps,
-                            image=img.unsqueeze(0),
-                            generator=generator,
-                        ).images[0]
-
-                    gen_config.save_image_atomic(img, i)
-                    gen_config.log_image(img, i)
-                    self._after_sample_image(i, len(image_configs))
-                    flush()
-
-                if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
-                    self.adapter.clear_memory()
-
-        unwrap_step_hooks()
-        # clear pipeline and cache to reduce vram usage
-        del pipeline
-        if refiner_pipeline is not None:
-            del refiner_pipeline
-        torch.cuda.empty_cache()
-
-        # restore training state
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
-
-        self.restore_device_state()
-        if network is not None:
-            network.train()
-            network.multiplier = start_multiplier
-
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
-        if network.is_merged_in:
-            network.merge_out(merge_multiplier)
-        # self.tokenizer.to(original_device_dict['tokenizer'])
-
-        # refuse loras
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Loading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = False
-                # move weights off the device
-                self.assistant_lora.force_to('cpu', self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = True
-                
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Unloading inference lora")
-            self.assistant_lora.is_active = False
-            # move weights off the device
-            self.assistant_lora.force_to('cpu', self.torch_dtype)
-
-        flush()
+                        cleanup.callback(setattr, self, '_sample_step_index', sample_step_index)
+                    for name, value in adapter_state.items():
+                        if value is missing:
+                            if hasattr(self.adapter, name):
+                                cleanup.callback(delattr, self.adapter, name)
+                        else:
+                            cleanup.callback(setattr, self.adapter, name, value)
+                    if network_state is not None:
+                        cleanup.callback(setattr, training_network, 'is_active', network_state[2])
+                        cleanup.callback(setattr, training_network, 'multiplier', network_state[1])
+                        cleanup.callback(training_network.train, network_state[0])
+                    if generation_device_state is not None:
+                        self.device_state = generation_device_state
+                        cleanup.callback(self.restore_device_state)
+                        cleanup.callback(self.unet.to, dtype=unet_dtype)
+                    if network_state is not None and not network_state[3] and training_network.is_merged_in:
+                        cleanup.callback(training_network.merge_out, merge_multiplier)
+                    if assistant_state is not None:
+                        cleanup.callback(assistant.force_to, assistant_state[1], assistant_state[2])
+                        cleanup.callback(setattr, assistant, 'is_active', assistant_state[0])
+                    cleanup.callback(torch.cuda.empty_cache)
+                    if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
+                        cleanup.callback(self.adapter.clear_memory)
+                    if unwrap_step_hooks is not None:
+                        cleanup.callback(unwrap_step_hooks)
+            except Exception as error:
+                raise PreviewStateRestorationError("Preview generation state restoration failed") from error
 
     def get_latent_noise(
             self,

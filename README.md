@@ -7,29 +7,33 @@ AI Toolkit is an easy to use all in one training suite for diffusion models. I t
 
 ## What's different from upstream
 
-This fork tracks `upstream/main` closely (currently 0 commits behind) and adds the following on top:
+This fork tracks `upstream/main` closely (merged periodically; run `git rev-list --left-right --count HEAD...upstream/main` for the current ahead/behind count) and adds the following on top:
 
 > [!NOTE]
-> The perceptual anchors, weight/gradient noising, rose optimizer, and auto-masking features were ported from [BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) (MIT licensed) and adapted to work with Krea 2 on top of this fork's newer upstream base. Full credit to that project for the original implementation.
+> The perceptual anchors, weight/gradient noising, rose optimizer, and auto-masking features were ported from [BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) (MIT licensed) and adapted to work with Krea 2 (and, for the VAE anchor and auto-masking, Qwen-Image 2.1) on top of this fork's newer upstream base. Full credit to that project for the original implementation.
 
-### Krea 2 perceptual anchor training
+### Perceptual anchor training (Krea 2; partly Qwen-Image 2.1)
 
 Auxiliary losses that can anchor a Krea 2 LoRA to structural ground truth; they do not guarantee identity/geometry usefulness without the required model weights and runtime evidence. Each anchor can be enabled independently only when its dependency/admission gate is satisfied, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):
 
 - **Depth anchor** — Depth Anything V2 (incl. DA2-Large option) depth-GT loss with a caching pipeline (depth maps are precomputed and round-tripped through the Krea VAE so train-time decode matches), unified latent decode, and depth-step-based preview rendering.
-- **Face identity anchor** — ArcFace embedding loss.
+- **Face identity anchor** — ArcFace embedding loss. Cached face boxes are mapped through the dataloader's flip, bucket scale and crop; samples whose face was cropped out are skipped. Reference modes: per-image (default), `identity_loss_use_average`, `identity_loss_average_blend`, random reference, and `num_refs` best-of.
 - **Body proportion anchor** — ViTPose keypoint-based loss with an attached confidence-shortfall gradient; synthetic CPU graph evidence does not certify useful real-checkpoint gradients, so the licensed dependency/runtime gate remains required.
 - **Surface normal anchor** — Sapiens normal-map loss.
 - **Body shape anchor** — HybrIK-based loss.
-- **Cross-VAE anchor** — perceptual loss through a frozen Flux 2 VAE encoder; requires a matching licensed local `ae.safetensors` checkpoint and remains unavailable when that backend is not present.
-- **Auto subject masking + region-weighted loss** — YOLO person detection + SegFormer semantics restrict anchor losses to the subject.
+- **Cross-VAE anchor** — perceptual loss through a frozen Flux 2 VAE encoder; requires a matching licensed local `ae.safetensors` checkpoint and remains unavailable when that backend is not present. Also available on Qwen-Image 2.1 with fail-closed guards: `low_vram` (tiled decode) and buckets above the 1 MP tile threshold are rejected, as are RGBA decodes. Regularisation datasets never activate it.
+- **Auto subject masking + region-weighted loss** — YOLO person detection + SegFormer semantics restrict anchor losses to the subject. Also exposed for Qwen-Image 2.1, where it acts as a plain loss mask (no differentiable decode involved).
 - A **loss split resolver** and **loss watch** instrumentation manage how the anchor losses combine with the base flow-matching loss, and a **Perceptual Anchors UI panel** (with safe depth-config migration) exposes all of it in the GUI.
 
-Extra dependencies live in `requirements_perceptual.txt`.
+Extra dependencies live in `requirements_perceptual.txt` (a probe inventory, not an install path; the manager installs only what `manager/spec.py` selects).
+
+Anchors are for image datasets: video items are rejected at the start of training when an image-only anchor is enabled. Perceptual-fork configs using `face_id.*` keys are translated into the matching sections by the config checker; conflicts are errors and unsupported fork settings produce warnings.
+
+**Gradient-cosine diagnostics** — `train.gradient_cosine_log_every` (default `0` = off). On firing steps where the depth loss contributes a graph, logs `grad/norm/diffusion`, `grad/norm/depth` and `grad/cos/diff_depth` so you can see whether the depth anchor fights the base loss. Depth telemetry (`depth/loss_raw`, `depth/loss_applied`, `depth/ssi`, `depth/grad`) is logged at the computing step and shown by default in the UI Loss Graph.
 
 ### Perceptual noising
 
-Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.gradient_noise`) with UI controls. Zero-RMS parameters are preserved (skipped) so sparse/perceptual parameters are not corrupted.
+Noise injection on LoRA weights and/or gradients (`train.weight_noise` / `train.gradient_noise`) with UI controls. Zero-RMS parameters are preserved (skipped) so sparse/perceptual parameters are not corrupted. The `weight_noise` `sigma` default is `0.0125`.
 
 ### Per-image adaptive learning rate
 
@@ -114,7 +118,7 @@ Quantized-base loading, FP32 islands, low-precision/AMP, offload, compile, spars
 - `exact` also restores data order. Its admitted scope remains CPU, single-process, `num_workers: 0`, no buckets, accumulation 1, and compile off.
 - `weights_only` loads selected weights and starts at step zero with fresh optimizer/scheduler/EMA/counters/RNG/order. Inference metadata does not restore training clocks. It is refused when the destination folder already contains raw `training_state.pt`; use a new output folder so the previous trajectory remains recoverable.
 
-Recipe identity excludes only `resume_mode`; other configuration or dataset-membership mismatches fail closed. `auto`, `continue`, and `exact` reject `merge_network_on_save` because a merged export cannot reconstruct the original base. Serialized config and visible GPU count do not establish rank count: the accelerator process count is checked at runtime, and distributed raw state cannot continue. Raw restoration never pairs optimizer state with an inference/EMA export.
+Recipe identity excludes `resume_mode` and the stop/retention settings `train.steps`, `save.save_every` and `save.max_step_saves_to_keep`, so a finished or interrupted run can be extended by raising `train.steps`; states saved before this change carry the old digest, are still accepted, and migrate on the next save. Every other configuration or dataset-membership mismatch fails closed. `auto`, `continue`, and `exact` reject `merge_network_on_save` because a merged export cannot reconstruct the original base. Serialized config and visible GPU count do not establish rank count: the accelerator process count is checked at runtime, and distributed raw state cannot continue. Raw restoration never pairs optimizer state with an inference/EMA export.
 
 Earlier remediation verification (2026-10-04, before the stabilization repairs below): 321 scoped Python cases and 9 UI policy cases passed; UI/extension typechecks and Ruff's syntax/undefined-name checks passed. The committed CPU raw-checkpoint regression covers update 3 through update 6. Isolated production API handlers rejected invalid YAML, incompatible configs, spoofed job metadata, and invalid stored start/queue requests before database mutation.
 
@@ -181,8 +185,12 @@ Measured behaviour from [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musu
 
 ### Other additions
 
-- `inference_lora_path` for Krea 2 — load a separate LoRA for turbo sampling during training samples. `assistant_lora_path` is limited to Flux, MiniMax-H3 (incl. Ref2VA and VSA), Qwen-Image 2.1, Z-Image (incl. L2P), Ming-Image and Krea 2.
-- A preview that runs out of GPU memory no longer ends the run: previews turn off for the rest of it (logged) and training continues. Any failed preview now always puts the raw training weights back from under the EMA ones (before, a failure left the EMA weights in the trained params, and the next sample rolled training back to a stale snapshot).
+- `inference_lora_path` for Flux and Krea 2 — load a separate LoRA for turbo sampling during training samples (other archs: use `preview_lora_path`). `assistant_lora_path` is limited to Flux, MiniMax-H3 (incl. Ref2VA and VSA), Qwen-Image 2.1, Z-Image (incl. L2P), Ming-Image and Krea 2.
+- A preview that runs out of GPU memory no longer ends the run: previews turn off for the rest of it (logged) and training continues after cleanup. Failed previews restore raw training weights from under EMA, assistant/inference adapter state, temporary network merges, device placement and sampling hooks. A state-restoration failure aborts instead of continuing with potentially corrupted weights, including during raw-weight previews.
+- Preview configuration and generation preserve the training Python RNG, including `seed: -1`, first samples and failures; generation also preserves the Torch RNG. Changing preview prompt count does not shift subsequent training RNG draws.
+- Training-step OOM recovery discards pending display-only scalar metrics, identity/depth/body-shape/diffusion timestep bins and step diagnostics before the next telemetry flush. Loss computation is unchanged.
+- UI: the sample comparison dialog can load another job and align panes by training step; a missing step stays empty. The Samples tab is a step-ordered matrix (see `ui/README.md`).
+- `train.max_grad_norm <= 0` disables gradient clipping (it previously zeroed every gradient).
 - UI settings **offline mode** — starts jobs with `HF_HUB_OFFLINE=1`.
 - Env-gated CUDA memory diagnostics (`KREA2_MEM_DIAG`) in the SD trainer.
 - Fix: timer no longer divides by zero on empty buckets after OOM recovery.

@@ -999,16 +999,24 @@ class ToolkitNetworkMixin:
     def merge_in(self, merge_weight=1.0):
         if self.network_type.lower() == 'dora':
             return
+        self._merged_modules = []
         self.is_merged_in = True
-        for module in self.get_all_modules():
-            module.merge_in(merge_weight)
+        try:
+            for module in self.get_all_modules():
+                module.merge_in(merge_weight)
+                self._merged_modules.append(module)
+        except BaseException:
+            self.merge_out(merge_weight)
+            raise
 
     def merge_out(self: Network, merge_weight=1.0):
         if not self.is_merged_in:
             return
-        self.is_merged_in = False
-        for module in self.get_all_modules():
+        while self._merged_modules:
+            module = self._merged_modules[-1]
             module.merge_out(merge_weight)
+            self._merged_modules.pop()
+        self.is_merged_in = False
 
     def extract_weight(
             self: Network,

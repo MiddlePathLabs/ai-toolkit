@@ -484,6 +484,10 @@ def _loop_host(tmp_path, model, optimizer, scheduler, loader, *, resume_mode="ex
     host.accelerator.wait_for_everyone = lambda: None
     host.accelerator.clip_grad_norm_ = torch.nn.utils.clip_grad_norm_
     host.hook_train_loop = SDTrainer.hook_train_loop.__get__(host)
+    host._drain_loss_metrics = SDTrainer._drain_loss_metrics.__get__(host)
+    host.hook_train_loop_oom = SDTrainer.hook_train_loop_oom.__get__(host)
+    host._canonical_telemetry_payload = SDTrainer._canonical_telemetry_payload
+    host._id_sim_bins = {}
 
     def train_single(batch, accum_scale=1.0):
         x = batch.x.to(host.device_torch)

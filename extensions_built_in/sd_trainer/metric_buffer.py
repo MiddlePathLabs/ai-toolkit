@@ -105,6 +105,10 @@ class MetricBuffer:
         self._per_sample: Dict[str, _PerSampleSlot] = {}
         self._per_sample_cap = int(per_sample_cap)
 
+    def reset(self) -> None:
+        self._scalars.clear()
+        self._per_sample.clear()
+
     def add_scalar(self, name: str, value: Any, weight: float = 1.0) -> None:
         if value is None:
             return

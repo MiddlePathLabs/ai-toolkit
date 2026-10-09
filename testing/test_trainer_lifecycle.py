@@ -159,6 +159,7 @@ def _trainer_for_real_hook(
     trainer._record_fisher_trace = lambda: None
     trainer._inject_weight_noise = lambda: None
     trainer._last_batches = []
+    trainer._id_sim_bins = {}
 
     def train_single(batch, accum_scale=1.0):
         trainer._last_objective_eligible = bool(batch.eligible)

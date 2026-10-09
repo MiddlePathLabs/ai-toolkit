@@ -262,6 +262,11 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             weight_device = org_weight.device
         # fold the full precision delta in
         merged_weight = base_weight + merge_weight * self.diff.float().to(weight_device)
+        merged_bias = None
+        if self.diff_b is not None and getattr(om, 'bias', None) is not None:
+            merged_bias = (
+                om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)
+            ).to(om.bias.dtype)
         if self.weight_is_quantized:
             # re-quantize so the model stays quantized across continuous merge/reset cycles
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight
@@ -269,8 +274,8 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         else:
             om.weight.data = merged_weight.to(weight_device, orig_dtype)
         # bias is never quantized
-        if self.diff_b is not None and getattr(om, 'bias', None) is not None:
-            om.bias.data = (om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)).to(om.bias.dtype)
+        if merged_bias is not None:
+            om.bias.data = merged_bias
 
     def reset_weights(self: 'FullModule'):
         with torch.no_grad():
