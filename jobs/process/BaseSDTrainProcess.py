@@ -528,52 +528,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if temporary_path is not None and os.path.exists(temporary_path):
                     os.unlink(temporary_path)
 
-        try:
-            # if we have an ema, set it to validation mode
-            if self.ema is not None:
-                self.ema.eval()
+        # Sampling must not perturb the training RNG stream: generation seeds
+        # the GLOBAL torch generators per sample (see
+        # stable_diffusion_model.generate_images), so without a fork the
+        # post-sampling stream — and with it the resumed trajectory — depends
+        # on how many prompts were sampled. fork_rng makes sample/* settings
+        # trajectory-neutral (they are excluded from the recipe identity);
+        # per-sample seeding inside the fork keeps the samples themselves
+        # deterministic.
+        fork_devices = [self.device_torch] if self.device_torch.type == 'cuda' else []
+        with torch.random.fork_rng(devices=fork_devices):
+            try:
+                # if we have an ema, set it to validation mode
+                if self.ema is not None:
+                    self.ema.eval()
 
-            # let adapter know we are sampling
-            if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                self.adapter.is_sampling = True
+                # let adapter know we are sampling
+                if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                    self.adapter.is_sampling = True
 
-            # send to be generated
-            if len(gen_img_config_list) > 0:
-                self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+                # send to be generated
+                if len(gen_img_config_list) > 0:
+                    self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-            # raw-weight sample pass: items flagged raw_weights are ROUTED here
-            # (not duplicated — the EMA set is the unflagged items only), generated
-            # with the raw training weights. Seeds derive from the same loop state
-            # as the EMA items; filenames carry the RAW_ prefix. For a same-prompt
-            # EMA-vs-raw pair, duplicate the sample row with a pinned seed and
-            # flag one copy. Isolated so a failure here cannot kill the run.
-            if len(raw_gen_img_config_list) > 0 and self.ema is not None:
-                self.ema.train()  # put the raw training weights back
-                try:
-                    self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
-                except Exception as e:
-                    if _is_out_of_memory(e):
-                        self._disable_previews_after_oom(step, e)
-                    else:
-                        print_acc(f"[sample] raw-weight sampling failed, continuing: {e}")
-                        traceback.print_exc()
-        except Exception as e:
-            # A preview that runs out of memory must not end the run.
-            # generate_images' own finally has already put the network,
-            # adapters, device placement and RNG back; the finally below
-            # puts the raw training weights back under the EMA ones.
-            if not _is_out_of_memory(e):
-                raise
-            self._disable_previews_after_oom(step, e)
-        finally:
-            if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                self.adapter.is_sampling = False
+                # raw-weight sample pass: items flagged raw_weights are ROUTED here
+                # (not duplicated — the EMA set is the unflagged items only), generated
+                # with the raw training weights. Seeds derive from the same loop state
+                # as the EMA items; filenames carry the RAW_ prefix. For a same-prompt
+                # EMA-vs-raw pair, duplicate the sample row with a pinned seed and
+                # flag one copy. Isolated so a failure here cannot kill the run.
+                if len(raw_gen_img_config_list) > 0 and self.ema is not None:
+                    self.ema.train()  # put the raw training weights back
+                    try:
+                        self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
+                    except Exception as e:
+                        if _is_out_of_memory(e):
+                            self._disable_previews_after_oom(step, e)
+                        else:
+                            print_acc(f"[sample] raw-weight sampling failed, continuing: {e}")
+                            traceback.print_exc()
+            except Exception as e:
+                # A preview that runs out of memory must not end the run.
+                # generate_images' own finally has already put the network,
+                # adapters, device placement and RNG back; the finally below
+                # puts the raw training weights back under the EMA ones.
+                if not _is_out_of_memory(e):
+                    raise
+                self._disable_previews_after_oom(step, e)
+            finally:
+                if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                    self.adapter.is_sampling = False
 
-            # without this a failed preview would leave the EMA weights in
-            # the trained params, and the next sample would roll training
-            # back to the stale raw snapshot
-            if self.ema is not None:
-                self.ema.train()
+                # without this a failed preview would leave the EMA weights in
+                # the trained params, and the next sample would roll training
+                # back to the stale raw snapshot
+                if self.ema is not None:
+                    self.ema.train()
         print_acc("") # add a line break
 
     def _disable_previews_after_oom(self, step, error):
@@ -641,27 +651,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return tuple(BaseSDTrainProcess._cpu_state(item) for item in value)
         return copy.deepcopy(value)
 
-    def _resume_recipe_identity(self, *, legacy: bool = False) -> str:
-        # train.steps is a stop condition, not trajectory math — the raw
-        # snapshot sits on a completed-update boundary, so relaunching with a
-        # higher horizon must stay resumable. save_every /
-        # max_step_saves_to_keep are retention-only. Everything else (lr,
-        # optimizer, datasets, resolution, sample/* — sampling consumes RNG)
-        # stays in the hash. legacy=True reproduces the old full-config
-        # digest so raw states saved before these exclusions keep matching
-        # until they are re-saved with the new identity.
-        excluded = {
-            "train": ("resume_mode",) if legacy else ("resume_mode", "steps"),
-            "save": () if legacy else ("save_every", "max_step_saves_to_keep"),
-        }
-        recipe = copy.deepcopy(self.config)
+    # Fields and whole sections excluded from the resume recipe digest, newest
+    # rules first; an empty field tuple drops the whole section. Version 0 is
+    # what new saves record; every older version stays accepted at the gate so
+    # raw states saved before an exclusion was broadened keep matching until
+    # they are re-saved with the current identity.
+    #
+    # v3 (current): sample generation runs under fork_rng (see sample()), so
+    #     sample/* cannot move the training trajectory — editing sample
+    #     prompts mid-run is a supported continuation.
+    # v2: train.steps is a stop condition, not trajectory math — the raw
+    #     snapshot sits on a completed-update boundary, so relaunching with a
+    #     higher horizon must stay resumable. save_every /
+    #     max_step_saves_to_keep are retention-only.
+    # v1: original digest — everything except train.resume_mode.
+    _RESUME_RECIPE_EXCLUSIONS = (
+        {  # v3
+            "train": ("resume_mode", "steps"),
+            "save": ("save_every", "max_step_saves_to_keep"),
+            "sample": (),
+            "first_sample": (),
+        },
+        {  # v2
+            "train": ("resume_mode", "steps"),
+            "save": ("save_every", "max_step_saves_to_keep"),
+        },
+        {  # v1
+            "train": ("resume_mode",),
+        },
+    )
+
+    @staticmethod
+    def _apply_resume_recipe_exclusions(recipe, *, version: int = 0):
+        excluded = BaseSDTrainProcess._RESUME_RECIPE_EXCLUSIONS[version]
+        recipe = copy.deepcopy(recipe)
         if isinstance(recipe, dict):
             for section, fields in excluded.items():
+                if not fields:
+                    recipe.pop(section, None)
+                    continue
                 part = recipe.get(section)
                 if isinstance(part, dict):
                     for field in fields:
                         part.pop(field, None)
-        encoded = json.dumps(recipe, sort_keys=True, default=str, separators=(",", ":"))
+        return recipe
+
+    def _resume_recipe_dict(self, *, version: int = 0):
+        """The exact dict the recipe digest is computed over. Also stored
+        verbatim in the raw state (recipe_config_snapshot) so future exclusion
+        changes can re-express an on-disk state without its original config."""
+        return self._apply_resume_recipe_exclusions(self.config, version=version)
+
+    def _resume_recipe_identity(self, *, version: int = 0) -> str:
+        encoded = json.dumps(
+            self._resume_recipe_dict(version=version),
+            sort_keys=True, default=str, separators=(",", ":"),
+        )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _deterministic_resume_supported(self) -> tuple[bool, list[str]]:
@@ -853,23 +898,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "Raw checkpoint exact replay is unsupported for the saved run. "
                 "Use resume_mode: continue for non-deterministic continuation."
             )
-        # accept the pre-exclusion digest too: states already on disk were
-        # saved with the full-config hash and stay resumable until re-saved
+        # accept the digest from every identity version: states already on
+        # disk were saved under older exclusion rules and stay resumable
+        # until they are re-saved with the current identity.
         saved_identity = self._resume_state.get("recipe_identity")
         if saved_identity not in {
-            self._resume_recipe_identity(),
-            self._resume_recipe_identity(legacy=True),
-        }:
-            raise ValueError(
-                "Raw checkpoint recipe/config identity differs from the current run. "
-                "Use the original training recipe or choose resume_mode: weights_only explicitly."
-            )
+            self._resume_recipe_identity(version=version)
+            for version in range(len(BaseSDTrainProcess._RESUME_RECIPE_EXCLUSIONS))
+        } and not self._resume_snapshot_matches_current_recipe():
+            raise ValueError(self._resume_identity_mismatch_message())
         if getattr(self.train_config, "merge_network_on_save", False):
             raise ValueError(
                 "Raw continuation cannot reconstruct a base model mutated by merge_network_on_save. "
                 "Use resume_mode: weights_only in a new output folder for an explicit warm start."
             )
         self._resume_exact = supported and saved_supported and self.resume_mode != "continue"
+
+    def _resume_snapshot_matches_current_recipe(self) -> bool:
+        """States saved since the snapshot was introduced carry
+        recipe_config_snapshot — the exact dict the saved digest was computed
+        over. Re-applying the CURRENT exclusions to both sides keeps such
+        states resumable even if the exclusion rules change again."""
+        snapshot = (self._resume_state or {}).get("recipe_config_snapshot")
+        if not isinstance(snapshot, dict):
+            return False
+
+        def _normalized(recipe):
+            return json.dumps(
+                self._apply_resume_recipe_exclusions(recipe),
+                sort_keys=True, default=str, separators=(",", ":"),
+            )
+
+        return _normalized(snapshot) == _normalized(self.config)
+
+    def _resume_identity_mismatch_message(self) -> str:
+        snapshot = (self._resume_state or {}).get("recipe_config_snapshot")
+        detail = ""
+        if isinstance(snapshot, dict):
+            snap = self._apply_resume_recipe_exclusions(snapshot)
+            current = self._resume_recipe_dict()
+            differing = sorted(
+                key for key in set(snap) | set(current)
+                if json.dumps(snap.get(key), sort_keys=True, default=str)
+                != json.dumps(current.get(key), sort_keys=True, default=str)
+            )
+            if differing:
+                detail = f" Differing top-level config sections: {', '.join(differing)}."
+        return (
+            "Raw checkpoint recipe/config identity differs from the current run."
+            + detail
+            + " Restore the original training recipe to continue this trajectory,"
+            " or start resume_mode: weights_only in a NEW output folder for a"
+            " deliberate fresh start (the optimizer/scheduler trajectory in this"
+            " folder is then abandoned — weights_only over an existing raw state"
+            " is refused). Sample prompts and sample settings are exempt and can"
+            " be edited freely between resumes."
+        )
 
     def _restore_resume_optimizer_state(self):
         state = self._resume_state
@@ -1029,6 +1113,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "kind": "ai_toolkit.raw_training_state",
             "schema": 1,
             "recipe_identity": self._resume_recipe_identity(),
+            "recipe_config_snapshot": self._resume_recipe_dict(),
             "determinism": {"supported": supported, "reasons": reasons},
             "num_processes": int(getattr(self.accelerator, "num_processes", 1)),
             "snapshot": dict(snapshot or self.get_completed_update_snapshot()),

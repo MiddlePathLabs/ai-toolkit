@@ -314,6 +314,10 @@ def _gate_holder(tmp_path, resume_mode, *, state=None, supported=True):
         train_config=SimpleNamespace(gradient_accumulation=1, gradient_accumulation_steps=1),
         dataset_configs=dataset_configs,
         _resume_recipe_identity=lambda *args, **kwargs: "RID",
+        _resume_snapshot_matches_current_recipe=lambda: False,
+        _resume_identity_mismatch_message=(
+            lambda: "Raw checkpoint recipe/config identity differs from the current run."
+        ),
         optimizer=None,
         lr_scheduler=None,
         step_num=0,
@@ -698,36 +702,50 @@ def test_recipe_identity_excludes_resume_mode_and_horizon_fields(tmp_path):
     host = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="auto")
     host.config["train"]["steps"] = 2000
     host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
+    host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
     identity = host._resume_recipe_identity()
-    legacy_identity = host._resume_recipe_identity(legacy=True)
-    assert legacy_identity != identity  # horizon fields were part of the old digest
+    v2_identity = host._resume_recipe_identity(version=1)
+    v1_identity = host._resume_recipe_identity(version=2)
+    assert v2_identity != identity  # horizon fields were part of the v2 digest
+    assert v1_identity != v2_identity  # retention fields were part of the v1 digest
 
-    # resume_mode, run horizon and retention-only fields keep the identity
+    # resume_mode, run horizon, retention-only and sample/* settings keep the
+    # current identity (sampling runs under fork_rng, so it cannot move
+    # training)
     host.config["train"]["resume_mode"] = "continue"
     host.config["train"]["steps"] = 3000
     host.config["save"] = {"save_every": 50, "max_step_saves_to_keep": 5}
+    host.config["sample"] = {"sample_every": 5, "samples": [{"prompt": "another"}]}
     assert host._resume_recipe_identity() == identity
 
-    # the legacy digest still binds the horizon: it only matched unchanged
+    # the older digests still bind those fields: they only matched unchanged.
+    # v2 rules already excluded the horizon; v1 bound everything but resume_mode
     host.config["train"]["steps"] = 2000
     host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
-    assert host._resume_recipe_identity(legacy=True) == legacy_identity
+    host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
+    assert host._resume_recipe_identity(version=1) == v2_identity
+    assert host._resume_recipe_identity(version=2) == v1_identity
     host.config["train"]["steps"] = 3000
-    assert host._resume_recipe_identity(legacy=True) != legacy_identity
+    assert host._resume_recipe_identity(version=2) != v1_identity
     host.config["train"]["steps"] = 2000
+    host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "rewritten"}]}
+    assert host._resume_recipe_identity(version=1) != v2_identity
+    assert host._resume_recipe_identity(version=2) != v1_identity
+    host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
+    host.config["save"] = {"save_every": 250}
+    assert host._resume_recipe_identity(version=2) != v1_identity
+    host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
 
-    # trajectory-relevant fields re-key both digests
+    # trajectory-relevant fields re-key every digest version
     host.config["train"]["gradient_accumulation"] = 2
     assert host._resume_recipe_identity() != identity
-    assert host._resume_recipe_identity(legacy=True) != legacy_identity
+    assert host._resume_recipe_identity(version=2) != v1_identity
     host.config["train"]["gradient_accumulation"] = 1
     host.config["train"]["lr"] = 5e-4
     assert host._resume_recipe_identity() != identity
     host.config["train"]["optimizer"] = "adamw"
     assert host._resume_recipe_identity() != identity
     host.config["datasets"] = [{"folder": "elsewhere"}]
-    assert host._resume_recipe_identity() != identity
-    host.config["sample"] = {"sample_every": 5}
     assert host._resume_recipe_identity() != identity
 
 
@@ -775,7 +793,6 @@ def test_resume_with_raised_steps_extends_completed_run(tmp_path):
         lambda config: config["train"].update(lr=1e-2),
         lambda config: config["train"].update(optimizer="adamw"),
         lambda config: config.update(datasets=[{"folder": "elsewhere"}]),
-        lambda config: config.update(sample={"sample_every": 5}),
     ],
 )
 def test_resume_still_rejects_trajectory_relevant_config_changes(tmp_path, mutation):
@@ -801,11 +818,13 @@ def test_legacy_full_config_identity_state_still_resumes_and_migrates(tmp_path):
     previous.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
     _step(previous, model, iter(loader), None, None, 0.0)
     previous.save(step=1)
-    # rewrite the digest the pre-exclusion code would have stored
-    legacy = previous._resume_recipe_identity(legacy=True)
+    # rewrite the digest the pre-exclusion code would have stored (those
+    # states predate recipe_config_snapshot, so drop it too)
+    legacy = previous._resume_recipe_identity(version=2)
     state = torch.load(previous._resume_state_path, weights_only=False)
     assert state["recipe_identity"] != legacy
     state["recipe_identity"] = legacy
+    state.pop("recipe_config_snapshot", None)
     torch.save(state, previous._resume_state_path)
 
     # an unchanged config still resumes through the legacy digest
@@ -837,6 +856,64 @@ def test_legacy_full_config_identity_state_still_resumes_and_migrates(tmp_path):
     extended.config["save"] = {"save_every": 2, "max_step_saves_to_keep": 2}
     _restore(extended)  # no raise
     assert extended.step_num == extended.completed_update_id == 1
+
+
+def test_sample_config_edits_do_not_block_resume(tmp_path):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 61)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    previous.config["sample"] = {
+        "sample_every": 250,
+        "samples": [{"prompt": "one"}, {"prompt": "two"}, {"prompt": "three"}],
+    }
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+    state = torch.load(previous._resume_state_path, weights_only=False)
+    assert "recipe_config_snapshot" in state  # the snapshot ships with the digest
+    assert state["recipe_config_snapshot"].get("sample") is None
+
+    # trimming/rewriting sample prompts and cadence must not block continuation
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 62)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 10
+    resumed.config["sample"] = {"sample_every": 100, "samples": [{"prompt": "edited"}]}
+    _restore(resumed)  # no raise
+    assert resumed.step_num == resumed.completed_update_id == 1
+
+
+def test_snapshot_accepts_states_saved_under_older_identity_rules(tmp_path):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 63)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    previous.config["sample"] = {"samples": [{"prompt": "one"}]}
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+    # simulate a state saved before sample was excluded: older digest, but the
+    # snapshot is present (current-rules dict)
+    state = torch.load(previous._resume_state_path, weights_only=False)
+    state["recipe_identity"] = previous._resume_recipe_identity(version=1)
+    torch.save(state, previous._resume_state_path)
+
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 64)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 10
+    resumed.config["sample"] = {"samples": [{"prompt": "edited"}]}
+    _restore(resumed)  # ladder misses (v2 digest hashed sample); snapshot accepts
+    assert resumed.step_num == resumed.completed_update_id == 1
+
+
+def test_identity_mismatch_message_lists_differing_sections(tmp_path):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 65)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 66)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["lr"] = 5e-4
+    with pytest.raises(ValueError, match="Differing top-level config sections: train"):
+        _restore(resumed)
 
 
 @pytest.mark.parametrize("mode", ["auto", "continue", "exact"])
