@@ -14,8 +14,12 @@ paths -- all intentionally excluded.
 Dependencies (NOT in requirements_base.txt -- install manually, see
 requirements_perceptual.txt): insightface, onnx2torch, onnxruntime-gpu. The
 CUDA-provider shadowing hazard (insightface pulls CPU onnxruntime which
-clobbers onnxruntime-gpu) requires uninstalling plain onnxruntime after
-install. All heavy imports are lazy so selecting Krea never imports them.
+clobbers onnxruntime-gpu) requires uninstalling BOTH onnxruntime and
+onnxruntime-gpu and then reinstalling --no-deps: uninstalling only plain
+onnxruntime guts the shared onnxruntime/ dir while pip still reports
+onnxruntime-gpu as satisfied, so the --no-deps reinstall no-ops and the
+import dies with "no attribute 'InferenceSession'" (namespace package).
+All heavy imports are lazy so selecting Krea never imports them.
 """
 from __future__ import annotations
 
@@ -49,7 +53,7 @@ def _require_face_deps():
             "face-identity anchor requires insightface + onnx2torch + onnxruntime-gpu.\n"
             "Install (note the onnxruntime shadowing fix):\n"
             "  pip install insightface onnx2torch onnxruntime-gpu\n"
-            "  pip uninstall -y onnxruntime\n"
+            "  pip uninstall -y onnxruntime onnxruntime-gpu\n"
             "  pip install --no-deps onnxruntime-gpu\n"
             "Then verify: python -c \"import onnxruntime as ort; "
             "print(ort.get_available_providers())\" lists CUDAExecutionProvider."
@@ -111,7 +115,7 @@ class FaceIDExtractor:
                 f"          Face-embedding caching will be EXTREMELY slow. Usually the\n"
                 f"          CPU-only `onnxruntime` package is shadowing `onnxruntime-gpu`,\n"
                 f"          or cuDNN is not on the library path. Fix:\n"
-                f"            pip uninstall -y onnxruntime && "
+                f"            pip uninstall -y onnxruntime onnxruntime-gpu && "
                 f"pip install --no-deps onnxruntime-gpu\n{bar}\n"
             )
 
@@ -192,7 +196,7 @@ class DifferentiableFaceEncoder(nn.Module):
                     f"ArcFace ONNX model not found at {onnx_path}. "
                     f"Install insightface for automatic download:\n"
                     f"  pip install insightface onnx2torch onnxruntime-gpu\n"
-                    f"  pip uninstall -y onnxruntime && pip install --no-deps onnxruntime-gpu\n"
+                    f"  pip uninstall -y onnxruntime onnxruntime-gpu && pip install --no-deps onnxruntime-gpu\n"
                     f"Or manually download the buffalo_l model pack to ~/.insightface/models/"
                 ) from e
         self.model = _onnx_to_torch(onnx_path)
