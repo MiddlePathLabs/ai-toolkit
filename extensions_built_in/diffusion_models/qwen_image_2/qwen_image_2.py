@@ -128,6 +128,7 @@ class QwenImage2Model(BaseModel):
         self.prompt_encoder: Optional[QwenImage21PromptEncoder] = None
         self.preview_turbo = None
         self._turbo_cfg_notice = False
+        self._turbo_steps_notice = False
 
         # Editing is not a separate model here, it is what happens when the
         # dataset has a control path: reference images ride into the text
@@ -144,24 +145,41 @@ class QwenImage2Model(BaseModel):
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
 
     def get_sampling_scheduler(self):
-        """Scheduler for sample events. The turbo preview recipe requires the
-        base config's shift_terminal (0.02) to be off — it wrecks the last
-        step; plain sampling keeps the train behavior."""
+        """Scheduler for sample events. Both turbo preview recipes need the
+        base config's shift_terminal (0.02) off — it wrecks the last step.
+        The Qwen/Comfy-Org Turbo also drops the dynamic shift (its own
+        scheduler_config: use_dynamic_shifting false, shift 1.0). Plain
+        sampling keeps the train behavior."""
         if self.preview_turbo is not None:
             config = dict(scheduler_config)
             config["shift_terminal"] = None
+            if self.preview_turbo.schedule == "turbo":
+                config["use_dynamic_shifting"] = False
+                config["shift"] = 1.0
             return CustomFlowMatchEulerDiscreteScheduler(**config)
         return self.get_train_scheduler()
 
     def get_sampling_sigmas(self, num_inference_steps: int):
-        """Raw sigmas for sampling, or None for the default linspace. Turbo
-        previews need the Viggle sigma schedule; the pipeline still applies
-        its resolution-dependent shift on top."""
-        if self.preview_turbo is not None:
-            from .preview_lora import turbo_sigma_grid
+        """Raw sigmas for sampling, or None for the default linspace.
 
-            return np.array(turbo_sigma_grid(num_inference_steps))
-        return None
+        Turbo LoRA: the Turbo checkpoint's fixed 8 sigmas, whatever the
+        configured step count (it is distilled for exactly that schedule).
+        Viggle LoRA: its own grid, with the pipeline's resolution shift on top.
+        """
+        if self.preview_turbo is None:
+            return None
+        from .preview_lora import TURBO_SIGMAS, TURBO_STEPS, turbo_sigma_grid
+
+        if self.preview_turbo.schedule == "turbo":
+            if num_inference_steps != TURBO_STEPS and not self._turbo_steps_notice:
+                self.print_and_status_update(
+                    f"[qwen-preview-lora] the Turbo LoRA samples on its own "
+                    f"{TURBO_STEPS}-step schedule; sample_steps={num_inference_steps} "
+                    "is ignored for previews"
+                )
+                self._turbo_steps_notice = True
+            return np.array(TURBO_SIGMAS)
+        return np.array(turbo_sigma_grid(num_inference_steps))
 
     def get_bucket_divisibility(self):
         # 16 for the VAE, 2 more because the DiT groups target latent tokens
@@ -195,6 +213,8 @@ class QwenImage2Model(BaseModel):
         )
         flush()
 
+        if self.model_config.assistant_lora_path is not None:
+            self.load_training_adapter(transformer)
         if self.model_config.preview_lora_path is not None:
             self.load_preview_turbo(transformer)
 
@@ -245,9 +265,54 @@ class QwenImage2Model(BaseModel):
             lora_path,
             self.model_config.preview_lora_strength,
             target_lin_modules=self.target_lora_modules,
+            schedule=self.model_config.preview_lora_schedule,
         )
-        self.print_and_status_update(turbo.report.summary())
+        self.print_and_status_update(
+            f"{turbo.report.summary()}, {turbo.schedule} schedule"
+        )
         self.preview_turbo = turbo
+
+    def load_training_adapter(self, transformer: QwenImage21Transformer2DModel):
+        """Frozen training adapter (``assistant_lora_path``), e.g. Fizgig's
+        Qwen-Image-2.1 adapter: plain 2.1 LoRAs tend to collapse into texture
+        or wobble mid-run, and the loss does not show it.
+
+        Kept as a LIVE module at strength 1 for every training step — never
+        merged, since the base is int8 and a merge would requantize it.
+        BaseModel's non-inverted assistant path switches it off for previews
+        and back on after, and it is a separate network, so it never lands in
+        the saved LoRA.
+        """
+        from toolkit.paths import MODELS_PATH
+
+        from .preview_lora import load_frozen_lora, resolve_preview_lora_path
+
+        self.print_and_status_update("Loading training adapter")
+        lora_path = resolve_preview_lora_path(
+            self.model_config.assistant_lora_path,
+            MODELS_PATH,
+            download_subdir="training_adapters",
+        )
+        self.model_config.assistant_lora_path = lora_path
+        adapter = load_frozen_lora(
+            transformer,
+            lora_path,
+            1.0,
+            target_lin_modules=self.target_lora_modules,
+            label="Qwen training adapter",
+            tag="qwen-training-adapter",
+            # base-weight deltas would need their own on/off around previews
+            apply_weight_diffs=False,
+        )
+        self.print_and_status_update(adapter.report.summary())
+
+        network = adapter.network
+        network.force_to(self.device_torch, self.torch_dtype)
+        network.multiplier = 1.0
+        network._update_torch_multiplier()
+        network.is_active = True
+        self.assistant_lora = network
+        self.invert_assistant_lora = False
 
     def _enter_generate_adapters(self):
         super()._enter_generate_adapters()

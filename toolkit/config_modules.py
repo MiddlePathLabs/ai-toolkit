@@ -233,7 +233,8 @@ class NetworkConfig:
         # only useful in very special cases.
         self.all_layers = kwargs.get('all_layers', False)
 
-        # H3 only: LoRA on these trunk blocks and nothing else ("20-49"). Nothing
+        # H3 and Qwen-Image 2.1: LoRA on these trunk blocks and nothing else
+        # ("20-49", or a named set: "identity" = Qwen 2.1 blocks 10-14). Nothing
         # before the first block is trainable, so autograd stops there. Parsed and
         # verified at network build (toolkit/h3_train_blocks.py). None = off.
         train_blocks = kwargs.get('train_blocks', None)
@@ -953,6 +954,10 @@ class ModelConfig:
         # H3 sampling-only Turbo LoRA. Default-off; never trained or saved.
         self.preview_lora_path = kwargs.get('preview_lora_path', None)
         self.preview_lora_strength = float(kwargs.get('preview_lora_strength', 1.0))
+        # qwen_image_2 only: which sampling recipe the preview LoRA needs.
+        # auto = 'viggle' when the file name says so, else 'turbo' (Comfy-Org /
+        # Qwen Turbo: 8 fixed sigmas, CFG 1, no shift)
+        self.preview_lora_schedule = str(kwargs.get('preview_lora_schedule', 'auto')).lower()
 
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
@@ -1148,6 +1153,11 @@ class ModelConfig:
                 raise ValueError(
                     f"preview_lora_strength must be a finite number, got {strength}"
                 )
+            if self.preview_lora_schedule not in ("auto", "turbo", "viggle"):
+                raise ValueError(
+                    "preview_lora_schedule must be 'auto', 'turbo' or 'viggle', "
+                    f"got {self.preview_lora_schedule!r}"
+                )
         elif self.inference_lora_path is not None:
             if self.arch == "minimax_h3":
                 raise ValueError(
@@ -1161,11 +1171,11 @@ class ModelConfig:
                 )
         if (
             self.assistant_lora_path is not None
-            and self.arch not in ("flux", "minimax_h3")
+            and self.arch not in ("flux", "minimax_h3", "qwen_image_2")
         ):
             raise ValueError(
-                "assistant_lora_path is only supported for Flux and MiniMax-H3 "
-                f"(got arch={self.arch!r})."
+                "assistant_lora_path is only supported for Flux, MiniMax-H3 and "
+                f"Qwen-Image 2.1 (got arch={self.arch!r})."
             )
 
         

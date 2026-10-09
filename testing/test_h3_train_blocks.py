@@ -125,7 +125,7 @@ def test_ignore_if_contains_still_applies():
 
 def test_prepare_fails_closed():
     transformer = ToyH3Transformer(25)
-    with pytest.raises(ValueError, match="H3-only"):
+    with pytest.raises(ValueError, match="minimax_h3"):
         prepare_train_blocks(_config("20-24"), SimpleNamespace(arch="flux", model=transformer), {})
     with pytest.raises(ValueError, match="only_if_contains"):
         prepare_train_blocks(_config("20-24"), _H3(transformer), {"only_if_contains": ["blocks.1."]})

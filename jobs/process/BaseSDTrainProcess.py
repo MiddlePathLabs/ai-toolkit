@@ -111,6 +111,12 @@ def _use_block_compile(block_compile: bool, gradient_checkpointing: bool) -> boo
     return block_compile and not gradient_checkpointing
 
 
+def _is_out_of_memory(error: BaseException) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+
+
 class BaseSDTrainProcess(BaseTrainProcess):
     # True on trainers whose hook_train_loop opens the optimizer runtime window
     # (see _open_optimizer_runtime_window); category_stop anchor mode needs it
@@ -380,6 +386,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
+        if getattr(self, '_previews_disabled_by_oom', False):
+            print_acc(f"[sample] skipped at step {step}: previews were turned off after running out of GPU memory")
+            return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -519,38 +528,61 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if temporary_path is not None and os.path.exists(temporary_path):
                     os.unlink(temporary_path)
 
-        # if we have an ema, set it to validation mode
-        if self.ema is not None:
-            self.ema.eval()
+        try:
+            # if we have an ema, set it to validation mode
+            if self.ema is not None:
+                self.ema.eval()
 
-        # let adapter know we are sampling
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            self.adapter.is_sampling = True
+            # let adapter know we are sampling
+            if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                self.adapter.is_sampling = True
 
-        # send to be generated
-        if len(gen_img_config_list) > 0:
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            # send to be generated
+            if len(gen_img_config_list) > 0:
+                self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        # raw-weight sample pass: items flagged raw_weights are ROUTED here
-        # (not duplicated — the EMA set is the unflagged items only), generated
-        # with the raw training weights. Seeds derive from the same loop state
-        # as the EMA items; filenames carry the RAW_ prefix. For a same-prompt
-        # EMA-vs-raw pair, duplicate the sample row with a pinned seed and
-        # flag one copy. Isolated so a failure here cannot kill the run.
-        if len(raw_gen_img_config_list) > 0 and self.ema is not None:
-            self.ema.train()  # put the raw training weights back
-            try:
-                self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
-            except Exception as e:
-                print_acc(f"[sample] raw-weight sampling failed, continuing: {e}")
-                traceback.print_exc()
+            # raw-weight sample pass: items flagged raw_weights are ROUTED here
+            # (not duplicated — the EMA set is the unflagged items only), generated
+            # with the raw training weights. Seeds derive from the same loop state
+            # as the EMA items; filenames carry the RAW_ prefix. For a same-prompt
+            # EMA-vs-raw pair, duplicate the sample row with a pinned seed and
+            # flag one copy. Isolated so a failure here cannot kill the run.
+            if len(raw_gen_img_config_list) > 0 and self.ema is not None:
+                self.ema.train()  # put the raw training weights back
+                try:
+                    self.sd.generate_images(raw_gen_img_config_list, sampler=sample_config.sampler)
+                except Exception as e:
+                    if _is_out_of_memory(e):
+                        self._disable_previews_after_oom(step, e)
+                    else:
+                        print_acc(f"[sample] raw-weight sampling failed, continuing: {e}")
+                        traceback.print_exc()
+        except Exception as e:
+            # A preview that runs out of memory must not end the run.
+            # generate_images' own finally has already put the network,
+            # adapters, device placement and RNG back; the finally below
+            # puts the raw training weights back under the EMA ones.
+            if not _is_out_of_memory(e):
+                raise
+            self._disable_previews_after_oom(step, e)
+        finally:
+            if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                self.adapter.is_sampling = False
 
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            self.adapter.is_sampling = False
-
-        if self.ema is not None:
-            self.ema.train()
+            # without this a failed preview would leave the EMA weights in
+            # the trained params, and the next sample would roll training
+            # back to the stale raw snapshot
+            if self.ema is not None:
+                self.ema.train()
         print_acc("") # add a line break
+
+    def _disable_previews_after_oom(self, step, error):
+        self._previews_disabled_by_oom = True
+        print_acc(
+            f"[sample] preview ran out of GPU memory at step {step}; previews are "
+            f"off for the rest of this run and training continues. ({error})"
+        )
+        flush()
 
     def update_training_metadata(self):
         o_dict = OrderedDict({

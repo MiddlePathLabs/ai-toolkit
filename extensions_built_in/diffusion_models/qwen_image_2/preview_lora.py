@@ -12,6 +12,18 @@ not is reported as skipped instead of silently dropped.
 The training LoRA keeps running underneath: both networks wrap the same
 Linears, the training network stays active, this one contributes only while
 a sample event holds it open.
+
+Two preview adapters are known, each with its own sampling recipe:
+
+  - ``turbo``: Comfy-Org's Qwen-Image-2.1 Turbo LoRA (extracted from Qwen's
+    Turbo checkpoint). 8 steps, CFG 1, the Turbo checkpoint's fixed sigmas
+    with no shift. The file also carries ``.diff`` deltas for the q/k and
+    text-input RMSNorm weights, applied while the adapter is active.
+  - ``viggle``: Viggle's community turbo. 5+ steps on its own sigma grid,
+    with the pipeline's resolution shift on top.
+
+The same frozen-network machinery also loads the training adapter
+(``assistant_lora_path``): active for training steps, off for previews.
 """
 
 from __future__ import annotations
@@ -25,6 +37,29 @@ from safetensors.torch import load_file
 
 _DOWN_SUFFIXES = (".lora_down.weight", ".lora_A.weight")
 _UP_SUFFIXES = (".lora_up.weight", ".lora_B.weight")
+# full-tensor deltas some files carry for non-Linear parameters
+_DIFF_SUFFIXES = ((".diff", "weight"), (".diff_b", "bias"))
+
+PREVIEW_SCHEDULES = ("auto", "turbo", "viggle")
+
+# Qwen-Image-2.1-Turbo's own schedule (model_index.json sample_sigmas). Its
+# scheduler_config turns the dynamic shift off (use_dynamic_shifting false,
+# shift 1.0, shift_terminal null), so these are used exactly as given.
+TURBO_SIGMAS = (1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568)
+TURBO_STEPS = len(TURBO_SIGMAS)
+
+
+def resolve_preview_schedule(schedule: str, path: str) -> str:
+    """'auto' picks by file name: Viggle's releases carry 'viggle' in theirs,
+    anything else is taken to be the Comfy-Org / Qwen Turbo LoRA."""
+    schedule = (schedule or "auto").lower()
+    if schedule not in PREVIEW_SCHEDULES:
+        raise ValueError(
+            f"preview_lora_schedule must be one of {PREVIEW_SCHEDULES}, got {schedule!r}"
+        )
+    if schedule != "auto":
+        return schedule
+    return "viggle" if "viggle" in os.path.basename(path).lower() else "turbo"
 
 # Viggle turbo sampling recipe (model card, Qwen-Image-2.1-viggle-turbo):
 # raw sigmas handed to the pipeline, which applies its resolution-dependent
@@ -52,8 +87,11 @@ def turbo_sigma_grid(steps: int) -> List[float]:
     return [1.0] + head + list(_TURBO_SIGMA_TAIL)
 
 
-def resolve_preview_lora_path(path: str, models_path: str) -> str:
-    """Local file, filename under models/loras, or user/repo/file.safetensors."""
+def resolve_preview_lora_path(
+    path: str, models_path: str, download_subdir: str = "preview_adapters"
+) -> str:
+    """Local file, filename under models/loras, or user/repo/file.safetensors
+    (downloaded into models/loras/<download_subdir>)."""
     if os.path.isfile(path):
         return path
     from toolkit.models.v2.resolver import find_file_recursive
@@ -65,13 +103,13 @@ def resolve_preview_lora_path(path: str, models_path: str) -> str:
     parts = path.split("/")
     if len(parts) != 3:
         raise ValueError(
-            f"Preview LoRA path {path} is not a local path, a file under "
+            f"LoRA path {path} is not a local path, a file under "
             f"{os.path.join(models_path, 'loras')}, or a "
             "'user/repo/file.safetensors' hub path."
         )
     import huggingface_hub
 
-    target_dir = os.path.join(models_path, "loras", "preview_adapters")
+    target_dir = os.path.join(models_path, "loras", download_subdir)
     os.makedirs(target_dir, exist_ok=True)
     try:
         return huggingface_hub.hf_hub_download(
@@ -80,7 +118,7 @@ def resolve_preview_lora_path(path: str, models_path: str) -> str:
             local_dir=target_dir,
         )
     except Exception as exc:
-        raise ValueError(f"Failed to download preview LoRA from {path}: {exc}") from exc
+        raise ValueError(f"Failed to download LoRA from {path}: {exc}") from exc
 
 
 def _sd_bases(state_dict: Dict[str, torch.Tensor]) -> set:
@@ -165,9 +203,40 @@ def _fused_split_gate(state_dict, module_path: str, linear):
     return None
 
 
+def partition_weight_diffs(
+    dit: torch.nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> Tuple[List[Tuple[str, str, torch.Tensor]], List[str]]:
+    """Match ``<module>.diff`` / ``<module>.diff_b`` full deltas onto the
+    transformer's parameters by name and shape.
+
+    Returns ``(module_path, attr, delta)`` triples and the file's unmatched
+    diff keys.
+    """
+    modules = dict(dit.named_modules())
+    lookup = {}
+    for path, module in modules.items():
+        for base in _candidate_bases(path):
+            lookup.setdefault(base, (path, module))
+    matched: List[Tuple[str, str, torch.Tensor]] = []
+    unmatched: List[str] = []
+    for key, value in state_dict.items():
+        suffix = next((s for s in _DIFF_SUFFIXES if key.endswith(s[0])), None)
+        if suffix is None:
+            continue
+        found = lookup.get(key[: -len(suffix[0])])
+        param = getattr(found[1], suffix[1], None) if found is not None else None
+        if not isinstance(param, torch.Tensor) or tuple(param.shape) != tuple(value.shape):
+            unmatched.append(key)
+            continue
+        matched.append((found[0], suffix[1], value))
+    return matched, sorted(unmatched)
+
+
 def partition_lora_weights(
     dit: torch.nn.Module,
     state_dict: Dict[str, torch.Tensor],
+    label: str = "Qwen preview LoRA",
 ) -> Tuple[Dict[str, torch.Tensor], List[str], int]:
     """Match the adapter file onto the transformer's Linear modules by shape.
 
@@ -209,13 +278,13 @@ def partition_lora_weights(
     skipped = sorted(_sd_bases(state_dict) - used_bases)
     if not keep:
         raise ValueError(
-            "Qwen preview LoRA matched no modules on this base — wrong-family "
+            f"{label} matched no modules on this base — wrong-family "
             "or all-mismatched file."
         )
     return keep, skipped, fused
 
 
-def _build_network(dit, keep, strength, target_lin_modules):
+def _build_network(dit, keep, strength, target_lin_modules, label="Qwen preview LoRA"):
     from toolkit.config_modules import NetworkConfig
     from toolkit.lora_special import LoRASpecialNetwork
 
@@ -246,7 +315,8 @@ def _build_network(dit, keep, strength, target_lin_modules):
         text_encoder=None,
         unet=dit,
         lora_dim=rank,
-        multiplier=float(strength),
+        # the multiplier setter needs modules to exist; strength is set below
+        multiplier=1.0,
         alpha=float(alpha),
         train_unet=True,
         train_text_encoder=False,
@@ -268,9 +338,10 @@ def _build_network(dit, keep, strength, target_lin_modules):
         param.requires_grad_(False)
     if not network.unet_loras:
         raise ValueError(
-            "Qwen preview LoRA matched no modules on this base — wrong-family "
+            f"{label} matched no modules on this base — wrong-family "
             "or all-mismatched file."
         )
+    network.multiplier = float(strength)
     return network
 
 
@@ -281,13 +352,16 @@ class PreviewLoadReport:
     skipped: List[str]
     strength: float
     fused_split_gates: int = 0
+    weight_diffs: int = 0
+    tag: str = "qwen-preview-lora"
 
     def summary(self) -> str:
         skip = f" ({len(self.skipped)} skipped)" if self.skipped else ""
         fused = f", {self.fused_split_gates} split-gates fused" if self.fused_split_gates else ""
+        diffs = f", {self.weight_diffs} norm/bias deltas" if self.weight_diffs else ""
         return (
-            f"[qwen-preview-lora] {self.matched} modules at strength "
-            f"{self.strength:g}{fused}{skip}"
+            f"[{self.tag}] {self.matched} modules at strength "
+            f"{self.strength:g}{fused}{diffs}{skip}"
         )
 
 
@@ -297,20 +371,85 @@ class QwenPreviewTurbo:
     report: PreviewLoadReport
     strength: float
     dtype: torch.dtype
-    _device_was: Optional[torch.device] = field(default=None)
+    schedule: str = "turbo"
+    # (module_path, attr, delta): added to the base parameter while active
+    weight_diffs: List[Tuple[str, str, torch.Tensor]] = field(default_factory=list)
+    _saved: List[Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
 
     def activate(self, dit: torch.nn.Module, device, dtype):
         self.network.force_to(device, dtype)
         self.network.multiplier = float(self.strength)
         self.network._update_torch_multiplier()
         self.network.is_active = True
+        if self._saved:
+            # already applied (a second activate without a deactivate)
+            return
+        with torch.no_grad():
+            for path, attr, delta in self.weight_diffs:
+                param = getattr(dit.get_submodule(path), attr)
+                # restored from this copy, not by subtracting: a bf16 add is
+                # not exactly reversible
+                self._saved.append((param, param.data.clone()))
+                param.data.add_(delta.to(param.device, param.dtype) * self.strength)
 
     def deactivate(self):
         self.network.is_active = False
         self.network.force_to("cpu", self.dtype)
+        with torch.no_grad():
+            for param, original in self._saved:
+                param.data.copy_(original)
+        self._saved = []
 
     def park(self):
         self.deactivate()
+
+
+def load_frozen_lora(
+    dit: torch.nn.Module,
+    path: str,
+    strength: float = 1.0,
+    *,
+    target_lin_modules: Optional[List[str]] = None,
+    label: str = "Qwen preview LoRA",
+    tag: str = "qwen-preview-lora",
+    apply_weight_diffs: bool = True,
+) -> QwenPreviewTurbo:
+    """A frozen, inactive LoRASpecialNetwork built from any supported file
+    layout (matched by shape, so kohya / PEFT / diffusers / ComfyUI keys all
+    load). The caller decides when it is active and where it lives."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    strength = float(strength)
+    if not (strength == strength) or abs(strength) == float("inf"):
+        raise ValueError(f"{label} strength must be a finite number, got {strength}")
+
+    state_dict = load_file(path)
+    keep, skipped, fused = partition_lora_weights(dit, state_dict, label=label)
+    diffs, unmatched_diffs = partition_weight_diffs(dit, state_dict)
+    if not apply_weight_diffs:
+        # reported, never silently dropped
+        unmatched_diffs = sorted(unmatched_diffs + [f"{p}.{a}" for p, a, _ in diffs])
+        diffs = []
+    targets = target_lin_modules or ["QwenImage21Transformer2DModel"]
+    network = _build_network(dit, keep, strength, targets, label=label)
+    dtype = next(dit.parameters()).dtype
+    network.force_to("cpu", dtype)
+    report = PreviewLoadReport(
+        path=path,
+        matched=len(network.unet_loras),
+        skipped=sorted(skipped + unmatched_diffs),
+        strength=strength,
+        fused_split_gates=fused,
+        weight_diffs=len(diffs),
+        tag=tag,
+    )
+    return QwenPreviewTurbo(
+        network=network,
+        report=report,
+        strength=strength,
+        dtype=dtype,
+        weight_diffs=diffs,
+    )
 
 
 def load_preview_lora(
@@ -319,29 +458,10 @@ def load_preview_lora(
     strength: float = 1.0,
     *,
     target_lin_modules: Optional[List[str]] = None,
+    schedule: str = "auto",
 ) -> QwenPreviewTurbo:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Qwen preview LoRA not found: {path}")
-    strength = float(strength)
-    if not (strength == strength) or abs(strength) == float("inf"):
-        raise ValueError(f"preview_lora_strength must be a finite number, got {strength}")
-
-    state_dict = load_file(path)
-    keep, skipped, fused = partition_lora_weights(dit, state_dict)
-    targets = target_lin_modules or ["QwenImage21Transformer2DModel"]
-    network = _build_network(dit, keep, strength, targets)
-    dtype = next(dit.parameters()).dtype
-    network.force_to("cpu", dtype)
-    report = PreviewLoadReport(
-        path=path,
-        matched=len(network.unet_loras),
-        skipped=skipped,
-        strength=strength,
-        fused_split_gates=fused,
+    turbo = load_frozen_lora(
+        dit, path, strength, target_lin_modules=target_lin_modules
     )
-    return QwenPreviewTurbo(
-        network=network,
-        report=report,
-        strength=strength,
-        dtype=dtype,
-    )
+    turbo.schedule = resolve_preview_schedule(schedule, path)
+    return turbo

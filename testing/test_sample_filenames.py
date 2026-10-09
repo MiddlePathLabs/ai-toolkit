@@ -55,6 +55,7 @@ def _sample_process(tmp_path, *, ema=True, first=False, postprocess=None, fail=F
         "GenerateImageConfig": image_config,
         "flush": lambda: None,
         "print_acc": lambda *_: None,
+        "_is_out_of_memory": lambda error: "out of memory" in str(error).lower(),
         "ClipVisionAdapter": type("ClipVisionAdapter", (), {}),
         "CustomAdapter": type("CustomAdapter", (), {}),
     })

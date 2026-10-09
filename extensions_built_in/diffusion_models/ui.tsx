@@ -578,6 +578,13 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].model.qtype": ["convrot8", "qfloat8"],
       "config.process[0].model.qtype_te": ["convrot8", "qfloat8"],
       "config.process[0].sample.guidance_scale": [3.0, 4.0],
+      // frozen training adapter, live for training steps and off for samples:
+      // without it 2.1 LoRAs collapse into texture or wobble mid-run (Fizgig
+      // A/B: likeness 77 with it, 56 without)
+      "config.process[0].model.assistant_lora_path": [
+        "ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter/fizgig_qwen_image_2.1_training_adapter.safetensors",
+        undefined,
+      ],
       // the VAE is RGBA: images load, encode and decode with their alpha
       "config.process[0].model.model_kwargs": [
         {
@@ -594,6 +601,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "sample.multi_ctrl_imgs",
       "model.low_vram",
       "model.layer_offloading",
+      "model.assistant_lora_path",
       "subject_mask",
       "vae_anchor",
     ],

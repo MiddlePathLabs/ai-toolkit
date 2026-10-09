@@ -1,26 +1,39 @@
-"""``network.train_blocks``: LoRA on a range of H3 trunk blocks and nothing else.
+"""``network.train_blocks``: LoRA on a range of trunk blocks and nothing else.
+
+Supported on MiniMax-H3 (``blocks.<i>``, token refiner excluded) and
+Qwen-Image 2.1 (``transformer_blocks.<i>``).
 
 With no trainable parameter before the first selected block, autograd never
 needs a gradient there, so the backward pass stops at that block instead of
-running the whole 50-block trunk. That is the difference from
+running the whole trunk. On H3 that is the difference from
 ``modality_block_routing``, which masks the optimizer after a full backward and
 keeps the token refiner training.
 
+A spec is a block list (``"20-49"``, ``"2, 10-14"``) or a named set the arch
+defines: on Qwen-Image 2.1 ``identity`` is blocks 10-14, where Fizgig's
+render-based profiling of character LoRAs found the likeness lives (switching
+them off removes almost all of it, on their own they carry most of it).
+Training only them is Fizgig's "Fast Identity Mode": ~1.5x faster per step
+with close to full-model likeness, and the rest of the base model's look is
+left alone.
+
 Selection goes through the existing ``only_if_contains`` / ``ignore_if_contains``
-name filters (``blocks.<i>.``, refiner excluded), then is verified by module
-ownership (``orig_module_ref`` against ``transformer.named_modules()``, the same
-mapping modality routing uses), so a naming change can only fail the run, never
-widen it. A one-shot forward hook on the block just before the window checks
-the guarantee on the first training forward.
+name filters, then is verified by module ownership (``orig_module_ref`` against
+``transformer.named_modules()``, the same mapping modality routing uses), so a
+naming change can only fail the run, never widen it. A one-shot forward hook on
+the block just before the window checks the guarantee on the first training
+forward.
 """
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
 
+from toolkit.accelerator import unwrap_model
 from toolkit.h3_modality_routing import (
-    _TRUNK_BLOCK_RE,
     _adapter_modules,
     format_block_spec,
     is_h3_arch,
@@ -32,11 +45,63 @@ from toolkit.print import print_acc
 _UNSUPPORTED_NETWORK_TYPES = ("locon", "lycoris", "lorm")
 
 
+@dataclass(frozen=True)
+class BlockLayout:
+    attr: str  # transformer attribute holding the trunk ModuleList
+    ignore: tuple = ()  # extra ignore_if_contains entries
+    named: dict = field(default_factory=dict)  # named spec -> block spec
+
+    @property
+    def block_re(self) -> re.Pattern:
+        return re.compile(rf"^{re.escape(self.attr)}\.(\d+)\.")
+
+    def selector(self, index: int) -> str:
+        return f"{self.attr}.{index}."
+
+
+# the refiner nests its own blocks.<i>. — kept out by name, then verified by
+# ownership
+_H3_LAYOUT = BlockLayout(attr="blocks", ignore=("token_refiner",))
+_QWEN_IMAGE_2_LAYOUT = BlockLayout(
+    attr="transformer_blocks", named={"identity": "10-14"}
+)
+
+
 def _arch_of(sd: Any) -> Any:
     arch = getattr(sd, "arch", None)
     if arch is None:
         arch = getattr(getattr(sd, "model_config", None), "arch", None)
     return arch
+
+
+def layout_for_arch(arch: Any) -> Optional[BlockLayout]:
+    if is_h3_arch(arch):
+        return _H3_LAYOUT
+    if str(arch or "") == "qwen_image_2":
+        return _QWEN_IMAGE_2_LAYOUT
+    return None
+
+
+def _resolve_transformer(sd: Any, layout: BlockLayout) -> torch.nn.Module:
+    if layout is _H3_LAYOUT:
+        return resolve_h3_transformer(sd)
+    for candidate in (getattr(sd, "model", None), sd):
+        if candidate is None:
+            continue
+        try:
+            inner = unwrap_model(candidate)
+        except Exception:
+            inner = candidate
+        if hasattr(inner, layout.attr):
+            return inner
+    raise ValueError(
+        f"network.train_blocks: could not find the transformer's {layout.attr!r}"
+    )
+
+
+def _expand_named(spec: Any, layout: BlockLayout) -> Any:
+    key = str(spec).strip().lower()
+    return layout.named.get(key, spec)
 
 
 def prepare_train_blocks(
@@ -52,8 +117,12 @@ def prepare_train_blocks(
     if spec is None:
         return network_kwargs, None
     arch = _arch_of(sd)
-    if not is_h3_arch(arch):
-        raise ValueError(f"network.train_blocks is H3-only (model.arch minimax_h3*), got {arch!r}")
+    layout = layout_for_arch(arch)
+    if layout is None:
+        raise ValueError(
+            "network.train_blocks is supported on model.arch minimax_h3* and "
+            f"qwen_image_2, got {arch!r}"
+        )
     if train_text_encoder or train_embedding:
         # text rows run through every block, so a trainable text path would
         # carry the backward through the frozen blocks anyway
@@ -71,15 +140,19 @@ def prepare_train_blocks(
             "network.train_blocks and network_kwargs.only_if_contains both pick "
             "modules; use one of them"
         )
-    transformer = resolve_h3_transformer(sd)
-    indices = parse_block_spec(spec, len(transformer.blocks))
+    transformer = _resolve_transformer(sd, layout)
+    named = _expand_named(spec, layout)
+    indices = parse_block_spec(named, len(getattr(transformer, layout.attr)))
+    if named is not spec:
+        print_acc(
+            f"[train-blocks] {str(spec).strip()!r} = blocks {format_block_spec(indices)}"
+        )
     kwargs = dict(network_kwargs)
-    kwargs["only_if_contains"] = [f"blocks.{i}." for i in indices]
+    kwargs["only_if_contains"] = [layout.selector(i) for i in indices]
     ignore = list(kwargs.get("ignore_if_contains") or [])
-    if "token_refiner" not in ignore:
-        # the refiner nests its own blocks.<i>. — keep it out by name, then
-        # verify by ownership below
-        ignore.append("token_refiner")
+    for word in layout.ignore:
+        if word not in ignore:
+            ignore.append(word)
     kwargs["ignore_if_contains"] = ignore
     return kwargs, indices
 
@@ -97,7 +170,9 @@ def verify_train_blocks(
     is torch.compiled (removing a hook inside a compiled graph recompiles it)."""
     if indices is None:
         return
-    transformer = resolve_h3_transformer(sd)
+    layout = layout_for_arch(_arch_of(sd))
+    transformer = _resolve_transformer(sd, layout)
+    block_re = layout.block_re
     allowed = set(indices)
     id_to_path = {id(module): name for name, module in transformer.named_modules()}
     per_block: dict[int, int] = {}
@@ -106,7 +181,7 @@ def verify_train_blocks(
     for adapter in _adapter_modules(network):
         orig = adapter.orig_module_ref()
         path = id_to_path.get(id(orig), "") if orig is not None else ""
-        matched = _TRUNK_BLOCK_RE.match(path)
+        matched = block_re.match(path)
         if matched is None or int(matched.group(1)) not in allowed:
             outside.append(path or getattr(adapter, "lora_name", "?"))
             continue
@@ -140,7 +215,7 @@ def verify_train_blocks(
     )
     if first > 0:
         if arm_runtime_check:
-            _arm_backward_stop_check(transformer.blocks[first - 1], first)
+            _arm_backward_stop_check(getattr(transformer, layout.attr)[first - 1], first)
         else:
             print_acc(
                 "[train-blocks] model is compiled: skipping the first-step backward "
