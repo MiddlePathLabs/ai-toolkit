@@ -1577,6 +1577,20 @@ class DatasetConfig:
         self.folder_path: str = kwargs.get('folder_path', None)
         # can be json or folder path
         self.dataset_path: str = kwargs.get('dataset_path', None)
+        # the UI edits only folder_path while the loader prefers dataset_path, so a
+        # config carrying both with different values silently ignores UI edits
+        if (
+            self.folder_path is not None
+            and self.dataset_path is not None
+            and os.path.normcase(os.path.normpath(self.folder_path))
+            != os.path.normcase(os.path.normpath(self.dataset_path))
+        ):
+            raise ValueError(
+                f"Dataset has both folder_path ('{self.folder_path}') and dataset_path "
+                f"('{self.dataset_path}') pointing at different paths. Training uses "
+                f"dataset_path and would ignore folder_path (the only key the UI edits). "
+                f"Delete one of them; keep folder_path for UI-managed jobs."
+            )
 
         self.default_caption: str = kwargs.get('default_caption', None)
         # trigger word for just this dataset
