@@ -237,6 +237,49 @@ class DiffusionTrainer(SDTrainer):
             if self.progress_bar is not None:
                 self.progress_bar.unpause()
 
+    def should_stop_after_save(self):
+        if not self.is_ui_trainer:
+            return False
+
+        def _check_stop_after_save():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(
+                        "SELECT stop_after_save FROM Job WHERE id = ?", (self.job_id,))
+                    stop_after_save = cursor.fetchone()
+                except sqlite3.OperationalError as e:
+                    if "no such column" in str(e):
+                        # db predates the column; the feature was never armed
+                        return False
+                    raise
+                return False if stop_after_save is None else stop_after_save[0] == 1
+
+        return self._retry_db_operation(_check_stop_after_save)
+
+    def maybe_stop_after_save(self):
+        if not self.is_ui_trainer:
+            return
+        # cannot save mid optimizer window; stay armed and retry on a later step
+        if self._optimizer_window_active or not self._last_optimizer_update_success:
+            return
+        if self.should_stop_after_save():
+            self.update_db_key("stop_after_save", 0)
+            if self.progress_bar is not None:
+                self.progress_bar.pause()
+            print_acc(f"\nStop after save requested: saving at step {self.step_num} and stopping")
+            self.save(self.step_num)
+            self.ensure_params_requires_grad()
+            flush()
+            if self.progress_bar is not None:
+                self.progress_bar.unpause()
+            # same graceful shutdown as the stop button: is_stopping keeps
+            # on_error from overwriting the status with 'error'
+            self._run_async_operation(
+                self._update_status("stopped", "Job stopped after save"))
+            self.is_stopping = True
+            raise Exception("Job stopped after save")
+
     async def _update_key(self, key, value):
         if not self.accelerator.is_main_process:
             return
@@ -373,6 +416,8 @@ class DiffusionTrainer(SDTrainer):
         if self.is_ui_trainer:
             self.update_step()
             self.maybe_stop()
+            # before maybe_save so an armed save_now doesn't double-save
+            self.maybe_stop_after_save()
             self.maybe_save()
             self.maybe_sample()
 

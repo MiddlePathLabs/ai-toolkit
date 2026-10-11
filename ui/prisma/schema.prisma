@@ -41,6 +41,7 @@ model Job {
   job_ref         String? // can be used for anything for special jobs, like dataset path for caption jobs
   save_now        Boolean  @default(false) // if true, the job will be saved on the next step
   sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step
+  stop_after_save Boolean  @default(false) // if true, the job will save on the next step and then stop
 
   @@index([status])
   @@index([gpu_ids])

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
-import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image } from 'lucide-react';
+import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image, Flag } from 'lucide-react';
 import { LuLoader } from 'react-icons/lu';
 import { Button, Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
@@ -13,6 +13,7 @@ import {
   markJobAsStopped,
   saveJobNow,
   sampleJobNow,
+  stopJobAfterSave,
 } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { formatAdmissionError } from '@/utils/admission';
@@ -31,7 +32,7 @@ interface JobActionBarProps {
   menuAnchor?: 'bottom' | 'top end';
 }
 
-type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'markStopped';
+type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'stopAfterSave' | 'markStopped';
 
 // If the job never reports a state change (e.g. the request silently failed
 // server-side), unlock the bar after this long so it can't stay stuck.
@@ -100,7 +101,7 @@ export default function JobActionBar({
   const menuItemDisabledClass = `${menuItemClass} opacity-40 cursor-not-allowed`;
   const spinner = <LuLoader className={`${iconSizeClass} animate-spin`} />;
   const menuSpinner = <LuLoader className="w-4 h-4 animate-spin" />;
-  const menuPending = pending === 'save' || pending === 'sample' || pending === 'markStopped';
+  const menuPending = pending === 'save' || pending === 'sample' || pending === 'stopAfterSave' || pending === 'markStopped';
 
   return (
     <div className={`flex items-center flex-shrink-0 ${className ?? ''}`}>
@@ -276,6 +277,36 @@ export default function JobActionBar({
               >
                 {pending === 'sample' ? menuSpinner : <Image className="w-4 h-4" />}
                 Sample Next Step
+              </div>
+            </MenuItem>
+          )}
+          {job.job_type === 'train' && canStop && (
+            <MenuItem disabled={isBusy || job.stop_after_save}>
+              <div
+                className={isBusy || job.stop_after_save ? menuItemDisabledClass : menuItemEnabledClass}
+                onClick={() => {
+                  if (isBusy || job.stop_after_save) return;
+                  openConfirm({
+                    title: 'Stop After Save',
+                    message: `Stop the job "${job.name}" after the next save? It will save a checkpoint on the next step and then stop. You CAN resume later.`,
+                    type: 'info',
+                    confirmText: 'Stop After Save',
+                    onConfirm: () =>
+                      // does not change job state until the trainer acts on it, so
+                      // release as soon as the request resolves
+                      runAction(
+                        'stopAfterSave',
+                        async () => {
+                          await stopJobAfterSave(job.id);
+                          if (onRefresh) onRefresh();
+                        },
+                        false,
+                      ),
+                  });
+                }}
+              >
+                {pending === 'stopAfterSave' ? menuSpinner : <Flag className="w-4 h-4" />}
+                {job.stop_after_save ? 'Stopping After Save…' : 'Stop After Save'}
               </div>
             </MenuItem>
           )}

@@ -82,6 +82,22 @@ export const sampleJobNow = (jobID: string) => {
   });
 };
 
+export const stopJobAfterSave = (jobID: string) => {
+  return new Promise<void>((resolve, reject) => {
+    apiClient
+      .get(`/api/jobs/${jobID}/stop_after_save`)
+      .then(res => res.data)
+      .then(data => {
+        console.log('Job set to save and stop on next step:', data);
+        resolve();
+      })
+      .catch(error => {
+        console.error('Error setting job to save and stop on next step:', error);
+        reject(error);
+      });
+  });
+};
+
 export const markJobAsStopped = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
     apiClient

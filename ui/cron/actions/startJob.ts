@@ -492,6 +492,7 @@ export default async function startJob(
       status: 'running',
       stop: false,
       return_to_queue: false,
+      stop_after_save: false,
       info: 'Starting job...',
     },
   });
