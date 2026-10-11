@@ -19,6 +19,14 @@ see the sampled timestep.
 
 Flow-matching convention matches ai-toolkit (t=1 noise -> t=0 clean, target =
 noise - clean), so `get_noise_prediction` does no time flip or negation.
+
+Qwen-Image-2.1-Turbo is the same architecture distilled to 8 steps at CFG 1.
+Point `name_or_path` at its weight file in the repack
+(`Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors`);
+`model_kwargs.turbo` samples with the schedule the checkpoint ships. Training
+it goes through a training adapter
+(`assistant_lora_path`): a LoRA that is live on the DiT while training and
+off while sampling, so samples show the turbo model plus what was trained.
 """
 
 import os
@@ -79,6 +87,16 @@ scheduler_config = {
 # configs and the processor, which the repack does not carry
 COMFY_REPO = "Comfy-Org/Qwen-Image-2.1"
 BASE_REPO = "Qwen/Qwen-Image-2.1"
+
+# the turbo checkpoint is sampled with the schedule it ships
+# (TURBO_SAMPLE_SIGMAS in src/pipeline.py) as-is: no resolution shift, no
+# terminal stretch; the step count is fixed
+turbo_scheduler_config = {
+    **scheduler_config,
+    "shift": 1.0,
+    "shift_terminal": None,
+    "use_dynamic_shifting": False,
+}
 
 # decode above this many output pixels goes through the VAE's tiled path
 TILE_DECODE_ABOVE_PIXELS = 1024 * 1024
@@ -181,6 +199,15 @@ class QwenImage2Model(BaseModel):
             return np.array(TURBO_SIGMAS)
         return np.array(turbo_sigma_grid(num_inference_steps))
 
+    @property
+    def is_turbo(self) -> bool:
+        return bool(self.model_config.model_kwargs.get("turbo", False))
+
+    def get_sample_scheduler(self):
+        if self.is_turbo:
+            return CustomFlowMatchEulerDiscreteScheduler(**turbo_scheduler_config)
+        return self.get_train_scheduler()
+
     def get_bucket_divisibility(self):
         # 16 for the VAE, 2 more because the DiT groups target latent tokens
         # into 2x2 blocks, one per vision slot
@@ -205,16 +232,37 @@ class QwenImage2Model(BaseModel):
             # a local full checkpoint supplies its own text encoder / vae
             base_model_path = model_path
 
+        load_kwargs = self.component_load_kwargs("transformer")
         self.print_and_status_update("Loading transformer")
-        transformer = QwenImage21Transformer2DModel.load(
-            model_path,
-            config_path=base_model_path,
-            **self.component_load_kwargs("transformer"),
-        )
+        if self.model_config.assistant_lora_path is None:
+            transformer = QwenImage21Transformer2DModel.load(
+                model_path, config_path=base_model_path, **load_kwargs
+            )
+        else:
+            # the adapter stays a live LoRA on the quantized linears, attached
+            # after quantization (it must wrap the quantized forward) and
+            # before layer offloading (the offloader routes through it)
+            offload = load_kwargs.pop("offload", 0.0)
+            transformer = QwenImage21Transformer2DModel.load_model(
+                model_path,
+                dtype=load_kwargs["dtype"],
+                config_path=base_model_path,
+                qtype=(load_kwargs.get("qtype") or "").split("|", 1)[0] or None,
+                quantize_on_load=False,
+            )
+            transformer.aitk_post_load(offload=0.0, **load_kwargs)
+            self.load_training_adapter(transformer)
+            if offload and offload > 0:
+                from toolkit.memory_management import MemoryManager
+
+                MemoryManager.attach(
+                    transformer,
+                    torch.device(load_kwargs["quantize_device"]),
+                    offload_percent=offload,
+                    ignore_modules=list(transformer.get_offload_ignore_modules() or []),
+                )
         flush()
 
-        if self.model_config.assistant_lora_path is not None:
-            self.load_training_adapter(transformer)
         if self.model_config.preview_lora_path is not None:
             self.load_preview_turbo(transformer)
 
