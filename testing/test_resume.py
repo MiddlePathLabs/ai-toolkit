@@ -704,46 +704,62 @@ def test_raw_checkpoint_invalid_components_fail_closed(tmp_path, field, value):
 def test_recipe_identity_excludes_resume_mode_and_horizon_fields(tmp_path):
     model, optimizer, scheduler, loader = _new_run(tmp_path, 713)
     host = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="auto")
+    host.config["train"]["gradient_checkpointing"] = True
     host.config["train"]["steps"] = 2000
     host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
     host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
+    host.config["model"] = {"arch": "flux", "preview_lora_path": None}
     identity = host._resume_recipe_identity()
-    v2_identity = host._resume_recipe_identity(version=1)
-    v1_identity = host._resume_recipe_identity(version=2)
-    assert v2_identity != identity  # horizon fields were part of the v2 digest
-    assert v1_identity != v2_identity  # retention fields were part of the v1 digest
+    v3_identity = host._resume_recipe_identity(version=1)
+    v2_identity = host._resume_recipe_identity(version=2)
+    v1_identity = host._resume_recipe_identity(version=3)
+    assert v3_identity != identity  # the v4 fields were part of the v3 digest
+    assert v2_identity != v3_identity  # sample/* was part of the v2 digest
+    assert v1_identity != v2_identity  # horizon/retention fields were part of the v1 digest
 
-    # resume_mode, run horizon, retention-only and sample/* settings keep the
-    # current identity (sampling runs under fork_rng, so it cannot move
-    # training)
+    # resume_mode, run horizon, retention, sample/* and the v4 whitelist keep
+    # the current identity (sampling runs under fork_rng; the v4 fields are
+    # memory-only, dead, telemetry-only or artifact-only)
     host.config["train"]["resume_mode"] = "continue"
     host.config["train"]["steps"] = 3000
-    host.config["save"] = {"save_every": 50, "max_step_saves_to_keep": 5}
+    host.config["train"]["gradient_checkpointing"] = False
+    host.config["train"]["unet_lr"] = 1e-4
+    host.config["save"] = {"save_every": 50, "max_step_saves_to_keep": 5, "save_format": "diffusers"}
     host.config["sample"] = {"sample_every": 5, "samples": [{"prompt": "another"}]}
+    host.config["logging"] = {"log_every": 1, "use_wandb": True}
+    host.config["model"]["preview_lora_path"] = "turbo.safetensors"
     assert host._resume_recipe_identity() == identity
 
-    # the older digests still bind those fields: they only matched unchanged.
-    # v2 rules already excluded the horizon; v1 bound everything but resume_mode
+    # the older digests still bind those fields: they only matched unchanged
     host.config["train"]["steps"] = 2000
+    host.config["train"]["gradient_checkpointing"] = True
+    host.config["train"].pop("unet_lr", None)
     host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
     host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
-    assert host._resume_recipe_identity(version=1) == v2_identity
-    assert host._resume_recipe_identity(version=2) == v1_identity
+    host.config.pop("logging", None)
+    host.config["model"]["preview_lora_path"] = None
+    assert host._resume_recipe_identity(version=1) == v3_identity
+    assert host._resume_recipe_identity(version=2) == v2_identity
+    assert host._resume_recipe_identity(version=3) == v1_identity
     host.config["train"]["steps"] = 3000
-    assert host._resume_recipe_identity(version=2) != v1_identity
+    assert host._resume_recipe_identity(version=3) != v1_identity  # v1 binds the horizon
     host.config["train"]["steps"] = 2000
     host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "rewritten"}]}
-    assert host._resume_recipe_identity(version=1) != v2_identity
-    assert host._resume_recipe_identity(version=2) != v1_identity
+    assert host._resume_recipe_identity(version=2) != v2_identity  # v2 binds sample/*
+    assert host._resume_recipe_identity(version=3) != v1_identity
     host.config["sample"] = {"sample_every": 250, "samples": [{"prompt": "a test"}]}
     host.config["save"] = {"save_every": 250}
-    assert host._resume_recipe_identity(version=2) != v1_identity
+    assert host._resume_recipe_identity(version=3) != v1_identity  # v1 binds retention
     host.config["save"] = {"save_every": 100, "max_step_saves_to_keep": 2}
+    host.config["train"]["gradient_checkpointing"] = False
+    assert host._resume_recipe_identity(version=1) != v3_identity  # v3 binds gradient_checkpointing
+    assert host._resume_recipe_identity(version=2) != v2_identity
+    host.config["train"]["gradient_checkpointing"] = True
 
     # trajectory-relevant fields re-key every digest version
     host.config["train"]["gradient_accumulation"] = 2
     assert host._resume_recipe_identity() != identity
-    assert host._resume_recipe_identity(version=2) != v1_identity
+    assert host._resume_recipe_identity(version=3) != v1_identity
     host.config["train"]["gradient_accumulation"] = 1
     host.config["train"]["lr"] = 5e-4
     assert host._resume_recipe_identity() != identity
@@ -824,7 +840,7 @@ def test_legacy_full_config_identity_state_still_resumes_and_migrates(tmp_path):
     previous.save(step=1)
     # rewrite the digest the pre-exclusion code would have stored (those
     # states predate recipe_config_snapshot, so drop it too)
-    legacy = previous._resume_recipe_identity(version=2)
+    legacy = previous._resume_recipe_identity(version=3)
     state = torch.load(previous._resume_state_path, weights_only=False)
     assert state["recipe_identity"] != legacy
     state["recipe_identity"] = legacy
@@ -874,7 +890,9 @@ def test_sample_config_edits_do_not_block_resume(tmp_path):
     previous.save(step=1)
     state = torch.load(previous._resume_state_path, weights_only=False)
     assert "recipe_config_snapshot" in state  # the snapshot ships with the digest
-    assert state["recipe_config_snapshot"].get("sample") is None
+    # since v4 the snapshot is the FULL pre-exclusion config, so sample rides
+    # along even though every digest version drops it
+    assert state["recipe_config_snapshot"]["sample"]["sample_every"] == 250
 
     # trimming/rewriting sample prompts and cadence must not block continuation
     model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 62)
@@ -893,9 +911,9 @@ def test_snapshot_accepts_states_saved_under_older_identity_rules(tmp_path):
     _step(previous, model, iter(loader), None, None, 0.0)
     previous.save(step=1)
     # simulate a state saved before sample was excluded: older digest, but the
-    # snapshot is present (current-rules dict)
+    # snapshot is present (full pre-exclusion config)
     state = torch.load(previous._resume_state_path, weights_only=False)
-    state["recipe_identity"] = previous._resume_recipe_identity(version=1)
+    state["recipe_identity"] = previous._resume_recipe_identity(version=2)
     torch.save(state, previous._resume_state_path)
 
     model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 64)
@@ -904,6 +922,88 @@ def test_snapshot_accepts_states_saved_under_older_identity_rules(tmp_path):
     resumed.config["sample"] = {"samples": [{"prompt": "edited"}]}
     _restore(resumed)  # ladder misses (v2 digest hashed sample); snapshot accepts
     assert resumed.step_num == resumed.completed_update_id == 1
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # the user-facing one: memory-only checkpointing toggle (compile off)
+        lambda config: config["train"].update(gradient_checkpointing=False),
+        # dead LR knobs (the trainer hardwires train.lr into every param group)
+        lambda config: config["train"].update(unet_lr=1e-4, text_encoder_lr=2e-4),
+        # pre-loop sampling gates
+        lambda config: config["train"].update(skip_first_sample=True),
+        # telemetry-only section swap
+        lambda config: config.update(logging={"log_every": 5, "use_wandb": True}),
+        # sampling-only preview adapter (activated inside generate_images)
+        lambda config: config["model"].update(preview_lora_path="turbo.safetensors"),
+        # dead face_id knob the UI writes but nothing reads
+        lambda config: config["face_id"].update(identity_loss_decoded_det_threshold=0.2),
+        # artifact/upload-only save knobs
+        lambda config: config["save"].update(save_format="diffusers", push_to_hub=True),
+    ],
+)
+def test_v4_whitelisted_config_edits_do_not_block_resume(tmp_path, edit):
+    model, optimizer, scheduler, loader = _new_run(tmp_path, 81)
+    previous = _host(tmp_path, model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    previous.config["train"]["gradient_checkpointing"] = True
+    previous.config["save"] = {"save_every": 250, "max_step_saves_to_keep": 5}
+    previous.config["model"] = {"arch": "flux", "preview_lora_path": None}
+    previous.config["face_id"] = {"identity_loss_weight": 0.1, "identity_loss_decoded_det_threshold": 0.5}
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path, 82)
+    resumed = _host(tmp_path, model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 10
+    resumed.config["train"]["gradient_checkpointing"] = True
+    resumed.config["save"] = dict(previous.config["save"])
+    resumed.config["model"] = dict(previous.config["model"])
+    resumed.config["face_id"] = dict(previous.config["face_id"])
+    edit(resumed.config)
+    _restore(resumed)  # no raise
+    assert resumed.step_num == resumed.completed_update_id == 1
+
+
+def test_gradient_checkpointing_flip_refused_only_when_block_compile_selected(tmp_path):
+    # compile + block_compile both on: the flag selects whole-model vs block
+    # torch.compile (_use_block_compile), so flipping it must refuse even
+    # though v4 excluded it from the digest
+    model, optimizer, scheduler, loader = _new_run(tmp_path / "blocky", 83)
+    previous = _host(tmp_path / "blocky", model, optimizer, scheduler, loader, resume_mode="exact")
+    previous.config["train"]["steps"] = 10
+    previous.config["train"]["gradient_checkpointing"] = True
+    previous.config["model"] = {"arch": "flux", "compile": True, "block_compile": True}
+    _step(previous, model, iter(loader), None, None, 0.0)
+    previous.save(step=1)
+
+    model2, optimizer2, scheduler2, loader2 = _new_run(tmp_path / "blocky", 84)
+    resumed = _host(tmp_path / "blocky", model2, optimizer2, scheduler2, loader2, resume_mode="continue")
+    resumed.config["train"]["steps"] = 10
+    resumed.config["train"]["gradient_checkpointing"] = False
+    resumed.config["model"] = {"arch": "flux", "compile": True, "block_compile": True}
+    with pytest.raises(ValueError, match="gradient_checkpointing"):
+        _restore(resumed)
+    assert resumed._resume_state_restored is False
+
+    # same flip with compile only (block_compile off): the flag cannot switch
+    # compile modes, so the v4 exclusion applies and the resume continues
+    model3, optimizer3, scheduler3, loader3 = _new_run(tmp_path / "whole", 85)
+    solo = _host(tmp_path / "whole", model3, optimizer3, scheduler3, loader3, resume_mode="exact")
+    solo.config["train"]["steps"] = 10
+    solo.config["train"]["gradient_checkpointing"] = True
+    solo.config["model"] = {"arch": "flux", "compile": True, "block_compile": False}
+    _step(solo, model3, iter(loader3), None, None, 0.0)
+    solo.save(step=1)
+
+    model4, optimizer4, scheduler4, loader4 = _new_run(tmp_path / "whole", 86)
+    flipped = _host(tmp_path / "whole", model4, optimizer4, scheduler4, loader4, resume_mode="continue")
+    flipped.config["train"]["steps"] = 10
+    flipped.config["train"]["gradient_checkpointing"] = False
+    flipped.config["model"] = {"arch": "flux", "compile": True, "block_compile": False}
+    _restore(flipped)  # no raise
+    assert flipped.step_num == flipped.completed_update_id == 1
 
 
 def test_identity_mismatch_message_lists_differing_sections(tmp_path):

@@ -661,20 +661,73 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return copy.deepcopy(value)
 
     # Fields and whole sections excluded from the resume recipe digest, newest
-    # rules first; an empty field tuple drops the whole section. Version 0 is
-    # what new saves record; every older version stays accepted at the gate so
-    # raw states saved before an exclusion was broadened keep matching until
-    # they are re-saved with the current identity.
+    # rules first; an empty field tuple drops the whole section (a section left
+    # empty by field pops is dropped too). Version 0 is what new saves record;
+    # every older version stays accepted at the gate so raw states saved before
+    # an exclusion was broadened keep matching until they are re-saved with the
+    # current identity.
     #
-    # v3 (current): sample generation runs under fork_rng (see sample()), so
-    #     sample/* cannot move the training trajectory — editing sample
-    #     prompts mid-run is a supported continuation.
+    # v4: fields proven trajectory-neutral by the 2026-10-11 whitelist audit
+    #     (proofs with file:line cites live in the workspace doc
+    #     resume_recipe_whitelist_audit.md). train.gradient_checkpointing is a
+    #     recompute-vs-store tradeoff with identical gradients — except that
+    #     with model.compile + model.block_compile both on it selects
+    #     whole-model vs block torch.compile (_use_block_compile), which is why
+    #     _refuse_gradient_checkpointing_flip_under_compile refuses exactly
+    #     that flip. unet_lr/text_encoder_lr are dead (the trainer hardwires
+    #     train.lr into every param group); weight_jitter is read only by the
+    #     slider processes. skip/force_first_sample gate the pre-loop sample()
+    #     (fork_rng envelope). show_turbo_outputs/max_loss_debug print only;
+    #     validation_config is a fixed-cache eval under fork_rng that logs.
+    #     save_format/push_to_hub/hf_* are artifact/upload-only. logging/* is
+    #     write-only telemetry. The model LoRA paths activate only inside the
+    #     forked sampling block with clone-based weight restore; vae_device/
+    #     te_device/model_paths/in_context are read by nothing. The rest are
+    #     dead (face_id det threshold) or preview/QC/output-only.
+    # v3: sample generation runs under fork_rng (see sample()), so sample/*
+    #     cannot move the training trajectory — editing sample prompts mid-run
+    #     is a supported continuation.
     # v2: train.steps is a stop condition, not trajectory math — the raw
     #     snapshot sits on a completed-update boundary, so relaunching with a
     #     higher horizon must stay resumable. save_every /
     #     max_step_saves_to_keep are retention-only.
     # v1: original digest — everything except train.resume_mode.
+    #
+    # Caveat found by the same audit, reg-dataset runs only (this fork runs
+    # none): sample_every/sample_start_step and save_every gate reg-batch
+    # alternation (is_sample_step/is_save_step in the step loop), so editing
+    # them on a run WITH a regularization dataset moves the data stream
+    # despite the exclusions below.
     _RESUME_RECIPE_EXCLUSIONS = (
+        {  # v4
+            "train": (
+                "resume_mode", "steps",
+                "gradient_checkpointing",
+                "unet_lr", "text_encoder_lr",
+                "weight_jitter",
+                "skip_first_sample", "force_first_sample",
+                "show_turbo_outputs", "max_loss_debug",
+                "validation_config",
+            ),
+            "save": (
+                "save_every", "max_step_saves_to_keep",
+                "save_format", "push_to_hub", "hf_repo_id", "hf_private",
+            ),
+            "logging": (),
+            "sample": (),
+            "first_sample": (),
+            "model": (
+                "preview_lora_path", "preview_lora_strength",
+                "preview_lora_schedule", "inference_lora_path",
+                "vae_device", "te_device", "model_paths", "in_context",
+            ),
+            "face_id": ("identity_loss_decoded_det_threshold",),
+            "depth_consistency": ("preview_every", "preview_max_keep"),
+            "normal_id": ("preview_every", "preview_max_keep"),
+            "subject_mask": ("save_debug_previews",),
+            "embedding": ("save_format",),
+            "adapter": ("test_img_path",),
+        },
         {  # v3
             "train": ("resume_mode", "steps"),
             "save": ("save_every", "max_step_saves_to_keep"),
@@ -703,12 +756,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if isinstance(part, dict):
                     for field in fields:
                         part.pop(field, None)
+                    if not part:
+                        recipe.pop(section, None)
         return recipe
 
     def _resume_recipe_dict(self, *, version: int = 0):
-        """The exact dict the recipe digest is computed over. Also stored
-        verbatim in the raw state (recipe_config_snapshot) so future exclusion
-        changes can re-express an on-disk state without its original config."""
+        """The exact dict the recipe digest is computed over. The raw state
+        stores the FULL pre-exclusion config instead (recipe_config_snapshot,
+        see _capture_training_state) so future exclusion changes and the
+        gradient_checkpointing compile guard can re-read fields the current
+        rules pop; both snapshot consumers apply the current exclusions before
+        comparing, which is a no-op on already-excluded legacy snapshots."""
         return self._apply_resume_recipe_exclusions(self.config, version=version)
 
     def _resume_recipe_identity(self, *, version: int = 0) -> str:
@@ -916,6 +974,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for version in range(len(BaseSDTrainProcess._RESUME_RECIPE_EXCLUSIONS))
         } and not self._resume_snapshot_matches_current_recipe():
             raise ValueError(self._resume_identity_mismatch_message())
+        BaseSDTrainProcess._refuse_gradient_checkpointing_flip_under_compile(self)
         if getattr(self.train_config, "merge_network_on_save", False):
             raise ValueError(
                 "Raw continuation cannot reconstruct a base model mutated by merge_network_on_save. "
@@ -925,9 +984,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def _resume_snapshot_matches_current_recipe(self) -> bool:
         """States saved since the snapshot was introduced carry
-        recipe_config_snapshot — the exact dict the saved digest was computed
-        over. Re-applying the CURRENT exclusions to both sides keeps such
-        states resumable even if the exclusion rules change again."""
+        recipe_config_snapshot — the full pre-exclusion config since v4 (the
+        digest dict before that). Re-applying the CURRENT exclusions to both
+        sides keeps such states resumable even if the exclusion rules change
+        again."""
         snapshot = (self._resume_state or {}).get("recipe_config_snapshot")
         if not isinstance(snapshot, dict):
             return False
@@ -939,6 +999,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
 
         return _normalized(snapshot) == _normalized(self.config)
+
+    @staticmethod
+    def _refuse_gradient_checkpointing_flip_under_compile(process):
+        # v4 removed train.gradient_checkpointing from the digest because the
+        # flag is a recompute-vs-store tradeoff with identical gradients; the
+        # one unsafe interaction is that with model.compile AND
+        # model.block_compile both enabled it selects whole-model vs block
+        # torch.compile (_use_block_compile), i.e. compiled numerics. The
+        # snapshot is the full pre-exclusion config, so both sides stay
+        # readable even for states saved under v4 rules.
+        snapshot = (getattr(process, "_resume_state", None) or {}).get("recipe_config_snapshot")
+        if not isinstance(snapshot, dict):
+            return
+        saved_model = snapshot.get("model")
+        if not (
+            isinstance(saved_model, dict)
+            and saved_model.get("compile")
+            and saved_model.get("block_compile")
+        ):
+            return
+        saved_train = snapshot.get("train")
+        if not isinstance(saved_train, dict):
+            saved_train = {}
+        current_train = (getattr(process, "config", None) or {}).get("train")
+        if not isinstance(current_train, dict):
+            current_train = {}
+        if saved_train.get("gradient_checkpointing", True) == current_train.get(
+            "gradient_checkpointing", True
+        ):
+            return
+        raise ValueError(
+            "train.gradient_checkpointing differs from the saved run while "
+            "model.compile and model.block_compile are both enabled: the flag "
+            "selects whole-model vs block torch.compile, so flipping it changes "
+            "compiled numerics. Restore the original gradient_checkpointing "
+            "value to continue this trajectory."
+        )
 
     def _resume_identity_mismatch_message(self) -> str:
         snapshot = (self._resume_state or {}).get("recipe_config_snapshot")
@@ -1122,7 +1219,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "kind": "ai_toolkit.raw_training_state",
             "schema": 1,
             "recipe_identity": self._resume_recipe_identity(),
-            "recipe_config_snapshot": self._resume_recipe_dict(),
+            # the full pre-exclusion config, not the digest dict: future
+            # exclusion rules and the gradient_checkpointing compile guard
+            # must be able to read fields the current rules pop
+            "recipe_config_snapshot": copy.deepcopy(self.config),
             "determinism": {"supported": supported, "reasons": reasons},
             "num_processes": int(getattr(self.accelerator, "num_processes", 1)),
             "snapshot": dict(snapshot or self.get_completed_update_snapshot()),
