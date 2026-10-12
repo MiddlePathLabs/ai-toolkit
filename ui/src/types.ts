@@ -270,6 +270,11 @@ export interface SubjectMaskConfig {
   background_loss_weight?: number | null;
   clothing_loss_weight?: number | null;
   body_loss_weight?: number | null;
+  subject_identity_dataset?: string | null;
+  match_threshold?: number;
+  match_margin?: number;
+  subject_person_loss_weight?: number | null;
+  others_person_loss_weight?: number | null;
   perceptual_restrict_to_body: boolean;
   save_debug_previews: boolean;
 }

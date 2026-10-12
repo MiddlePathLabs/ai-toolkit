@@ -897,6 +897,35 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Clothing Loss Weight',
     description: <>Multiplies the diffusion loss INSIDE the clothing region by this factor.</>,
   },
+  'subject_mask.subject_identity_dataset': {
+    title: 'Subject Identity Dataset',
+    description: (
+      <>
+        Path of the solo-subject dataset folder. Its faces are averaged into an ArcFace reference
+        embedding, and every training image's faces are matched against it: the matched person is
+        cached as the subject_person mask and everyone else as others_person. Required for the
+        Subject/Others Person loss weights. A face accepts the match when its cosine similarity is
+        at or above the threshold and beats the runner-up by the margin; unmatched images leave both
+        weights inert.
+      </>
+    ),
+  },
+  'subject_mask.subject_person_loss_weight': {
+    title: 'Subject Person Loss Weight',
+    description: <>Multiplies the diffusion loss INSIDE the identity-matched subject's person region by this factor. Set it below 1 (e.g. 0.1) on the multi-person dataset entry to stop those images from reinforcing the subject. Requires the Subject Identity Dataset.</>,
+  },
+  'subject_mask.others_person_loss_weight': {
+    title: 'Others Person Loss Weight',
+    description: <>Multiplies the diffusion loss INSIDE the non-subject persons' region by this factor. Requires the Subject Identity Dataset.</>,
+  },
+  'subject_mask.match_threshold': {
+    title: 'Identity Match Threshold',
+    description: <>Minimum ArcFace cosine similarity for a face to be accepted as the subject (default 0.4).</>,
+  },
+  'subject_mask.match_margin': {
+    title: 'Identity Match Margin',
+    description: <>Required cosine gap between the best and second-best face in multi-person images (default 0.1). Prevents ambiguous matches; the image then falls back to no identity weighting.</>,
+  },
   'subject_mask.perceptual_restrict_to_body': {
     title: 'Restrict Perceptual Anchors to Body',
     description: <>When on, the surface-normal anchor loss is computed only inside the body region (per-sample normalized so unrestricted items keep their magnitude).</>,

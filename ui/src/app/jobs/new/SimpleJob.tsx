@@ -2370,6 +2370,75 @@ export default function SimpleJob({
                           placeholder="1.0 (inherit)"
                           min={0}
                         />
+                        <TextInput
+                          label="Subject Identity Dataset"
+                          className="pt-2"
+                          docKey={'subject_mask.subject_identity_dataset'}
+                          value={subjectMaskConfig?.subject_identity_dataset ?? ''}
+                          onChange={value =>
+                            setJobConfig(
+                              value === '' || value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.subject_identity_dataset',
+                            )
+                          }
+                          placeholder="Path of the solo-subject dataset folder"
+                        />
+                        <NumberInput
+                          label="Subject Person Loss Weight"
+                          className="pt-2"
+                          docKey={'subject_mask.subject_person_loss_weight'}
+                          value={subjectMaskConfig?.subject_person_loss_weight ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.subject_person_loss_weight',
+                            )
+                          }
+                          placeholder="1.0 (inherit)"
+                          min={0}
+                        />
+                        <NumberInput
+                          label="Others Person Loss Weight"
+                          className="pt-2"
+                          docKey={'subject_mask.others_person_loss_weight'}
+                          value={subjectMaskConfig?.others_person_loss_weight ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? null : value,
+                              'config.process[0].subject_mask.others_person_loss_weight',
+                            )
+                          }
+                          placeholder="1.0 (inherit)"
+                          min={0}
+                        />
+                        <NumberInput
+                          label="Identity Match Threshold"
+                          className="pt-2"
+                          docKey={'subject_mask.match_threshold'}
+                          value={subjectMaskConfig?.match_threshold ?? 0.4}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? 0.4 : value,
+                              'config.process[0].subject_mask.match_threshold',
+                            )
+                          }
+                          min={0}
+                          max={1}
+                        />
+                        <NumberInput
+                          label="Identity Match Margin"
+                          className="pt-2"
+                          docKey={'subject_mask.match_margin'}
+                          value={subjectMaskConfig?.match_margin ?? 0.1}
+                          onChange={value =>
+                            setJobConfig(
+                              value === null || value === undefined ? 0.1 : value,
+                              'config.process[0].subject_mask.match_margin',
+                            )
+                          }
+                          min={0}
+                          max={1}
+                        />
                         {modelArch?.additionalSections?.includes('normal_id') && (
                           <Checkbox
                             label="Restrict Perceptual Anchors to Body"

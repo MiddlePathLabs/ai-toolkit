@@ -115,6 +115,11 @@ export const defaultSubjectMaskConfig: SubjectMaskConfig = {
   background_loss_weight: null,
   clothing_loss_weight: null,
   body_loss_weight: null,
+  subject_identity_dataset: null,
+  match_threshold: 0.4,
+  match_margin: 0.1,
+  subject_person_loss_weight: null,
+  others_person_loss_weight: null,
   perceptual_restrict_to_body: false,
   save_debug_previews: false,
 };

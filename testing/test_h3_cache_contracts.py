@@ -177,6 +177,8 @@ def test_subject_mask_identity_contains_full_transform_and_source(tmp_path):
         primary_only=True,
         sam_size="small",
         segformer_res=768,
+        yolo_conf=0.25,
+        yolo_ckpt="yolo11n.pt",
     )
     first = _mask_cache_identity(item, config, 96, 96)
     item.crop_x = 8
@@ -185,6 +187,25 @@ def test_subject_mask_identity_contains_full_transform_and_source(tmp_path):
     item.flip_x = True
     third = _mask_cache_identity(item, config, 96, 96)
     assert len({first, second, third}) == 3
+    # identity-matching: the reference-embedding digest must re-key the cache
+    ref_a = torch.nn.functional.normalize(torch.ones(512), dim=0)
+    ref_b = torch.nn.functional.normalize(torch.cat([torch.ones(256), -torch.ones(256)]), dim=0)
+    fourth = _mask_cache_identity(item, config, 96, 96, subject_reference=ref_a)
+    fifth = _mask_cache_identity(item, config, 96, 96, subject_reference=ref_b)
+    assert len({first, fourth, fifth}) == 3
+    # matched masks depend on the YOLO detector (person-box selection), so
+    # detector settings re-key matched caches — but NOT non-matching ones
+    # (base masks are pure SegFormer).
+    config_yolo = SimpleNamespace(**{**config.__dict__, "yolo_conf": 0.95})
+    config_ckpt = SimpleNamespace(**{**config.__dict__, "yolo_ckpt": "yolo11x.pt"})
+    sixth = _mask_cache_identity(item, config_yolo, 96, 96, subject_reference=ref_a)
+    seventh = _mask_cache_identity(item, config_ckpt, 96, 96, subject_reference=ref_a)
+    assert len({fourth, sixth, seventh}) == 3
+    # item.flip_x is still True here (the `third` state) — the no-reference
+    # calls must match `third`, proving detector settings don't re-key
+    # non-matching caches.
+    assert _mask_cache_identity(item, config_yolo, 96, 96) == third
+    assert _mask_cache_identity(item, config_ckpt, 96, 96) == third
 
 
 def test_latent_identity_memoizes_duplicate_checkpoint_paths(tmp_path, monkeypatch):

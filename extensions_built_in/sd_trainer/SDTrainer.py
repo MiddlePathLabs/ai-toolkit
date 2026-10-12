@@ -350,6 +350,25 @@ def preflight_body_shape(
     return config
 
 
+def _sm_identity_weights_present(subject_mask_config, datasets) -> bool:
+    """True when a subject/others identity loss weight is configured.
+
+    Checks the global SubjectMaskConfig fields AND the per-dataset overrides
+    resolved on each file item's dataset_config (pooled datasets resolve
+    their per-folder members there, so nested weights are seen too). Either
+    source requires subject_identity_dataset to produce identity masks.
+    """
+    if any(getattr(subject_mask_config, k, None) is not None
+           for k in ('subject_person_loss_weight', 'others_person_loss_weight')):
+        return True
+    return any(
+        getattr(getattr(fi, 'dataset_config', None), k, None) is not None
+        for dataset in datasets
+        for fi in getattr(dataset, 'file_list', [])
+        for k in ('subject_person_loss_weight', 'others_person_loss_weight')
+    )
+
+
 def vae_anchor_active_for_dataset(
     vae_anchor_config: Optional[VAEAnchorConfig],
     dataset_config,
@@ -2219,11 +2238,15 @@ class SDTrainer(BaseSDTrainProcess):
         """Build a per-latent region weight map from cached subject masks.
 
         Returns ``None`` (no-op) when auto-masking is disabled, no masks are
-        present, or all of background/clothing/body loss weights resolve to
-        None. Otherwise a ``(B, C_lat, lat_h, lat_w)`` float tensor composed
-        multiplicatively: weight_map = ones; *= where(person, 1, bg_w);
-        *= where(clothing, clothing_w, 1); *= where(body, body_w, 1). Per-item
-        weight resolution: non-None per-dataset override > non-None global > None.
+        present, or all of background/clothing/body/subject_person/others_person
+        loss weights resolve to None. Otherwise a ``(B, C_lat, lat_h, lat_w)``
+        float tensor composed multiplicatively: weight_map = ones; *=
+        where(person, 1, bg_w); *= where(clothing, clothing_w, 1); *=
+        where(body, body_w, 1); *= where(subject_person, subj_w, 1); *=
+        where(others_person, others_w, 1). The identity-matched regions require
+        subject_mask.subject_identity_dataset (masks stay None otherwise).
+        Per-item weight resolution: non-None per-dataset override > non-None
+        global > None.
         """
         import torch.nn.functional as _F
         smc = self.subject_mask_config
@@ -2232,7 +2255,10 @@ class SDTrainer(BaseSDTrainProcess):
         person = getattr(batch, 'subject_masks', None)
         body = getattr(batch, 'body_masks', None)
         clothing = getattr(batch, 'clothing_masks', None)
-        if person is None and body is None and clothing is None:
+        subject_person = getattr(batch, 'subject_person_masks', None)
+        others_person = getattr(batch, 'others_person_masks', None)
+        if person is None and body is None and clothing is None \
+                and subject_person is None and others_person is None:
             return None
 
         B = len(batch.file_items)
@@ -2253,7 +2279,17 @@ class SDTrainer(BaseSDTrainProcess):
         bg = _per_item(smc.background_loss_weight, 'background_loss_weight')
         cl = _per_item(smc.clothing_loss_weight, 'clothing_loss_weight')
         bd = _per_item(smc.body_loss_weight, 'body_loss_weight')
-        if all(w is None for w in bg) and all(w is None for w in cl) and all(w is None for w in bd):
+        sp = _per_item(getattr(smc, 'subject_person_loss_weight', None), 'subject_person_loss_weight')
+        op = _per_item(getattr(smc, 'others_person_loss_weight', None), 'others_person_loss_weight')
+        # Identity weights are strictly mask-gated: without cached identity
+        # masks (subject_identity_dataset unset, or a fully unmatched batch)
+        # they no-op instead of producing an all-ones weight map.
+        if subject_person is None:
+            sp = [None] * B
+        if others_person is None:
+            op = [None] * B
+        if all(w is None for w in bg) and all(w is None for w in cl) and all(w is None for w in bd) \
+                and all(w is None for w in sp) and all(w is None for w in op):
             return None
 
         def _resize_mask(stacked):
@@ -2265,6 +2301,8 @@ class SDTrainer(BaseSDTrainProcess):
         person_lat = _resize_mask(person)
         body_lat = _resize_mask(body)
         clothing_lat = _resize_mask(clothing)
+        subject_lat = _resize_mask(subject_person)
+        others_lat = _resize_mask(others_person)
         weight_map = torch.ones((B, 1, lat_h, lat_w), device=device, dtype=torch.float32)
 
         for i in range(B):
@@ -2279,6 +2317,14 @@ class SDTrainer(BaseSDTrainProcess):
             if bd[i] is not None and body_lat is not None:
                 weight_map[i] = weight_map[i] * torch.where(
                     body_lat[i] > 0.5, torch.full_like(body_lat[i], float(bd[i])), torch.ones_like(body_lat[i])
+                )
+            if sp[i] is not None and subject_lat is not None:
+                weight_map[i] = weight_map[i] * torch.where(
+                    subject_lat[i] > 0.5, torch.full_like(subject_lat[i], float(sp[i])), torch.ones_like(subject_lat[i])
+                )
+            if op[i] is not None and others_lat is not None:
+                weight_map[i] = weight_map[i] * torch.where(
+                    others_lat[i] > 0.5, torch.full_like(others_lat[i], float(op[i])), torch.ones_like(others_lat[i])
                 )
 
         if dtype is not None:
@@ -2685,15 +2731,67 @@ class SDTrainer(BaseSDTrainProcess):
         # masks when subject_mask is enabled. Fully inert (no model downloads,
         # no extraction) when disabled.
         if self.subject_mask_config is not None and self.subject_mask_config.enabled:
-            from toolkit.subject_mask import cache_subject_masks
+            from toolkit.subject_mask import (build_subject_reference, cache_subject_masks,
+                                              release_face_detector)
+            _sm_cfg = self.subject_mask_config
+            _sm_identity_ds = getattr(_sm_cfg, 'subject_identity_dataset', None)
+            _sm_all_datasets = []
+            for loader in (self.data_loader, self.data_loader_reg):
+                if loader is not None:
+                    _sm_all_datasets.extend(get_dataloader_datasets(loader))
+            # Identity weights ride on the global config OR on individual
+            # datasets; either way the reference identity is required, or the
+            # loss helper silently disables them for the whole run.
+            if not _sm_identity_ds and _sm_identity_weights_present(_sm_cfg, _sm_all_datasets):
+                raise ValueError(
+                    "subject_mask.subject_person_loss_weight / others_person_loss_weight "
+                    "(set globally or on a dataset) require subject_mask."
+                    "subject_identity_dataset (the solo-subject dataset folder "
+                    "whose faces define the reference identity)."
+                )
+            _subject_ref = None
+            if _sm_identity_ds:
+                # Resolve the identity dataset by folder across ALL datasets,
+                # matching each file item's own source config so pooled
+                # datasets resolve their per-folder members correctly.
+                def _norm_p(p):
+                    return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else None
+
+                _wanted = _norm_p(_sm_identity_ds)
+                _ref_items = []
+                _seen_paths = set()
+                _candidate_paths = set()
+                for dataset in _sm_all_datasets:
+                    for fi in dataset.file_list:
+                        dc = getattr(fi, 'dataset_config', None)
+                        if dc is None:
+                            continue
+                        for p in (getattr(dc, 'dataset_path', None), getattr(dc, 'folder_path', None)):
+                            if p:
+                                _candidate_paths.add(p)
+                                if _norm_p(p) == _wanted:
+                                    _ref_items.append(fi)
+                                    _seen_paths.add(p)
+                                    break
+                if not _ref_items:
+                    raise ValueError(
+                        f"subject_mask.subject_identity_dataset does not match any dataset "
+                        f"folder: {_sm_identity_ds!r}. Available: "
+                        f"{sorted(_candidate_paths)}"
+                    )
+                print_acc(f"Auto-masking: building subject identity reference from "
+                          f"{len(_ref_items)} images of {_sm_identity_ds}")
+                _subject_ref = build_subject_reference(_ref_items)
             print_acc("Auto-masking: Extracting and caching subject masks...")
             _sm_preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
-            for loader in (self.data_loader, self.data_loader_reg):
-                if loader is None:
-                    continue
-                for dataset in get_dataloader_datasets(loader):
+            try:
+                for dataset in _sm_all_datasets:
                     cache_subject_masks(dataset.file_list, self.subject_mask_config,
-                                        preview_dir=_sm_preview_dir)
+                                        preview_dir=_sm_preview_dir,
+                                        subject_reference=_subject_ref)
+            finally:
+                if _subject_ref is not None:
+                    release_face_detector()
         # Cross-check: depth mask_source subject|body requires subject_mask enabled.
         if (self.depth_consistency_config is not None
                 and self.depth_consistency_config.loss_weight > 0

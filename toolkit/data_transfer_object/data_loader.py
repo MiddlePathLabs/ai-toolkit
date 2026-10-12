@@ -273,11 +273,17 @@ class FileItemDTO(
         self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
         self.body_loss_weight: Union[float, None] = self.dataset_config.body_loss_weight
         self.perceptual_restrict_to_body: Union[bool, None] = self.dataset_config.perceptual_restrict_to_body
+        self.subject_person_loss_weight: Union[float, None] = self.dataset_config.subject_person_loss_weight
+        self.others_person_loss_weight: Union[float, None] = self.dataset_config.others_person_loss_weight
         # Populated by cache_subject_masks when subject_mask.enabled (direct-set;
         # masks are small bool tensors held resident). None when disabled.
         self.subject_mask: Union[torch.Tensor, None] = None
         self.body_mask: Union[torch.Tensor, None] = None
         self.clothing_mask: Union[torch.Tensor, None] = None
+        # Identity-matched split (set only when subject_identity_dataset is
+        # configured): the matched person, and everyone else.
+        self.subject_person_mask: Union[torch.Tensor, None] = None
+        self.others_person_mask: Union[torch.Tensor, None] = None
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
@@ -580,6 +586,12 @@ class DataLoaderBatchDTO:
             self.perceptual_restrict_to_body_list: List[Union[bool, None]] = [
                 x.perceptual_restrict_to_body for x in self.file_items
             ]
+            self.subject_person_loss_weight_list: List[Union[float, None]] = [
+                x.subject_person_loss_weight for x in self.file_items
+            ]
+            self.others_person_loss_weight_list: List[Union[float, None]] = [
+                x.others_person_loss_weight for x in self.file_items
+            ]
 
             # collect GT depth maps (variable per-image shape -- kept as a list);
             # only assigned when at least one item has a cached map.
@@ -685,6 +697,8 @@ class DataLoaderBatchDTO:
             self.subject_masks = _stack_mask('subject_mask')
             self.body_masks = _stack_mask('body_mask')
             self.clothing_masks = _stack_mask('clothing_mask')
+            self.subject_person_masks = _stack_mask('subject_person_mask')
+            self.others_person_masks = _stack_mask('others_person_mask')
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base

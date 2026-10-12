@@ -1467,12 +1467,21 @@ class SubjectMaskConfig:
     Extracts per-image person/body/clothing masks (preflight only, non-
     differentiable) used to region-weight the diffusion loss and to restrict
     the perceptual anchors. SegFormer is the semantic source of truth; YOLO
-    detects people; SAM 2 provides a reference silhouette. Enable by setting
-    ``enabled: true``. The masks cache from dataloader-transformed pixels at
-    crop-dim resolution (v2 cache), so changing the bucket transform or
-    ``body_close_radius`` invalidates the cache. Requires ultralytics +
+    detects people; SAM 2 isolates the identity-matched person. Enable by
+    setting ``enabled: true``. The masks cache from dataloader-transformed
+    pixels at crop-dim resolution (v2 cache), so changing the bucket transform
+    or ``body_close_radius`` invalidates the cache. Requires ultralytics +
     transformers (Sam2/SegFormer) + opencv; lazy-imported so selecting Krea
     never pulls them.
+
+    Identity matching (``subject_identity_dataset``): the solo-subject
+    dataset's faces are averaged into an ArcFace reference; every image's
+    faces are matched against it (argmax cosine >= match_threshold, beating
+    the runner-up by match_margin). Multi-person images split the person mask
+    into ``subject_person`` (SAM-isolated matched person) and ``others_person``
+    (everyone else); a failed match leaves both empty so the weights no-op.
+    Per-dataset ``subject_person_loss_weight`` / ``others_person_loss_weight``
+    overrides ride on DatasetConfig like the three base region weights.
     """
 
     def __init__(self, **kwargs):
@@ -1490,6 +1499,16 @@ class SubjectMaskConfig:
         self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
         self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
+        # Identity-matched masking: pick which person in each image is the
+        # training subject via ArcFace similarity to a reference embedding
+        # averaged over the solo-subject dataset named below. Enables the
+        # subject_person/others_person loss-weight regions; inert when
+        # subject_identity_dataset is unset.
+        self.subject_identity_dataset: Optional[str] = kwargs.get('subject_identity_dataset', None)
+        self.match_threshold: float = float(kwargs.get('match_threshold', 0.40))
+        self.match_margin: float = float(kwargs.get('match_margin', 0.10))
+        self.subject_person_loss_weight: Optional[float] = kwargs.get('subject_person_loss_weight', None)
+        self.others_person_loss_weight: Optional[float] = kwargs.get('others_person_loss_weight', None)
         self.perceptual_restrict_to_body: bool = bool(kwargs.get('perceptual_restrict_to_body', False))
         self.save_debug_previews: bool = bool(kwargs.get('save_debug_previews', False))
 
@@ -1765,6 +1784,9 @@ class DatasetConfig:
         self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)
         self.body_loss_weight: Union[float, None] = kwargs.get('body_loss_weight', None)
         self.perceptual_restrict_to_body: Union[bool, None] = kwargs.get('perceptual_restrict_to_body', None)
+        # Identity-matched regions (require subject_mask.subject_identity_dataset).
+        self.subject_person_loss_weight: Union[float, None] = kwargs.get('subject_person_loss_weight', None)
+        self.others_person_loss_weight: Union[float, None] = kwargs.get('others_person_loss_weight', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

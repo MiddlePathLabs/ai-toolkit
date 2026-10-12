@@ -154,6 +154,27 @@ class FaceIDExtractor:
         face = self._get_largest_face(faces)
         return face.normed_embedding.astype(np.float32), face.bbox.astype(np.float32)
 
+    def detect_all_with_embeddings(self, pil_image):
+        """Return [(512-d normed embedding, [x1,y1,x2,y2] bbox), ...] for ALL faces.
+
+        Sorted by bbox area descending (largest first), mirroring the YOLO box
+        convention. Used by the subject-mask identity matcher; the GT cache
+        pass keeps using the largest-face-only path.
+        """
+        import cv2
+        pil_image = pil_image.convert("RGB")
+        image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        faces, _ = self._detect(image)
+        found = []
+        for f in faces:
+            emb = getattr(f, "normed_embedding", None)
+            if emb is None:
+                continue
+            found.append((np.asarray(emb, dtype=np.float32),
+                          np.asarray(f.bbox, dtype=np.float32)))
+        found.sort(key=lambda eb: (eb[1][2] - eb[1][0]) * (eb[1][3] - eb[1][1]), reverse=True)
+        return found
+
 
 def _crop_face_pil(pil_image, bbox, padding: float = 0.15):
     """PIL face crop with fractional padding, clipped to image bounds."""
