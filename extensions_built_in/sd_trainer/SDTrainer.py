@@ -4145,6 +4145,14 @@ class SDTrainer(BaseSDTrainProcess):
                 visual_weights = visual_weights.unsqueeze(2).expand(
                     -1, -1, loss.shape[2], -1, -1
                 )
+            if visual_weights.shape != loss.shape:
+                # Same broadcast guard as the normalization weights: the
+                # reduction flattens, so partially-shaped multipliers must be
+                # expanded here where the elementwise shape is still known.
+                try:
+                    visual_weights = visual_weights.expand(loss.shape)
+                except RuntimeError:
+                    pass  # let the reduction raise its broadcast error
             if _subject_weight is not None:
                 if torch.is_tensor(_subject_focus_weight):
                     visual_normalization_weights = _subject_focus_weight.to(
@@ -4156,16 +4164,18 @@ class SDTrainer(BaseSDTrainProcess):
                                 -1, -1, loss.shape[2], -1, -1
                             )
                         )
-                    if (
-                        visual_normalization_weights.ndim == visual_weights.ndim
-                        and visual_normalization_weights.shape[1] == 1
-                        and visual_weights.shape[1] != 1
-                    ):
+                    # Broadcast any partially-shaped focus multiplier out to
+                    # the full elementwise loss shape before the reduction.
+                    # The default no-manual-mask multiplier is ones (B,1,1,1);
+                    # expanding only its channel axis (the old fixup) produced
+                    # (B,C,1,1), which the flattening weighted mean cannot
+                    # re-broadcast and crashed training (2026-10-12 SM1 run).
+                    try:
                         visual_normalization_weights = (
-                            visual_normalization_weights.expand(
-                                -1, visual_weights.shape[1], *visual_normalization_weights.shape[2:]
-                            )
+                            visual_normalization_weights.expand(loss.shape)
                         )
+                    except RuntimeError:
+                        pass  # incompatible shapes raise at reduction time
                 else:
                     visual_normalization_weights = torch.full_like(
                         visual_weights, float(_subject_focus_weight)
