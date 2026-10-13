@@ -28,6 +28,8 @@ export interface IdentityJobContext {
   resultsPath: string;
   progressPath: string;
   runStatePath: string;
+  reportPath: string;
+  categoriesPath: string;
 }
 
 export async function getIdentityJobContext(jobId: string): Promise<IdentityJobContext | null> {
@@ -51,6 +53,8 @@ export async function getIdentityJobContext(jobId: string): Promise<IdentityJobC
     resultsPath: path.join(identityDir, 'results.json'),
     progressPath: path.join(identityDir, 'progress.json'),
     runStatePath: path.join(identityDir, 'run_state.json'),
+    reportPath: path.join(identityDir, 'checkpoint_report.json'),
+    categoriesPath: path.join(identityDir, 'prompt_categories.json'),
   };
 }
 

@@ -13,6 +13,7 @@ import {
   type IdentitySelection,
   type IdentitySource,
 } from '@/utils/identityEval';
+import { sanitizeCategories, type CheckpointReport } from '@/utils/identityCheckpoint';
 
 export interface IdentityProgress {
   phase: string;
@@ -51,6 +52,10 @@ export interface IdentityEvalApi {
   startRun: (options: { samples: string[]; deviceMode: 'auto' | 'gpu' | 'cpu' }) => Promise<void>;
   cancel: () => Promise<void>;
   clear: (includeCache: boolean) => Promise<void>;
+  report: CheckpointReport | null;
+  reportLoading: boolean;
+  loadReport: () => Promise<void>;
+  saveCategories: (categories: Record<string, string>) => Promise<void>;
 }
 
 export default function useIdentityEval(job: Job): IdentityEvalApi {
@@ -62,8 +67,11 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [source, setSource] = useState<IdentitySource | 'both'>('training');
+  const [report, setReport] = useState<CheckpointReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
   const jobId = job.id;
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wasRunning = useRef(false);
 
   const applyStatus = useCallback((data: StatusResponse) => {
     setRunning(data.running);
@@ -228,6 +236,7 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
         await apiClient.post(`/api/identity-eval/clear`, { jobId, includeCache });
         setResults(null);
         setProgress(null);
+        setReport(null);
       } catch (err) {
         console.error('identity-eval clear failed:', err);
         setError('Failed to clear results');
@@ -235,6 +244,56 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     },
     [jobId],
   );
+
+  // Checkpoint comparison report (Phase 2b): served from cache by the route,
+  // recomputed by the compare worker when results or category tags changed.
+  const loadReport = useCallback(async () => {
+    setReportLoading(true);
+    try {
+      const res = await apiClient.get<{ report: CheckpointReport | null; error?: string }>(`/api/identity-eval/compare`, {
+        params: { jobId },
+      });
+      if (res.data.error) setError(res.data.error);
+      setReport(res.data.report ?? null);
+    } catch (err) {
+      console.error('identity-eval compare failed:', err);
+      setError('Failed to load checkpoint comparison');
+    } finally {
+      setReportLoading(false);
+    }
+  }, [jobId]);
+
+  const saveCategories = useCallback(
+    async (categories: Record<string, string>) => {
+      setReportLoading(true);
+      try {
+        const res = await apiClient.post<{ report: CheckpointReport | null; categories: Record<string, string>; error?: string }>(
+          `/api/identity-eval/compare`,
+          { jobId, categories: sanitizeCategories(categories) },
+        );
+        if (res.data.error) setError(res.data.error);
+        if (res.data.report) setReport(res.data.report);
+      } catch (err) {
+        console.error('identity-eval category save failed:', err);
+        setError('Failed to save prompt categories');
+      } finally {
+        setReportLoading(false);
+      }
+    },
+    [jobId],
+  );
+
+  // refresh the report when a run finishes (results.json just changed)
+  useEffect(() => {
+    if (wasRunning.current && !running) {
+      loadReport();
+    }
+    wasRunning.current = running;
+  }, [running, loadReport]);
+
+  useEffect(() => {
+    loadReport();
+  }, [loadReport]);
 
   const index = useMemo(() => buildIdentityIndex(results), [results]);
   const disagreements = useMemo(
@@ -263,5 +322,9 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     startRun,
     cancel,
     clear,
+    report,
+    reportLoading,
+    loadReport,
+    saveCategories,
   };
 }

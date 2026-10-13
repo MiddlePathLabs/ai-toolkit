@@ -18,6 +18,7 @@ import {
   type IdentitySource,
 } from '@/utils/identityEval';
 import { encodeFilePathForUrl } from '@/utils/basic';
+import IdentityCheckpointSection from './IdentityCheckpointSection';
 import { openConfirm } from './ConfirmModal';
 
 const controlClass =
@@ -204,7 +205,7 @@ interface IdentityEvalPanelProps {
 }
 
 export default function IdentityEvalPanel({ job, identity, samplePaths, onClose, onOpenSample }: IdentityEvalPanelProps) {
-  const { refs, selection, results, progress, running, loading, error, source } = identity;
+  const { refs, selection, results, progress, running, loading, error, source, report, reportLoading } = identity;
   const [deviceMode, setDeviceMode] = useState<'auto' | 'gpu' | 'cpu'>('auto');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -474,6 +475,20 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
               </div>
             )}
           </div>
+        )}
+
+        {/* checkpoint comparison (Phase 2b) */}
+        {results && results.samples.length > 0 && (
+          <IdentityCheckpointSection
+            report={report}
+            loading={reportLoading}
+            onRefresh={identity.loadReport}
+            onSaveCategories={identity.saveCategories}
+            onOpenSample={filename => {
+              const sample = identity.index.get(filename);
+              if (sample) onOpenSample(sample.path);
+            }}
+          />
         )}
 
         {/* footer actions */}

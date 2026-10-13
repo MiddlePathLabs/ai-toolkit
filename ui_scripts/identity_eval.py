@@ -10,9 +10,14 @@ All state lives under ``output/<job>/identity_eval/``; partial results stay
 valid if the process is killed (cancel = kill, no graceful shutdown needed).
 
 Usage:
-  python ui_scripts/identity_eval.py --command refs  --job-name NAME --output-root DIR [...]
-  python ui_scripts/identity_eval.py --command run   --job-name NAME --output-root DIR \
+  python ui_scripts/identity_eval.py --command refs   --job-name NAME --output-root DIR [...]
+  python ui_scripts/identity_eval.py --command run    --job-name NAME --output-root DIR \
       --sources training,external --args-file run_args.json
+  python ui_scripts/identity_eval.py --command compare --job-name NAME --output-root DIR [--db PATH]
+
+``compare`` (Phase 2b) is pure post-processing over results.json: no face
+models load, so it is safe at any time (also during training). It writes
+``checkpoint_report.json`` next to results.json and prints a result summary.
 """
 
 import argparse
@@ -33,7 +38,7 @@ def emit(payload: dict) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Identity evaluation worker')
-    parser.add_argument('--command', choices=['refs', 'run'], required=True)
+    parser.add_argument('--command', choices=['refs', 'run', 'compare'], required=True)
     parser.add_argument('--job-name', required=True)
     parser.add_argument('--output-root', required=True, help='training/output root')
     parser.add_argument('--models-dir', default=os.path.join(REPO_ROOT, 'models', 'face'))
@@ -60,6 +65,36 @@ def main() -> int:
         if args.command == 'refs':
             document = runner.discover_refs()
             emit({'type': 'result', 'command': 'refs', 'refs': _summarize_refs(document)})
+            return 0
+        if args.command == 'compare':
+            from toolkit.identity_eval import checkpoint_compare
+
+            results = checkpoint_compare_json(args.output_root, args.job_name)
+            if results is None:
+                emit({'type': 'error', 'command': 'compare', 'message': 'no results.json found; run an evaluation first'})
+                return 1
+            prompt_texts = checkpoint_compare.extract_prompt_texts(runner.load_job_config())
+            report = checkpoint_compare.build_checkpoint_report(
+                results,
+                checkpoint_compare.load_categories(runner.identity_dir),
+                prompt_texts,
+                checkpoint_compare.convergence_summary(runner.job_dir),
+            )
+            report_path = os.path.join(runner.identity_dir, 'checkpoint_report.json')
+            with open(report_path + '.tmp', 'w', encoding='utf-8') as handle:
+                json.dump(report, handle)
+            os.replace(report_path + '.tmp', report_path)
+            emit(
+                {
+                    'type': 'result',
+                    'command': 'compare',
+                    'report_path': report_path,
+                    'steps': len(report['steps']),
+                    'pairs': len(report['pairs']),
+                    'models': report['models'],
+                    'sources': report['sources'],
+                }
+            )
             return 0
         samples = []
         if args.args_file:
@@ -95,6 +130,16 @@ def _summarize_refs(document: dict) -> dict:
             'error': sum(1 for i in images if i['status'] == 'error'),
         }
     return {'counts': counts, 'models': document.get('models')}
+
+
+def checkpoint_compare_json(output_root: str, job_name: str):
+    """results.json for a job, or None when no evaluation has run yet."""
+    path = os.path.join(output_root, job_name, 'identity_eval', 'results.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
 
 
 if __name__ == '__main__':

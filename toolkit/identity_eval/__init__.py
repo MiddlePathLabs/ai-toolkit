@@ -11,6 +11,12 @@ SFace-only permissive mode.
 """
 
 from .cache import EmbeddingCache
+from .checkpoint_compare import (
+    build_checkpoint_report,
+    convergence_summary,
+    extract_prompt_texts,
+    load_categories,
+)
 from .detector import DetectedFace, FaceDetector
 from .device import choose_device, resolve_device
 from .refs import (
@@ -31,8 +37,12 @@ __all__ = [
     'EmbeddingCache',
     'FaceDetector',
     'IdentityEvalRunner',
+    'build_checkpoint_report',
     'choose_device',
+    'convergence_summary',
     'discover_training_refs',
+    'extract_prompt_texts',
+    'load_categories',
     'load_selection',
     'loo_band',
     'max_cosine',

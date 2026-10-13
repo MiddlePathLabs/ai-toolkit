@@ -130,7 +130,47 @@ results.json       per-sample scores (partial-valid, written incrementally)
 progress.json      live progress for the status route
 run_state.json     pid + start time of the active worker (route-managed)
 run.log            worker stdout/stderr for debugging
+checkpoint_report.json   Phase 2b: per-checkpoint stats + paired comparisons
+prompt_categories.json   Phase 2b: user prompt-index category tags (per job)
 ```
+
+## Checkpoint comparison (Phase 2b)
+
+Compares checkpoints within a job **without fooling you with non-comparable
+sample sets**. It is pure post-processing over `results.json` — no face
+models load, so it is safe at any time, including during training.
+
+- **Grouping:** by step from the filename; `RAW_` dual-save samples form
+  separate raw/EMA groups at the same step and never mix.
+- **Comparability:** direct comparison uses only the intersection of
+  (prompt index, seed, weights-kind) pairs present at both steps. Everything
+  else is listed per pair with a reason (`missing_at_a/b` = config or seed
+  change, `not_evaluated` = no face / ambiguous / failed). Prompt texts are
+  snapshotted from the job config at report time; mid-run sample-config
+  changes cannot be recovered from filenames (stated in the report notes).
+- **Per checkpoint, per model, per reference source:** median, p10, IQR, a
+  distribution strip of all evaluated samples, status counts
+  (evaluated / ambiguous / no-face / failed) and the training-vs-external
+  median gap (a rising gap can indicate memorization).
+- **Paired comparison:** per (prompt, seed) score differences; median
+  difference with a deterministic percentile-bootstrap CI (10k resamples)
+  and a win count. A checkpoint is only called "higher identity" when the
+  CI excludes zero; otherwise the wording is "no detectable difference".
+  **There is no overall best-checkpoint verdict, by design.**
+- **Prompt categories:** tag prompt indices (e.g. solo / multi /
+  gate-no-trigger) in the panel; medians split per category because these
+  prompt kinds behave very differently. Tags persist per job in
+  `prompt_categories.json`.
+- **Convergence panel:** a loss-based "would more steps help?" readout
+  (250-step bucket means, late-500 change vs bucket noise, LR floor — the
+  core heuristic of the workspace-level `krea2_loss_progress.py`), shown as
+  a clearly separate panel when `output/<job>/loss_log.db` exists. Loss is
+  never mixed into identity numbers.
+
+The report is recomputed by the `compare` worker command whenever
+`results.json` or the category tags change; the API route serves the cached
+`checkpoint_report.json` otherwise. ArcFace and SFace are never averaged or
+share a scale anywhere in the report.
 
 ## Code map
 
@@ -138,20 +178,26 @@ run.log            worker stdout/stderr for debugging
   `sface.py` (incl. the SCRFD→YuNet landmark row conversion; landmark order
   verified by a real-model test), `scoring.py` (mean/max/LOO + filename
   parsing), `cache.py`, `refs.py` (discovery + selection), `device.py`
-  (policy), `models.py` (discovery/status), `runner.py` (orchestration).
-- `ui_scripts/identity_eval.py` — CLI worker (`--command refs|run`).
+  (policy), `models.py` (discovery/status), `runner.py` (orchestration),
+  `checkpoint_compare.py` (Phase 2b report builder + convergence heuristic).
+- `ui_scripts/identity_eval.py` — CLI worker (`--command refs|run|compare`).
 - `ui/src/app/api/identity-eval/` — `refs` (GET/POST), `run`, `status`,
-  `cancel`, `clear` routes; shared helpers in `ui/src/server/identityEval.ts`.
+  `cancel`, `clear`, `compare` (GET report / POST category tags) routes;
+  shared helpers in `ui/src/server/identityEval.ts`.
 - UI: `IdentityEvalPanel.tsx` (side panel), `IdentityScoreOverlay.tsx`
-  (card overlay), `useIdentityEval.ts` (state/actions), pure logic in
-  `ui/src/utils/identityEval.ts`; sorting + overlays integrated in
-  `SampleImages.tsx` / `SampleImageCard.tsx`.
+  (card overlay), `IdentityCheckpointSection.tsx` (Phase 2b section),
+  `useIdentityEval.ts` (state/actions), pure logic in
+  `ui/src/utils/identityEval.ts` and `ui/src/utils/identityCheckpoint.ts`;
+  sorting + overlays integrated in `SampleImages.tsx` / `SampleImageCard.tsx`.
 
 ## Tests
 
 - Python: `testing/integration/test_identity_eval.py` (pure logic always
-  runs; real-model tests skip with a reason when weights/fixtures are absent).
-- UI: `ui/testing/identity-eval.test.ts` (`npx sucrase-node
-  testing/identity-eval.test.ts`).
+  runs; real-model tests skip with a reason when weights/fixtures are absent)
+  and `testing/integration/test_identity_checkpoint_compare.py` (pairing,
+  bootstrap CIs, categories, convergence, CLI — always runs).
+- UI: `ui/testing/identity-eval.test.ts` and
+  `ui/testing/identity-checkpoint.test.ts` (`npx sucrase-node
+  testing/<file>.test.ts`).
 - Manual checklist: run an evaluation during an active training run and
   confirm CPU was chosen and step time / VRAM are unaffected.
