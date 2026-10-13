@@ -803,3 +803,125 @@ class TestWorkerEndToEnd:
     def test_no_models_clear_error(self, tmp_path):
         with pytest.raises(RuntimeError, match='no detector available|no recognition model'):
             FaceDetector(device='cpu', insightface_root=str(tmp_path), models_dir=str(tmp_path))
+
+
+# --------------------------------------------------- CUDA inference fallback
+
+
+class TestCudaInferenceFallback:
+    """Spec 5.4: ANY CUDA error (including first-inference cuDNN failures,
+    which load-time try_load cannot see) degrades the run to CPU with a
+    recorded warning instead of killing the worker."""
+
+    def _runner(self, tmp_path):
+        runner = IdentityEvalRunner(job_name='job_fallback', output_root=str(tmp_path), db_path=None)
+        runner.device = 'cuda'
+        return runner
+
+    def test_cuda_inference_error_switches_to_cpu_and_retries(self, tmp_path, monkeypatch):
+        runner = self._runner(tmp_path)
+        calls = []
+
+        def fake_score(path, refsets, sources):
+            calls.append(path)
+            if runner.device == 'cuda':
+                raise RuntimeError(
+                    "[ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : cuDNN is unavailable or disabled "
+                    "for CUDA Execution Provider: LoadLibrary failed for cudnn64_9.dll with error 2"
+                )
+            return {'filename': path, 'status': 'evaluated'}
+
+        def fake_load_models():
+            runner.device = 'cpu'
+            runner.detector = object()
+
+        monkeypatch.setattr(runner, '_score_sample', fake_score)
+        monkeypatch.setattr(runner, '_load_models', fake_load_models)
+        record = runner._score_with_cuda_fallback('a.jpg', {}, [])
+        assert record['status'] == 'evaluated'
+        assert calls == ['a.jpg', 'a.jpg']  # failed on CUDA, retried on CPU
+        assert runner.device == 'cpu'
+        assert runner.device_mode == 'cpu'
+        assert any('CUDA inference failed' in w and 'cudnn64_9.dll' in w for w in runner.device_warnings)
+        assert any('switched to CPU' in note for note in runner.model_notes)
+
+    def test_cpu_errors_are_not_swallowed(self, tmp_path, monkeypatch):
+        runner = self._runner(tmp_path)
+        runner.device = 'cpu'
+
+        def fake_score(path, refsets, sources):
+            raise RuntimeError('unreadable image file')
+
+        monkeypatch.setattr(runner, '_score_sample', fake_score)
+        with pytest.raises(RuntimeError, match='unreadable image file'):
+            runner._score_with_cuda_fallback('a.jpg', {}, [])
+
+    def test_non_cuda_errors_on_gpu_raise(self, tmp_path, monkeypatch):
+        runner = self._runner(tmp_path)
+
+        def fake_score(path, refsets, sources):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(runner, '_score_sample', fake_score)
+        with pytest.raises(OSError, match='disk full'):
+            runner._score_with_cuda_fallback('a.jpg', {}, [])
+
+
+class TestEnsureCudaDlls:
+    def test_registers_torch_lib_idempotently(self, tmp_path, monkeypatch):
+        import toolkit.identity_eval.device as device_mod
+
+        torch_lib = tmp_path / 'Lib' / 'site-packages' / 'torch' / 'lib'
+        torch_lib.mkdir(parents=True)
+        (torch_lib / 'cudnn64_9.dll').write_bytes(b'x')
+        fake_python = tmp_path / 'python.exe'
+        fake_python.write_bytes(b'x')
+        monkeypatch.setattr(device_mod, '_CUDA_DLLS_REGISTERED', False)
+        monkeypatch.setattr(device_mod.sys, 'executable', str(fake_python))
+        monkeypatch.setattr(device_mod.os, 'add_dll_directory', lambda p: None)
+        original_path = device_mod.os.environ['PATH']
+        try:
+            notes = device_mod.ensure_cuda_dlls()
+            assert notes and str(torch_lib) in notes[0]
+            assert device_mod.os.environ['PATH'].startswith(str(torch_lib) + os.pathsep)
+            # second call is a no-op (PATH not prefixed twice)
+            again = device_mod.ensure_cuda_dlls()
+            assert again == []
+            assert device_mod.os.environ['PATH'].count(str(torch_lib)) == 1
+        finally:
+            device_mod.os.environ['PATH'] = original_path
+
+    def test_missing_torch_is_silent_noop(self, tmp_path, monkeypatch):
+        import toolkit.identity_eval.device as device_mod
+
+        monkeypatch.setattr(device_mod, '_CUDA_DLLS_REGISTERED', False)
+        monkeypatch.setattr(device_mod.sys, 'executable', str(tmp_path / 'python.exe'))
+        assert device_mod.ensure_cuda_dlls() == []
+
+
+class TestWorkerErrorSurfacing:
+    def test_cli_failure_lands_in_progress_json(self, tmp_path):
+        import subprocess
+        import sys
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        worker = os.path.join(repo_root, 'ui_scripts', 'identity_eval.py')
+        result = subprocess.run(
+            [
+                sys.executable, '-u', worker,
+                '--command', 'run',
+                '--job-name', 'job_err',
+                '--output-root', str(tmp_path),
+                '--device-mode', 'cpu',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=repo_root,
+        )
+        assert result.returncode == 1
+        progress_path = tmp_path / 'job_err' / 'identity_eval' / 'progress.json'
+        assert progress_path.is_file()
+        progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        assert progress.get('running') is False
+        assert progress.get('error')

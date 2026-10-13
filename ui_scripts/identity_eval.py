@@ -115,6 +115,14 @@ def main() -> int:
         return 0
     except Exception as e:  # noqa: BLE001 -- worker reports errors as JSON, not tracebacks
         emit({'type': 'error', 'command': args.command, 'message': str(e)})
+        # also land the error in progress.json so /status (and the panel)
+        # can show WHY the worker died instead of silently going idle
+        try:
+            runner._write_progress(
+                {'phase': 'samples', 'done': 0, 'total': 0, 'running': False, 'error': str(e)[:500]}
+            )
+        except Exception:  # noqa: BLE001 -- best-effort surfacing only
+            pass
         return 1
 
 

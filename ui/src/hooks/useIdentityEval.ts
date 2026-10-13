@@ -20,6 +20,7 @@ export interface IdentityProgress {
   done: number;
   total: number;
   running?: boolean;
+  error?: string;
 }
 
 interface StatusResponse {

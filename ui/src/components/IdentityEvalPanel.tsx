@@ -280,6 +280,12 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
         {error && (
           <div className="rounded border border-red-400/60 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">{error}</div>
         )}
+        {progress?.error && (
+          <div className="rounded border border-red-400/60 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">
+            Evaluation worker failed: {progress.error}{' '}
+            <span className="text-gray-500 dark:text-gray-400">(details in output/{job.name}/identity_eval/run.log)</span>
+          </div>
+        )}
 
         {/* models */}
         <div className="flex flex-wrap items-center gap-2 text-xs">

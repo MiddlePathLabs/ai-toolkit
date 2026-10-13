@@ -131,7 +131,10 @@ export interface DetachedRun {
 // Long-lived evaluation run: detached so it survives the HTTP request and
 // the panel being closed; stdout/stderr append to run.log for debugging.
 // Cancel is a process kill; results.json is written incrementally by the
-// worker so partial results stay valid.
+// worker so partial results stay valid. On Windows `detached: true` would
+// give the child its own console window (a visible flash), and Windows
+// children outlive their parent regardless -- so detach off-Windows only,
+// keeping windowsHide everywhere.
 export async function spawnIdentityWorkerDetached(args: string[], logPath: string): Promise<DetachedRun> {
   await fsp.mkdir(path.dirname(logPath), { recursive: true });
   const logFd = await fsp.open(logPath, 'a');
@@ -139,7 +142,7 @@ export async function spawnIdentityWorkerDetached(args: string[], logPath: strin
     cwd: TOOLKIT_ROOT,
     env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     windowsHide: true,
-    detached: true,
+    detached: process.platform !== 'win32',
     stdio: ['ignore', logFd.fd, logFd.fd],
   });
   child.unref();

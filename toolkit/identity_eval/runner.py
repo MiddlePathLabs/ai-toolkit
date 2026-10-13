@@ -26,7 +26,7 @@ from . import refs as refs_mod
 from .arcface import ArcFaceEmbedder
 from .cache import EmbeddingCache
 from .detector import DetectedFace, FaceDetector
-from .device import resolve_device
+from .device import ensure_cuda_dlls, resolve_device
 from .models import find_arcface, find_sface, sha256_file
 from .scoring import loo_band, parse_sample_filename, round3, score_face
 from .sface import SFaceEmbedder
@@ -128,6 +128,10 @@ class IdentityEvalRunner:
         self.device_warnings = list(warnings)
         self.device = device
         self.gpu_id = gpu_id
+        if device != 'cpu':
+            # cuDNN lives in torch/lib (the worker never imports torch); ORT
+            # sessions create fine without it and then die on the first Conv
+            self.model_notes.extend(ensure_cuda_dlls())
 
         def make_detector(dev):
             return FaceDetector(
@@ -419,6 +423,35 @@ class IdentityEvalRunner:
             'loo': {name: round3(loo_band(matrix)) for name, matrix in matrices.items()},
         }
 
+    def _switch_to_cpu(self, reason: str) -> None:
+        """Drop all loaded models and reload them on CPU.
+
+        Used when CUDA fails at inference time (e.g. cuDNN DLL missing from
+        the search path): session creation succeeds, so :meth:`try_load`'s
+        load-time fallback never fires -- the error only surfaces on the
+        first Conv node. Embedding cache keys carry no device component, so
+        anything embedded before the switch stays valid.
+        """
+        self.device_warnings.append(reason)
+        self.model_notes.append('device switched to CPU after a CUDA inference failure')
+        self.device_mode = 'cpu'
+        self.device = None
+        self.detector = None
+        self.arcface = None
+        self.sface = None
+        self._load_models()
+
+    def _score_with_cuda_fallback(self, path: str, refsets: Dict[str, Optional[dict]], sources: List[str]) -> dict:
+        """Score one sample, degrading to CPU if CUDA fails mid-inference."""
+        try:
+            return self._score_sample(path, refsets, sources)
+        except Exception as e:  # noqa: BLE001 -- CUDA inference errors degrade, others raise
+            text = str(e)
+            if self.device == 'cpu' or not ('cuda' in text.lower() or 'onnxruntime' in text.lower()):
+                raise
+            self._switch_to_cpu(f'CUDA inference failed ({text.strip()[:200]}); continuing on CPU')
+            return self._score_sample(path, refsets, sources)
+
     def run(self, sample_paths: List[str], sources: Optional[List[str]] = None) -> dict:
         """Score samples against the selected reference sets."""
         self._load_models()
@@ -488,8 +521,17 @@ class IdentityEvalRunner:
         }
 
         for done, path in enumerate(sample_paths, start=1):
-            results['samples'].append(self._score_sample(path, refsets, active_sources))
+            results['samples'].append(self._score_with_cuda_fallback(path, refsets, active_sources))
             results['updated_at'] = _now()
+            # a mid-run CUDA failure may have switched devices; keep the
+            # recorded device + warnings in sync with what actually ran
+            results['device'] = {
+                'requested': self.device_mode,
+                'resolved': self.device,
+                'gpu': self.gpu_id,
+                'warnings': self.device_warnings,
+            }
+            results['warnings'] = list(self.device_warnings)
             _atomic_json(self.results_path, results)
             self.emit({'type': 'progress', 'phase': 'samples', 'done': done, 'total': len(sample_paths)})
             self._write_progress(

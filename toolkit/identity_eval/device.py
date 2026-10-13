@@ -13,12 +13,42 @@ read, auto degrades to CPU rather than risking a training OOM.
 
 import os
 import subprocess
+import sys
 from typing import List, Optional, Tuple
 
 # keep nvidia-smi indices aligned with ORT device ids (set before ORT init)
 os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
 
 FREE_VRAM_MB_THRESHOLD = 4096
+
+_CUDA_DLLS_REGISTERED = False
+
+
+def ensure_cuda_dlls() -> List[str]:
+    """Make torch-bundled CUDA/cuDNN DLLs loadable by onnxruntime.
+
+    The worker never imports torch, and the embedded python keeps cuDNN 9
+    inside ``Lib/site-packages/torch/lib`` -- the trainer's face_id CUDA
+    path only works because importing torch loads these DLLs into that
+    process. Without this, ORT session creation succeeds but the first Conv
+    node dies with ``LoadLibrary failed for cudnn64_9.dll``. Registers the
+    directory via ``os.add_dll_directory`` + PATH prepend (idempotent).
+    Returns notes describing what was registered (empty when torch is
+    absent or already registered).
+    """
+    global _CUDA_DLLS_REGISTERED
+    if _CUDA_DLLS_REGISTERED:
+        return []
+    _CUDA_DLLS_REGISTERED = True
+    torch_lib = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'Lib', 'site-packages', 'torch', 'lib')
+    if not os.path.isdir(torch_lib):
+        return []
+    try:
+        os.add_dll_directory(torch_lib)
+    except (OSError, AttributeError):  # noqa: BLE001 -- non-Windows / restricted
+        pass
+    os.environ['PATH'] = torch_lib + os.pathsep + os.environ.get('PATH', '')
+    return [f'registered torch-bundled CUDA DLLs: {torch_lib}']
 
 
 def choose_device(mode: str, job_running_on_gpu: Optional[bool], free_vram_mb: Optional[int]) -> str:
