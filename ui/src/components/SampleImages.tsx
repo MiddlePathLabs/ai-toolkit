@@ -15,6 +15,10 @@ import SampleImageViewer from './SampleImageViewer';
 import { openConfirm } from './ConfirmModal';
 import { buildSampleMatrix, getSampleItems, getSampleMetadata, parseSampleFilename } from '@/utils/sampleImages';
 import SampleComparisonViewer from './SampleComparisonViewer';
+import useIdentityEval from '@/hooks/useIdentityEval';
+import IdentityEvalPanel from './IdentityEvalPanel';
+import IdentityScoreOverlay from './IdentityScoreOverlay';
+import { identityFilenameKey, sortPathsByScore, type IdentitySortMode } from '@/utils/identityEval';
 
 interface SampleImagesMenuProps {
   job?: Job | null;
@@ -93,6 +97,9 @@ export default function SampleImages({ job }: SampleImagesProps) {
   const [jumpTarget, setJumpTarget] = useState('');
   const [pendingJump, setPendingJump] = useState<string | null>(null);
   const [comparisonOpen, setComparisonOpen] = useState(false);
+  const identity = useIdentityEval(job);
+  const [showIdentityPanel, setShowIdentityPanel] = useState(false);
+  const [identitySort, setIdentitySort] = useState<IdentitySortMode>('off');
   const hasEma = useMemo(() => {
     if (!job.job_config) return false;
     const config = JSON.parse(job.job_config) as JobConfig;
@@ -139,6 +146,16 @@ export default function SampleImages({ job }: SampleImagesProps) {
     () => visibleRows.flatMap(row => row.paths.filter((path): path is string => path !== null)),
     [visibleRows],
   );
+  // identity sort: flatten the matrix and order by the chosen model's score
+  // (worst first so the weakest matches surface); unscored samples go last
+  const identitySortedRows = useMemo(() => {
+    if (identitySort === 'off' || !identity.results) return null;
+    const sorted = sortPathsByScore(sortedSampleImages, identity.index, identitySort, identity.scoreSource, 'worst-first');
+    const chunked: string[][] = [];
+    for (let i = 0; i < sorted.length; i += numSamples) chunked.push(sorted.slice(i, i + numSamples));
+    return chunked.length ? chunked : null;
+  }, [identitySort, identity.results, identity.index, identity.scoreSource, sortedSampleImages, numSamples]);
+
   useEffect(() => {
     anchorIdxRef.current = null;
     baseSetRef.current = new Set();
@@ -189,6 +206,33 @@ export default function SampleImages({ job }: SampleImagesProps) {
       });
     },
     [sortedSampleImages],
+  );
+
+  const renderSampleCard = useCallback(
+    (samplePath: string, column: number) => {
+      const identityKey = identityFilenameKey(samplePath);
+      return (
+        <SampleImageCard
+          key={samplePath}
+          imageUrl={samplePath}
+          metadata={getSampleMetadata(samplePath, sampleConfig, column)}
+          showMetadata={showMetadata}
+          alt={`Sample ${column + 1}`}
+          onClick={e => handleCardClick(samplePath, e)}
+          selected={selectedSet.has(samplePath) || selectedSamplePath === samplePath}
+          observerRoot={scrollParent}
+          identityOverlay={
+            <IdentityScoreOverlay
+              sample={identity.index.get(identityKey)}
+              source={identity.scoreSource}
+              disagree={identity.disagreements.get(identityKey)}
+              running={identity.running}
+            />
+          }
+        />
+      );
+    },
+    [identity, selectedSet, selectedSamplePath, scrollParent, handleCardClick, showMetadata, sampleConfig],
   );
 
   const deleteSelected = useCallback(() => {
@@ -392,6 +436,30 @@ export default function SampleImages({ job }: SampleImagesProps) {
         >
           Compare samples
         </button>
+        <button
+          type="button"
+          onClick={() => setShowIdentityPanel(open => !open)}
+          className={controlClass}
+          title="Score sample faces against reference faces (ArcFace / SFace)"
+        >
+          Identity…
+        </button>
+        {identity.results && (
+          <label className="flex items-center gap-2">
+            Sort by
+            <select
+              aria-label="Sort samples by identity score"
+              value={identitySort}
+              onChange={e => setIdentitySort(e.target.value as IdentitySortMode)}
+              className={controlClass}
+              title="Lowest (worst-matching) samples first; unscored samples last"
+            >
+              <option value="off">Off</option>
+              <option value="arcface">ArcFace</option>
+              <option value="sface">SFace</option>
+            </select>
+          </label>
+        )}
         {selectedSet.size > 0 && (
           <button type="button" onClick={deleteSelected} className={controlClass}>
             Delete selected ({selectedSet.size})
@@ -448,7 +516,23 @@ export default function SampleImages({ job }: SampleImagesProps) {
               })}
             </div>
           )}
-          {visibleRows.length > 0 && scrollParent && (
+          {visibleRows.length > 0 && scrollParent && identitySortedRows && (
+            <Virtuoso
+              key={`identity-${identitySort}-${stepFilter}`}
+              customScrollParent={scrollParent}
+              totalCount={identitySortedRows.length}
+              increaseViewportBy={400}
+              computeItemKey={index => identitySortedRows[index][0]}
+              itemContent={index => (
+                <div className="pb-1">
+                  <div className="grid gap-1" style={gridStyle}>
+                    {identitySortedRows[index].map((sample, column) => renderSampleCard(sample, column))}
+                  </div>
+                </div>
+              )}
+            />
+          )}
+          {visibleRows.length > 0 && scrollParent && !identitySortedRows && (
             <Virtuoso
               key={stepFilter}
               ref={virtuosoRef}
@@ -468,16 +552,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
                     <div className="grid gap-1" style={gridStyle}>
                       {row.paths.map((sample, column) =>
                         sample ? (
-                          <SampleImageCard
-                            key={sample}
-                            imageUrl={sample}
-                            metadata={getSampleMetadata(sample, sampleConfig, column)}
-                            showMetadata={showMetadata}
-                            alt={`Sample ${column + 1}`}
-                            onClick={e => handleCardClick(sample, e)}
-                            selected={selectedSet.has(sample) || selectedSamplePath === sample}
-                            observerRoot={scrollParent}
-                          />
+                          renderSampleCard(sample, column)
                         ) : (
                           <div
                             key={`empty-${column}`}
@@ -525,6 +600,15 @@ export default function SampleImages({ job }: SampleImagesProps) {
           </DialogPanel>
         </div>
       </Dialog>
+      {showIdentityPanel && (
+        <IdentityEvalPanel
+          job={job}
+          identity={identity}
+          samplePaths={sampleImages}
+          onClose={() => setShowIdentityPanel(false)}
+          onOpenSample={path => setSelectedSamplePath(path)}
+        />
+      )}
       <SampleImageViewer
         imgPath={selectedSamplePath}
         numSamples={numSamples}

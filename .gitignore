@@ -204,3 +204,6 @@ testing/.*
 
 # Downloaded model weights (*.pt: YOLO person detector etc., pulled by preflights)
 *.pt
+
+# local identity-eval test fixtures (real subject data paths; never commit)
+testing/integration/identity_fixtures.local.json

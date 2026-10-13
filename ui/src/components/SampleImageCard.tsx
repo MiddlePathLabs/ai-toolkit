@@ -12,6 +12,8 @@ interface SampleImageCardProps {
   className?: string;
   onClick?: (e: React.MouseEvent<HTMLDivElement>) => void;
   selected?: boolean;
+  /** optional compact overlay pinned to the top of the image (identity scores) */
+  identityOverlay?: ReactNode;
   /** pass your scroll container element (e.g. containerRef.current) */
   observerRoot?: Element | null;
   /** optional: tweak pre-load buffer */
@@ -27,6 +29,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
   className = '',
   onClick = () => {},
   selected = false,
+  identityOverlay,
   observerRoot = null,
   rootMargin = '200px 0px',
 }) => {
@@ -212,6 +215,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
             ) : null
           ) : null}
           {showMetadata && isVisible && !isVideoPlaying && <SampleMetadataOverlay metadata={metadata} />}
+          {identityOverlay && isVisible && identityOverlay}
 
           {children && isVisible && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
         </div>
