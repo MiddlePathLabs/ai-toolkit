@@ -29,7 +29,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .checkpoint_compare import STATUS_EVALUATED, checkpoint_key, pair_up, score_of
+from .checkpoint_compare import (
+    MIN_PAIRS_FOR_VERDICT,
+    STATUS_EVALUATED,
+    checkpoint_key,
+    pair_up,
+    score_of,
+)
 
 DRIFT_VERSION = 1
 BOOTSTRAP_RESAMPLES = 10_000
@@ -73,6 +79,13 @@ def _fmt(value: Optional[float], digits: int = 3) -> str:
     if value is None or not np.isfinite(value):
         return 'n/a'
     return f'{value:+.{digits}f}' if value < 0 else f'{value:.{digits}f}'
+
+
+def _fmt_gap(value: Optional[float]) -> str:
+    """Signed format for training-external gaps (negative = external above)."""
+    if value is None or not np.isfinite(value):
+        return 'n/a'
+    return f'{value:+.3f}'
 
 
 # ------------------------------------------------------------------- pose
@@ -341,7 +354,32 @@ def _signal_train_external_divergence(
         external = (pair.get('models') or {}).get(f'{model}:external')
         if not training or not external:
             continue
-        if training.get('verdict') != 'higher' or external.get('verdict') not in ('none', 'lower'):
+        # "Training rose" alone is not memorization: an external trend whose
+        # verdict is "none" only means its CI includes zero, which also
+        # covers an external median that rose MORE than training. The
+        # evidence that matters is the training-external gap GROWING -- gate
+        # on a paired bootstrap of the per-sample gap change so an
+        # inconclusive-but-rising external trend can never fire this.
+        if training.get('verdict') != 'higher':
+            continue
+        rows: List[Tuple[float, float]] = []
+        for a, b in pair_up(groups[key_first], groups[key_last], model, 'training')[0]:
+            ea = score_of(a, model, 'external')
+            eb = score_of(b, model, 'external')
+            if ea is None or eb is None:
+                continue
+            rows.append((score_of(a, model, 'training') - ea, score_of(b, model, 'training') - eb))
+        if len(rows) < MIN_PAIRS_FOR_VERDICT:
+            continue
+        growth_median = round(float(np.median([b - a for a, b in rows])), 3)
+        growth_low, growth_high = bootstrap_diff_ci(
+            [a for a, _ in rows],
+            [b for _, b in rows],
+            np.median,
+            seed_key=f'train_external_divergence|{model}|{key_first}|{key_last}',
+            paired=True,
+        )
+        if not (growth_low > 0):
             continue
         gap_first = ((step_entries.get(key_first, {}).get('train_vs_external') or {}).get(model) or {}).get('gap')
         gap_last = ((step_entries.get(key_last, {}).get('train_vs_external') or {}).get(model) or {}).get('gap')
@@ -352,7 +390,7 @@ def _signal_train_external_divergence(
                 ((score_of(s, model, 'training') or 0) - (score_of(s, model, 'external') or 0))
             ),
         )[:MAX_SAMPLE_LINKS]
-        external_word = 'fell' if external.get('verdict') == 'lower' else 'stayed flat'
+        external_word = 'fell' if external.get('verdict') == 'lower' else 'did not keep pace'
         signals.append(
             {
                 'kind': 'train_external_divergence',
@@ -365,8 +403,10 @@ def _signal_train_external_divergence(
                     f"({_fmt(training.get('diff_median'))}, 95% CI [{_fmt(training.get('ci_low'), 4)}, "
                     f"{_fmt(training.get('ci_high'), 4)}]) while external-ref scores {external_word} "
                     f"({_fmt(external.get('diff_median'))}, 95% CI [{_fmt(external.get('ci_low'), 4)}, "
-                    f"{_fmt(external.get('ci_high'), 4)}]) -- a memorization signature: the model may be "
-                    f"matching the training images rather than the identity"
+                    f"{_fmt(external.get('ci_high'), 4)}]) and the training-external gap grew "
+                    f"({_fmt_gap(gap_first)} -> {_fmt_gap(gap_last)}; paired gap change {_fmt(growth_median)}, "
+                    f"95% CI [{_fmt(growth_low, 4)}, {_fmt(growth_high, 4)}] excludes 0) -- a memorization "
+                    f"signature: the model may be matching the training images rather than the identity"
                 ),
                 'evidence': {
                     'first_step': key_first[0],
@@ -377,7 +417,9 @@ def _signal_train_external_divergence(
                     'external_ci': [external.get('ci_low'), external.get('ci_high')],
                     'gap_first': gap_first,
                     'gap_last': gap_last,
-                    'n_pairs': training.get('n_pairs'),
+                    'gap_growth_median': growth_median,
+                    'gap_growth_ci': [growth_low, growth_high],
+                    'n_pairs': len(rows),
                 },
                 'samples': [s['filename'] for s in later_samples if s.get('filename')],
             }
@@ -473,7 +515,9 @@ def _signal_narrow_generalization(
     Pooled per weights kind because per-step category cells are usually a
     few samples strong; pooling is also why this reads as a run-level
     property ("the model generalizes narrowly") rather than a temporal
-    change. Untagged prompts never form their own comparison group.
+    change -- a single checkpoint with enough tagged samples qualifies.
+    Untagged prompts never form their own comparison group. ``seq`` holds
+    the group keys of ONE weights kind (the caller filters).
     """
 
     def category_of_sample(sample: dict) -> str:
@@ -482,67 +526,64 @@ def _signal_narrow_generalization(
             return 'untagged'
         return categories.get(str(key[1]), '').strip() or 'untagged'
 
+    weights_word = 'raw' if seq[0][1] else 'EMA'
     for model in models:
         for source in sources:
-            for is_raw in sorted({k[1] for k in seq}):
-                pooled: Dict[str, List[float]] = {}
-                pooled_samples: Dict[str, List[dict]] = {}
-                for key in [k for k in seq if k[1] == is_raw]:
-                    for sample in groups[key].values():
-                        cat = category_of_sample(sample)
-                        if cat == 'untagged':
-                            continue
-                        value = score_of(sample, model, source)
-                        if value is None:
-                            continue
-                        pooled.setdefault(cat, []).append(value)
-                        pooled_samples.setdefault(cat, []).append(sample)
-                qualifying = {cat: values for cat, values in pooled.items() if len(values) >= MIN_CATEGORY_N}
-                if len(qualifying) < 2:
-                    continue
-                hi_cat = max(qualifying, key=lambda c: float(np.median(qualifying[c])))
-                lo_cat = min(qualifying, key=lambda c: float(np.median(qualifying[c])))
-                # a=high, b=low -> the difference is low-minus-high, negative
-                # when the spread is real; the CI must exclude 0 from below
-                ci_low, ci_high = bootstrap_diff_ci(
-                    qualifying[hi_cat],
-                    qualifying[lo_cat],
-                    np.median,
-                    seed_key=f'narrow_generalization|{model}|{source}|{is_raw}|{lo_cat}|{hi_cat}',
-                )
-                if not (ci_high < 0):
-                    continue
-                weakest = sorted(pooled_samples[lo_cat], key=lambda s: score_of(s, model, source) or 0)[
-                    :MAX_SAMPLE_LINKS
-                ]
-                weights_word = 'raw' if is_raw else 'EMA'
-                signals.append(
-                    {
-                        'kind': 'narrow_generalization',
-                        'model': model,
-                        'source': source,
-                        'scope': None,
-                        'message': (
-                            f"possible drift: narrow generalization -- {_model_display(model)} identity "
-                            f"({_source_display(source)}, {weights_word} checkpoints pooled) is high in prompt "
-                            f"category '{hi_cat}' (median {_fmt(_median(qualifying[hi_cat]))}) but low in "
-                            f"'{lo_cat}' (median {_fmt(_median(qualifying[lo_cat]))}); 95% CI of the median "
-                            f"difference [{_fmt(ci_low, 4)}, {_fmt(ci_high, 4)}] excludes 0"
-                        ),
-                        'evidence': {
-                            'high_category': hi_cat,
-                            'high_median': _median(qualifying[hi_cat]),
-                            'low_category': lo_cat,
-                            'low_median': _median(qualifying[lo_cat]),
-                            'ci_low': ci_low,
-                            'ci_high': ci_high,
-                            'n_high': len(qualifying[hi_cat]),
-                            'n_low': len(qualifying[lo_cat]),
-                            'weights': weights_word,
-                        },
-                        'samples': [s['filename'] for s in weakest if s.get('filename')],
-                    }
-                )
+            pooled: Dict[str, List[float]] = {}
+            pooled_samples: Dict[str, List[dict]] = {}
+            for key in seq:
+                for sample in groups[key].values():
+                    cat = category_of_sample(sample)
+                    if cat == 'untagged':
+                        continue
+                    value = score_of(sample, model, source)
+                    if value is None:
+                        continue
+                    pooled.setdefault(cat, []).append(value)
+                    pooled_samples.setdefault(cat, []).append(sample)
+            qualifying = {cat: values for cat, values in pooled.items() if len(values) >= MIN_CATEGORY_N}
+            if len(qualifying) < 2:
+                continue
+            hi_cat = max(qualifying, key=lambda c: float(np.median(qualifying[c])))
+            lo_cat = min(qualifying, key=lambda c: float(np.median(qualifying[c])))
+            # a=high, b=low -> the difference is low-minus-high, negative
+            # when the spread is real; the CI must exclude 0 from below
+            ci_low, ci_high = bootstrap_diff_ci(
+                qualifying[hi_cat],
+                qualifying[lo_cat],
+                np.median,
+                seed_key=f'narrow_generalization|{model}|{source}|{seq[0][1]}|{lo_cat}|{hi_cat}',
+            )
+            if not (ci_high < 0):
+                continue
+            weakest = sorted(pooled_samples[lo_cat], key=lambda s: score_of(s, model, source) or 0)[:MAX_SAMPLE_LINKS]
+            signals.append(
+                {
+                    'kind': 'narrow_generalization',
+                    'model': model,
+                    'source': source,
+                    'scope': None,
+                    'message': (
+                        f"possible drift: narrow generalization -- {_model_display(model)} identity "
+                        f"({_source_display(source)}, {weights_word} checkpoints pooled) is high in prompt "
+                        f"category '{hi_cat}' (median {_fmt(_median(qualifying[hi_cat]))}) but low in "
+                        f"'{lo_cat}' (median {_fmt(_median(qualifying[lo_cat]))}); 95% CI of the median "
+                        f"difference [{_fmt(ci_low, 4)}, {_fmt(ci_high, 4)}] excludes 0"
+                    ),
+                    'evidence': {
+                        'high_category': hi_cat,
+                        'high_median': _median(qualifying[hi_cat]),
+                        'low_category': lo_cat,
+                        'low_median': _median(qualifying[lo_cat]),
+                        'ci_low': ci_low,
+                        'ci_high': ci_high,
+                        'n_high': len(qualifying[hi_cat]),
+                        'n_low': len(qualifying[lo_cat]),
+                        'weights': weights_word,
+                    },
+                    'samples': [s['filename'] for s in weakest if s.get('filename')],
+                }
+            )
 
 
 def _signal_near_copy(
@@ -558,53 +599,63 @@ def _signal_near_copy(
     image separates the two. Distribution-relative cutoff (median + MAD
     robust z) instead of an absolute margin, so it self-calibrates per
     job; informational -- flagged samples are for review, not accusations.
+
+    RAW and EMA margins are pooled into one distribution by nothing here:
+    the cutoff is computed per weights kind (like every other signal --
+    the two populations can sit at very different margin levels and must
+    not shift each other's cutoff).
     """
     training = (refsets or {}).get('training') or {}
     if not training.get('n') or training['n'] < NEAR_COPY_REFSET_MIN:
         return
-    for model in models:
-        margins: List[Tuple[dict, float]] = []
-        for group in groups.values():
-            for sample in group.values():
-                if sample.get('status') != STATUS_EVALUATED:
+    for is_raw in (False, True):
+        weights_word = 'raw' if is_raw else 'EMA'
+        for model in models:
+            margins: List[Tuple[dict, float]] = []
+            for key, group in groups.items():
+                if key[1] != is_raw:
                     continue
-                entry = ((sample.get('primary') or {}).get(model) or {}).get('training') or {}
-                mean, mx = entry.get('mean'), entry.get('max')
-                if mean is None or mx is None:
-                    continue
-                margins.append((sample, float(mx) - float(mean)))
-        if len(margins) < NEAR_COPY_MIN_SAMPLES:
-            continue
-        values = np.asarray([m for _, m in margins], dtype=float)
-        median = float(np.median(values))
-        mad = float(np.median(np.abs(values - median)))
-        cutoff = median + max(NEAR_COPY_MAD_SIGMA * 1.4826 * mad, NEAR_COPY_MARGIN_FLOOR)
-        flagged = sorted([item for item in margins if item[1] > cutoff], key=lambda item: -item[1])
-        if not flagged:
-            continue
-        signals.append(
-            {
-                'kind': 'near_copy',
-                'model': model,
-                'source': 'training',
-                'scope': None,
-                'message': (
-                    f"possible drift: {len(flagged)} sample(s) score far higher against their single closest "
-                    f"training reference than against the reference-set average ({_model_display(model)}; "
-                    f"max-minus-mean above {cutoff:.3f} vs median {median:.3f}) -- possible near-copies; "
-                    f"review the linked samples at full resolution"
-                ),
-                'evidence': {
-                    'cutoff': round(cutoff, 4),
-                    'median_margin': round(median, 4),
-                    'mad': round(mad, 4),
-                    'n_flagged': len(flagged),
-                    'n_samples': len(margins),
-                    'training_refs': training.get('n'),
-                },
-                'samples': [s['filename'] for s, _ in flagged[:MAX_SAMPLE_LINKS] if s.get('filename')],
-            }
-        )
+                for sample in group.values():
+                    if sample.get('status') != STATUS_EVALUATED:
+                        continue
+                    entry = ((sample.get('primary') or {}).get(model) or {}).get('training') or {}
+                    mean, mx = entry.get('mean'), entry.get('max')
+                    if mean is None or mx is None:
+                        continue
+                    margins.append((sample, float(mx) - float(mean)))
+            if len(margins) < NEAR_COPY_MIN_SAMPLES:
+                continue
+            values = np.asarray([m for _, m in margins], dtype=float)
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median)))
+            cutoff = median + max(NEAR_COPY_MAD_SIGMA * 1.4826 * mad, NEAR_COPY_MARGIN_FLOOR)
+            flagged = sorted([item for item in margins if item[1] > cutoff], key=lambda item: -item[1])
+            if not flagged:
+                continue
+            signals.append(
+                {
+                    'kind': 'near_copy',
+                    'model': model,
+                    'source': 'training',
+                    'scope': None,
+                    'message': (
+                        f"possible drift: {len(flagged)} sample(s) score far higher against their single closest "
+                        f"training reference than against the reference-set average ({_model_display(model)}, "
+                        f"{weights_word} checkpoints; max-minus-mean above {cutoff:.3f} vs median {median:.3f}) "
+                        f"-- possible near-copies; review the linked samples at full resolution"
+                    ),
+                    'evidence': {
+                        'cutoff': round(cutoff, 4),
+                        'median_margin': round(median, 4),
+                        'mad': round(mad, 4),
+                        'n_flagged': len(flagged),
+                        'n_samples': len(margins),
+                        'training_refs': training.get('n'),
+                        'weights': weights_word,
+                    },
+                    'samples': [s['filename'] for s, _ in flagged[:MAX_SAMPLE_LINKS] if s.get('filename')],
+                }
+            )
 
 
 # ------------------------------------------------------------------ entry
@@ -642,12 +693,16 @@ def detect_drift(results: dict, report: dict) -> dict:
 
     for is_raw in (False, True):
         seq = [k for k in ordered_keys if k[1] == is_raw]
+        if not seq:
+            continue
+        # narrow generalization compares prompt categories, not steps -- a
+        # single checkpoint with enough tagged samples already qualifies
+        _signal_narrow_generalization(groups, seq, categories, models, sources, signals)
         if len(seq) < 2:
             continue
         _signal_similarity_decline(groups, seq, step_entries, pair_entries, models, sources, signals)
         _signal_variance_increase(groups, seq, step_entries, models, sources, signals)
         _signal_train_external_divergence(groups, seq, step_entries, pair_entries, models, sources, signals)
-        _signal_narrow_generalization(groups, seq, categories, models, sources, signals)
 
     if not any(v.strip() and v.strip() != 'untagged' for v in categories.values()):
         notes.append(

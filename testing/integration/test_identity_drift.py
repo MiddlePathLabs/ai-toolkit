@@ -182,6 +182,29 @@ class TestTrainExternalDivergence:
             assert signal['evidence']['external_diff'] == pytest.approx(0.0, abs=1e-6)
             assert len(signal['samples']) == 6
 
+    def test_inconclusive_external_rise_is_not_memorization(self):
+        # training +0.05 (CI excludes 0) but external rose +0.15 median with
+        # a CI straddling 0 (verdict 'none') and the gap SHRANK -- an
+        # inconclusive external trend must not be read as "stayed flat"
+        external_deltas = [0.33, 0.33, -0.17, -0.17, 0.33, -0.17]  # external diffs +0.4 x3 / -0.1 x3
+        samples = [make_sample(1000, p, 42, 0.55, external_delta=-0.02) for p in range(6)]
+        samples += [make_sample(2000, p, 42, 0.60, external_delta=external_deltas[p]) for p in range(6)]
+        report = build(samples)
+        assert of_kind(report, 'train_external_divergence') == []
+
+    def test_gap_growth_ci_in_evidence_when_firing(self):
+        samples = [make_sample(1000, p, 42, 0.55, external_delta=-0.02) for p in range(6)]
+        samples += [make_sample(2000, p, 42, 0.58, external_delta=-0.05) for p in range(6)]
+        report = build(samples)
+        fired = of_kind(report, 'train_external_divergence')
+        assert fired
+        for signal in fired:
+            growth_low, growth_high = signal['evidence']['gap_growth_ci']
+            assert growth_low > 0
+            # per-sample gap 0.02 -> 0.05 on every pair
+            assert signal['evidence']['gap_growth_median'] == pytest.approx(0.03, abs=1e-6)
+            assert 'gap grew' in signal['message']
+
     def test_both_rising_does_not_fire(self):
         samples = [make_sample(1000, p, 42, 0.55, external_delta=-0.02) for p in range(6)]
         samples += [make_sample(2000, p, 42, 0.58, external_delta=-0.02) for p in range(6)]
@@ -249,6 +272,19 @@ class TestNarrowGeneralization:
         assert of_kind(report, 'narrow_generalization') == []
         assert any('no prompt categories tagged' in note for note in report['drift']['notes'])
 
+    def test_single_checkpoint_fires(self):
+        # category spread is not temporal: one checkpoint with 6+ samples per
+        # tagged category is enough -- the old two-step guard skipped it
+        samples = [make_sample(1000, p, 42, 0.64 if p < 6 else 0.50) for p in range(12)]
+        categories = {str(p): ('closeup' if p < 6 else 'wide') for p in range(12)}
+        report = build(samples, categories)
+        fired = of_kind(report, 'narrow_generalization')
+        assert fired
+        for signal in fired:
+            assert signal['evidence']['high_category'] == 'closeup'
+            assert signal['evidence']['low_category'] == 'wide'
+            assert signal['evidence']['n_high'] == 6 and signal['evidence']['n_low'] == 6
+
     def test_single_qualified_category_does_not_fire(self):
         samples = []
         for step in (1000, 2000):
@@ -278,6 +314,40 @@ class TestNearCopy:
         samples += [make_sample(2000, p, 42, 0.60) for p in range(6)]
         report = build(samples)
         assert of_kind(report, 'near_copy') == []
+
+    def test_raw_pool_cannot_shift_the_ema_cutoff(self):
+        # one EMA near-copy outlier; 20 RAW samples with uniform 0.30 margins
+        # must not lift the pooled cutoff above it -- cutoffs are per weights kind
+        samples = [make_sample(1000, p, 42, 0.60, sface=0.61) for p in range(6)]
+        samples += [make_sample(2000, p, 42, 0.60, sface=0.61, max_delta=0.20 if p == 3 else 0.01) for p in range(6)]
+        for step in (1000, 2000):
+            for p in range(6, 16):  # RAW_ population at the same steps, uniform high margins
+                samples.append(make_sample(step, p, 42, 0.60, sface=0.61, max_delta=0.30, is_raw=True))
+        report = build(samples)
+        fired = of_kind(report, 'near_copy')
+        ema = [s for s in fired if s['evidence']['weights'] == 'EMA']
+        assert ema, 'RAW margins must not suppress the EMA near-copy warning'
+        for signal in ema:
+            assert signal['evidence']['n_flagged'] == 1
+            assert '_03_' in signal['samples'][0]
+        # the uniform RAW margins are their own population: cutoff 0.30+floor, no outliers
+        assert [s for s in fired if s['evidence']['weights'] == 'raw'] == []
+
+    def test_per_weights_kind_outliers_flagged_independently(self):
+        samples = [make_sample(1000, p, 42, 0.60, sface=0.61) for p in range(6)]
+        samples += [make_sample(2000, p, 42, 0.60, sface=0.61, max_delta=0.20 if p == 3 else 0.01) for p in range(6)]
+        # RAW population with its own outlier (uniform 0.30 margins + one at 0.60)
+        for step in (1000, 2000):
+            for p in range(6, 16):
+                samples.append(
+                    make_sample(step, p, 42, 0.60, sface=0.61, max_delta=0.60 if p == 8 else 0.30, is_raw=True)
+                )
+        report = build(samples)
+        fired = of_kind(report, 'near_copy')
+        by_weights = {s['evidence']['weights']: s for s in fired}
+        assert set(by_weights) == {'EMA', 'raw'}
+        assert by_weights['EMA']['evidence']['cutoff'] == pytest.approx(0.06)
+        assert by_weights['raw']['evidence']['cutoff'] == pytest.approx(0.35)  # 0.30 median + floor
 
     def test_small_refset_skips_signal(self):
         samples = [make_sample(1000, p, 42, 0.60) for p in range(6)]
@@ -309,9 +379,10 @@ class TestIntegrity:
             assert set(signal['evidence'].keys()) <= {
                 'anchor_step', 'anchor_label', 'diff_median', 'ci_low', 'ci_high', 'wins_later', 'wins_anchor', 'n_pairs',
                 'iqr_anchor', 'iqr_later', 'first_step', 'last_step', 'training_diff', 'training_ci', 'external_diff',
-                'external_ci', 'gap_first', 'gap_last', 'pose_counts', 'frontal_median', 'non_frontal_median',
-                'n_frontal', 'n_non_frontal', 'high_category', 'high_median', 'low_category', 'low_median', 'n_high',
-                'n_low', 'weights', 'cutoff', 'median_margin', 'mad', 'n_flagged', 'n_samples', 'training_refs',
+                'external_ci', 'gap_first', 'gap_last', 'gap_growth_median', 'gap_growth_ci', 'pose_counts',
+                'frontal_median', 'non_frontal_median', 'n_frontal', 'n_non_frontal', 'high_category', 'high_median',
+                'low_category', 'low_median', 'n_high', 'n_low', 'weights', 'cutoff', 'median_margin', 'mad',
+                'n_flagged', 'n_samples', 'training_refs',
             }
 
     def test_arcface_only_input_yields_arcface_only_warnings(self):

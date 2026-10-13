@@ -230,10 +230,10 @@ face models — pose comes from stored landmarks):
 |---|---|---|
 | `similarity_decline` | a later checkpoint scores below the highest-median earlier checkpoint | reuses the Phase 2b paired comparison; fires only when its bootstrap CI excludes 0 |
 | `variance_increase` | score spread (IQR) grows from the peak checkpoint | paired bootstrap of the IQR difference, CI excludes 0 (≥ 5 pairs) |
-| `train_external_divergence` | training-ref scores rise while external-ref scores stay flat or fall | earliest→latest paired CIs on both sources; the memorization signature |
+| `train_external_divergence` | training-ref scores rise AND the training−external gap widens | training CI excludes 0 upward plus a paired bootstrap of the per-sample gap change excluding 0 — an inconclusive external trend (CI straddling 0) alone never fires it |
 | `pose_weakness` | non-frontal samples score below frontal ones at a step | pose from the 5-point landmarks (eye–nose asymmetry ratio; no model), independent bootstrap of the median difference |
-| `narrow_generalization` | one prompt category scores far above another | pooled across checkpoints per weights kind, independent bootstrap (≥ 2 tagged categories, ≥ 6 samples each) |
-| `near_copy` | a sample's closest-reference score far exceeds its mean-reference score | `max − mean` margin above a robust cutoff (median + 3·MAD, floor 0.05, refset ≥ 4); informational |
+| `narrow_generalization` | one prompt category scores far above another | pooled per weights kind, independent bootstrap (≥ 2 tagged categories, ≥ 6 samples each; a single checkpoint qualifies — the signal is not temporal) |
+| `near_copy` | a sample's closest-reference score far exceeds its mean-reference score | `max − mean` margin above a robust cutoff (median + 3·MAD, floor 0.05, refset ≥ 4), computed **per weights kind** — RAW and EMA margins never share a cutoff; informational |
 
 Cut-points (pose buckets frontal < 0.18 / three-quarter < 0.35 / profile on
 the asymmetry ratio, the near-copy floor, category minimums) are **provisional
