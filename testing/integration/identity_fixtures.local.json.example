@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to identity_fixtures.local.json (gitignored) and point at LOCAL data. These paths reference real subject photos and must never be committed. Env overrides: AI_TOOLKIT_IDENTITY_SUBJECT_DATASET, AI_TOOLKIT_IDENTITY_IMPOSTOR_DATASET, AI_TOOLKIT_IDENTITY_SAMPLES_DIR.",
+  "subject_dataset": "C:/path/to/single-person-dataset",
+  "impostor_dataset": "C:/path/to/different-person-dataset",
+  "samples_dir": "C:/path/to/a-job-output/samples"
+}

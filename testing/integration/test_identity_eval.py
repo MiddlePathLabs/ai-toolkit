@@ -42,8 +42,34 @@ from toolkit.identity_eval.runner import try_load
 from toolkit.identity_eval.sface import yunet_row
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SUBJECT_DATASET = os.path.join(REPO_ROOT, 'datasets', 'subject_dataset')
-IMPOSTOR_DATASET = os.path.join(REPO_ROOT, 'datasets', 'impostor_dataset')
+MODELS_DIR = os.path.join(REPO_ROOT, 'models', 'face')
+
+# Real-data fixtures point at LOCAL subject data and are never committed.
+# Configure them via env vars or identity_fixtures.local.json next to this
+# file (see the committed identity_fixtures.local.json.example). Tests that
+# need them skip with a pointer to that file when they are unset.
+_LOCAL_FIXTURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'identity_fixtures.local.json')
+
+
+def _local_fixtures() -> dict:
+    try:
+        with open(_LOCAL_FIXTURES_PATH, 'r', encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+_LOCAL = _local_fixtures()
+_SUBJECT = os.environ.get('AI_TOOLKIT_IDENTITY_SUBJECT_DATASET') or _LOCAL.get('subject_dataset') or ''
+_IMPOSTOR = os.environ.get('AI_TOOLKIT_IDENTITY_IMPOSTOR_DATASET') or _LOCAL.get('impostor_dataset') or ''
+_SAMPLES_DIR = os.environ.get('AI_TOOLKIT_IDENTITY_SAMPLES_DIR') or _LOCAL.get('samples_dir') or ''
+SUBJECT_DATASET = _SUBJECT if os.path.isdir(_SUBJECT) else ''
+IMPOSTOR_DATASET = _IMPOSTOR if os.path.isdir(_IMPOSTOR) else ''
+FIXTURES_HINT = (
+    'set AI_TOOLKIT_IDENTITY_SUBJECT_DATASET / AI_TOOLKIT_IDENTITY_IMPOSTOR_DATASET '
+    '/ AI_TOOLKIT_IDENTITY_SAMPLES_DIR or create testing/integration/identity_fixtures.local.json '
+    '(see identity_fixtures.local.json.example)'
+)
 
 pytestmark = pytest.mark.integration
 
@@ -65,8 +91,8 @@ def _images_in(folder, limit):
 
 @pytest.fixture(scope='session')
 def subject_images():
-    if not os.path.isdir(SUBJECT_DATASET):
-        pytest.skip(f'subject fixture dataset not present: {SUBJECT_DATASET}')
+    if not SUBJECT_DATASET:
+        pytest.skip(f'subject fixture dataset not configured; {FIXTURES_HINT}')
     images = _images_in(SUBJECT_DATASET, 6)
     if len(images) < 4:
         pytest.skip(f'not enough fixture images in {SUBJECT_DATASET}')
@@ -75,8 +101,8 @@ def subject_images():
 
 @pytest.fixture(scope='session')
 def impostor_images():
-    if not os.path.isdir(IMPOSTOR_DATASET):
-        pytest.skip(f'impostor fixture dataset not present: {IMPOSTOR_DATASET}')
+    if not IMPOSTOR_DATASET:
+        pytest.skip(f'impostor fixture dataset not configured; {FIXTURES_HINT}')
     images = _images_in(IMPOSTOR_DATASET, 6)
     if len(images) < 4:
         pytest.skip(f'not enough fixture images in {IMPOSTOR_DATASET}')
@@ -410,8 +436,37 @@ class TestYuNetRow:
 # ------------------------------------------------------- real-model behaviors
 
 
+def _single_face_embeddings(embedder, detector, paths, swap):
+    """Embed every single-face image; swapped input feeds RGB (the legacy
+    scripts' channel-order bug) instead of cv2.imread BGR."""
+    import cv2
+
+    vectors = []
+    for path in paths:
+        img = cv2.imread(path)
+        if img is None:
+            continue
+        feed = img[:, :, ::-1] if swap else img
+        faces = detector.detect(feed)
+        if faces.count != 1:
+            continue
+        vectors.append(embedder.embed(feed, faces.faces[0]))
+    return np.stack(vectors) if len(vectors) >= 3 else None
+
+
+def _bgr_vs_rgb_gaps(embedder, detector, subject_images, impostor_images):
+    gaps = {}
+    for swap in (False, True):
+        same = _single_face_embeddings(embedder, detector, subject_images, swap)
+        impostors = _single_face_embeddings(embedder, detector, impostor_images, swap)
+        if same is None or impostors is None:
+            pytest.skip('not enough single-face fixture images')
+        gaps[swap] = loo_band(same) - float(np.mean(impostors @ same.T))
+    return gaps
+
+
 class TestRealModels:
-    def test_embedding_dims_and_norm(self, arcface_ready, subject_images, tmp_path):
+    def test_arcface_embedding_dims_and_norm(self, arcface_ready, subject_images):
         import cv2
 
         from toolkit.identity_eval.arcface import ArcFaceEmbedder
@@ -425,39 +480,40 @@ class TestRealModels:
         assert emb.shape == (512,)
         assert np.linalg.norm(emb) == pytest.approx(1.0, abs=1e-4)
 
-    def test_bgr_input_beats_rgb_gap(self, arcface_ready, subject_images, impostor_images):
+    def test_sface_embedding_dims_and_norm(self, subject_images):
+        if not find_sface(MODELS_DIR).available:
+            pytest.skip('SFace weights not installed (models/face); see docs/identity_eval.md')
+        import cv2
+
+        from toolkit.identity_eval.sface import SFaceEmbedder
+
+        embedder = SFaceEmbedder(MODELS_DIR, device='cpu')
+        img = cv2.imread(subject_images[0])
+        faces = FaceDetector(device='cpu').detect(img)
+        if not faces.count:
+            pytest.skip('no face in fixture image')
+        emb = embedder.embed(img, faces.faces[0])
+        assert emb.shape == (128,)
+        assert np.linalg.norm(emb) == pytest.approx(1.0, abs=1e-4)
+
+    def test_arcface_bgr_input_beats_rgb_gap(self, arcface_ready, subject_images, impostor_images):
         """Section 1 regression guard: feeding cv2.imread BGR straight in
         must separate same-id from impostors better than channel-swapped
         RGB input (the legacy eval scripts' bug)."""
-        import cv2
-
         from toolkit.identity_eval.arcface import ArcFaceEmbedder
 
-        embedder = ArcFaceEmbedder(device='cpu')
-        detector = FaceDetector(device='cpu')
+        gaps = _bgr_vs_rgb_gaps(ArcFaceEmbedder(device='cpu'), FaceDetector(device='cpu'), subject_images, impostor_images)
+        assert gaps[False] > gaps[True]
 
-        def embed_set(paths, swap):
-            vectors = []
-            for path in paths:
-                img = cv2.imread(path)
-                faces = detector.detect(img[:, :, ::-1] if swap else img)
-                if faces.count != 1:
-                    continue
-                vectors.append(embedder.embed(img[:, :, ::-1] if swap else img, faces.faces[0]))
-            return np.stack(vectors) if len(vectors) >= 3 else None
+    def test_sface_bgr_input_beats_rgb_gap(self, subject_images, impostor_images):
+        """Same channel-order guard for SFace: OpenCV DNN models are fed
+        cv2.imread BGR here; a swapped feed must separate worse."""
+        if not find_sface(MODELS_DIR).available:
+            pytest.skip('SFace weights not installed (models/face); see docs/identity_eval.md')
+        from toolkit.identity_eval.sface import SFaceEmbedder
 
-        for swap in (False, True):
-            same = embed_set(subject_images, swap)
-            impostors = embed_set(impostor_images, swap)
-            if same is None or impostors is None:
-                pytest.skip('not enough single-face fixture images')
-            loo = loo_band(same)
-            impostor_mean = float(np.mean(impostors @ same.T))
-            if swap:
-                gap_rgb = loo - impostor_mean
-            else:
-                gap_bgr = loo - impostor_mean
-        assert gap_bgr > gap_rgb
+        gaps = _bgr_vs_rgb_gaps(SFaceEmbedder(MODELS_DIR, device='cpu'), FaceDetector(device='cpu'), subject_images, impostor_images)
+        assert gaps[False] > gaps[True]
 
     def test_sface_alignment_matches_arcface_alignment(self, tmp_path):
         status_arc = find_arcface()
@@ -469,9 +525,9 @@ class TestRealModels:
         from toolkit.identity_eval.arcface import ArcFaceEmbedder, _norm_crop
         from toolkit.identity_eval.sface import SFaceEmbedder
 
-        images = _images_in(SUBJECT_DATASET, 3) if os.path.isdir(SUBJECT_DATASET) else []
+        images = _images_in(SUBJECT_DATASET, 3) if SUBJECT_DATASET else []
         if not images:
-            pytest.skip('no fixture images')
+            pytest.skip(f'no fixture images; {FIXTURES_HINT}')
         detector = FaceDetector(device='cpu')
         arcface = ArcFaceEmbedder(device='cpu')
         sface = SFaceEmbedder(os.path.join(REPO_ROOT, 'models', 'face'), device='cpu')
@@ -613,13 +669,12 @@ class _ScratchJob:
 
 @pytest.fixture(scope='session')
 def sample_images():
-    samples_root = os.path.join(REPO_ROOT, 'output')
-    for job in ('job_smoke', 'job_base', 'job_bpp'):
-        folder = os.path.join(samples_root, job, 'samples')
-        found = sorted(glob.glob(os.path.join(folder, '*_seed-*.jpg')))
-        if len(found) >= 4:
-            return found
-    pytest.skip('no real sample images found under output/')
+    if not _SAMPLES_DIR or not os.path.isdir(_SAMPLES_DIR):
+        pytest.skip(f'samples fixture dir not configured; {FIXTURES_HINT}')
+    found = sorted(glob.glob(os.path.join(_SAMPLES_DIR, '*_seed-*.jpg')))
+    if len(found) < 4:
+        pytest.skip(f'not enough sample images in {_SAMPLES_DIR}')
+    return found
 
 
 @pytest.fixture(scope='session')
