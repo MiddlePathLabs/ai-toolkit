@@ -925,3 +925,50 @@ class TestWorkerErrorSurfacing:
         progress = json.loads(progress_path.read_text(encoding='utf-8'))
         assert progress.get('running') is False
         assert progress.get('error')
+
+
+class TestYuNetFallback:
+    """YuNet is the SFace-only-mode detector (used when buffalo_l is absent).
+    These run when the user has placed face_detection_yunet_2023mar.onnx in
+    models/face/ and the subject fixtures are configured."""
+
+    @pytest.fixture(scope='class')
+    def yunet_detector(self, tmp_path_factory):
+        from toolkit.identity_eval.models import find_yunet
+
+        status = find_yunet(MODELS_DIR)
+        if not status.available:
+            pytest.skip(f'YuNet weights absent: {status.reason}')
+        # force the fallback: an insightface root without buffalo_l
+        empty_root = str(tmp_path_factory.mktemp('no_buffalo'))
+        return FaceDetector(device='cpu', insightface_root=empty_root, models_dir=MODELS_DIR)
+
+    def test_backend_is_yunet_and_sig_has_no_det_size(self, yunet_detector):
+        assert yunet_detector.backend == 'yunet'
+        assert yunet_detector.det_sig.startswith('v2:yunet:')
+        assert 'native' in yunet_detector.det_sig
+
+    def test_detects_real_faces_at_native_resolution(self, yunet_detector, subject_images):
+        import cv2
+
+        for path in subject_images[:3]:
+            image = cv2.imread(path)
+            faces = yunet_detector.detect(image).faces
+            assert len(faces) >= 1, f'no YuNet face in {path}'
+            face = faces[0]
+            h, w = image.shape[:2]
+            x1, y1, x2, y2 = face.bbox
+            assert 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h, 'bbox outside the frame'
+            assert face.kps.shape == (5, 2)
+            assert 0.0 < face.det_score <= 1.0
+
+    def test_size_mismatch_regression_different_shapes(self, yunet_detector, subject_images):
+        """The original bug: YuNet was constructed at det_size 640x640 and
+        crashed on any other frame size (setInputSize is now per image)."""
+        import cv2
+
+        image = cv2.imread(subject_images[0])
+        for target in ((512, 384), (1024, 1024), (333, 471)):
+            resized = cv2.resize(image, target)
+            faces = yunet_detector.detect(resized).faces
+            assert len(faces) >= 1, f'no face at size {target}'

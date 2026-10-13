@@ -142,13 +142,16 @@ class FaceDetector:
 
     @property
     def det_sig(self) -> str:
-        """Cache signature: detector weights + det size + face order logic."""
+        """Cache signature: detector weights + face order logic.
+
+        SCRFD entries also carry the det size (it fixes the network input).
+        YuNet detects at each image's native size, so its tag has no det-size
+        component -- ``setInputSize`` is called per image in :meth:`detect`.
+        """
         if self.backend == 'scrfd':
             model_hash = sha256_file(os.path.join(self._arcface_status.path, ARCFACE_DET_FILE))
-            tag = f'scrfd:{model_hash}'
-        else:
-            tag = f'yunet:{self._yunet_status.file_hash}'
-        return f'v{FACE_ORDER_VERSION}:{tag}:{self.det_size[0]}x{self.det_size[1]}'
+            return f'v{FACE_ORDER_VERSION}:scrfd:{model_hash}:{self.det_size[0]}x{self.det_size[1]}'
+        return f'v{FACE_ORDER_VERSION}:yunet:{self._yunet_status.file_hash}:native'
 
     # -- detection ---------------------------------------------------------------
 
@@ -172,6 +175,10 @@ class FaceDetector:
 
         import cv2
 
+        # YuNet requires the input size to match the frame (unlike SCRFD,
+        # which resizes internally): set it per image and detect at native
+        # resolution. Sample images are <= ~1024 px, which YuNet handles fine.
+        self._det.setInputSize((int(img_bgr.shape[1]), int(img_bgr.shape[0])))
         ok, rows = self._det.detect(img_bgr)
         faces = []
         if ok and rows is not None and len(rows):
