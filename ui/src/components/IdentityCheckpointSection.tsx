@@ -15,27 +15,20 @@ import {
   convergencePhrase,
   fmtScore,
   fmtSigned,
+  pairInOrientation,
   promptIndicesInReport,
+  stepValue,
   stripDomain,
   stripX,
   verdictPhrase,
   type CheckpointReport,
   type CheckpointStepEntry,
-  type PairComparison,
   type ScoreModel,
   type ScoreSource,
 } from '@/utils/identityCheckpoint';
 
 const controlClass =
   'rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500';
-
-function stepValue(step: { step: number; is_raw: boolean }): string {
-  return `${step.step}:${step.is_raw ? 1 : 0}`;
-}
-
-function findPair(report: CheckpointReport, aValue: string, bValue: string): PairComparison | null {
-  return report.pairs.find(p => stepValue(p.a) === aValue && stepValue(p.b) === bValue) ?? null;
-}
 
 function ScoreStrip({
   steps,
@@ -145,7 +138,7 @@ export default function IdentityCheckpointSection({
   report: CheckpointReport | null;
   loading: boolean;
   onRefresh: () => void;
-  onSaveCategories: (categories: Record<string, string>) => void;
+  onSaveCategories: (categories: Record<string, string>) => Promise<boolean>;
   onOpenSample: (filename: string) => void;
 }) {
   const models = report?.models ?? [];
@@ -162,7 +155,7 @@ export default function IdentityCheckpointSection({
   const defaultB = stepOptions.length > 1 ? stepValue(stepOptions[stepOptions.length - 1]) : '';
   const effectiveA = stepOptions.some(s => stepValue(s) === aValue) ? aValue : defaultA;
   const effectiveB = stepOptions.some(s => stepValue(s) === bValue) ? bValue : defaultB;
-  const pair = report && effectiveA && effectiveB ? findPair(report, effectiveA, effectiveB) : null;
+  const pair = report && effectiveA && effectiveB ? pairInOrientation(report, effectiveA, effectiveB) : null;
 
   const promptIndices = useMemo(() => (report ? promptIndicesInReport(report) : []), [report]);
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -337,9 +330,11 @@ export default function IdentityCheckpointSection({
               type="button"
               className={classNames(controlClass, 'px-1.5 py-0.5 text-[10px]')}
               disabled={!dirty || loading}
-              onClick={() => {
-                onSaveCategories(draft);
-                setDirty(false);
+              onClick={async () => {
+                // keep the draft marked dirty until persistence succeeds, so
+                // a failed request cannot clobber the edits via the sync effect
+                const ok = await onSaveCategories(draft);
+                if (ok) setDirty(false);
               }}
             >
               Save tags

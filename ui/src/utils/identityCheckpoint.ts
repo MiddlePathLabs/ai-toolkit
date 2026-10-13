@@ -174,7 +174,9 @@ export function promptIndicesInReport(report: CheckpointReport): number[] {
     for (const modelData of Object.values(step.strip ?? {})) {
       for (const entries of Object.values(modelData ?? {})) {
         for (const entry of entries ?? []) {
-          const match = entry.f.match(/_(\d{2})_seed-/);
+          // Python formats the prompt index with :02d (minimum width), so
+          // prompt 100+ encodes as _100_seed-; match variable width.
+          const match = entry.f.match(/_(\d{2,})_seed-/);
           if (match) stripIdx.add(Number(match[1]));
         }
       }
@@ -182,6 +184,74 @@ export function promptIndicesInReport(report: CheckpointReport): number[] {
   }
   for (const idx of stripIdx) indices.add(idx);
   return [...indices].sort((a, b) => a - b);
+}
+
+// ------------------------------------------------------------------ pairing
+
+export function stepValue(step: { step: number; is_raw: boolean }): string {
+  return `${step.step}:${step.is_raw ? 1 : 0}`;
+}
+
+export function findPair(report: CheckpointReport, aValue: string, bValue: string): PairComparison | null {
+  return report.pairs.find(p => stepValue(p.a) === aValue && stepValue(p.b) === bValue) ?? null;
+}
+
+// The report builder emits each checkpoint combination once, in ascending
+// order. The dropdowns allow either selection order, so a reversed selection
+// is served by inverting the stored comparison: swap endpoints, negate the
+// differences (CI bounds swap AND negate), swap win counts and flip the
+// higher/lower verdict. Orientation-neutral fields (excluded ids) are kept,
+// per-side statuses swapped.
+export function invertPairComparison(pair: PairComparison): PairComparison {
+  const models: PairComparison['models'] = {};
+  for (const [key, value] of Object.entries(pair.models ?? {})) {
+    models[key] = {
+      ...value,
+      diff_median: value.diff_median == null ? null : roundSigned(-value.diff_median),
+      ci_low: value.ci_high == null ? null : roundSigned(-value.ci_high),
+      ci_high: value.ci_low == null ? null : roundSigned(-value.ci_low),
+      wins_a: value.wins_b,
+      wins_b: value.wins_a,
+      verdict: value.verdict === 'higher' ? 'lower' : value.verdict === 'lower' ? 'higher' : value.verdict,
+      excluded: (value.excluded ?? []).map(entry => ({
+        ...entry,
+        status_a: entry.status_b,
+        status_b: entry.status_a,
+      })),
+    };
+  }
+  return { a: pair.b, b: pair.a, models };
+}
+
+// Orientation-aware lookup: exact match first, else the stored reversed pair
+// inverted to the requested direction.
+export function pairInOrientation(report: CheckpointReport, aValue: string, bValue: string): PairComparison | null {
+  const exact = findPair(report, aValue, bValue);
+  if (exact) return exact;
+  const reversed = findPair(report, bValue, aValue);
+  return reversed ? invertPairComparison(reversed) : null;
+}
+
+function roundSigned(value: number): number {
+  return Object.is(value, -0) ? 0 : Math.round(value * 10000) / 10000;
+}
+
+// ------------------------------------------------------- report freshness
+
+// Pure mtime predicate behind the compare route's cache decision (-1 = file
+// absent). The loss log participates because training advances it (the
+// convergence panel) without touching results.json; lossWal covers WAL-mode
+// SQLite, whose writes land in the -wal sidecar without updating the main
+// db file's mtime until a checkpoint.
+export function reportFreshByMtimes(parts: {
+  results: number;
+  categories: number;
+  loss: number;
+  lossWal: number;
+  report: number;
+}): boolean {
+  if (parts.results < 0 || parts.report < 0) return false;
+  return parts.report >= parts.results && parts.report >= parts.categories && parts.report >= parts.loss && parts.report >= parts.lossWal;
 }
 
 // ---------------------------------------------------------------- stripping

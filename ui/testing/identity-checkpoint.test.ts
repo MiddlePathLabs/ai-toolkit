@@ -8,12 +8,17 @@ import {
   excludedReasonLabel,
   fmtScore,
   fmtSigned,
+  invertPairComparison,
+  pairInOrientation,
   promptIndicesInReport,
+  reportFreshByMtimes,
   sanitizeCategories,
   stripDomain,
   stripX,
+  stepValue,
   verdictPhrase,
   type CheckpointReport,
+  type PairComparison,
   type PairModelComparison,
 } from '../src/utils/identityCheckpoint';
 
@@ -169,4 +174,94 @@ test('stripX maps scores into the plot width', () => {
   assert.ok(Math.abs(stripX(0.5, domain, 100) - 96) < 1e-9);
   const mid = stripX(0.4, domain, 100);
   assert.ok(mid > 4 && mid < 96);
+});
+
+// ------------------------------------------------------- review-fix regressions
+
+test('reportFreshByMtimes: newer loss log (main db or WAL) invalidates the cache', () => {
+  const fresh = { results: 100, categories: 90, loss: 80, lossWal: -1, report: 120 };
+  assert.equal(reportFreshByMtimes(fresh), true);
+  // training advanced the loss log without touching results.json
+  assert.equal(reportFreshByMtimes({ ...fresh, loss: 130 }), false);
+  // WAL-mode write: only the -wal sidecar moved
+  assert.equal(reportFreshByMtimes({ ...fresh, lossWal: 130 }), false);
+  // no loss log at all (job never trained locally)
+  assert.equal(reportFreshByMtimes({ ...fresh, loss: -1 }), true);
+  // newer results or categories also invalidate
+  assert.equal(reportFreshByMtimes({ ...fresh, results: 130 }), false);
+  assert.equal(reportFreshByMtimes({ ...fresh, categories: 130 }), false);
+  // missing results or report -> never fresh
+  assert.equal(reportFreshByMtimes({ ...fresh, results: -1 }), false);
+  assert.equal(reportFreshByMtimes({ ...fresh, report: -1 }), false);
+});
+
+test('pairInOrientation serves a reversed selection by inverting the stored pair', () => {
+  const stored: PairComparison = {
+    a: { step: 1000, is_raw: false, label: '1000' },
+    b: { step: 2000, is_raw: false, label: '2000' },
+    models: {
+      'arcface:training': comparison({
+        diff_median: 0.04,
+        ci_low: 0.03,
+        ci_high: 0.05,
+        wins_a: 0,
+        wins_b: 4,
+        verdict: 'higher',
+        excluded: [{ id: 'step 1000 · prompt 3 · seed 42', reason: 'missing_at_b', status_a: 'evaluated' }],
+      }),
+    },
+  };
+  const doc = report({ pairs: [stored] });
+  // exact orientation returns the stored pair unchanged
+  assert.equal(pairInOrientation(doc, stepValue(stored.a), stepValue(stored.b)), stored);
+  // reversed selection: same endpoints, inverted evidence
+  const reversed = pairInOrientation(doc, stepValue(stored.b), stepValue(stored.a));
+  assert.ok(reversed);
+  assert.equal(reversed.a.label, '2000');
+  assert.equal(reversed.b.label, '1000');
+  const cmp = reversed.models['arcface:training'];
+  assert.equal(cmp.diff_median, -0.04);
+  assert.equal(cmp.ci_low, -0.05); // bounds swap AND negate
+  assert.equal(cmp.ci_high, -0.03);
+  assert.equal(cmp.wins_a, 4);
+  assert.equal(cmp.wins_b, 0);
+  assert.equal(cmp.verdict, 'lower');
+  assert.equal(reversed.models['arcface:training'].excluded[0].status_b, 'evaluated');
+  // verdict phrasing follows the inversion: 2000 remains the higher checkpoint
+  const phrase = verdictPhrase(cmp, 'arcface', reversed.a.label, reversed.b.label);
+  assert.equal(phrase, '2000 shows higher ArcFace identity than 1000 on comparable prompts (CI excludes 0)');
+  // double inversion round-trips
+  const roundTrip = invertPairComparison(reversed);
+  assert.equal(roundTrip.a.label, '1000');
+  assert.equal(roundTrip.models['arcface:training'].diff_median, 0.04);
+  assert.equal(roundTrip.models['arcface:training'].verdict, 'higher');
+  // unrelated selection stays null
+  assert.equal(pairInOrientation(doc, '3000:0', '4000:0'), null);
+});
+
+test('promptIndicesInReport accepts prompt indices of 100+ in strip filenames', () => {
+  const doc = report({
+    prompt_texts: {},
+    steps: [
+      {
+        step: 1000,
+        is_raw: false,
+        label: '1000',
+        counts: { evaluated: 0, ambiguous: 0, no_face: 0, failed: 0 },
+        n_prompts: 0,
+        stats: {},
+        by_category: {},
+        strip: {
+          arcface: {
+            training: [
+              { f: 'x__000001000_99_seed-42_steps-20.jpg', s: 0.4 },
+              { f: 'x__000001000_100_seed-42_steps-20.jpg', s: 0.41 }, // :02d pads to minimum width
+              { f: 'x__000001000_007_seed-42_steps-20.jpg', s: 0.42 },
+            ],
+          },
+        },
+      },
+    ],
+  });
+  assert.deepEqual(promptIndicesInReport(doc), [7, 99, 100]);
 });

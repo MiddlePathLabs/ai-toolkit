@@ -55,7 +55,7 @@ export interface IdentityEvalApi {
   report: CheckpointReport | null;
   reportLoading: boolean;
   loadReport: () => Promise<void>;
-  saveCategories: (categories: Record<string, string>) => Promise<void>;
+  saveCategories: (categories: Record<string, string>) => Promise<boolean>;
 }
 
 export default function useIdentityEval(job: Job): IdentityEvalApi {
@@ -263,9 +263,12 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     }
   }, [jobId]);
 
+  // Returns true when the tags were persisted and the report recomputed;
+  // the caller keeps its draft on false so edits survive a failed save.
   const saveCategories = useCallback(
-    async (categories: Record<string, string>) => {
+    async (categories: Record<string, string>): Promise<boolean> => {
       setReportLoading(true);
+      let ok = false;
       try {
         const res = await apiClient.post<{ report: CheckpointReport | null; categories: Record<string, string>; error?: string }>(
           `/api/identity-eval/compare`,
@@ -273,12 +276,14 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
         );
         if (res.data.error) setError(res.data.error);
         if (res.data.report) setReport(res.data.report);
+        ok = !res.data.error;
       } catch (err) {
         console.error('identity-eval category save failed:', err);
         setError('Failed to save prompt categories');
       } finally {
         setReportLoading(false);
       }
+      return ok;
     },
     [jobId],
   );

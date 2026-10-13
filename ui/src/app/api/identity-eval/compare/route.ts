@@ -7,6 +7,7 @@
 //       ({ "0": "solo", "1": "multi" }), then return the recomputed report.
 import { NextRequest, NextResponse } from 'next/server';
 import fsp from 'fs/promises';
+import path from 'path';
 import {
   getIdentityJobContext,
   readJsonFile,
@@ -14,6 +15,7 @@ import {
   writeJsonFile,
   type IdentityJobContext,
 } from '@/server/identityEval';
+import { reportFreshByMtimes } from '@/utils/identityCheckpoint';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -33,17 +35,24 @@ interface CompareReport {
   pairs?: unknown[];
 }
 
-// The report is stale when results or category tags changed after it was
-// written, or when it predates the current report format.
+// The report is stale when results, category tags or the loss log changed
+// after it was written (see reportFreshByMtimes for the WAL rationale).
 async function reportIsFresh(context: IdentityJobContext, report: CompareReport | null): Promise<boolean> {
   if (!report || report.version !== 1) return false;
-  const [resultsMtime, categoriesMtime, reportMtime] = await Promise.all([
+  const [resultsMtime, categoriesMtime, reportMtime, lossMtime, lossWalMtime] = await Promise.all([
     mtime(context.resultsPath),
     mtime(context.categoriesPath),
     mtime(context.reportPath),
+    mtime(path.join(context.jobDir, 'loss_log.db')),
+    mtime(path.join(context.jobDir, 'loss_log.db-wal')),
   ]);
-  if (resultsMtime < 0) return false;
-  return reportMtime >= resultsMtime && reportMtime >= categoriesMtime;
+  return reportFreshByMtimes({
+    results: resultsMtime,
+    categories: categoriesMtime,
+    loss: lossMtime,
+    lossWal: lossWalMtime,
+    report: reportMtime,
+  });
 }
 
 async function buildReport(context: IdentityJobContext): Promise<{ error: string | null }> {
