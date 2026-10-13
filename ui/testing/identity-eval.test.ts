@@ -84,7 +84,43 @@ test('per-step summary grouping counts statuses and takes medians', () => {
   assert.equal(step1500.medianArcface, 0.6);
   assert.ok(Math.abs((step1500.medianSface ?? 0) - 0.3) < 1e-9);
   assert.equal(step1500.lowest[0].filename, 'a.jpg'); // lowest arcface first
+  assert.deepEqual(step1500.lowest.map(s => s.filename), ['a.jpg', 'b.jpg']);
+  assert.deepEqual(step1500.highest.map(s => s.filename), ['b.jpg', 'a.jpg']); // highest arcface first
   assert.equal(summaries[1].medianArcface, 0.55);
+});
+
+test('highest/lowest rank by SFace in SFace-only mode, never fabricate scores', () => {
+  // no ArcFace scores anywhere -> ranking falls back to SFace and the lists
+  // are ordered by it, not by input order with missing scores shown as 0.000
+  const samples = [
+    sample({ filename: 'a.jpg', step: 1500, primary: mean(null, 0.1) }),
+    sample({ filename: 'b.jpg', step: 1500, primary: mean(null, 0.9) }),
+    sample({ filename: 'c.jpg', step: 1500, primary: mean(null, 0.5) }),
+  ];
+  const [summary] = groupSummariesByStep(samples, 'training');
+  assert.equal(summary.rankModel, 'sface');
+  assert.deepEqual(summary.highest.map(s => s.filename), ['b.jpg', 'c.jpg', 'a.jpg']);
+  assert.deepEqual(summary.lowest.map(s => s.filename), ['a.jpg', 'c.jpg', 'b.jpg']);
+});
+
+test('highest/lowest exclude samples missing the ranking model score', () => {
+  const samples = [
+    sample({ filename: 'scored.jpg', step: 1500, primary: mean(0.7, null) }),
+    sample({ filename: 'unscored1.jpg', step: 1500, primary: mean(null, 0.4) }),
+    sample({ filename: 'unscored2.jpg', step: 1500, primary: mean(null, 0.8) }),
+  ];
+  const [summary] = groupSummariesByStep(samples, 'training');
+  assert.equal(summary.rankModel, 'arcface');
+  assert.deepEqual(summary.highest.map(s => s.filename), ['scored.jpg']);
+  assert.deepEqual(summary.lowest.map(s => s.filename), ['scored.jpg']);
+  // nothing scored at all -> no ranking, empty lists
+  const [none] = groupSummariesByStep(
+    [sample({ filename: 'x.jpg', step: 100, primary: { arcface: {}, sface: {} } })],
+    'training',
+  );
+  assert.equal(none.rankModel, null);
+  assert.deepEqual(none.highest, []);
+  assert.deepEqual(none.lowest, []);
 });
 
 test('overlay info formats the compact score line', () => {

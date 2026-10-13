@@ -87,8 +87,10 @@ export type ScoreSource = IdentitySource | 'combined';
 
 // ------------------------------------------------------------------ phrasing
 
-// The spec's wording rules: "higher identity" only when the paired bootstrap
-// CI excludes zero; "no detectable difference" otherwise; never "best".
+// The spec's wording rules: a checkpoint is only called "better" when the
+// paired bootstrap CI excludes zero; "tied" otherwise; never "best". The
+// phrasing spells out what the CI means so the takeaway needs no stats
+// background.
 export function verdictPhrase(comparison: PairModelComparison, model: string, labelA: string, labelB: string): string {
   const name = model === 'arcface' ? 'ArcFace' : model === 'sface' ? 'SFace' : model;
   if (comparison.n_pairs === 0) return `no comparable (prompt, seed) pairs between ${labelA} and ${labelB}`;
@@ -96,12 +98,12 @@ export function verdictPhrase(comparison: PairModelComparison, model: string, la
     return `too few comparable pairs (${comparison.n_pairs}) to judge ${name} identity`;
   }
   if (comparison.verdict === 'higher') {
-    return `${labelB} shows higher ${name} identity than ${labelA} on comparable prompts (CI excludes 0)`;
+    return `${labelB} matches the reference faces better than ${labelA} on comparable prompts — a real difference (the 95% confidence interval excludes 0)`;
   }
   if (comparison.verdict === 'lower') {
-    return `${labelA} shows higher ${name} identity than ${labelB} on comparable prompts (CI excludes 0)`;
+    return `${labelA} matches the reference faces better than ${labelB} on comparable prompts — a real difference (the 95% confidence interval excludes 0)`;
   }
-  return `no detectable ${name} identity difference between ${labelA} and ${labelB} on comparable prompts`;
+  return `no trustworthy ${name} difference between ${labelA} and ${labelB} on comparable prompts — treat them as tied`;
 }
 
 export function excludedReasonLabel(reason: string): string {
@@ -230,6 +232,19 @@ export function pairInOrientation(report: CheckpointReport, aValue: string, bVal
   if (exact) return exact;
   const reversed = findPair(report, bValue, aValue);
   return reversed ? invertPairComparison(reversed) : null;
+}
+
+// Step keys holding the highest median for the given model/source (exact ties
+// kept). This is what the checkpoint table highlights: the leader by that one
+// number — evidence to look at, never a best-checkpoint verdict.
+export function highestMedianSteps(steps: CheckpointStepEntry[], model: ScoreModel, source: ScoreSource): string[] {
+  let best = -Infinity;
+  for (const step of steps) {
+    const median = step.stats?.[model]?.[source]?.median;
+    if (median != null && median > best) best = median;
+  }
+  if (!Number.isFinite(best)) return [];
+  return steps.filter(step => step.stats?.[model]?.[source]?.median === best).map(stepValue);
 }
 
 function roundSigned(value: number): number {

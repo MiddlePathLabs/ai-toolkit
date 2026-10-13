@@ -8,6 +8,7 @@ import {
   excludedReasonLabel,
   fmtScore,
   fmtSigned,
+  highestMedianSteps,
   invertPairComparison,
   pairInOrientation,
   promptIndicesInReport,
@@ -18,6 +19,7 @@ import {
   stepValue,
   verdictPhrase,
   type CheckpointReport,
+  type CheckpointStepEntry,
   type PairComparison,
   type PairModelComparison,
 } from '../src/utils/identityCheckpoint';
@@ -37,18 +39,24 @@ const comparison = (over: Partial<PairModelComparison>): PairModelComparison => 
 
 test('verdictPhrase: higher only when CI excludes zero, names the checkpoints', () => {
   const phrase = verdictPhrase(comparison({}), 'arcface', '1500 (EMA)', '2000 (EMA)');
-  assert.equal(phrase, '2000 (EMA) shows higher ArcFace identity than 1500 (EMA) on comparable prompts (CI excludes 0)');
+  assert.equal(
+    phrase,
+    '2000 (EMA) matches the reference faces better than 1500 (EMA) on comparable prompts — a real difference (the 95% confidence interval excludes 0)',
+  );
   assert.ok(!phrase.toLowerCase().includes('best'));
 });
 
 test('verdictPhrase: lower direction names the earlier checkpoint', () => {
   const phrase = verdictPhrase(comparison({ verdict: 'lower', diff_median: -0.02, ci_low: -0.03, ci_high: -0.01, wins_a: 4, wins_b: 0 }), 'sface', '1000', '1500');
-  assert.equal(phrase, '1000 shows higher SFace identity than 1500 on comparable prompts (CI excludes 0)');
+  assert.equal(
+    phrase,
+    '1000 matches the reference faces better than 1500 on comparable prompts — a real difference (the 95% confidence interval excludes 0)',
+  );
 });
 
 test('verdictPhrase: CI including zero says no detectable difference', () => {
   const phrase = verdictPhrase(comparison({ verdict: 'none', diff_median: 0.001, ci_low: -0.01, ci_high: 0.012, wins_b: 2, wins_a: 2 }), 'arcface', '1000', '1500');
-  assert.equal(phrase, 'no detectable ArcFace identity difference between 1000 and 1500 on comparable prompts');
+  assert.equal(phrase, 'no trustworthy ArcFace difference between 1000 and 1500 on comparable prompts — treat them as tied');
 });
 
 test('verdictPhrase: too few pairs is explicit, never a winner', () => {
@@ -86,6 +94,27 @@ test('sanitizeCategories mirrors the route rules', () => {
 test('convergencePhrase stays on the loss question', () => {
   assert.ok(convergencePhrase({ converged: true } as never).includes('converged'));
   assert.ok(convergencePhrase({ converged: false } as never).includes('gaining'));
+});
+
+const stepEntry = (step: number, median: number | null): CheckpointStepEntry => ({
+  step,
+  is_raw: false,
+  label: String(step),
+  counts: { evaluated: 4, ambiguous: 0, no_face: 0, failed: 0 },
+  n_prompts: 4,
+  stats: { arcface: { training: { n: 4, median, p10: null, p25: null, p75: null, iqr: null } } },
+  by_category: {},
+  strip: {},
+});
+
+test('highestMedianSteps picks the top median, keeps exact ties, empty when no data', () => {
+  const steps = [stepEntry(1000, 0.55), stepEntry(1500, 0.59), stepEntry(2000, 0.57)];
+  assert.deepEqual(highestMedianSteps(steps, 'arcface', 'training'), ['1500:0']);
+  const tied = [stepEntry(1000, 0.55), stepEntry(1500, 0.55), stepEntry(2000, null)];
+  assert.deepEqual(highestMedianSteps(tied, 'arcface', 'training'), ['1000:0', '1500:0']);
+  // a different source has no stats at all -> nothing to highlight
+  assert.deepEqual(highestMedianSteps(steps, 'arcface', 'external'), []);
+  assert.deepEqual(highestMedianSteps([], 'arcface', 'training'), []);
 });
 
 const report = (over: Partial<CheckpointReport>): CheckpointReport => ({
@@ -229,7 +258,10 @@ test('pairInOrientation serves a reversed selection by inverting the stored pair
   assert.equal(reversed.models['arcface:training'].excluded[0].status_b, 'evaluated');
   // verdict phrasing follows the inversion: 2000 remains the higher checkpoint
   const phrase = verdictPhrase(cmp, 'arcface', reversed.a.label, reversed.b.label);
-  assert.equal(phrase, '2000 shows higher ArcFace identity than 1000 on comparable prompts (CI excludes 0)');
+  assert.equal(
+    phrase,
+    '2000 matches the reference faces better than 1000 on comparable prompts — a real difference (the 95% confidence interval excludes 0)',
+  );
   // double inversion round-trips
   const roundTrip = invertPairComparison(reversed);
   assert.equal(roundTrip.a.label, '1000');

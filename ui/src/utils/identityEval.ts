@@ -120,7 +120,7 @@ export function overlayInfo(
   if (sfaceMean !== null) parts.push(`S ${sfaceMean.toFixed(3)}`);
   const label = parts.join(' · ');
   const tooltipBits = [
-    'Raw cosine similarities; 1.0 = identical. ArcFace and SFace use different scales and are never averaged.',
+    'A = ArcFace, S = SFace — face-recognition similarity to the reference faces; 1.0 = identical. The two models use different scales and are never compared to each other.',
     sample.warnings?.length ? sample.warnings.join(' ') : '',
   ].filter(Boolean);
   return {
@@ -148,7 +148,11 @@ export interface IdentityStepSummary {
   ambiguous: number;
   medianArcface: number | null;
   medianSface: number | null;
+  // Model the highest/lowest lists are ranked by: ArcFace when it scored
+  // anything for this source, else SFace (SFace-only mode), else null.
+  rankModel: 'arcface' | 'sface' | null;
   lowest: IdentitySampleResult[];
+  highest: IdentitySampleResult[];
 }
 
 export function groupSummariesByStep(
@@ -156,6 +160,12 @@ export function groupSummariesByStep(
   source: IdentitySource | 'combined',
   lowestCount = 3,
 ): IdentityStepSummary[] {
+  const score = (s: IdentitySampleResult, model: string) => s.primary?.[model]?.[source]?.mean ?? null;
+  const model = samples.some(s => score(s, 'arcface') !== null)
+    ? 'arcface'
+    : samples.some(s => score(s, 'sface') !== null)
+      ? 'sface'
+      : null;
   const byStep = new Map<number, IdentitySampleResult[]>();
   for (const sample of samples) {
     if (sample.step === null || sample.step === undefined) continue;
@@ -167,12 +177,19 @@ export function groupSummariesByStep(
     .sort((a, b) => a[0] - b[0])
     .map(([step, bucket]) => {
       const evaluated = bucket.filter(s => s.status === 'evaluated');
-      const score = (s: IdentitySampleResult, model: string) => s.primary?.[model]?.[source]?.mean ?? null;
       const arcfaceScores = evaluated.map(s => score(s, 'arcface')).filter((v): v is number => v !== null);
       const sfaceScores = evaluated.map(s => score(s, 'sface')).filter((v): v is number => v !== null);
-      const lowest = [...evaluated]
-        .sort((a, b) => (score(a, 'arcface') ?? 2) - (score(b, 'arcface') ?? 2))
-        .slice(0, lowestCount);
+      // Only samples the ranking model actually scored compete for the
+      // highest/lowest slots -- a missing score must never surface as 0.000.
+      let lowest: IdentitySampleResult[] = [];
+      let highest: IdentitySampleResult[] = [];
+      if (model !== null) {
+        const ranked = evaluated.filter(s => score(s, model) !== null);
+        const byModel = (a: IdentitySampleResult, b: IdentitySampleResult) =>
+          (score(a, model) as number) - (score(b, model) as number);
+        lowest = [...ranked].sort(byModel).slice(0, lowestCount);
+        highest = [...ranked].sort((a, b) => byModel(b, a)).slice(0, lowestCount);
+      }
       return {
         step,
         evaluated: evaluated.length,
@@ -180,7 +197,9 @@ export function groupSummariesByStep(
         ambiguous: bucket.filter(s => s.status === 'ambiguous').length,
         medianArcface: median(arcfaceScores),
         medianSface: median(sfaceScores),
+        rankModel: model,
         lowest,
+        highest,
       };
     });
 }

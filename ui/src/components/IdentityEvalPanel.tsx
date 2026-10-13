@@ -15,6 +15,7 @@ import {
   normalizeRefPath,
   selectionForImage,
   type IdentityRefImage,
+  type IdentitySampleResult,
   type IdentitySource,
 } from '@/utils/identityEval';
 import { encodeFilePathForUrl } from '@/utils/basic';
@@ -69,6 +70,42 @@ function FaceCropThumb({ src, bbox, size = 72 }: { src: string; bbox: number[]; 
         }}
       />
     </div>
+  );
+}
+
+// Clickable ArcFace score chip for the highest/lowest sample links: opens the
+// sample, tooltip carries both models' scores.
+function SampleScoreChip({
+  sample,
+  source,
+  tone,
+  onOpen,
+}: {
+  sample: IdentitySampleResult;
+  source: IdentitySource | 'combined';
+  tone: 'high' | 'low';
+  onOpen: (path: string) => void;
+}) {
+  const arcface = sample.primary?.arcface?.[source]?.mean;
+  const sface = sample.primary?.sface?.[source]?.mean;
+  const scoreBits = [
+    arcface != null ? `ArcFace ${arcface.toFixed(3)}` : null,
+    sface != null ? `SFace ${sface.toFixed(3)}` : null,
+  ].filter(Boolean);
+  return (
+    <button
+      type="button"
+      className={classNames(
+        'rounded border px-1.5 py-0.5 tabular-nums hover:bg-gray-100 dark:hover:bg-gray-800',
+        tone === 'high'
+          ? 'border-emerald-400/60 text-emerald-700 dark:text-emerald-300'
+          : 'border-red-400/50 text-red-600 dark:text-red-400',
+      )}
+      onClick={() => onOpen(sample.path)}
+      title={`Step ${sample.step?.toLocaleString()} · prompt ${sample.prompt_idx}\n${scoreBits.join(' · ')}\nclick to open`}
+    >
+      {arcface != null ? arcface.toFixed(3) : sface != null ? `S ${sface.toFixed(3)}` : '–'}
+    </button>
   );
 }
 
@@ -261,6 +298,9 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
   const summaries = groupSummariesByStep(results?.samples ?? [], activeSource);
   const looArcface = results?.refsets?.[activeSource]?.loo?.arcface ?? null;
   const looSface = results?.refsets?.[activeSource]?.loo?.sface ?? null;
+  const latestSummary = summaries.length > 0 ? summaries[summaries.length - 1] : null;
+  const maxMedianArcface = summaries.reduce((acc, row) => Math.max(acc, row.medianArcface ?? -Infinity), -Infinity);
+  const maxMedianSface = summaries.reduce((acc, row) => Math.max(acc, row.medianSface ?? -Infinity), -Infinity);
 
   return (
     <div className="absolute inset-y-0 right-0 z-[15] flex w-[420px] max-w-[92vw] flex-col border-l border-gray-300 bg-gray-50 text-sm text-gray-900 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100">
@@ -277,6 +317,36 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto p-3">
+        <p className="text-xs text-gray-500 dark:text-gray-400">
+          Scores every sample against your reference photos with two face-recognition models — higher means closer to
+          the reference face (1.0 = identical). Use it to see where likeness peaks and to compare checkpoints.
+        </p>
+        <details className="text-xs text-gray-500 dark:text-gray-400">
+          <summary className="cursor-pointer select-none font-medium text-gray-600 dark:text-gray-300">
+            How to read these numbers
+          </summary>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            <li>
+              <span className="font-medium">ArcFace / SFace</span> are two independent face-recognition models. Their
+              scales differ — never compare an ArcFace number to an SFace number.
+            </li>
+            <li>
+              The <span className="font-medium">leave-one-out (LOO) band</span> shown in parentheses is how similar your
+              reference photos are to <em>each other</em> — a same-person baseline. Strong generated faces often land
+              near or slightly above it; well below it means weak likeness.
+            </li>
+            <li>
+              Sample counts: <span className="font-medium">ok</span> = one face, scored ·{' '}
+              <span className="font-medium">amb</span> = ambiguous, multiple faces found ·{' '}
+              <span className="font-medium">fail</span> = no face or error.
+            </li>
+            <li>
+              <span className="font-medium">▲</span> marks the highest median — where similarity peaks. When checkpoints
+              are close, trust the “Checkpoint comparison” paired verdicts (a difference is only real when its 95%
+              confidence interval excludes 0), then judge the samples by eye.
+            </li>
+          </ul>
+        </details>
         {error && (
           <div className="rounded border border-red-400/60 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">{error}</div>
         )}
@@ -436,47 +506,89 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
               <thead>
                 <tr className="text-gray-500 dark:text-gray-400">
                   <th className="text-left font-medium">Step</th>
-                  <th className="font-medium">A med</th>
-                  <th className="font-medium">S med</th>
-                  <th className="font-medium">ok/amb/fail</th>
+                  <th
+                    className="font-medium"
+                    title="Median ArcFace similarity to the reference faces — higher = closer. ArcFace and SFace use different scales; never compare across models."
+                  >
+                    ArcFace med
+                  </th>
+                  <th className="font-medium" title="Median SFace similarity to the reference faces — higher = closer">
+                    SFace med
+                  </th>
+                  <th
+                    className="font-medium"
+                    title="Sample counts: ok = one face, scored · amb = ambiguous, multiple faces found · fail = no face or error"
+                  >
+                    ok/amb/fail
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {summaries.map(row => (
-                  <tr key={row.step} className="border-t border-gray-200 dark:border-gray-700">
-                    <td className="py-0.5 text-left">{row.step.toLocaleString()}</td>
-                    <td className="py-0.5 text-center">
-                      {row.medianArcface?.toFixed(3) ?? '–'}
-                      {looArcface !== null && <span className="text-gray-400"> ({looArcface.toFixed(3)})</span>}
-                    </td>
-                    <td className="py-0.5 text-center">
-                      {row.medianSface?.toFixed(3) ?? '–'}
-                      {looSface !== null && <span className="text-gray-400"> ({looSface.toFixed(3)})</span>}
-                    </td>
-                    <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">
-                      {row.evaluated}/{row.ambiguous}/{row.failed}
-                    </td>
-                  </tr>
-                ))}
+                {summaries.map(row => {
+                  const bestA = row.medianArcface != null && row.medianArcface === maxMedianArcface;
+                  const bestS = row.medianSface != null && row.medianSface === maxMedianSface;
+                  return (
+                    <tr key={row.step} className="border-t border-gray-200 dark:border-gray-700">
+                      <td className="py-0.5 text-left">{row.step.toLocaleString()}</td>
+                      <td
+                        className={classNames(
+                          'py-0.5 text-center',
+                          bestA && 'bg-blue-500/10 font-semibold text-gray-900 dark:text-gray-50',
+                        )}
+                      >
+                        {bestA && (
+                          <span title="highest median across steps" className="text-blue-500">
+                            ▲
+                          </span>
+                        )}{' '}
+                        {row.medianArcface?.toFixed(3) ?? '–'}
+                        {looArcface !== null && <span className="text-gray-400"> ({looArcface.toFixed(3)})</span>}
+                      </td>
+                      <td
+                        className={classNames(
+                          'py-0.5 text-center',
+                          bestS && 'bg-blue-500/10 font-semibold text-gray-900 dark:text-gray-50',
+                        )}
+                      >
+                        {bestS && (
+                          <span title="highest median across steps" className="text-blue-500">
+                            ▲
+                          </span>
+                        )}{' '}
+                        {row.medianSface?.toFixed(3) ?? '–'}
+                        {looSface !== null && <span className="text-gray-400"> ({looSface.toFixed(3)})</span>}
+                      </td>
+                      <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">
+                        {row.evaluated}/{row.ambiguous}/{row.failed}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
             <p className="text-xs text-gray-500 dark:text-gray-400">
-              Values in parentheses are the reference LOO self-similarity band (the natural ceiling). Medians exclude
-              ambiguous and failed samples.
+              Numbers in parentheses are the leave-one-out (LOO) reference band: each reference photo scored against
+              the others — how similar real photos of this person are to each other. It is a same-person baseline, not
+              an upper bound: a generated face that captures the shared identity can score above it. ▲ marks the
+              highest median; medians exclude ambiguous and failed samples.
             </p>
-            {summaries.length > 0 && summaries[summaries.length - 1].lowest.length > 0 && (
+            {latestSummary && latestSummary.highest.length > 0 && (
               <div className="flex flex-wrap items-center gap-1 text-xs">
-                <span className="text-gray-500 dark:text-gray-400">lowest:</span>
-                {summaries[summaries.length - 1].lowest.map(sample => (
-                  <button
-                    key={sample.filename}
-                    type="button"
-                    className="rounded border border-gray-300 px-1.5 py-0.5 hover:bg-gray-100 dark:border-gray-600 dark:hover:bg-gray-800"
-                    onClick={() => onOpenSample(sample.path)}
-                    title={`Step ${sample.step?.toLocaleString()} · prompt ${sample.prompt_idx}`}
-                  >
-                    {(sample.primary?.arcface?.[activeSource]?.mean ?? 0).toFixed(3)}
-                  </button>
+                <span className="text-gray-500 dark:text-gray-400">
+                  highest at step {latestSummary.step.toLocaleString()}:
+                </span>
+                {latestSummary.highest.map(sample => (
+                  <SampleScoreChip key={sample.filename} sample={sample} source={activeSource} tone="high" onOpen={onOpenSample} />
+                ))}
+              </div>
+            )}
+            {latestSummary && latestSummary.lowest.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1 text-xs">
+                <span className="text-gray-500 dark:text-gray-400">
+                  lowest at step {latestSummary.step.toLocaleString()}:
+                </span>
+                {latestSummary.lowest.map(sample => (
+                  <SampleScoreChip key={sample.filename} sample={sample} source={activeSource} tone="low" onOpen={onOpenSample} />
                 ))}
               </div>
             )}

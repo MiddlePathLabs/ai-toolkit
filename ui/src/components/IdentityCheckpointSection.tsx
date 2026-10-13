@@ -15,6 +15,7 @@ import {
   convergencePhrase,
   fmtScore,
   fmtSigned,
+  highestMedianSteps,
   pairInOrientation,
   promptIndicesInReport,
   stepValue,
@@ -51,7 +52,8 @@ function ScoreStrip({
       <div className="flex justify-between text-[10px] text-gray-400 dark:text-gray-500">
         <span>{domain.min.toFixed(3)}</span>
         <span>
-          distribution of all evaluated samples · dashed line = reference LOO band{loo !== null ? ` (${loo.toFixed(3)})` : ''}
+          distribution of all evaluated samples · dashed line = leave-one-out (LOO) reference band
+          {loo !== null ? ` (${loo.toFixed(3)})` : ''}
         </span>
         <span>{domain.max.toFixed(3)}</span>
       </div>
@@ -158,6 +160,10 @@ export default function IdentityCheckpointSection({
   const pair = report && effectiveA && effectiveB ? pairInOrientation(report, effectiveA, effectiveB) : null;
 
   const promptIndices = useMemo(() => (report ? promptIndicesInReport(report) : []), [report]);
+  const bestSteps = useMemo(
+    () => (report ? highestMedianSteps(report.steps, effectiveModel, effectiveSource) : []),
+    [report, effectiveModel, effectiveSource],
+  );
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState(false);
   useEffect(() => {
@@ -212,19 +218,55 @@ export default function IdentityCheckpointSection({
         </button>
       </div>
 
-      {/* per-checkpoint table: median (p10) + IQR tooltip; no best-checkpoint verdict */}
+      {/* how to read this: the intended workflow, spelled out */}
+      <details className="text-[10px] text-gray-500 dark:text-gray-400">
+        <summary className="cursor-pointer select-none font-medium text-gray-600 dark:text-gray-300">How to read this</summary>
+        <ul className="mt-1 list-disc space-y-0.5 pl-4">
+          <li>
+            <span className="font-medium">▲</span> marks the checkpoint with the highest median similarity — the leader
+            by this one number, not a verdict.
+          </li>
+          <li>
+            A checkpoint is only clearly better when the paired comparison below calls a{' '}
+            <span className="font-medium">real difference</span> (its 95% confidence interval excludes 0). Otherwise the
+            checkpoints are tied — pick between them by looking at the samples.
+          </li>
+          <li>Every dot in the strips below is one sample — click it to open and judge with your own eyes.</li>
+          <li>
+            The dashed line is the <span className="font-medium">leave-one-out (LOO)</span> band: how similar your
+            reference photos are to each other — a same-person baseline, not a ceiling. Generated faces often land
+            near or above it; well below it means weak likeness.
+          </li>
+          <li>
+            <span className="font-medium">T−E gap</span> = training-refs median − external-refs median. A gap that grows
+            over steps can mean the model is memorizing the training photos instead of learning the face — external
+            refs are the honest test.
+          </li>
+        </ul>
+      </details>
+
+      {/* per-checkpoint table: median (p10) + IQR tooltip; leader highlighted, but no best-checkpoint verdict */}
       <table className="w-full table-fixed text-xs tabular-nums">
         <thead>
           <tr className="text-gray-500 dark:text-gray-400">
             <th className="text-left font-medium">Checkpoint</th>
-            <th className="font-medium" title="evaluated / ambiguous / no-face / failed samples">
-              n ev/amb/nf/fail
+            <th
+              className="font-medium"
+              title="Sample counts: ok = one face, scored · amb = ambiguous, multiple faces · nf = no face · fail = error"
+            >
+              n ok/amb/nf/fail
             </th>
-            <th className="font-medium" title={`highest median ${modelName} on comparable prompts — evidence, not a best-checkpoint verdict`}>
+            <th
+              className="font-medium"
+              title={`Median ${modelName} similarity on comparable prompts — higher = closer to the reference faces. ▲ marks the highest.`}
+            >
               {modelName} med
             </th>
             {report.steps.some(s => s.train_vs_external) && (
-              <th className="font-medium" title="training-ref median − external-ref median; a rising gap can indicate memorization">
+              <th
+                className="font-medium"
+                title="Training-refs median − external-refs median. A gap that grows over steps can indicate memorizing the training photos; external refs are the honest test."
+              >
                 T−E gap
               </th>
             )}
@@ -234,13 +276,39 @@ export default function IdentityCheckpointSection({
           {report.steps.map(step => {
             const stats = step.stats?.[effectiveModel]?.[effectiveSource];
             const gap = step.train_vs_external?.[effectiveModel]?.gap;
+            const isBest = bestSteps.includes(stepValue(step));
             return (
-              <tr key={stepValue(step)} className="border-t border-gray-200 dark:border-gray-700">
-                <td className="py-0.5 text-left">{step.label}</td>
+              <tr
+                key={stepValue(step)}
+                className={classNames('border-t border-gray-200 dark:border-gray-700', isBest && 'bg-blue-500/[0.07]')}
+              >
+                <td className="py-0.5 text-left">
+                  {isBest && (
+                    <span
+                      title="highest median on comparable prompts — the leader by this number, not a verdict"
+                      className="text-blue-500"
+                    >
+                      ▲
+                    </span>
+                  )}{' '}
+                  {step.label}
+                </td>
                 <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">{countsLabel(step.counts)}</td>
-                <td className="py-0.5 text-center" title={stats?.iqr != null ? `IQR ${fmtScore(stats.iqr)} · p25 ${fmtScore(stats.p25)} · p75 ${fmtScore(stats.p75)} · n ${stats.n}` : undefined}>
+                <td
+                  className={classNames('py-0.5 text-center', isBest && 'font-semibold text-gray-900 dark:text-gray-50')}
+                  title={
+                    stats?.iqr != null
+                      ? `IQR ${fmtScore(stats.iqr)} (middle half of samples) · p25 ${fmtScore(stats.p25)} · p75 ${fmtScore(stats.p75)} · n ${stats.n}`
+                      : undefined
+                  }
+                >
                   {fmtScore(stats?.median)}
-                  {stats?.p10 != null && <span className="text-gray-400"> p10 {fmtScore(stats.p10)}</span>}
+                  {stats?.p10 != null && (
+                    <span className="text-gray-400" title="p10 = 10th percentile — 1 in 10 samples scored below this">
+                      {' '}
+                      p10 {fmtScore(stats.p10)}
+                    </span>
+                  )}
                 </td>
                 {report.steps.some(s => s.train_vs_external) && (
                   <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">{gap == null ? '–' : fmtSigned(gap)}</td>
@@ -250,6 +318,10 @@ export default function IdentityCheckpointSection({
           })}
         </tbody>
       </table>
+      <p className="text-[10px] text-gray-400 dark:text-gray-500">
+        ▲ = highest median — strong evidence, not a verdict. Confirm with the paired comparison before calling a
+        checkpoint better.
+      </p>
 
       {/* distribution strips per checkpoint */}
       <ScoreStrip steps={report.steps} model={effectiveModel} source={effectiveSource} loo={loo} onOpenSample={onOpenSample} />
@@ -283,18 +355,23 @@ export default function IdentityCheckpointSection({
               <div key={sourceKey} className="space-y-0.5 text-[10px]">
                 <div className="tabular-nums text-gray-700 dark:text-gray-200">
                   <span className="text-gray-500 dark:text-gray-400">{sourceKey} refs: </span>
-                  Δmed {fmtSigned(comparison.diff_median)}{' '}
-                  {comparison.ci_low != null && comparison.ci_high != null && (
-                    <span className="text-gray-400">
-                      (CI {fmtSigned(comparison.ci_low)} … {fmtSigned(comparison.ci_high)})
-                    </span>
-                  )}{' '}
-                  · {pair.b.label} wins {comparison.wins_b}/{comparison.n_pairs}
+                  <span
+                    title={`median of ${pair.b.label} − ${pair.a.label} on matched (prompt, seed) pairs; the brackets are a bootstrap 95% confidence interval — if it excludes 0 the difference is real, if it straddles 0 it is noise`}
+                  >
+                    median diff {fmtSigned(comparison.diff_median)}{' '}
+                    {comparison.ci_low != null && comparison.ci_high != null && (
+                      <span className="text-gray-400">
+                        (95% CI {fmtSigned(comparison.ci_low)} … {fmtSigned(comparison.ci_high)})
+                      </span>
+                    )}{' '}
+                  </span>
+                  · {pair.b.label} higher on {comparison.wins_b}/{comparison.n_pairs} pairs
+                  {comparison.ties > 0 && ` · ${comparison.ties} tied`}
                 </div>
                 <div
                   className={classNames(
                     comparison.verdict === 'higher' || comparison.verdict === 'lower'
-                      ? 'font-medium text-gray-900 dark:text-gray-100'
+                      ? 'font-medium text-emerald-700 dark:text-emerald-300'
                       : 'text-gray-500 dark:text-gray-400',
                   )}
                 >
@@ -365,23 +442,36 @@ export default function IdentityCheckpointSection({
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(
+                {Object.keys(
                   Object.fromEntries(
                     report.steps.flatMap(step =>
                       Object.entries(step.by_category ?? {}).map(([cat]) => [cat, true] as const),
                     ),
                   ),
-                ).map(([cat]) => (
-                  <tr key={cat} className="border-t border-gray-200 dark:border-gray-700">
-                    <td className="py-0.5 text-left">{cat}</td>
-                    {report.steps.map(step => (
-                      <td key={stepValue(step)} className="py-0.5 text-center">
-                        {fmtScore(step.by_category?.[cat]?.[effectiveModel]?.[effectiveSource]?.median)}
-                        <span className="text-gray-400"> ({step.by_category?.[cat]?.[effectiveModel]?.[effectiveSource]?.n ?? 0})</span>
-                      </td>
-                    ))}
-                  </tr>
-                ))}
+                ).map(cat => {
+                  const cell = (step: CheckpointStepEntry) => step.by_category?.[cat]?.[effectiveModel]?.[effectiveSource];
+                  const rowBest = report.steps.reduce((acc, step) => Math.max(acc, cell(step)?.median ?? -Infinity), -Infinity);
+                  return (
+                    <tr key={cat} className="border-t border-gray-200 dark:border-gray-700">
+                      <td className="py-0.5 text-left">{cat}</td>
+                      {report.steps.map(step => {
+                        const stats = cell(step);
+                        const isBest = stats?.median != null && stats.median === rowBest;
+                        return (
+                          <td key={stepValue(step)} className={classNames('py-0.5 text-center', isBest && 'bg-blue-500/10 font-semibold')}>
+                            {isBest && (
+                              <span title="highest median in this prompt category" className="text-blue-500">
+                                ▲
+                              </span>
+                            )}{' '}
+                            {fmtScore(stats?.median)}
+                            <span className="text-gray-400"> ({stats?.n ?? 0})</span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}

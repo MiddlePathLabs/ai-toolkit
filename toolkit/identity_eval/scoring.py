@@ -13,7 +13,9 @@ Conventions:
 - primary  = mean(R @ g)   -- mean of per-reference raw cosines
 - max      = max(R @ g)    -- best single reference (near-copy hint)
 - ref band = LOO           -- mean over references of each reference's mean
-  cosine to the other references; the natural ceiling for the primary.
+  cosine to the other references; a same-person baseline for the primary,
+  not an upper bound (a generated embedding near the reference mean can
+  score above it).
 """
 
 import math

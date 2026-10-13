@@ -47,8 +47,11 @@ clear error naming the expected paths.
     (same scale as the existing eval scripts);
   - **max** = `max(R @ g)` (detail view; a high max with a low mean can
     indicate a near-copy of one training image);
-  - **reference LOO band** = mean over references of each reference's mean
-    cosine to the others — the natural ceiling, shown as `0.42 (refs: 0.35)`.
+  - **reference LOO band** (leave-one-out) = mean over references of each
+    reference's mean cosine to the others — how similar real photos of the
+    person are to each other; a same-person baseline, not an upper bound (a
+    generated face that captures the shared identity can score above the
+    band, and strong checkpoints often do); shown as `0.42 (refs: 0.35)`.
 - Raw cosines, 3 decimals, no percentages. The trainer's identity loss
   subtracts a noise-mean direction (bias-corrected); this UI shows **raw**
   cosine, so trainer-logged identity values are not comparable to these.
