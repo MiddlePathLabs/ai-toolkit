@@ -238,8 +238,13 @@ export default function IdentityRetentionGraph({
     const handler = (e: MouseEvent) => {
       const rect = u.over.getBoundingClientRect();
       const px = e.clientX - rect.left;
-      const bbox = u.bbox;
-      if (px < bbox.left || px > bbox.left + bbox.width) return;
+      // u.over is positioned over the plot area only (uPlot sets its left/top
+      // to the plot's CSS offset), so px is plot-relative CSS -- the same
+      // space posToVal/valToPos use without the canvas flag. u.bbox is DEVICE
+      // pixels offset within the canvas (axis area included); mixing it with
+      // px silently rejects clicks near the plot's left edge, first
+      // checkpoint included, at any DPR > 1.
+      if (px < 0 || px > rect.width) return;
       const xval = u.posToVal(px, 'x');
       let best = -1;
       let bestDist = Infinity;
