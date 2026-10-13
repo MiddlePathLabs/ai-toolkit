@@ -14,6 +14,9 @@ import {
   countsLabel,
   excludedReasonLabel,
   convergencePhrase,
+  driftHiddenCount,
+  driftKindLabel,
+  driftSignals,
   fmtScore,
   fmtSigned,
   highestMedianSteps,
@@ -27,6 +30,7 @@ import {
   verdictPhrase,
   type CheckpointReport,
   type CheckpointStepEntry,
+  type DriftSignal,
   type RetentionWeightsKind,
   type ScoreModel,
   type ScoreSource,
@@ -134,6 +138,106 @@ function CategorySelect({
   );
 }
 
+// Phase 2d: statistical drift warnings. Amber like the convergence panel,
+// but the wording is weaker on purpose: "possible drift" is the strongest
+// claim the tool ever makes — anything stronger comes from the user's own
+// review of the linked samples. Signals are per model and filtered to the
+// section's model/source selection; the hidden count surfaces the rest.
+function DriftWarnings({
+  report,
+  drift,
+  signals,
+  hidden,
+  model,
+  source,
+  onOpenSample,
+}: {
+  report: CheckpointReport;
+  drift: NonNullable<CheckpointReport['drift']>;
+  signals: DriftSignal[];
+  hidden: number;
+  model: ScoreModel;
+  source: ScoreSource;
+  onOpenSample: (filename: string) => void;
+}) {
+  const modelName = model === 'arcface' ? 'ArcFace' : 'SFace';
+  const scopeLabel = (signal: DriftSignal): string | null => {
+    if (!signal.scope) return null;
+    const entry = report.steps.find(step => step.step === signal.scope?.step && step.is_raw === signal.scope?.is_raw);
+    return entry ? entry.label : `step ${signal.scope.step}`;
+  };
+  return (
+    <div
+      className={classNames(
+        'space-y-1 rounded border p-1.5 text-[10px]',
+        signals.length > 0
+          ? 'border-amber-400/50 bg-amber-500/5 dark:border-amber-500/40'
+          : 'border-gray-300 dark:border-gray-600',
+      )}
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        <span
+          className="font-semibold text-amber-700 dark:text-amber-300"
+          title="Statistical warnings from the checkpoint data (similarity decline, spread growth, memorization signature, pose dependence, category spread, near-copies). Computed per model; ArcFace and SFace are never merged."
+        >
+          Identity drift warnings
+        </span>
+        <span className="text-gray-400 dark:text-gray-500">possible drift — never a verdict</span>
+      </div>
+      {signals.length === 0 ? (
+        <p className="text-gray-600 dark:text-gray-300">
+          No drift signals for {modelName} ({source} refs){hidden > 0 ? ` — ${hidden} hidden by this filter` : ''}.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {signals.map((signal, index) => (
+            <div key={index} className="space-y-0.5">
+              <div className="text-gray-500 dark:text-gray-400">
+                <span className="font-medium text-gray-700 dark:text-gray-200">{driftKindLabel(signal.kind)}</span>
+                {signal.source && <span> · {signal.source} refs</span>}
+                {scopeLabel(signal) && <span> · {scopeLabel(signal)}</span>}
+              </div>
+              <p className="text-gray-600 dark:text-gray-300">{signal.message}</p>
+              {signal.samples.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1">
+                  <span className="text-gray-400 dark:text-gray-500">review at full resolution:</span>
+                  {signal.samples.map((filename, i) => (
+                    <button
+                      key={filename}
+                      type="button"
+                      className="rounded border border-amber-400/60 px-1.5 py-0.5 tabular-nums text-gray-600 hover:bg-amber-500/10 dark:border-amber-500/40 dark:text-gray-300"
+                      title={filename}
+                      onClick={() => onOpenSample(filename)}
+                    >
+                      {i + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+          {hidden > 0 && (
+            <p className="text-gray-400 dark:text-gray-500">
+              {hidden} warning{hidden === 1 ? '' : 's'} for the other model/source hidden by the {modelName} / {source}{' '}
+              filter.
+            </p>
+          )}
+        </div>
+      )}
+      {drift.notes.length > 0 && (
+        <details className="text-gray-400 dark:text-gray-500">
+          <summary className="cursor-pointer select-none">drift-check notes</summary>
+          <ul className="ml-3 list-disc">
+            {drift.notes.map(note => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
 export default function IdentityCheckpointSection({
   report,
   loading,
@@ -168,6 +272,16 @@ export default function IdentityCheckpointSection({
   const promptIndices = useMemo(() => (report ? promptIndicesInReport(report) : []), [report]);
   const bestSteps = useMemo(
     () => (report ? highestMedianSteps(report.steps, effectiveModel, effectiveSource) : []),
+    [report, effectiveModel, effectiveSource],
+  );
+  // Drift warnings (Phase 2d) filtered to the selected model/source; the
+  // hidden count keeps the rest discoverable instead of silently dropped.
+  const driftList = useMemo(
+    () => (report ? driftSignals(report, effectiveModel, effectiveSource) : []),
+    [report, effectiveModel, effectiveSource],
+  );
+  const driftHidden = useMemo(
+    () => (report ? driftHiddenCount(report, effectiveModel, effectiveSource) : 0),
     [report, effectiveModel, effectiveSource],
   );
   // Retention graph (Phase 2c): weights-kind default follows what the run
@@ -258,8 +372,26 @@ export default function IdentityCheckpointSection({
             over steps can mean the model is memorizing the training photos instead of learning the face — external
             refs are the honest test.
           </li>
+          <li>
+            The <span className="font-medium">drift warnings</span> block below lists statistical warning signs
+            (decline, spread growth, memorization signature, pose dependence, near-copies) with links to the samples
+            involved. They are suggestions to look, never conclusions — you make the call.
+          </li>
         </ul>
       </details>
+
+      {/* drift warnings (Phase 2d): amber, statistical, never a verdict */}
+      {report.drift && (
+        <DriftWarnings
+          report={report}
+          drift={report.drift}
+          signals={driftList}
+          hidden={driftHidden}
+          model={effectiveModel}
+          source={effectiveSource}
+          onOpenSample={onOpenSample}
+        />
+      )}
 
       {/* identity retention graph (Phase 2c): two models, two scales, never merged */}
       <div className="space-y-1 rounded border border-gray-300 p-1.5 dark:border-gray-600">

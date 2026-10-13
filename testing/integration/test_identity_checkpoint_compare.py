@@ -72,7 +72,7 @@ class TestStats:
 
     def test_report_version_pinned_for_route_cache(self):
         # the compare route rebuilds any report whose version differs
-        assert cc.REPORT_VERSION == 2
+        assert cc.REPORT_VERSION == 3
 
     def test_count_statuses_splits_no_face_from_failed(self):
         samples = [

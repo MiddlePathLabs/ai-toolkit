@@ -17,6 +17,9 @@ export type IdentityFaceScores = Record<string, Partial<Record<IdentitySource | 
 export interface IdentityFace {
   index: number;
   bbox: number[];
+  // 5-point landmarks (results v2+); absent in older documents -- the Phase
+  // 2d pose signal skips samples without them
+  kps?: number[][] | null;
   det_score: number;
   scores: IdentityFaceScores;
 }

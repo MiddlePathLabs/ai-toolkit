@@ -31,7 +31,10 @@ from .models import find_arcface, find_sface, sha256_file
 from .scoring import loo_band, parse_sample_filename, round3, score_face
 from .sface import SFaceEmbedder
 
-RESULTS_VERSION = 1
+# v2: sample faces gained per-face ``kps`` (5-point landmarks) so the
+# Phase 2d pose signal can run in post-processing. Nothing validates this
+# on read; older documents simply lack the field and the pose signal skips.
+RESULTS_VERSION = 2
 
 
 def _now() -> str:
@@ -588,6 +591,9 @@ class IdentityEvalRunner:
                 {
                     'index': face_entry['index'],
                     'bbox': face_entry['bbox'],
+                    # landmarks persist per sample face (Phase 2d pose signal);
+                    # refs have always carried them, samples previously dropped them
+                    'kps': face_entry.get('kps'),
                     'det_score': face_entry['det_score'],
                     'scores': scores,
                 }

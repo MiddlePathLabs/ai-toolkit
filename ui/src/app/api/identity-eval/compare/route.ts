@@ -38,8 +38,9 @@ interface CompareReport {
 // The report is stale when results, category tags or the loss log changed
 // after it was written (see reportFreshByMtimes for the WAL rationale), or
 // when its version predates the current builder (v2 added p90 for the
-// retention graph -- a cached v1 report must be rebuilt, not served).
-const REPORT_VERSION = 2;
+// retention graph; v3 added the Phase 2d drift warnings -- a cached older
+// report must be rebuilt, not served).
+const REPORT_VERSION = 3;
 
 async function reportIsFresh(context: IdentityJobContext, report: CompareReport | null): Promise<boolean> {
   if (!report || report.version !== REPORT_VERSION) return false;

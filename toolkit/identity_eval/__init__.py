@@ -19,6 +19,7 @@ from .checkpoint_compare import (
 )
 from .detector import DetectedFace, FaceDetector
 from .device import choose_device, resolve_device
+from .drift import detect_drift
 from .refs import (
     discover_training_refs,
     load_selection,
@@ -40,6 +41,7 @@ __all__ = [
     'build_checkpoint_report',
     'choose_device',
     'convergence_summary',
+    'detect_drift',
     'discover_training_refs',
     'extract_prompt_texts',
     'load_categories',

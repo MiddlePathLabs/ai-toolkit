@@ -205,6 +205,53 @@ likeness rises, plateaus or fades across the run.
   no face models); the compare route rebuilds any report older than the
   current `REPORT_VERSION` so v1 caches lacking p90 are refreshed, not served.
 
+## Identity drift warnings (Phase 2d)
+
+An amber block between "How to read this" and the retention graph surfaces
+**statistical warning signs** from the checkpoint data. Warnings, never
+verdicts: the strongest wording the tool ever produces is "possible drift",
+and only for a statistical signal (a bootstrap CI excluding zero, or a robust
+outlier rule). Anything stronger ("confirmed by review") is exclusively
+user-marked — the tool never asserts it. Every warning carries the numbers
+behind it plus numbered buttons that open the linked samples at full
+resolution; never judge from downscaled sheets.
+
+All signals are computed **per model and shown per model** (the section's
+ArcFace/SFace and source selectors filter the block; a muted line counts the
+warnings hidden by the filter). ArcFace and SFace are never averaged, merged
+or given a shared threshold — same rule as everywhere else. The loss-based
+convergence panel stays separate: loss is never an identity signal and never
+a drift signal.
+
+The six signals (`toolkit/identity_eval/drift.py`, pure post-processing, no
+face models — pose comes from stored landmarks):
+
+| Kind | Fires when | Method |
+|---|---|---|
+| `similarity_decline` | a later checkpoint scores below the highest-median earlier checkpoint | reuses the Phase 2b paired comparison; fires only when its bootstrap CI excludes 0 |
+| `variance_increase` | score spread (IQR) grows from the peak checkpoint | paired bootstrap of the IQR difference, CI excludes 0 (≥ 5 pairs) |
+| `train_external_divergence` | training-ref scores rise while external-ref scores stay flat or fall | earliest→latest paired CIs on both sources; the memorization signature |
+| `pose_weakness` | non-frontal samples score below frontal ones at a step | pose from the 5-point landmarks (eye–nose asymmetry ratio; no model), independent bootstrap of the median difference |
+| `narrow_generalization` | one prompt category scores far above another | pooled across checkpoints per weights kind, independent bootstrap (≥ 2 tagged categories, ≥ 6 samples each) |
+| `near_copy` | a sample's closest-reference score far exceeds its mean-reference score | `max − mean` margin above a robust cutoff (median + 3·MAD, floor 0.05, refset ≥ 4); informational |
+
+Cut-points (pose buckets frontal < 0.18 / three-quarter < 0.35 / profile on
+the asymmetry ratio, the near-copy floor, category minimums) are **provisional
+pending the Phase 2 validation set** (11.7); everything statistical rides on
+bootstrap CIs, which are deterministic (crc32-seeded like Phase 2b).
+
+Requirements and limits:
+
+- **Pose signal needs results v2**: sample faces must carry per-face `kps`
+  (landmarks are persisted since results version 2; older documents predate
+  them). Evaluations from before that skip the pose signal and get an
+  availability note — re-run the evaluation to enable it. The landmarks come
+  from the detector at scoring time; the drift pass never loads a model.
+- RAW_/EMA weights never mix (each signal runs within one weights kind).
+- Report version 3: the drift block ships inside `checkpoint_report.json`
+  under `drift` (`version`, `signals`, `notes`); the compare route rebuilds
+  older cached reports.
+
 ## Code map
 
 - `toolkit/identity_eval/` — `detector.py` (SCRFD/YuNet), `arcface.py`,
@@ -212,7 +259,8 @@ likeness rises, plateaus or fades across the run.
   verified by a real-model test), `scoring.py` (mean/max/LOO + filename
   parsing), `cache.py`, `refs.py` (discovery + selection), `device.py`
   (policy), `models.py` (discovery/status), `runner.py` (orchestration),
-  `checkpoint_compare.py` (Phase 2b report builder + convergence heuristic).
+  `checkpoint_compare.py` (Phase 2b report builder + convergence heuristic),
+  `drift.py` (Phase 2d signals + pose estimate + generic bootstrap).
 - `ui_scripts/identity_eval.py` — CLI worker (`--command refs|run|compare`).
 - `ui/src/app/api/identity-eval/` — `refs` (GET/POST), `run`, `status`,
   `cancel`, `clear`, `compare` (GET report / POST category tags) routes;
@@ -227,13 +275,16 @@ likeness rises, plateaus or fades across the run.
 ## Tests
 
 - Python: `testing/integration/test_identity_eval.py` (pure logic always
-  runs; real-model tests skip with a reason when weights/fixtures are absent)
-  and `testing/integration/test_identity_checkpoint_compare.py` (pairing,
-  bootstrap CIs, categories, convergence, CLI — always runs).
+  runs; real-model tests skip with a reason when weights/fixtures are absent),
+  `testing/integration/test_identity_checkpoint_compare.py` (pairing,
+  bootstrap CIs, categories, convergence, CLI — always runs) and
+  `testing/integration/test_identity_drift.py` (pose fixtures, each signal's
+  fire/control cases, determinism, wording rules, per-model separation).
 - UI: `ui/testing/identity-eval.test.ts` and
   `ui/testing/identity-checkpoint.test.ts` (`npx sucrase-node
   testing/<file>.test.ts`); the latter covers the retention-series builder
   (per-model separation, hollow flags for n < 5, band arrays, raw/EMA and
-  category filters).
+  category filters) and the drift helpers (filtering, hidden counts, kind
+  labels that never invent verdicts).
 - Manual checklist: run an evaluation during an active training run and
   confirm CPU was chosen and step time / VRAM are unaffected.

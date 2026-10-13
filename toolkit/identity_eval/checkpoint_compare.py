@@ -35,7 +35,9 @@ import numpy as np
 # v2: distribution_stats gained p90 (retention graph band, Phase 2c). The
 # compare route pins this version so a cached v1 report is rebuilt, never
 # served with missing p90 fields.
-REPORT_VERSION = 2
+# v3: the report gained the Phase 2d drift block (warnings, never verdicts)
+# computed by ``drift.detect_drift`` over the same results document.
+REPORT_VERSION = 3
 BOOTSTRAP_RESAMPLES = 10_000
 MIN_PAIRS_FOR_VERDICT = 3
 
@@ -403,7 +405,7 @@ def build_checkpoint_report(
     if prompt_texts:
         notes.append('Prompt texts were captured from the job config at report time; mid-run sample-config changes cannot be recovered from filenames.')
 
-    return {
+    report = {
         'version': REPORT_VERSION,
         'job': results.get('job'),
         'generated_at': _now(),
@@ -423,6 +425,12 @@ def build_checkpoint_report(
         'convergence': convergence,
         'notes': notes,
     }
+    # Phase 2d drift warnings. Imported here, not at module top: drift reads
+    # helpers from this module, so a top-level import would be circular.
+    from .drift import detect_drift
+
+    report['drift'] = detect_drift(results, report)
+    return report
 
 
 # ------------------------------------------------------- convergence (loss)

@@ -1,11 +1,15 @@
 // Checkpoint comparison (Phase 2b) pure-logic tests: verdict phrasing,
-// category sanitizing, strip domain math, prompt-index extraction and the
-// retention-graph series builder (Phase 2c).
+// category sanitizing, strip domain math, prompt-index extraction, the
+// retention-graph series builder (Phase 2c) and the drift-warning helpers
+// (Phase 2d).
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   countsLabel,
   convergencePhrase,
+  driftHiddenCount,
+  driftKindLabel,
+  driftSignals,
   excludedReasonLabel,
   buildRetentionSeries,
   fmtScore,
@@ -26,6 +30,7 @@ import {
   type CheckpointReport,
   type CheckpointStepEntry,
   type CheckpointStats,
+  type DriftSignal,
   type PairComparison,
   type PairModelComparison,
 } from '../src/utils/identityCheckpoint';
@@ -451,4 +456,81 @@ test('retentionWeightsKinds / retentionCategories enumerate what the report hold
   assert.deepEqual(retentionWeightsKinds(report({ steps: [stepEntry(1000, 0.5)] })), ['ema']);
   assert.deepEqual(retentionWeightsKinds(report({ steps: [] })), []);
   assert.deepEqual(retentionCategories(retentionReport), ['multi', 'solo', 'untagged']);
+});
+
+// ------------------------------------------------------- drift warnings (2d)
+
+const driftSignal = (over: Partial<DriftSignal>): DriftSignal => ({
+  kind: 'similarity_decline',
+  model: 'arcface',
+  source: 'training',
+  scope: { step: 2000, is_raw: false },
+  message: 'possible drift: ArcFace identity (training refs) at 2000 fell below the highest-median earlier checkpoint 1500',
+  evidence: { anchor_step: 1500, diff_median: -0.04 },
+  samples: ['a.jpg', 'b.jpg'],
+  ...over,
+});
+
+test('driftSignals filters by model and source, cross-source signals always shown', () => {
+  const doc = report({
+    drift: {
+      version: 1,
+      signals: [
+        driftSignal({}), // arcface / training
+        driftSignal({ kind: 'pose_weakness', model: 'arcface', source: 'external' }),
+        driftSignal({ kind: 'near_copy', model: 'sface', source: 'training' }),
+        driftSignal({ kind: 'train_external_divergence', model: 'sface', source: null }),
+      ],
+      notes: [],
+    },
+  });
+  assert.deepEqual(
+    driftSignals(doc, 'arcface', 'training').map(s => s.kind),
+    ['similarity_decline'],
+  );
+  // divergence has no single source -> visible under every source filter
+  assert.deepEqual(
+    driftSignals(doc, 'sface', 'external').map(s => s.kind),
+    ['train_external_divergence'],
+  );
+  assert.deepEqual(driftSignals(doc, 'sface', 'training').map(s => s.kind), ['near_copy', 'train_external_divergence']);
+});
+
+test('driftSignals: missing drift block and empty signals yield empty lists', () => {
+  assert.deepEqual(driftSignals(report({}), 'arcface', 'training'), []);
+  assert.deepEqual(driftSignals(report({ drift: { version: 1, signals: [], notes: [] } }), 'arcface', 'training'), []);
+});
+
+test('driftHiddenCount counts everything the filter removed', () => {
+  const doc = report({
+    drift: {
+      version: 1,
+      signals: [
+        driftSignal({}),
+        driftSignal({ model: 'sface' }),
+        driftSignal({ kind: 'pose_weakness', source: 'external' }),
+      ],
+      notes: [],
+    },
+  });
+  assert.equal(driftHiddenCount(doc, 'arcface', 'training'), 2);
+  assert.equal(driftHiddenCount(doc, 'sface', 'training'), 2);
+  assert.equal(driftHiddenCount(doc, 'arcface', 'external'), 2);
+});
+
+test('driftKindLabel maps every shipped kind, never invents verdicts', () => {
+  for (const kind of [
+    'similarity_decline',
+    'variance_increase',
+    'train_external_divergence',
+    'pose_weakness',
+    'narrow_generalization',
+    'near_copy',
+  ] as const) {
+    const label = driftKindLabel(kind);
+    assert.ok(label.length > 0 && label !== kind);
+    assert.ok(!label.toLowerCase().includes('best'));
+    assert.ok(!label.toLowerCase().includes('confirmed'));
+  }
+  assert.equal(driftKindLabel('future_kind'), 'future_kind');
 });

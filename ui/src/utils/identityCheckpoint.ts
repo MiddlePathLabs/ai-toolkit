@@ -66,6 +66,34 @@ export interface ConvergenceSummary {
   source: string;
 }
 
+export type DriftSignalKind =
+  | 'similarity_decline'
+  | 'variance_increase'
+  | 'train_external_divergence'
+  | 'pose_weakness'
+  | 'narrow_generalization'
+  | 'near_copy';
+
+// One Phase 2d drift warning. Always per model (never a blend), always
+// statistical ("possible drift" wording lives in the message text), always
+// with the numbers behind it and sample filenames for full-res review.
+export interface DriftSignal {
+  kind: DriftSignalKind;
+  model: string;
+  // null for cross-source signals (training-vs-external divergence)
+  source: string | null;
+  scope: { step: number; is_raw: boolean } | null;
+  message: string;
+  evidence: Record<string, unknown>;
+  samples: string[];
+}
+
+export interface DriftReport {
+  version: number;
+  signals: DriftSignal[];
+  notes: string[];
+}
+
 export interface CheckpointReport {
   version: number;
   job: string;
@@ -80,6 +108,7 @@ export interface CheckpointReport {
   steps: CheckpointStepEntry[];
   pairs: PairComparison[];
   convergence: ConvergenceSummary | null;
+  drift?: DriftReport | null;
   notes: string[];
 }
 
@@ -379,4 +408,41 @@ export function buildRetentionSeries(
     }
     return { model, xs, median, p10, p90, n, sparse, loo: report.refsets?.[source]?.loo?.[model] ?? null };
   });
+}
+
+// --------------------------------------------------------- drift warnings (2d)
+
+// The checkpoint section shows one model/source at a time (the header
+// toggle), so the warnings block filters to that selection. Cross-source
+// signals (training-vs-external divergence carries source: null) are always
+// shown; the hidden count keeps the other model/source's warnings discoverable
+// instead of silently dropped. Per-model presentation is a spec rule: ArcFace
+// and SFace warnings are never merged.
+export function driftSignals(report: CheckpointReport, model: string, source: string): DriftSignal[] {
+  return (report.drift?.signals ?? []).filter(
+    signal => signal.model === model && (signal.source === null || signal.source === source),
+  );
+}
+
+export function driftHiddenCount(report: CheckpointReport, model: string, source: string): number {
+  return (report.drift?.signals ?? []).length - driftSignals(report, model, source).length;
+}
+
+export function driftKindLabel(kind: DriftSignalKind | string): string {
+  switch (kind) {
+    case 'similarity_decline':
+      return 'identity decline';
+    case 'variance_increase':
+      return 'score spread growth';
+    case 'train_external_divergence':
+      return 'training vs external divergence';
+    case 'pose_weakness':
+      return 'pose-dependent scoring';
+    case 'narrow_generalization':
+      return 'narrow generalization';
+    case 'near_copy':
+      return 'possible near-copies';
+    default:
+      return kind;
+  }
 }
