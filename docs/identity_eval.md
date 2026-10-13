@@ -287,4 +287,5 @@ Requirements and limits:
   category filters) and the drift helpers (filtering, hidden counts, kind
   labels that never invent verdicts).
 - Manual checklist: run an evaluation during an active training run and
-  confirm CPU was chosen and step time / VRAM are unaffected.
+  confirm CPU was chosen and step time / VRAM are unaffected — verified
+  live, user-confirmed 2026-10-13.
