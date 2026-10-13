@@ -23,6 +23,7 @@ import pytest
 from toolkit.identity_eval import (
     EmbeddingCache,
     FaceDetector,
+    IdentityEvalRunner,
     choose_device,
     discover_training_refs,
     load_selection,
@@ -34,9 +35,9 @@ from toolkit.identity_eval import (
 )
 from toolkit.identity_eval.cache import CACHE_VERSION
 from toolkit.identity_eval.device import parse_gpu_ids, read_job_gpu_state
-from toolkit.identity_eval.detector import DetectedFace
+from toolkit.identity_eval.detector import DetectedFace, ort_cuda_providers
 from toolkit.identity_eval.models import find_arcface, find_sface
-from toolkit.identity_eval.refs import prune_selection
+from toolkit.identity_eval.refs import canonical_ref_key, prune_selection
 from toolkit.identity_eval.runner import try_load
 from toolkit.identity_eval.sface import yunet_row
 
@@ -240,6 +241,13 @@ class TestSelection:
         assert set(pruned['training_refs']) == {'/y/2.jpg'}
         assert set(pruned['external_refs']) == {'abc'}
 
+    def test_canonical_key_matches_ui_contract(self):
+        # the panel writes / selectionForImage reads the same form in TS
+        # (normalizeRefPath); the worker must look up the identical string
+        assert canonical_ref_key(r'E:\Data\MixedCase\Img.JPG') == 'e:/data/mixedcase/img.jpg'
+        assert canonical_ref_key('/home/user/refs/pic.png') == '/home/user/refs/pic.png'
+        assert canonical_ref_key('/odd//trail/') == '/odd/trail'
+
     def test_corrupt_resets(self, tmp_path):
         path = str(tmp_path / 'selection.json')
         open(path, 'w').write('{not json')
@@ -321,14 +329,16 @@ class TestDevice:
         con.execute('CREATE TABLE Job (name TEXT, gpu_ids TEXT, status TEXT)')
         con.executemany(
             'INSERT INTO Job VALUES (?, ?, ?)',
-            [('mine', '0', 'completed'), ('other', '0', 'running'), ('elsewhere', '1', 'running')],
+            [('mine', '0', 'completed'), ('other', '0', 'running'), ('solo', '1', 'completed'), ('selfrun', '2', 'running')],
         )
         con.commit()
         con.close()
         running, gpus = read_job_gpu_state(db, 'mine')
         assert running is True and gpus == [0]  # 'other' runs on the same gpu
-        running, gpus = read_job_gpu_state(db, 'elsewhere')
-        assert running is False and gpus == [1]  # only gpu 1 in own set
+        running, gpus = read_job_gpu_state(db, 'solo')
+        assert running is False and gpus == [1]  # the only running job is on gpu 2
+        running, gpus = read_job_gpu_state(db, 'selfrun')
+        assert running is True  # the queried job itself counts: eval of a training job's samples must use CPU
 
     def test_no_running_job_is_not_busy(self, tmp_path):
         db = str(tmp_path / 'aitk.db')
@@ -355,6 +365,14 @@ class TestDevice:
         model, error = try_load(loader, 'ArcFace', 'cuda', warnings.append)
         assert model == 'model-on-cpu' and error is None
         assert any('CUDA' in w for w in warnings)
+
+    def test_cuda_providers_target_selected_gpu(self):
+        providers = ort_cuda_providers(1)
+        assert providers[0][0] == 'CUDAExecutionProvider'
+        assert providers[0][1]['device_id'] == 1  # matches the GPU free VRAM was checked on
+        assert providers[0][1]['gpu_mem_limit'] == 2 * 1024 ** 3
+        assert providers[0][1]['arena_extend_strategy'] == 'kSameAsRequested'
+        assert providers[-1] == 'CPUExecutionProvider'
 
     def test_cpu_failure_is_error_not_fallback(self):
         def loader(device):
@@ -512,6 +530,65 @@ def _face_from_kps(kps):
     return _KpsFace(np.asarray(kps, dtype=np.float32))
 
 
+# ---------------------------------------------------- model-change resilience
+
+
+class _FakeEmbedder:
+    def __init__(self, sig):
+        self.model_sig = sig
+
+
+class TestModelChangeResilience:
+    """Installing a recognition model after discovery must refresh, not crash."""
+
+    def _runner(self, tmp_path):
+        runner = IdentityEvalRunner(job_name='j', output_root=str(tmp_path))
+        runner._embedders = lambda: {'arcface': _FakeEmbedder('arcface:a'), 'sface': _FakeEmbedder('sface:b')}
+        return runner
+
+    def test_refs_missing_models_detection(self, tmp_path):
+        runner = self._runner(tmp_path)
+        refs_doc = {
+            'training': {'images': [{'faces': [{'embeddings': {'arcface:a': [0.1]}}]}]},
+            'external': {'images': []},
+        }
+        assert runner._refs_missing_models(refs_doc) is True  # sface installed after discovery
+        refs_doc['training']['images'][0]['faces'][0]['embeddings']['sface:b'] = [0.2]
+        assert runner._refs_missing_models(refs_doc) is False
+
+    def test_refset_skips_faces_missing_a_model(self, tmp_path):
+        runner = self._runner(tmp_path)
+        face_both = {'index': 0, 'bbox': [0, 0, 1, 1], 'det_score': 0.9,
+                     'embeddings': {'arcface:a': [1.0, 0.0], 'sface:b': [0.0, 1.0]}}
+        face_arc_only = {'index': 0, 'bbox': [0, 0, 1, 1], 'det_score': 0.9,
+                         'embeddings': {'arcface:a': [1.0, 0.0]}}
+        images = [
+            {'path': 'x/a.jpg', 'name': 'a.jpg', 'sha': 's1', 'status': 'ok', 'faces': [face_both]},
+            {'path': 'x/b.jpg', 'name': 'b.jpg', 'sha': 's2', 'status': 'ok', 'faces': [face_arc_only]},
+        ]
+        refset = runner._build_refset(images, {}, 'training')
+        assert refset is not None
+        assert refset['n'] == 1
+        assert refset['skipped']['error'] == 1  # skipped, not a KeyError
+        assert set(refset['matrices']) == {'arcface', 'sface'}
+
+    def test_selection_exclusion_round_trip_canonical_key(self, tmp_path):
+        """An exclusion saved under the canonical key must be honoured by the
+        worker lookup (regression guard for the P1 path-key mismatch)."""
+        runner = self._runner(tmp_path)
+        face = {'index': 0, 'bbox': [0, 0, 1, 1], 'det_score': 0.9,
+                'embeddings': {'arcface:a': [1.0, 0.0], 'sface:b': [0.0, 1.0]}}
+        images = [
+            {'path': r'E:\Data\MixedCase\a.JPG', 'name': 'a.JPG', 'sha': 's1', 'status': 'ok', 'faces': [face]},
+        ]
+        # key as the UI writes it (normalizeRefPath form)
+        selection = {canonical_ref_key(r'E:\Data\MixedCase\a.JPG'): {'excluded': True}}
+        refset = runner._build_refset(images, selection, 'training')
+        assert refset is None  # excluded -> empty reference set, not silently included
+        refset = runner._build_refset(images, {}, 'training')
+        assert refset is not None and refset['n'] == 1
+
+
 # ------------------------------------------------------- worker end-to-end
 
 
@@ -572,7 +649,7 @@ class TestWorkerEndToEnd:
         assert lines[-1]['refs']['counts']['external']['total'] == 3
         refs_doc = json.load(open(os.path.join(scratch_job.root, scratch_job.name, 'identity_eval', 'refs.json')))
         assert refs_doc['models']['arcface']['active'] is True
-        assert refs_doc['models']['sface']['active'] is False  # not installed locally
+        assert refs_doc['models']['sface']['active'] == find_sface(os.path.join(REPO_ROOT, 'models', 'face')).available
 
         args_file = os.path.join(scratch_job.root, 'args.json')
         json.dump({'samples': scratch_job.samples}, open(args_file, 'w'))

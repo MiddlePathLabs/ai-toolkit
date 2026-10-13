@@ -107,6 +107,7 @@ class IdentityEvalRunner:
 
         # populated by _load_models
         self.device: Optional[str] = None
+        self.gpu_id: int = 0
         self.device_warnings: List[str] = []
         self.detector: Optional[FaceDetector] = None
         self.arcface: Optional[ArcFaceEmbedder] = None
@@ -123,15 +124,17 @@ class IdentityEvalRunner:
         """
         if self.detector is not None:
             return
-        device, warnings = resolve_device(self.device_mode, self.db_path, self.job_name)
+        device, warnings, gpu_id = resolve_device(self.device_mode, self.db_path, self.job_name)
         self.device_warnings = list(warnings)
         self.device = device
+        self.gpu_id = gpu_id
 
         def make_detector(dev):
             return FaceDetector(
                 device=dev,
                 insightface_root=self.insightface_root,
                 models_dir=self.models_dir,
+                gpu_id=self.gpu_id,
             )
 
         detector, error = try_load(make_detector, 'face detector', device, self.device_warnings.append)
@@ -144,7 +147,7 @@ class IdentityEvalRunner:
         arcface_status = find_arcface(self.insightface_root)
         if arcface_status.available:
             embedder, error = try_load(
-                lambda dev: ArcFaceEmbedder(device=dev, insightface_root=self.insightface_root),
+                lambda dev: ArcFaceEmbedder(device=dev, insightface_root=self.insightface_root, gpu_id=self.gpu_id),
                 'ArcFace',
                 device,
                 self.device_warnings.append,
@@ -156,7 +159,7 @@ class IdentityEvalRunner:
         sface_status = find_sface(self.models_dir)
         if sface_status.available:
             embedder, error = try_load(
-                lambda dev: SFaceEmbedder(self.models_dir, device=dev),
+                lambda dev: SFaceEmbedder(self.models_dir, device=dev, gpu_id=self.gpu_id),
                 'SFace',
                 device,
                 self.device_warnings.append,
@@ -180,6 +183,18 @@ class IdentityEvalRunner:
         if self.sface is not None:
             out['sface'] = self.sface
         return out
+
+    def _refs_missing_models(self, refs_doc: dict) -> bool:
+        """True when any reference face lacks an embedding for a currently
+        active model (discovery predates installing that model)."""
+        signatures = [embedder.model_sig for embedder in self._embedders().values()]
+        for source in ('training', 'external'):
+            for record in refs_doc.get(source, {}).get('images', []):
+                for face in record.get('faces', []):
+                    embeddings = face.get('embeddings') or {}
+                    if any(sig not in embeddings for sig in signatures):
+                        return True
+        return False
 
     def _models_report(self) -> dict:
         arcface_status = find_arcface(self.insightface_root)
@@ -335,7 +350,7 @@ class IdentityEvalRunner:
             'version': RESULTS_VERSION,
             'job': self.job_name,
             'generated_at': _now(),
-            'device': {'requested': self.device_mode, 'resolved': self.device, 'warnings': self.device_warnings},
+            'device': {'requested': self.device_mode, 'resolved': self.device, 'gpu': self.gpu_id, 'warnings': self.device_warnings},
             'models': self._models_report(),
             'training': {'datasets': training['datasets'], 'images': training_images, 'warnings': training['warnings']},
             'external': {'images': external_images},
@@ -349,14 +364,18 @@ class IdentityEvalRunner:
     # ------------------------------------------------------------------ run
 
     def _build_refset(self, images: List[dict], selection_entries: dict, source: str) -> Optional[dict]:
-        """Reference matrices per model from discovery records + selection."""
+        """Reference matrices per model from discovery records + selection.
+
+        Training-ref selection keys use :func:`canonical_ref_key` -- the
+        same lowercase/forward-slash form the UI writes and reads.
+        """
         embedders = self._embedders()
         vectors: Dict[str, List[np.ndarray]] = {name: [] for name in embedders}
         included = 0
         skipped = {'excluded': 0, 'needs_review': 0, 'no_face': 0, 'error': 0}
         hash_parts = []
         for record in images:
-            key = record['name'] if source == 'external' else os.path.normcase(os.path.normpath(record['path']))
+            key = record['name'] if source == 'external' else refs_mod.canonical_ref_key(record['path'])
             choice = selection_entries.get(key) or {}
             if choice.get('excluded'):
                 skipped['excluded'] += 1
@@ -374,7 +393,11 @@ class IdentityEvalRunner:
                 face_index = 0
             face_entry = record['faces'][face_index]
             face_vectors = self._face_vectors(face_entry)
-            if not face_vectors:
+            # every active model must have an embedding for this face; a
+            # record missing one is skipped, not crashed on (stale refs.json
+            # after installing a model is refreshed before we get here, so
+            # this only catches unreadable images)
+            if not face_vectors or any(name not in face_vectors for name in embedders):
                 skipped['error'] += 1
                 continue
             for name in embedders:
@@ -405,6 +428,13 @@ class IdentityEvalRunner:
         refs_doc = _read_json(self.refs_path)
         if not refs_doc:
             raise RuntimeError('no reference discovery found; run refs discovery first')
+        if self._refs_missing_models(refs_doc):
+            # e.g. SFace was installed after discovery: reference records
+            # predate the newly active model. Re-run discovery (cache-first,
+            # only the missing model's embeddings are computed) instead of
+            # crashing on the stale records.
+            self.emit({'type': 'progress', 'phase': 'refs', 'done': 0, 'total': 0, 'reason': 'newly active model; refreshing reference embeddings'})
+            refs_doc = self.discover_refs()
         if not sample_paths:
             raise ValueError('no samples to evaluate')
 
@@ -438,7 +468,7 @@ class IdentityEvalRunner:
             'updated_at': started,
             'completed': False,
             'sources': active_sources,
-            'device': {'requested': self.device_mode, 'resolved': self.device, 'warnings': self.device_warnings},
+            'device': {'requested': self.device_mode, 'resolved': self.device, 'gpu': self.gpu_id, 'warnings': self.device_warnings},
             'models': self._models_report(),
             'refsets': {
                 name: (

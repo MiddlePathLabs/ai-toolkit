@@ -10,6 +10,7 @@ import {
   overlayInfo,
   rankDisagreements,
   sampleScore,
+  selectionForImage,
   sortPathsByScore,
   type IdentitySampleResult,
   type IdentitySelection,
@@ -178,6 +179,22 @@ test('selection merge round-trips exclusions and face picks', () => {
   const sanitized = mergeSelection(withExternal, { trainingRefs: { bad: { face_index: 99 } as never, worse: 'nope' as never } });
   assert.equal('bad' in sanitized.training_refs, false);
   assert.equal('worse' in sanitized.training_refs, false);
+});
+
+test('selection keys round-trip between panel writes and the reader', () => {
+  // the panel writes under normalizeRefPath(path); selectionForImage must
+  // read the same entry back from the raw path (same canonical form the
+  // worker's canonical_ref_key uses)
+  const rawPath = 'E:\\Data\\MixedCase\\Img.JPG';
+  const selection = mergeSelection({ version: 1, training_refs: {}, external_refs: {} }, {
+    trainingRefs: { [normalizeRefPath(rawPath)]: { face_index: 1, excluded: false } },
+  });
+  const read = selectionForImage(selection, { path: rawPath, name: 'Img.JPG' }, 'training');
+  assert.equal(read.face_index, 1);
+  assert.equal(read.excluded, false);
+  // external refs key on the sha filename, no path normalization involved
+  const withExternal = mergeSelection(selection, { externalRefs: { abc: { excluded: true } } });
+  assert.equal(selectionForImage(withExternal, { path: '/x/abc.jpg', name: 'abc' }, 'external').excluded, true);
 });
 
 test('ref path normalization matches the worker keys', () => {

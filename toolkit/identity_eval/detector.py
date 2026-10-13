@@ -26,6 +26,21 @@ DET_THRESHOLD = 0.5
 # are not silently reused across incompatible orders.
 FACE_ORDER_VERSION = 2
 
+# CUDA ORT arena cap: enough for SCRFD/ArcFace inference while never
+# starving a training job on the same GPU.
+CUDA_ARENA_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def ort_cuda_providers(gpu_id: int = 0) -> list:
+    """CUDA-first provider list capped to a small arena, targeting the
+    policy-selected GPU (must match the GPU free VRAM was checked on)."""
+    cuda_options = {
+        'device_id': int(gpu_id),
+        'gpu_mem_limit': CUDA_ARENA_LIMIT_BYTES,
+        'arena_extend_strategy': 'kSameAsRequested',
+    }
+    return [('CUDAExecutionProvider', cuda_options), 'CPUExecutionProvider']
+
 
 @dataclass
 class DetectedFace:
@@ -65,8 +80,10 @@ class FaceDetector:
         det_size: Tuple[int, int] = DET_SIZE,
         insightface_root: Optional[str] = None,
         models_dir: Optional[str] = None,
+        gpu_id: int = 0,
     ):
         self.device = device
+        self.gpu_id = int(gpu_id)
         self.det_size = tuple(int(v) for v in det_size)
         self._arcface_status = find_arcface(insightface_root)
         self._yunet_status = find_yunet(models_dir) if models_dir else find_yunet(os.path.join(os.getcwd(), 'models', 'face'))
@@ -97,14 +114,7 @@ class FaceDetector:
 
     def _ort_providers(self):
         if self.device == 'cuda':
-            cuda_options = {
-                'device_id': 0,
-                # cap the ORT arena so a concurrent training job is not
-                # starved by the eval worker (Section 5 GPU policy)
-                'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
-                'arena_extend_strategy': 'kSameAsRequested',
-            }
-            return [('CUDAExecutionProvider', cuda_options), 'CPUExecutionProvider']
+            return ort_cuda_providers(self.gpu_id)
         return ['CPUExecutionProvider']
 
     def _init_scrfd(self):

@@ -25,8 +25,20 @@ SELECTION_VERSION = 1
 _CONTROL_OR_MASK_KEY = re.compile(r'^(control_path|mask_path)(_\d+)?$')
 
 
+def canonical_ref_key(path: str) -> str:
+    """Canonical selection key for a training-ref path.
+
+    Contract shared with the UI (``normalizeRefPath`` in
+    ``ui/src/utils/identityEval.ts``): lowercase, forward slashes,
+    normalized. Selection writes, UI reads and worker lookups all use
+    this exact form so exclusions and face picks survive the round-trip
+    on case-insensitive (Windows) and case-sensitive platforms alike.
+    """
+    return os.path.normcase(os.path.normpath(path)).replace(os.sep, '/')
+
+
 def _normalize(path: str) -> str:
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    return canonical_ref_key(path)
 
 
 def _iter_dataset_images(folder: str) -> List[str]:
@@ -113,7 +125,8 @@ def discover_training_refs(job_config: Optional[dict]) -> dict:
         kept = []
         for image in all_images:
             normalized = _normalize(image)
-            if any(normalized == d or normalized.startswith(d + os.sep) for d in excluded_dirs):
+            # canonical keys use forward slashes, so the child-of check does too
+            if any(normalized == d or normalized.startswith(d + '/') for d in excluded_dirs):
                 continue
             kept.append(image)
         out['excluded_by_control_mask'] = len(all_images) - len(kept)

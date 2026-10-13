@@ -46,12 +46,18 @@ def cuda_target_available() -> bool:
 
 
 class SFaceEmbedder:
-    def __init__(self, models_dir: str, device: str = 'cpu'):
+    def __init__(self, models_dir: str, device: str = 'cpu', gpu_id: int = 0):
         self.status = find_sface(models_dir)
         if not self.status.available:
             raise RuntimeError(self.status.reason)
         self.device = 'cpu'
-        if device == 'cuda' and cuda_target_available():
+        if device == 'cuda' and gpu_id != 0:
+            # OpenCV DNN's CUDA target has no per-device selection and always
+            # uses device 0; never silently evaluate on an unchecked GPU.
+            self.status.notes.append(
+                f'OpenCV DNN CUDA always targets device 0; SFace runs on CPU (selected GPU is {gpu_id})'
+            )
+        elif device == 'cuda' and cuda_target_available():
             self.device = 'cuda'
         elif device == 'cuda':
             self.status.notes.append('CUDA DNN target unavailable in this OpenCV build; SFace runs on CPU')
@@ -62,11 +68,18 @@ class SFaceEmbedder:
 
     @property
     def model_sig(self) -> str:
-        return f'sface:{self.status.file_hash}:{self.device}'
+        # Weights-hash only: the embedding model itself is device-independent
+        # for cache purposes, and a device suffix would needlessly invalidate
+        # embeddings when auto mode flips between CUDA and CPU.
+        return f'sface:{self.status.file_hash}'
 
     def embed(self, img_bgr: np.ndarray, face: DetectedFace) -> np.ndarray:
         """Aligned, L2-normalized embedding for one detected face."""
         aligned = self._recognizer.alignCrop(img_bgr, yunet_row(face))
-        feature = self._recognizer.feature(aligned)
-        feature = self._recognizer.normL2(feature)
-        return np.asarray(feature, dtype=np.float64).flatten()
+        feature = np.asarray(self._recognizer.feature(aligned), dtype=np.float64).flatten()
+        # some OpenCV builds (4.11 windows wheel) omit the normL2 binding;
+        # plain L2 normalization is the same math
+        norm = np.linalg.norm(feature)
+        if norm > 0:
+            feature = feature / norm
+        return feature

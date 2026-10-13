@@ -11,14 +11,14 @@ from typing import Optional
 
 import numpy as np
 
-from .detector import DetectedFace
+from .detector import DetectedFace, ort_cuda_providers
 from .models import ARCFACE_REC_FILE, find_arcface
 
 ARCFACE_DIM = 512
 
 
 class ArcFaceEmbedder:
-    def __init__(self, device: str = 'cpu', insightface_root: Optional[str] = None):
+    def __init__(self, device: str = 'cpu', insightface_root: Optional[str] = None, gpu_id: int = 0):
         self.status = find_arcface(insightface_root)
         if not self.status.available:
             raise RuntimeError(self.status.reason)
@@ -26,12 +26,7 @@ class ArcFaceEmbedder:
 
         providers = ['CPUExecutionProvider']
         if device == 'cuda':
-            cuda_options = {
-                'device_id': 0,
-                'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
-                'arena_extend_strategy': 'kSameAsRequested',
-            }
-            providers = [('CUDAExecutionProvider', cuda_options), 'CPUExecutionProvider']
+            providers = ort_cuda_providers(gpu_id)
         self._model = model_zoo.get_model(os.path.join(self.status.path, ARCFACE_REC_FILE), providers=providers)
         ctx_id = 0 if device == 'cuda' else -1
         self._model.prepare(ctx_id)

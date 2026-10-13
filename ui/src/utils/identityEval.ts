@@ -50,7 +50,7 @@ export interface IdentityResults {
   created_at: string;
   updated_at: string;
   sources: IdentitySource[];
-  device?: { requested?: string; resolved?: string; warnings?: string[] };
+  device?: { requested?: string; resolved?: string; gpu?: number; warnings?: string[] };
   models?: Record<string, { active?: boolean; available?: boolean; reason?: string | null }>;
   refsets: Partial<Record<IdentitySource | 'combined', IdentityRefset | null>>;
   samples: IdentitySampleResult[];
@@ -284,7 +284,9 @@ export function selectionForImage(
   return map[key] ?? {};
 }
 
-// Training-ref keys are normalized like the worker's (normcase + normpath).
+// Training-ref keys are the canonical selection-key contract shared with the
+// worker's canonical_ref_key (normcase + normpath + forward slashes): the
+// panel writes, this reader and the Python lookup all use this exact form.
 export function normalizeRefPath(path: string): string {
   const forward = path.replace(/\\/g, '/').toLowerCase();
   // collapse duplicate slashes; strip trailing slash (posix normpath behaviour)

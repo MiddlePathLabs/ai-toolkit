@@ -55,8 +55,10 @@ def parse_gpu_ids(raw: Optional[str]) -> List[int]:
 def read_job_gpu_state(db_path: Optional[str], job_name: str) -> Tuple[Optional[bool], List[int]]:
     """(job_running_on_job_gpu, job_gpu_ids) from the SQLite Job table.
 
-    Returns (None, []) when the DB is unreadable so callers treat GPU
-    state as unknown.
+    The queried job itself counts: evaluating the samples of an
+    actively-training job must fall back to CPU just like any other
+    running job on the same GPU. Returns (None, []) when the DB is
+    unreadable so callers treat GPU state as unknown.
     """
     job_gpus: List[int] = []
     if not db_path or not os.path.isfile(db_path):
@@ -77,8 +79,6 @@ def read_job_gpu_state(db_path: Optional[str], job_name: str) -> Tuple[Optional[
     if not job_gpus:
         job_gpus = [0]
     for name, gpu_ids, status in rows:
-        if name == job_name:
-            continue
         if str(status).lower() == 'running' and set(parse_gpu_ids(gpu_ids)) & set(job_gpus):
             return True, job_gpus
     return False, job_gpus
@@ -106,12 +106,18 @@ def query_free_vram_mb(gpu_id: int) -> Optional[int]:
         return None
 
 
-def resolve_device(mode: str, db_path: Optional[str], job_name: str) -> Tuple[str, List[str]]:
-    """Apply the policy with live job/VRAM state. Returns (device, warnings)."""
+def resolve_device(mode: str, db_path: Optional[str], job_name: str) -> Tuple[str, List[str], int]:
+    """Apply the policy with live job/VRAM state.
+
+    Returns (device, warnings, gpu_id) -- gpu_id is the job's first GPU
+    (default 0) and is what CUDA sessions must target, so eligibility
+    and execution always agree on the device.
+    """
     warnings: List[str] = []
     mode = (mode or 'auto').lower()
     job_running, job_gpus = read_job_gpu_state(db_path, job_name)
-    free_vram = query_free_vram_mb(job_gpus[0]) if job_gpus else None
+    gpu_id = job_gpus[0] if job_gpus else 0
+    free_vram = query_free_vram_mb(gpu_id)
     device = choose_device(mode, job_running, free_vram)
     if mode == 'auto':
         if job_running:
@@ -122,4 +128,4 @@ def resolve_device(mode: str, db_path: Optional[str], job_name: str) -> Tuple[st
             warnings.append('GPU state unavailable; using CPU')
     if mode == 'gpu' and job_running:
         warnings.append('GPU forced while a training job is running on this GPU; training may run out of VRAM')
-    return device, warnings
+    return device, warnings, gpu_id

@@ -92,16 +92,28 @@ One active evaluation per job; a second start returns the running one.
 
 Device selection (`auto` default, `gpu`/`cpu` override):
 
-1. A job is running on the job's GPU (SQLite `Job.status` + `gpu_ids`) → CPU.
+1. A job is running on the job's GPU (SQLite `Job.status` + `gpu_ids`) —
+   **including the evaluated job itself** (watching a training job's samples
+   mid-run is the normal case) → CPU.
 2. Else > 4 GB free VRAM on that GPU (nvidia-smi) → CUDA, with the ORT arena
-   capped (~2 GB, `arena_extend_strategy=kSameAsRequested`).
+   capped (~2 GB, `arena_extend_strategy=kSameAsRequested`) **on that same
+   GPU id** — the policy-checked device and the session device always agree.
 3. Else CPU. Unknown GPU state → CPU (conservative).
 4. Any CUDA init/OOM → CPU fallback recorded as a warning in the result.
 
 Forcing GPU while training runs asks for confirmation in the UI.
 `CUDA_DEVICE_ORDER=PCI_BUS_ID` is set so nvidia-smi indices match ORT device
 ids. SFace runs on CPU unless the installed OpenCV build actually has the
-CUDA DNN target (checked, not assumed — pip wheels usually don't).
+CUDA DNN target (checked, not assumed — pip wheels usually don't); OpenCV's
+CUDA target cannot select a device, so on multi-GPU hosts with a non-zero
+selected GPU, SFace stays on CPU with a recorded note.
+
+Selection keys for training references use one canonical form everywhere
+(panel writes, UI reads, worker lookups): lowercase, forward-slash,
+normalized paths (`normalizeRefPath` in the UI, `canonical_ref_key` in the
+worker). Installing a recognition model after discovery is self-healing:
+the run detects reference faces missing the new model's embeddings and
+re-runs discovery (cache-first) before scoring.
 
 ## Storage
 

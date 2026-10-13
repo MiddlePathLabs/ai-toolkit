@@ -12,6 +12,7 @@ import type { Job } from '@prisma/client';
 import type { IdentityEvalApi } from '@/hooks/useIdentityEval';
 import {
   groupSummariesByStep,
+  normalizeRefPath,
   selectionForImage,
   type IdentityRefImage,
   type IdentitySource,
@@ -219,8 +220,11 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
   const sfaceOn = Boolean(models.sface?.active);
   const activeSource: IdentitySource | 'combined' = source === 'both' ? 'combined' : source;
 
+  // Selection keys for training refs use the shared canonical form
+  // (normalizeRefPath) -- exactly what selectionForImage reads and the
+  // worker looks up, so exclusions/face picks survive the round-trip.
   const refKey = (image: IdentityRefImage, src: 'training' | 'external') =>
-    src === 'external' ? image.name : image.path;
+    src === 'external' ? image.name : normalizeRefPath(image.path);
 
   const handleToggleExclude = (src: 'training' | 'external') => (image: IdentityRefImage, excluded: boolean) => {
     const key = refKey(image, src);
