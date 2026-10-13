@@ -125,11 +125,22 @@ export default function DatasetPage({ params }: { params: Promise<{ datasetName:
             <FaChevronLeft />
           </Button>
         </div>
-        <div className="min-w-0 flex-shrink">
+        <div className="min-w-0 flex-shrink flex items-center gap-2">
           <h1 className="text-base sm:text-lg truncate">
             <span className="hidden sm:inline">Dataset: </span>
             {datasetName}
           </h1>
+          {/* Item counter: every media file in the dataset (images, videos, audio).
+              Hidden until the first successful load so it never flashes a false 0;
+              keeps the previous count during refreshes. */}
+          {(status === 'success' || imgList.length > 0) && (
+            <span
+              className="flex-shrink-0 inline-flex items-center rounded-full bg-slate-700 px-2.5 py-0.5 text-xs sm:text-sm font-medium text-gray-200"
+              title="Total media items in this dataset (images, videos, and audio)"
+            >
+              {imgList.length.toLocaleString()} {imgList.length === 1 ? 'item' : 'items'}
+            </span>
+          )}
         </div>
         <div className="flex-1"></div>
         <div className="flex-shrink-0 flex items-center gap-1 sm:gap-2">
