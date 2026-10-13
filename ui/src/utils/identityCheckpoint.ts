@@ -11,6 +11,7 @@ export interface CheckpointStats {
   p10: number | null;
   p25: number | null;
   p75: number | null;
+  p90: number | null;
   iqr: number | null;
 }
 
@@ -295,4 +296,87 @@ export function stripDomain(
 export function stripX(score: number, domain: { min: number; max: number }, width: number): number {
   const t = (score - domain.min) / (domain.max - domain.min || 1);
   return 4 + t * (width - 8);
+}
+
+// --------------------------------------------------------- retention graph (2c)
+
+// Chart data for the identity-retention graph: median similarity per training
+// step, one series per model on its own scale (ArcFace and SFace are never
+// merged onto a shared axis), with a p10-p90 band and per-point sample counts.
+// Everything here derives from the precomputed checkpoint report; no network,
+// no React -- ui/testing/identity-checkpoint.test.ts covers it.
+
+export type RetentionWeightsKind = 'ema' | 'raw';
+
+// Steps with fewer than this many evaluated samples draw as hollow points:
+// too little data for the median to mean much.
+export const RETENTION_SPARSE_N = 5;
+
+export interface RetentionModelSeries {
+  model: ScoreModel;
+  xs: number[];
+  median: (number | null)[];
+  p10: (number | null)[];
+  p90: (number | null)[];
+  n: number[];
+  // true where a median point exists but n < RETENTION_SPARSE_N (hollow)
+  sparse: boolean[];
+  loo: number | null;
+}
+
+// Which weights kinds actually carry steps (dual-save runs have both RAW_ and
+// EMA groups; plain runs only EMA). The graph never mixes them in one line.
+export function retentionWeightsKinds(report: CheckpointReport): RetentionWeightsKind[] {
+  const kinds: RetentionWeightsKind[] = [];
+  if (report.steps.some(s => !s.is_raw)) kinds.push('ema');
+  if (report.steps.some(s => s.is_raw)) kinds.push('raw');
+  return kinds;
+}
+
+// Category values that actually appear in the step breakdowns (union of
+// by_category keys), sorted; the UI prepends an "all" option.
+export function retentionCategories(report: CheckpointReport): string[] {
+  const set = new Set<string>();
+  for (const step of report.steps) {
+    for (const cat of Object.keys(step.by_category ?? {})) set.add(cat);
+  }
+  return [...set].sort();
+}
+
+export function buildRetentionSeries(
+  report: CheckpointReport,
+  source: ScoreSource,
+  weightsKind: RetentionWeightsKind,
+  category: string | null,
+): RetentionModelSeries[] {
+  const models = (['arcface', 'sface'] as const).filter(model => report.models.includes(model));
+  const statsOf = (step: CheckpointStepEntry, model: ScoreModel): CheckpointStats | null =>
+    category == null
+      ? step.stats?.[model]?.[source] ?? null
+      : step.by_category?.[category]?.[model]?.[source] ?? null;
+  // Steps of the selected weights kind where at least one model carries data
+  // for the filter -- one shared x list keeps every model's arrays aligned
+  // (uPlot requires it), and category views stay compact instead of padding
+  // gaps for steps that never had that category.
+  const steps = report.steps.filter(
+    step => step.is_raw === (weightsKind === 'raw') && (category == null || models.some(model => statsOf(step, model) != null)),
+  );
+  return models.map(model => {
+    const xs: number[] = [];
+    const median: (number | null)[] = [];
+    const p10: (number | null)[] = [];
+    const p90: (number | null)[] = [];
+    const n: number[] = [];
+    const sparse: boolean[] = [];
+    for (const step of steps) {
+      xs.push(step.step);
+      const stats = statsOf(step, model);
+      median.push(stats?.median ?? null);
+      p10.push(stats?.p10 ?? null);
+      p90.push(stats?.p90 ?? null);
+      n.push(stats?.n ?? 0);
+      sparse.push(stats?.median != null && (stats?.n ?? 0) < RETENTION_SPARSE_N);
+    }
+    return { model, xs, median, p10, p90, n, sparse, loo: report.refsets?.[source]?.loo?.[model] ?? null };
+  });
 }

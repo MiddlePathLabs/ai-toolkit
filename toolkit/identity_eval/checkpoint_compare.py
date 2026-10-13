@@ -32,7 +32,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-REPORT_VERSION = 1
+# v2: distribution_stats gained p90 (retention graph band, Phase 2c). The
+# compare route pins this version so a cached v1 report is rebuilt, never
+# served with missing p90 fields.
+REPORT_VERSION = 2
 BOOTSTRAP_RESAMPLES = 10_000
 MIN_PAIRS_FOR_VERDICT = 3
 
@@ -103,17 +106,22 @@ def score_of(sample: dict, model: str, source: str) -> Optional[float]:
 
 
 def distribution_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
-    """median / p10 / IQR for a score distribution; empty input -> all None."""
+    """median / p10 / p90 / IQR for a score distribution; empty input -> all None.
+
+    p10/p90 feed the retention graph's shaded band (Phase 2c); the paired
+    comparisons never read them.
+    """
     if not values:
-        return {'n': 0, 'median': None, 'p10': None, 'p25': None, 'p75': None, 'iqr': None}
+        return {'n': 0, 'median': None, 'p10': None, 'p25': None, 'p75': None, 'p90': None, 'iqr': None}
     array = np.asarray(values, dtype=float)
-    p10, p25, p50, p75 = np.percentile(array, [10, 25, 50, 75])
+    p10, p25, p50, p75, p90 = np.percentile(array, [10, 25, 50, 75, 90])
     return {
         'n': int(array.size),
         'median': round(float(p50), 3),
         'p10': round(float(p10), 3),
         'p25': round(float(p25), 3),
         'p75': round(float(p75), 3),
+        'p90': round(float(p90), 3),
         'iqr': round(float(p75 - p25), 3),
     }
 

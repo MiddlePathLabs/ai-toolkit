@@ -175,6 +175,36 @@ The report is recomputed by the `compare` worker command whenever
 `checkpoint_report.json` otherwise. ArcFace and SFace are never averaged or
 share a scale anywhere in the report.
 
+## Identity retention graph (Phase 2c)
+
+Compact uPlot chart at the top of the checkpoint section: median primary
+score per training step over the whole evaluation, so you can see where
+likeness rises, plateaus or fades across the run.
+
+- **Two series, two scales, always:** ArcFace on its own left axis, SFace on
+  its own right axis. The models' cosine scales are incomparable, so a shared
+  y-axis would imply an equivalence that does not exist; there is also **no
+  composite series** (Phase 2a calibration has not shipped, so no combined
+  score is drawn anywhere).
+- **Band:** shaded 10th–90th percentile of the sample distribution at each
+  step (`distribution_stats` computes p90 for this; report version 2). Hover
+  anywhere to read the step, both models' medians, n per point, the band and
+  the LOO value.
+- **Sparse points:** steps with fewer than 5 evaluated samples draw as hollow
+  rings — the median is noise-level there.
+- **LOO guide:** a dashed horizontal line per model at the reference
+  self-similarity (leave-one-out) value for the selected reference source,
+  labeled in the legend.
+- **Filters:** reference source follows the section's training/external
+  selector; a prompt-category filter (from the tags below) and, on dual-save
+  runs, an EMA/raw weights selector — raw and EMA are never mixed into one
+  line.
+- **Click a point** to filter the Samples grid to that step; click a sample
+  in the grid or a strip dot to open it full-size (`SampleImageViewer`).
+- Data comes entirely from the cached checkpoint report (pure post-processing,
+  no face models); the compare route rebuilds any report older than the
+  current `REPORT_VERSION` so v1 caches lacking p90 are refreshed, not served.
+
 ## Code map
 
 - `toolkit/identity_eval/` — `detector.py` (SCRFD/YuNet), `arcface.py`,
@@ -189,8 +219,9 @@ share a scale anywhere in the report.
   shared helpers in `ui/src/server/identityEval.ts`.
 - UI: `IdentityEvalPanel.tsx` (side panel), `IdentityScoreOverlay.tsx`
   (card overlay), `IdentityCheckpointSection.tsx` (Phase 2b section),
-  `useIdentityEval.ts` (state/actions), pure logic in
-  `ui/src/utils/identityEval.ts` and `ui/src/utils/identityCheckpoint.ts`;
+  `IdentityRetentionGraph.tsx` (Phase 2c chart), `useIdentityEval.ts`
+  (state/actions), pure logic in `ui/src/utils/identityEval.ts` and
+  `ui/src/utils/identityCheckpoint.ts` (retention-series builder included);
   sorting + overlays integrated in `SampleImages.tsx` / `SampleImageCard.tsx`.
 
 ## Tests
@@ -201,6 +232,8 @@ share a scale anywhere in the report.
   bootstrap CIs, categories, convergence, CLI — always runs).
 - UI: `ui/testing/identity-eval.test.ts` and
   `ui/testing/identity-checkpoint.test.ts` (`npx sucrase-node
-  testing/<file>.test.ts`).
+  testing/<file>.test.ts`); the latter covers the retention-series builder
+  (per-model separation, hollow flags for n < 5, band arrays, raw/EMA and
+  category filters).
 - Manual checklist: run an evaluation during an active training run and
   confirm CPU was chosen and step time / VRAM are unaffected.

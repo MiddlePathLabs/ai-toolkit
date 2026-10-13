@@ -239,9 +239,10 @@ interface IdentityEvalPanelProps {
   samplePaths: string[];
   onClose: () => void;
   onOpenSample: (path: string) => void;
+  onFilterStep: (step: number) => void;
 }
 
-export default function IdentityEvalPanel({ job, identity, samplePaths, onClose, onOpenSample }: IdentityEvalPanelProps) {
+export default function IdentityEvalPanel({ job, identity, samplePaths, onClose, onOpenSample, onFilterStep }: IdentityEvalPanelProps) {
   const { refs, selection, results, progress, running, loading, error, source, report, reportLoading } = identity;
   const [deviceMode, setDeviceMode] = useState<'auto' | 'gpu' | 'cpu'>('auto');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -606,6 +607,7 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
               const sample = identity.index.get(filename);
               if (sample) onOpenSample(sample.path);
             }}
+            onFilterStep={onFilterStep}
           />
         )}
 

@@ -63,9 +63,16 @@ class TestStats:
         assert stats['p75'] == pytest.approx(0.4)
         assert stats['iqr'] == pytest.approx(0.2, abs=1e-6)
         assert 0.1 <= stats['p10'] <= stats['p25']
+        # p90 (retention-graph band, Phase 2c): linear percentile of the ramp
+        assert stats['p90'] == pytest.approx(0.46)
+        assert stats['p75'] <= stats['p90'] <= 0.5
 
     def test_distribution_stats_empty(self):
-        assert cc.distribution_stats([]) == {'n': 0, 'median': None, 'p10': None, 'p25': None, 'p75': None, 'iqr': None}
+        assert cc.distribution_stats([]) == {'n': 0, 'median': None, 'p10': None, 'p25': None, 'p75': None, 'p90': None, 'iqr': None}
+
+    def test_report_version_pinned_for_route_cache(self):
+        # the compare route rebuilds any report whose version differs
+        assert cc.REPORT_VERSION == 2
 
     def test_count_statuses_splits_no_face_from_failed(self):
         samples = [

@@ -607,6 +607,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
           samplePaths={sampleImages}
           onClose={() => setShowIdentityPanel(false)}
           onOpenSample={path => setSelectedSamplePath(path)}
+          onFilterStep={step => setStepFilter(String(step))}
         />
       )}
       <SampleImageViewer

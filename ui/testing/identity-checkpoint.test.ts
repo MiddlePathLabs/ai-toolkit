@@ -1,11 +1,13 @@
 // Checkpoint comparison (Phase 2b) pure-logic tests: verdict phrasing,
-// category sanitizing, strip domain math and prompt-index extraction.
+// category sanitizing, strip domain math, prompt-index extraction and the
+// retention-graph series builder (Phase 2c).
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   countsLabel,
   convergencePhrase,
   excludedReasonLabel,
+  buildRetentionSeries,
   fmtScore,
   fmtSigned,
   highestMedianSteps,
@@ -13,6 +15,9 @@ import {
   pairInOrientation,
   promptIndicesInReport,
   reportFreshByMtimes,
+  retentionCategories,
+  retentionWeightsKinds,
+  RETENTION_SPARSE_N,
   sanitizeCategories,
   stripDomain,
   stripX,
@@ -20,6 +25,7 @@ import {
   verdictPhrase,
   type CheckpointReport,
   type CheckpointStepEntry,
+  type CheckpointStats,
   type PairComparison,
   type PairModelComparison,
 } from '../src/utils/identityCheckpoint';
@@ -102,7 +108,7 @@ const stepEntry = (step: number, median: number | null): CheckpointStepEntry => 
   label: String(step),
   counts: { evaluated: 4, ambiguous: 0, no_face: 0, failed: 0 },
   n_prompts: 4,
-  stats: { arcface: { training: { n: 4, median, p10: null, p25: null, p75: null, iqr: null } } },
+  stats: { arcface: { training: { n: 4, median, p10: null, p25: null, p75: null, p90: null, iqr: null } } },
   by_category: {},
   strip: {},
 });
@@ -296,4 +302,153 @@ test('promptIndicesInReport accepts prompt indices of 100+ in strip filenames', 
     ],
   });
   assert.deepEqual(promptIndicesInReport(doc), [7, 99, 100]);
+});
+
+// ------------------------------------------------- retention graph (Phase 2c)
+
+const stats = (over: Partial<CheckpointStats>): CheckpointStats => ({
+  n: 8,
+  median: 0.5,
+  p10: 0.4,
+  p25: null,
+  p75: null,
+  p90: 0.6,
+  iqr: null,
+  ...over,
+});
+
+// Two models with distinct values, a sparse step (n < 5), a raw-only step and
+// a category split on step 2000.
+const retentionSteps = (): CheckpointStepEntry[] => [
+  {
+    step: 1000,
+    is_raw: false,
+    label: '1000',
+    counts: { evaluated: 3, ambiguous: 0, no_face: 0, failed: 0 },
+    n_prompts: 3,
+    stats: {
+      arcface: { training: stats({ n: 3, median: 0.5, p10: 0.45, p90: 0.55 }) },
+      sface: { training: stats({ n: 3, median: 0.25, p10: 0.22, p90: 0.28 }) },
+    },
+    by_category: { solo: { arcface: { training: stats({ n: 3, median: 0.52 }) } } },
+    strip: {},
+  },
+  {
+    step: 1500,
+    is_raw: false,
+    label: '1500',
+    counts: { evaluated: 8, ambiguous: 0, no_face: 0, failed: 0 },
+    n_prompts: 8,
+    stats: {
+      arcface: { training: stats({ n: 8, median: 0.58, p10: 0.5, p90: 0.65 }) },
+      sface: { training: stats({ n: 8, median: 0.31, p10: 0.27, p90: 0.35 }) },
+    },
+    by_category: { solo: { arcface: { training: stats({ n: 8, median: 0.6 }) } }, multi: { arcface: { training: stats({ n: 8, median: 0.4 }) } } },
+    strip: {},
+  },
+  {
+    step: 2000,
+    is_raw: false,
+    label: '2000',
+    counts: { evaluated: 8, ambiguous: 0, no_face: 0, failed: 0 },
+    n_prompts: 8,
+    stats: {
+      arcface: { training: stats({ n: 8, median: 0.56, p10: 0.49, p90: 0.63 }) },
+      sface: { training: stats({ n: 8, median: 0.3, p10: 0.26, p90: 0.34 }) },
+    },
+    by_category: { untagged: { arcface: { training: stats({ n: 8, median: 0.56 }) } } },
+    strip: {},
+  },
+  {
+    step: 2000,
+    is_raw: true,
+    label: '2000 (raw)',
+    counts: { evaluated: 8, ambiguous: 0, no_face: 0, failed: 0 },
+    n_prompts: 8,
+    stats: {
+      arcface: { training: stats({ n: 8, median: 0.6, p10: 0.55, p90: 0.66 }) },
+      sface: { training: stats({ n: 8, median: 0.33, p10: 0.29, p90: 0.37 }) },
+    },
+    by_category: {},
+    strip: {},
+  },
+];
+
+const retentionReport = report({
+  sources: ['training'],
+  models: ['arcface', 'sface'],
+  refsets: { training: { n: 5, loo: { arcface: 0.58, sface: 0.3 } } },
+  steps: retentionSteps(),
+});
+
+test('buildRetentionSeries: one series per model, each with its own medians and LOO', () => {
+  const series = buildRetentionSeries(retentionReport, 'training', 'ema', null);
+  assert.deepEqual(
+    series.map(s => s.model),
+    ['arcface', 'sface'],
+  );
+  assert.deepEqual(series[0].xs, [1000, 1500, 2000]);
+  assert.deepEqual(series[0].median, [0.5, 0.58, 0.56]);
+  // models keep their own scales' data; never merged or averaged
+  assert.deepEqual(series[1].median, [0.25, 0.31, 0.3]);
+  assert.equal(series[0].loo, 0.58);
+  assert.equal(series[1].loo, 0.3);
+});
+
+test('buildRetentionSeries: steps with n < 5 are flagged sparse (hollow points)', () => {
+  assert.equal(RETENTION_SPARSE_N, 5);
+  const [arcface] = buildRetentionSeries(retentionReport, 'training', 'ema', null);
+  assert.deepEqual(arcface.sparse, [true, false, false]);
+  assert.deepEqual(arcface.n, [3, 8, 8]);
+});
+
+test('buildRetentionSeries: band arrays carry p10/p90, nulls stay null', () => {
+  const [arcface] = buildRetentionSeries(retentionReport, 'training', 'ema', null);
+  assert.deepEqual(arcface.p10, [0.45, 0.5, 0.49]);
+  assert.deepEqual(arcface.p90, [0.55, 0.65, 0.63]);
+  const partial = report({
+    models: ['arcface'],
+    refsets: { training: { n: 5, loo: { arcface: 0.58 } } },
+    steps: [
+      { ...retentionSteps()[0], stats: { arcface: { training: stats({ n: 8, median: null, p10: null, p90: null }) } } },
+      retentionSteps()[1],
+    ],
+  });
+  const [series] = buildRetentionSeries(partial, 'training', 'ema', null);
+  assert.deepEqual(series.median, [null, 0.58]);
+  assert.deepEqual(series.sparse, [false, false]); // no median point -> not a hollow point
+});
+
+test('buildRetentionSeries: raw and EMA weights never mix in one series', () => {
+  const ema = buildRetentionSeries(retentionReport, 'training', 'ema', null);
+  const raw = buildRetentionSeries(retentionReport, 'training', 'raw', null);
+  assert.deepEqual(ema[0].xs, [1000, 1500, 2000]);
+  assert.deepEqual(raw[0].xs, [2000]);
+  assert.deepEqual(raw[0].median, [0.6]);
+});
+
+test('buildRetentionSeries: category filter reads by_category, all-prompt reads stats', () => {
+  const solo = buildRetentionSeries(retentionReport, 'training', 'ema', 'solo');
+  assert.deepEqual(solo[0].xs, [1000, 1500]); // step 2000 has no solo-tagged prompts
+  assert.deepEqual(solo[0].median, [0.52, 0.6]);
+  assert.deepEqual(solo[0].n, [3, 8]);
+  const all = buildRetentionSeries(retentionReport, 'training', 'ema', null);
+  assert.deepEqual(all[0].median, [0.5, 0.58, 0.56]);
+});
+
+test('buildRetentionSeries: models missing from the report are skipped', () => {
+  const single = report({ models: ['sface'], steps: retentionSteps() });
+  const series = buildRetentionSeries(single, 'training', 'ema', null);
+  assert.deepEqual(
+    series.map(s => s.model),
+    ['sface'],
+  );
+  assert.equal(series[0].loo, null); // no refsets in this fixture
+});
+
+test('retentionWeightsKinds / retentionCategories enumerate what the report holds', () => {
+  assert.deepEqual(retentionWeightsKinds(retentionReport), ['ema', 'raw']);
+  assert.deepEqual(retentionWeightsKinds(report({ steps: [stepEntry(1000, 0.5)] })), ['ema']);
+  assert.deepEqual(retentionWeightsKinds(report({ steps: [] })), []);
+  assert.deepEqual(retentionCategories(retentionReport), ['multi', 'solo', 'untagged']);
 });

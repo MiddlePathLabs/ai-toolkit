@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import classNames from 'classnames';
 import { LuLoader, LuRefreshCw } from 'react-icons/lu';
+import IdentityRetentionGraph from './IdentityRetentionGraph';
 import {
   CATEGORY_PRESETS,
   countsLabel,
@@ -18,12 +19,15 @@ import {
   highestMedianSteps,
   pairInOrientation,
   promptIndicesInReport,
+  retentionCategories,
+  retentionWeightsKinds,
   stepValue,
   stripDomain,
   stripX,
   verdictPhrase,
   type CheckpointReport,
   type CheckpointStepEntry,
+  type RetentionWeightsKind,
   type ScoreModel,
   type ScoreSource,
 } from '@/utils/identityCheckpoint';
@@ -136,12 +140,14 @@ export default function IdentityCheckpointSection({
   onRefresh,
   onSaveCategories,
   onOpenSample,
+  onFilterStep,
 }: {
   report: CheckpointReport | null;
   loading: boolean;
   onRefresh: () => void;
   onSaveCategories: (categories: Record<string, string>) => Promise<boolean>;
   onOpenSample: (filename: string) => void;
+  onFilterStep: (step: number) => void;
 }) {
   const models = report?.models ?? [];
   const [model, setModel] = useState<ScoreModel>('arcface');
@@ -164,6 +170,16 @@ export default function IdentityCheckpointSection({
     () => (report ? highestMedianSteps(report.steps, effectiveModel, effectiveSource) : []),
     [report, effectiveModel, effectiveSource],
   );
+  // Retention graph (Phase 2c): weights-kind default follows what the run
+  // actually saved (dual-save runs offer EMA/raw; the graph never mixes them).
+  const retentionKindOptions = useMemo(() => (report ? retentionWeightsKinds(report) : []), [report]);
+  const [weightsKind, setWeightsKind] = useState<RetentionWeightsKind>('ema');
+  const effectiveWeights: RetentionWeightsKind = retentionKindOptions.includes(weightsKind)
+    ? weightsKind
+    : (retentionKindOptions[0] ?? 'ema');
+  const categoryOptions = useMemo(() => (report ? retentionCategories(report) : []), [report]);
+  const [category, setCategory] = useState<string | null>(null);
+  const effectiveCategory = category != null && categoryOptions.includes(category) ? category : null;
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState(false);
   useEffect(() => {
@@ -244,6 +260,51 @@ export default function IdentityCheckpointSection({
           </li>
         </ul>
       </details>
+
+      {/* identity retention graph (Phase 2c): two models, two scales, never merged */}
+      <div className="space-y-1 rounded border border-gray-300 p-1.5 dark:border-gray-600">
+        <div className="flex items-center gap-1 text-xs">
+          <span
+            className="font-medium"
+            title="Median similarity per training step — where likeness peaks as training progresses. ArcFace and SFace are drawn on separate scales and are never compared to each other."
+          >
+            Identity retention
+          </span>
+          {categoryOptions.length > 0 && (
+            <select
+              className={classNames(controlClass, 'ml-auto px-1 py-0.5 text-[10px]')}
+              value={effectiveCategory ?? ''}
+              onChange={e => setCategory(e.target.value || null)}
+              title="Restrict the graph to one prompt category (tags set below)"
+            >
+              <option value="">all prompts</option>
+              {categoryOptions.map(cat => (
+                <option key={cat} value={cat}>
+                  {cat}
+                </option>
+              ))}
+            </select>
+          )}
+          {retentionKindOptions.length > 1 && (
+            <select
+              className={classNames(controlClass, 'px-1 py-0.5 text-[10px]')}
+              value={effectiveWeights}
+              onChange={e => setWeightsKind(e.target.value as RetentionWeightsKind)}
+              title="RAW_ dual-save samples and the un-prefixed (EMA) samples are separate checkpoint series and are never mixed"
+            >
+              <option value="ema">EMA weights</option>
+              <option value="raw">raw weights</option>
+            </select>
+          )}
+        </div>
+        <IdentityRetentionGraph
+          report={report}
+          source={effectiveSource}
+          weightsKind={effectiveWeights}
+          category={effectiveCategory}
+          onFilterStep={onFilterStep}
+        />
+      </div>
 
       {/* per-checkpoint table: median (p10) + IQR tooltip; leader highlighted, but no best-checkpoint verdict */}
       <table className="w-full table-fixed text-xs tabular-nums">
