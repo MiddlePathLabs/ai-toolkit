@@ -19,6 +19,8 @@ import {
   pairInOrientation,
   promptIndicesInReport,
   reportFreshByMtimes,
+  leakageRateLabel,
+  leakLevelLabel,
   retentionCategories,
   retentionWeightsKinds,
   RETENTION_SPARSE_N,
@@ -219,7 +221,7 @@ test('stripX maps scores into the plot width', () => {
 // ------------------------------------------------------- review-fix regressions
 
 test('reportFreshByMtimes: newer loss log (main db or WAL) invalidates the cache', () => {
-  const fresh = { results: 100, categories: 90, loss: 80, lossWal: -1, report: 120 };
+  const fresh = { results: 100, categories: 90, picks: 90, loss: 80, lossWal: -1, report: 120 };
   assert.equal(reportFreshByMtimes(fresh), true);
   // training advanced the loss log without touching results.json
   assert.equal(reportFreshByMtimes({ ...fresh, loss: 130 }), false);
@@ -230,9 +232,26 @@ test('reportFreshByMtimes: newer loss log (main db or WAL) invalidates the cache
   // newer results or categories also invalidate
   assert.equal(reportFreshByMtimes({ ...fresh, results: 130 }), false);
   assert.equal(reportFreshByMtimes({ ...fresh, categories: 130 }), false);
+  // Phase 2e: a newer selection.json (subject-face pick / twin mark) must
+  // invalidate too -- picks change the report without touching results.json
+  assert.equal(reportFreshByMtimes({ ...fresh, picks: 130 }), false);
+  assert.equal(reportFreshByMtimes({ ...fresh, picks: -1 }), true);
   // missing results or report -> never fresh
   assert.equal(reportFreshByMtimes({ ...fresh, results: -1 }), false);
   assert.equal(reportFreshByMtimes({ ...fresh, report: -1 }), false);
+});
+
+// ------------------------------------------------------- leakage (Phase 2e)
+
+test('leakageRateLabel formats the table cell', () => {
+  assert.equal(leakageRateLabel(undefined), '–');
+  assert.equal(leakageRateLabel({ flagged: 2, evaluable: 5, rate: 0.4 }), '2/5');
+  assert.equal(leakageRateLabel({ flagged: 0, evaluable: 3, rate: 0 }), '0/3');
+});
+
+test('leakLevelLabel stays hedged per the spec wording rules', () => {
+  assert.equal(leakLevelLabel('likely_duplicate'), 'possible duplicate');
+  assert.equal(leakLevelLabel('resembles'), 'resembles subject');
 });
 
 test('pairInOrientation serves a reversed selection by inverting the stored pair', () => {

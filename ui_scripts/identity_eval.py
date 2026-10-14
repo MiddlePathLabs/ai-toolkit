@@ -68,17 +68,20 @@ def main() -> int:
             return 0
         if args.command == 'compare':
             from toolkit.identity_eval import checkpoint_compare
+            from toolkit.identity_eval import refs as refs_mod
 
             results = checkpoint_compare_json(args.output_root, args.job_name)
             if results is None:
                 emit({'type': 'error', 'command': 'compare', 'message': 'no results.json found; run an evaluation first'})
                 return 1
             prompt_texts = checkpoint_compare.extract_prompt_texts(runner.load_job_config())
+            selection = refs_mod.load_selection(refs_mod.selection_path(runner.identity_dir))
             report = checkpoint_compare.build_checkpoint_report(
                 results,
                 checkpoint_compare.load_categories(runner.identity_dir),
                 prompt_texts,
                 checkpoint_compare.convergence_summary(runner.job_dir),
+                picks=selection.get('sample_picks', {}),
             )
             report_path = os.path.join(runner.identity_dir, 'checkpoint_report.json')
             with open(report_path + '.tmp', 'w', encoding='utf-8') as handle:

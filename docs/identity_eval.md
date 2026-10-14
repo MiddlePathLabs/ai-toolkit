@@ -252,15 +252,80 @@ Requirements and limits:
   under `drift` (`version`, `signals`, `notes`); the compare route rebuilds
   older cached reports.
 
+## Multi-person identity leakage (Phase 2e)
+
+For multi-face samples (Phase 1 status "ambiguous"), the panel's
+**Multi-person samples** section lets you click the intended subject's face.
+Because Phase 1 already scores *every* face, a pick is pure post-processing:
+the sample immediately behaves as evaluated (its picked face joins the
+summaries, sorting, overlays, and the Phase 2b stats/paired comparisons after
+the report rebuilds) — no re-run of the worker is needed, and un-picking is
+just as instant.
+
+Twin/duplication levels on the **non-subject** faces, per model and per
+reference source (never averaged, never a shared scale — the same rule as
+everywhere else):
+
+- **resembles subject** — the face scores within `0.10` below the model's own
+  LOO band. Informational; excluded from the per-checkpoint rate and capped
+  in the report's face list (stronger levels are always kept).
+- **possible duplicate** — the face scores **at or above** the LOO band: as
+  close to your references as they are to each other. The tool's strongest
+  wording; a moderately high score alone is never called a duplicate.
+- **user-marked twin** — your own mark (the "mark twin" button under a
+  non-subject face). Comes exclusively from you, outranks the statistical
+  levels for display, and counts toward the rate; the tool never asserts it.
+
+Both thresholds are LOO-anchored per model and **provisional** pending the
+Phase 2a calibration and the 11.7 validation set (the same convention as the
+2d cut-points). Without a pick, a multi-face sample is not evaluable: nothing
+is flagged, the sample keeps its ambiguous count, and the section says it
+needs a pick.
+
+The inspection view expands a sample into per-face cards: face crops (CSS
+cropped from the full image — no thumbnails), the subject ring, per-model
+level chips with the evidence in the tooltip (mean vs LOO band), a
+**closest reference** crop with its cosine (persisted per face since
+**results version 3**; older evaluations hide it — re-run to enable), and an
+"Open full resolution" link — never judge duplicates from downscaled crops.
+
+The checkpoint table gains a **leak** column: `flagged/evaluable` multi-person
+samples per checkpoint (evaluable = a subject pick exists), per the selected
+model and source. The rate counts possible-duplicate faces and user twin
+marks; resembles-level faces never count. RAW and EMA rates are grouped by
+`(step, is_raw)` and never pooled. Picked samples fold into the `ok` count
+with a blue `+n` marker.
+
+Storage and plumbing:
+
+- Picks + twin marks live in the `sample_picks` section of
+  `identity_eval/selection.json`, keyed by sample filename (version stays 1;
+  the section is optional and survives reference pruning). Saved through the
+  refs route POST (`samplePicks`), which sanitizes keys to bare filenames.
+- The report builder (`build_checkpoint_report(..., picks=...)`) resolves
+  picks **before** grouping, so stats, strips, paired comparisons and the
+  drift signals all see the same resolved view; `counts.picked` records how
+  many ambiguous samples a pick resolved.
+- `toolkit/identity_eval/leakage.py` (pure post-processing, no face models)
+  builds the `leakage` block: thresholds per model/source, the flagged-face
+  list for the inspection view, per-step rates and notes. Report version 4;
+  the compare route also treats `selection.json` as a freshness input, so a
+  new pick invalidates the cached report.
+- Wording is test-enforced: "confirmed" and "clone" never appear in the
+  leakage block, and the twin level is only ever shown as user-marked.
+
 ## Code map
 
 - `toolkit/identity_eval/` — `detector.py` (SCRFD/YuNet), `arcface.py`,
   `sface.py` (incl. the SCRFD→YuNet landmark row conversion; landmark order
   verified by a real-model test), `scoring.py` (mean/max/LOO + filename
-  parsing), `cache.py`, `refs.py` (discovery + selection), `device.py`
-  (policy), `models.py` (discovery/status), `runner.py` (orchestration),
-  `checkpoint_compare.py` (Phase 2b report builder + convergence heuristic),
-  `drift.py` (Phase 2d signals + pose estimate + generic bootstrap).
+  parsing), `cache.py`, `refs.py` (discovery + selection incl. Phase 2e
+  `sample_picks`), `device.py` (policy), `models.py` (discovery/status),
+  `runner.py` (orchestration; refset membership + per-face `closest_ref`
+  since results v3), `checkpoint_compare.py` (Phase 2b report builder +
+  convergence heuristic + pick resolution), `drift.py` (Phase 2d signals +
+  pose estimate + generic bootstrap), `leakage.py` (Phase 2e levels, rates,
+  flagged faces).
 - `ui_scripts/identity_eval.py` — CLI worker (`--command refs|run|compare`).
 - `ui/src/app/api/identity-eval/` — `refs` (GET/POST), `run`, `status`,
   `cancel`, `clear`, `compare` (GET report / POST category tags) routes;
@@ -285,7 +350,10 @@ Requirements and limits:
   testing/<file>.test.ts`); the latter covers the retention-series builder
   (per-model separation, hollow flags for n < 5, band arrays, raw/EMA and
   category filters) and the drift helpers (filtering, hidden counts, kind
-  labels that never invent verdicts).
+  labels that never invent verdicts). The former covers Phase 2e pick
+  resolution, level classification (margin pinned to the Python constant)
+  and sample-pick sanitizing; the freshness predicate covers the
+  selection.json input.
 - Manual checklist: run an evaluation during an active training run and
   confirm CPU was chosen and step time / VRAM are unaffected — verified
   live, user-confirmed 2026-10-13.

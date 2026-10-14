@@ -11,13 +11,19 @@ import { FaPlay, FaStop, FaTrash } from 'react-icons/fa';
 import type { Job } from '@prisma/client';
 import type { IdentityEvalApi } from '@/hooks/useIdentityEval';
 import {
+  classifyFaceLevel,
   groupSummariesByStep,
   normalizeRefPath,
+  samplePickFor,
   selectionForImage,
+  twinMarked,
+  type IdentityFace,
   type IdentityRefImage,
   type IdentitySampleResult,
+  type IdentitySelection,
   type IdentitySource,
 } from '@/utils/identityEval';
+import { leakLevelLabel } from '@/utils/identityCheckpoint';
 import { encodeFilePathForUrl } from '@/utils/basic';
 import IdentityCheckpointSection from './IdentityCheckpointSection';
 import { openConfirm } from './ConfirmModal';
@@ -233,6 +239,218 @@ function RefSection({
   );
 }
 
+// Phase 2e: multi-person sample picker + leakage inspection. Picking the
+// subject face resolves an "ambiguous" sample instantly (per-face scores
+// already exist); non-subject faces show their leakage level per model
+// against that model's own LOO band. Levels are informational — the tool's
+// strongest wording is "possible duplicate"; "user-marked twin" is your own
+// mark, never the tool's claim.
+function MultiPersonSamples({
+  samples,
+  picks,
+  trainingRefs,
+  externalRefs,
+  results,
+  source,
+  onSavePick,
+  onToggleTwin,
+  onOpenSample,
+}: {
+  samples: IdentitySampleResult[];
+  picks: IdentitySelection['sample_picks'] | null | undefined;
+  trainingRefs: IdentityRefImage[];
+  externalRefs: IdentityRefImage[];
+  results: IdentityEvalApi['results'];
+  source: IdentitySource | 'combined';
+  onSavePick: (sample: IdentitySampleResult, faceIndex: number | null) => void;
+  onToggleTwin: (sample: IdentitySampleResult, faceIndex: number) => void;
+  onOpenSample: (path: string) => void;
+}) {
+  const multi = useMemo(
+    () =>
+      samples
+        .filter(s => s.faces.length >= 2)
+        .sort((a, b) => (b.step ?? 0) - (a.step ?? 0) || a.filename.localeCompare(b.filename)),
+    [samples],
+  );
+  const [openFile, setOpenFile] = useState<string | null>(null);
+  // reference lookup for the closest-reference crop: training keys are the
+  // canonical path form (normalizeRefPath), external keys are content names
+  const refByKey = useMemo(() => {
+    const map = new Map<string, IdentityRefImage>();
+    for (const image of trainingRefs) map.set(normalizeRefPath(image.path), image);
+    for (const image of externalRefs) map.set(image.name, image);
+    return map;
+  }, [trainingRefs, externalRefs]);
+  if (multi.length === 0) return null;
+
+  const loo = (model: string): number | null => results?.refsets?.[source]?.loo?.[model] ?? null;
+  // per-model leakage chips for one non-subject face (current source only)
+  const levelsFor = (face: IdentityFace): { model: 'arcface' | 'sface'; level: 'resembles' | 'likely_duplicate'; mean: number; band: number }[] => {
+    const out: { model: 'arcface' | 'sface'; level: 'resembles' | 'likely_duplicate'; mean: number; band: number }[] = [];
+    for (const model of ['arcface', 'sface'] as const) {
+      const mean = face.scores?.[model]?.[source]?.mean ?? null;
+      const band = loo(model);
+      const level = classifyFaceLevel(mean, band);
+      if (level && mean != null && band != null) out.push({ model, level, mean, band });
+    }
+    return out;
+  };
+  // the closest reference crop next to a non-subject face (results v3+;
+  // hidden for older evaluations)
+  const closestRefOf = (face: IdentityFace): { image: IdentityRefImage; bbox: number[]; sim: number } | null => {
+    for (const model of ['arcface', 'sface'] as const) {
+      const entry = face.closest_ref?.[model]?.[source];
+      if (entry?.key) {
+        const image = refByKey.get(entry.key);
+        const refFace = image?.faces[entry.face_index ?? 0];
+        if (image && refFace) return { image, bbox: refFace.bbox, sim: entry.sim };
+      }
+    }
+    return null;
+  };
+
+  return (
+    <div className="space-y-2 rounded border border-gray-300 p-2 dark:border-gray-600">
+      <div className="flex items-baseline justify-between">
+        <span className="text-xs font-semibold" title="Multi-face samples: pick which face is the intended subject — the sample then counts as evaluated (its picked face joins the summaries). Other faces are checked against the reference band for duplication of the subject.">
+          Multi-person samples
+        </span>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          {multi.length} · {multi.filter(s => samplePickFor(s, picks)).length} picked
+        </span>
+      </div>
+      <p className="text-[10px] text-gray-500 dark:text-gray-400">
+        Click the intended subject&apos;s face. &quot;possible duplicate&quot; = that face scores at or above the LOO band (as close to
+        your references as they are to each other); &quot;resembles subject&quot; = within {0.1.toFixed(1)} below it — informational. Levels
+        are per model; mark a twin yourself when you see one at full resolution.
+      </p>
+      <div className="space-y-1.5">
+        {multi.map(sample => {
+          const pick = samplePickFor(sample, picks);
+          const subject = pick?.face_index ?? null;
+          const open = openFile === sample.filename;
+          // "flagged" keeps the checkpoint rate's meaning (possible duplicate
+          // or user twin mark); resembles-level faces get their own count
+          const nonSubject = sample.faces.filter(f => f.index !== subject);
+          const flagged = nonSubject.filter(
+            f => levelsFor(f).some(l => l.level === 'likely_duplicate') || (pick ? twinMarked(pick, f.index) : false),
+          ).length;
+          const resembles = nonSubject.filter(
+            f => !levelsFor(f).some(l => l.level === 'likely_duplicate') && !(pick ? twinMarked(pick, f.index) : false) && levelsFor(f).length > 0,
+          ).length;
+          return (
+            <div key={sample.filename} className="rounded border border-gray-200 dark:border-gray-700">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-1.5 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                onClick={() => setOpenFile(open ? null : sample.filename)}
+              >
+                {sample.faces[0] && <FaceCropThumb src={sample.path} bbox={sample.faces[0].bbox} size={28} />}
+                <span className="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-200" title={sample.filename}>
+                  step {sample.step?.toLocaleString() ?? '?'} · prompt {sample.prompt_idx ?? '?'}
+                  {sample.is_raw ? ' · raw' : ''}
+                </span>
+                {subject == null ? (
+                  <span className="shrink-0 rounded border border-amber-400/60 px-1 text-[10px] text-amber-700 dark:text-amber-300">needs pick</span>
+                ) : (
+                  <span className="shrink-0 rounded border border-emerald-400/50 px-1 text-[10px] text-emerald-700 dark:text-emerald-300">
+                    picked{flagged > 0 ? ` · ${flagged} flagged` : resembles > 0 ? ` · ${resembles} resembles` : ''}
+                  </span>
+                )}
+              </button>
+              {open && (
+                <div className="space-y-2 border-t border-gray-200 p-1.5 dark:border-gray-700">
+                  <div className="flex flex-wrap gap-3">
+                    {sample.faces.map(face => {
+                      const isSubject = face.index === subject;
+                      const levels = isSubject ? [] : levelsFor(face);
+                      const twin = !isSubject && pick ? twinMarked(pick, face.index) : false;
+                      const closest = !isSubject ? closestRefOf(face) : null;
+                      const scoreBits = (['arcface', 'sface'] as const)
+                        .map(model => {
+                          const entry = face.scores?.[model]?.[source];
+                          return entry?.mean != null ? `${model === 'arcface' ? 'A' : 'S'} ${entry.mean.toFixed(3)}${entry.max != null ? ` (max ${entry.max.toFixed(3)})` : ''}` : null;
+                        })
+                        .filter(Boolean)
+                        .join(' · ');
+                      return (
+                        <div key={face.index} className="w-[152px] space-y-1">
+                          <button
+                            type="button"
+                            onClick={() => onSavePick(sample, isSubject ? null : face.index)}
+                            className={classNames(
+                              'block rounded p-0 transition',
+                              isSubject ? 'ring-2 ring-blue-500' : twin ? 'ring-2 ring-purple-500' : 'opacity-90 hover:opacity-100',
+                            )}
+                            title={`${isSubject ? 'subject face — click to un-pick' : 'click to make this the subject face'}\n${scoreBits}`}
+                          >
+                            <FaceCropThumb src={sample.path} bbox={face.bbox} size={72} />
+                          </button>
+                          <div className="flex items-center justify-between gap-1">
+                            <span className={classNames('text-[10px]', isSubject ? 'font-medium text-blue-600 dark:text-blue-400' : 'text-gray-500 dark:text-gray-400')}>
+                              {isSubject ? 'subject' : `face ${face.index + 1}`}
+                            </span>
+                            {!isSubject && (
+                              <button
+                                type="button"
+                                className={classNames(
+                                  'rounded border px-1 text-[10px]',
+                                  twin
+                                    ? 'border-purple-400/70 bg-purple-500/10 text-purple-700 dark:text-purple-300'
+                                    : 'border-gray-300 text-gray-500 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-800',
+                                )}
+                                disabled={subject == null}
+                                title={subject == null ? 'pick the subject face first' : twin ? 'your own mark — the tool never asserts a twin. click to unmark' : 'mark this face as a duplicated subject yourself'}
+                                onClick={() => onToggleTwin(sample, face.index)}
+                              >
+                                {twin ? 'user-marked twin' : 'mark twin'}
+                              </button>
+                            )}
+                          </div>
+                          {levels.map(({ model, level, mean, band }) => (
+                            <div
+                              key={model}
+                              className={classNames(
+                                'rounded border px-1 text-[10px] tabular-nums',
+                                level === 'likely_duplicate'
+                                  ? 'border-red-400/60 text-red-600 dark:text-red-400'
+                                  : 'border-amber-400/60 text-amber-700 dark:text-amber-300',
+                              )}
+                              title={`${model === 'arcface' ? 'ArcFace' : 'SFace'} mean ${mean.toFixed(3)} vs LOO band ${band.toFixed(3)} (${source} refs) — per model, never averaged`}
+                            >
+                              {model === 'arcface' ? 'A' : 'S'}: {leakLevelLabel(level)}
+                            </div>
+                          ))}
+                          {closest && (
+                            <div className="flex items-center gap-1" title={`closest reference by cosine (${closest.sim.toFixed(3)}) — compare them at full resolution`}>
+                              <FaceCropThumb src={closest.image.path} bbox={closest.bbox} size={36} />
+                              <span className="text-[10px] text-gray-400 dark:text-gray-500">closest ref {closest.sim.toFixed(3)}</span>
+                            </div>
+                          )}
+                          {!isSubject && levels.length === 0 && !twin && (
+                            <div className="text-[10px] text-gray-400 dark:text-gray-500">no flag</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] text-gray-500 dark:text-gray-400">
+                    <button type="button" className={controlClass} onClick={() => onOpenSample(sample.path)}>
+                      Open full resolution
+                    </button>
+                    <span>judge duplicates from the full image, not this crop</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 interface IdentityEvalPanelProps {
   job: Job;
   identity: IdentityEvalApi;
@@ -243,7 +461,7 @@ interface IdentityEvalPanelProps {
 }
 
 export default function IdentityEvalPanel({ job, identity, samplePaths, onClose, onOpenSample, onFilterStep }: IdentityEvalPanelProps) {
-  const { refs, selection, results, progress, running, loading, error, source, report, reportLoading } = identity;
+  const { refs, selection, results, resolvedSamples, progress, running, loading, error, source, report, reportLoading } = identity;
   const [deviceMode, setDeviceMode] = useState<'auto' | 'gpu' | 'cpu'>('auto');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -277,6 +495,27 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
     identity.saveSelection(src === 'external' ? { externalRefs: update } : { trainingRefs: update });
   };
 
+  // Phase 2e: subject-face picks + twin marks per generated sample
+  const samplePicks = selection?.sample_picks;
+  const handleSaveSamplePick = (sample: IdentitySampleResult, faceIndex: number | null) => {
+    const existing = samplePicks?.[sample.filename];
+    const marks = faceIndex == null ? [] : (existing?.twin_confirmed ?? []).filter(i => i !== faceIndex);
+    identity.saveSelection({
+      samplePicks: { [sample.filename]: { face_index: faceIndex, ...(marks.length > 0 ? { twin_confirmed: marks } : {}) } },
+    });
+  };
+  const handleToggleTwin = (sample: IdentitySampleResult, faceIndex: number) => {
+    const existing = samplePicks?.[sample.filename];
+    if (existing?.face_index == null) return; // a twin mark needs a subject first
+    const marks = new Set(existing.twin_confirmed ?? []);
+    if (marks.has(faceIndex)) marks.delete(faceIndex);
+    else marks.add(faceIndex);
+    const sorted = [...marks].sort((a, b) => a - b);
+    identity.saveSelection({
+      samplePicks: { [sample.filename]: { face_index: existing.face_index, ...(sorted.length > 0 ? { twin_confirmed: sorted } : {}) } },
+    });
+  };
+
   const handleRun = () => {
     const doStart = () => identity.startRun({ samples: samplePaths, deviceMode });
     if (deviceMode === 'gpu' && job.status === 'running') {
@@ -296,7 +535,9 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
 
   const progressTotal = progress?.total ?? 0;
   const progressDone = progress?.done ?? 0;
-  const summaries = groupSummariesByStep(results?.samples ?? [], activeSource);
+  // summaries see pick-resolved samples: a picked multi-face sample counts
+  // as evaluated with its picked face's scores
+  const summaries = groupSummariesByStep(resolvedSamples, activeSource);
   const looArcface = results?.refsets?.[activeSource]?.loo?.arcface ?? null;
   const looSface = results?.refsets?.[activeSource]?.loo?.sface ?? null;
   const latestSummary = summaries.length > 0 ? summaries[summaries.length - 1] : null;
@@ -493,6 +734,21 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
             </div>
           </div>
         </div>
+
+        {/* multi-person samples: subject picker + leakage inspection (Phase 2e) */}
+        {results && results.samples.length > 0 && (
+          <MultiPersonSamples
+            samples={results.samples}
+            picks={samplePicks}
+            trainingRefs={trainingImages}
+            externalRefs={externalImages}
+            results={results}
+            source={activeSource}
+            onSavePick={handleSaveSamplePick}
+            onToggleTwin={handleToggleTwin}
+            onOpenSample={onOpenSample}
+          />
+        )}
 
         {/* summary */}
         {results && results.samples.length > 0 && (

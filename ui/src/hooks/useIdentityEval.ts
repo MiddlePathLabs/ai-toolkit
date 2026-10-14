@@ -8,8 +8,10 @@ import { apiClient } from '@/utils/api';
 import {
   buildIdentityIndex,
   rankDisagreements,
+  resolveSamplePicks,
   type IdentityRefs,
   type IdentityResults,
+  type IdentitySampleResult,
   type IdentitySelection,
   type IdentitySource,
 } from '@/utils/identityEval';
@@ -37,7 +39,10 @@ export interface IdentityEvalApi {
   refs: IdentityRefs | null;
   selection: IdentitySelection | null;
   results: IdentityResults | null;
-  index: Map<string, IdentityResults['samples'][number]>;
+  // Phase 2e: results with subject-face picks applied (picked ambiguous
+  // samples behave as evaluated; overlays/summaries/sorting read these)
+  resolvedSamples: IdentitySampleResult[];
+  index: Map<string, IdentitySampleResult>;
   disagreements: Map<string, boolean>;
   progress: IdentityProgress | null;
   running: boolean;
@@ -47,7 +52,11 @@ export interface IdentityEvalApi {
   setSource: (source: IdentitySource | 'both') => void;
   scoreSource: IdentitySource | 'combined';
   loadRefs: (refresh?: boolean) => Promise<void>;
-  saveSelection: (update: { trainingRefs?: IdentitySelection['training_refs']; externalRefs?: IdentitySelection['external_refs'] }) => Promise<void>;
+  saveSelection: (update: {
+    trainingRefs?: IdentitySelection['training_refs'];
+    externalRefs?: IdentitySelection['external_refs'];
+    samplePicks?: IdentitySelection['sample_picks'];
+  }) => Promise<void>;
   addExternalFiles: (files: File[]) => Promise<void>;
   removeExternal: (names: string[]) => Promise<void>;
   startRun: (options: { samples: string[]; deviceMode: 'auto' | 'gpu' | 'cpu' }) => Promise<void>;
@@ -131,28 +140,6 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
       }
     },
     [jobId],
-  );
-
-  const saveSelection = useCallback(
-    async (update: { trainingRefs?: IdentitySelection['training_refs']; externalRefs?: IdentitySelection['external_refs'] }) => {
-      setSelection(prev => {
-        if (!prev) return prev;
-        const merged = {
-          version: 1,
-          training_refs: { ...prev.training_refs, ...update.trainingRefs },
-          external_refs: { ...prev.external_refs, ...update.externalRefs },
-        } as IdentitySelection;
-        return merged;
-      });
-      try {
-        await apiClient.post(`/api/identity-eval/refs`, { jobId, trainingRefs: update.trainingRefs, externalRefs: update.externalRefs });
-      } catch (err) {
-        console.error('identity-eval selection save failed:', err);
-        setError('Failed to save selection');
-        fetchStatus();
-      }
-    },
-    [jobId, fetchStatus],
   );
 
   const addExternalFiles = useCallback(
@@ -264,6 +251,42 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     }
   }, [jobId]);
 
+  const saveSelection = useCallback(
+    async (update: {
+      trainingRefs?: IdentitySelection['training_refs'];
+      externalRefs?: IdentitySelection['external_refs'];
+      samplePicks?: IdentitySelection['sample_picks'];
+    }) => {
+      setSelection(prev => {
+        if (!prev) return prev;
+        const merged = {
+          version: 1,
+          training_refs: { ...prev.training_refs, ...update.trainingRefs },
+          external_refs: { ...prev.external_refs, ...update.externalRefs },
+          sample_picks: { ...(prev.sample_picks ?? {}), ...update.samplePicks },
+        } as IdentitySelection;
+        return merged;
+      });
+      try {
+        await apiClient.post(`/api/identity-eval/refs`, {
+          jobId,
+          trainingRefs: update.trainingRefs,
+          externalRefs: update.externalRefs,
+          samplePicks: update.samplePicks,
+        });
+        // Sample picks change the checkpoint report (pick resolution feeds
+        // the stats/comparisons; twin marks feed the leakage rate) -- ref
+        // exclusions do not (they affect the next run, not the stored one).
+        if (update.samplePicks) loadReport();
+      } catch (err) {
+        console.error('identity-eval selection save failed:', err);
+        setError('Failed to save selection');
+        fetchStatus();
+      }
+    },
+    [jobId, fetchStatus, loadReport],
+  );
+
   // Returns true when the tags were persisted and the report recomputed;
   // the caller keeps its draft on false so edits survive a failed save.
   const saveCategories = useCallback(
@@ -301,10 +324,17 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     loadReport();
   }, [loadReport]);
 
-  const index = useMemo(() => buildIdentityIndex(results), [results]);
+  // Phase 2e: ambiguous samples with a subject-face pick behave as evaluated
+  // everywhere in the UI (overlay, summaries, sorting) -- same resolution the
+  // Python report builder applies, so both sides agree.
+  const resolvedSamples = useMemo(
+    () => resolveSamplePicks(results?.samples ?? [], selection?.sample_picks),
+    [results, selection],
+  );
+  const index = useMemo(() => buildIdentityIndex(results ? { samples: resolvedSamples } : null), [results, resolvedSamples]);
   const disagreements = useMemo(
-    () => rankDisagreements(results?.samples ?? [], source === 'both' ? 'combined' : source),
-    [results, source],
+    () => rankDisagreements(resolvedSamples, source === 'both' ? 'combined' : source),
+    [resolvedSamples, source],
   );
   const scoreSource: IdentitySource | 'combined' = source === 'both' ? 'combined' : source;
 
@@ -312,6 +342,7 @@ export default function useIdentityEval(job: Job): IdentityEvalApi {
     refs,
     selection,
     results,
+    resolvedSamples,
     index,
     disagreements,
     progress,

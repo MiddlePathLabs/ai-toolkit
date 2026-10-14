@@ -34,7 +34,10 @@ from .sface import SFaceEmbedder
 # v2: sample faces gained per-face ``kps`` (5-point landmarks) so the
 # Phase 2d pose signal can run in post-processing. Nothing validates this
 # on read; older documents simply lack the field and the pose signal skips.
-RESULTS_VERSION = 2
+# v3: sample faces gained ``closest_ref`` (per model per source: which
+# reference face is the single nearest, and its cosine) for the Phase 2e
+# inspection view; older documents lack it and the UI hides the crop.
+RESULTS_VERSION = 3
 
 
 def _now() -> str:
@@ -378,6 +381,7 @@ class IdentityEvalRunner:
         """
         embedders = self._embedders()
         vectors: Dict[str, List[np.ndarray]] = {name: [] for name in embedders}
+        members: List[dict] = []
         included = 0
         skipped = {'excluded': 0, 'needs_review': 0, 'no_face': 0, 'error': 0}
         hash_parts = []
@@ -411,6 +415,10 @@ class IdentityEvalRunner:
                 vectors[name].append(face_vectors[name])
             included += 1
             hash_parts.append(f"{record['sha']}:{face_index}")
+            # row-aligned membership: which reference image/face each matrix
+            # row is (same key form as the selection lookup), so scoring can
+            # name the single nearest reference (Phase 2e closest_ref)
+            members.append({'key': key, 'face_index': face_index})
         if included == 0:
             return None
         import hashlib
@@ -423,6 +431,7 @@ class IdentityEvalRunner:
             'hash': refset_hash,
             'skipped': skipped,
             'matrices': matrices,
+            'members': members,
             'loo': {name: round3(loo_band(matrix)) for name, matrix in matrices.items()},
         }
 
@@ -580,13 +589,31 @@ class IdentityEvalRunner:
 
         for face_entry in faces:
             vectors = self._face_vectors(face_entry)
+            scored_sources = sources + (['combined'] if refsets.get('combined') else [])
             scores = {
                 name: {
                     source: (score_face(refsets[source]['matrices'][name], vec) if refsets.get(source) and name in refsets[source]['matrices'] and vec is not None else {'mean': None, 'max': None})
-                    for source in (sources + (['combined'] if refsets.get('combined') else []))
+                    for source in scored_sources
                 }
                 for name, vec in vectors.items()
             }
+            # Phase 2e: name the single nearest reference per model/source
+            # (inspection view crops it next to the flagged face)
+            closest_ref = {}
+            for name, vec in vectors.items():
+                for source in scored_sources:
+                    refset = refsets.get(source)
+                    if vec is None or not refset or name not in refset['matrices']:
+                        continue
+                    sims = refset['matrices'][name] @ vec
+                    best = int(np.argmax(sims))
+                    members = refset.get('members') or []
+                    member = members[best] if best < len(members) else {}
+                    closest_ref.setdefault(name, {})[source] = {
+                        'key': member.get('key'),
+                        'face_index': member.get('face_index'),
+                        'sim': round3(float(sims[best])),
+                    }
             record['faces'].append(
                 {
                     'index': face_entry['index'],
@@ -596,6 +623,7 @@ class IdentityEvalRunner:
                     'kps': face_entry.get('kps'),
                     'det_score': face_entry['det_score'],
                     'scores': scores,
+                    'closest_ref': closest_ref,
                 }
             )
         record['status'] = 'evaluated' if len(faces) == 1 else 'ambiguous'

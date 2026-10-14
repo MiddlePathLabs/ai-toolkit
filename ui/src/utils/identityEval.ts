@@ -22,6 +22,9 @@ export interface IdentityFace {
   kps?: number[][] | null;
   det_score: number;
   scores: IdentityFaceScores;
+  // Single nearest reference per model per source (results v3+; absent in
+  // older documents -- the Phase 2e inspection view then hides the crop)
+  closest_ref?: Record<string, Partial<Record<IdentitySource | 'combined', { key: string | null; face_index: number | null; sim: number }>>>;
 }
 
 export interface IdentitySampleResult {
@@ -37,6 +40,10 @@ export interface IdentitySampleResult {
   primary: IdentityFaceScores | null;
   faces: IdentityFace[];
   warnings: string[];
+  // Phase 2e pick-resolution markers (client-side copies only; the worker
+  // never writes them)
+  picked_subject?: boolean;
+  subject_face_index?: number;
 }
 
 export interface IdentityRefset {
@@ -79,10 +86,17 @@ export interface IdentityRefs {
   warnings?: string[];
 }
 
+export interface IdentitySamplePick {
+  face_index?: number | null;
+  twin_confirmed?: number[];
+}
+
 export interface IdentitySelection {
   version: number;
   training_refs: Record<string, { excluded?: boolean; face_index?: number | null }>;
   external_refs: Record<string, { excluded?: boolean; face_index?: number | null }>;
+  // Phase 2e: keyed by generated-sample filename
+  sample_picks?: Record<string, IdentitySamplePick>;
 }
 
 export type IdentitySortMode = 'off' | 'arcface' | 'sface';
@@ -94,7 +108,7 @@ export function identityFilenameKey(path: string): string {
   return parts[parts.length - 1] ?? path;
 }
 
-export function buildIdentityIndex(results: IdentityResults | null): Map<string, IdentitySampleResult> {
+export function buildIdentityIndex(results: { samples?: IdentitySampleResult[] } | null): Map<string, IdentitySampleResult> {
   const index = new Map<string, IdentitySampleResult>();
   if (!results?.samples) return index;
   for (const sample of results.samples) {
@@ -272,13 +286,38 @@ export function sortPathsByScore(
 
 export function mergeSelection(
   current: IdentitySelection,
-  update: { trainingRefs?: IdentitySelection['training_refs']; externalRefs?: IdentitySelection['external_refs'] },
+  update: {
+    trainingRefs?: IdentitySelection['training_refs'];
+    externalRefs?: IdentitySelection['external_refs'];
+    samplePicks?: IdentitySelection['sample_picks'];
+  },
 ): IdentitySelection {
   return {
     version: 1,
     training_refs: { ...current.training_refs, ...sanitizeEntries(update.trainingRefs) },
     external_refs: { ...current.external_refs, ...sanitizeEntries(update.externalRefs) },
+    sample_picks: { ...(current.sample_picks ?? {}), ...sanitizeSamplePicks(update.samplePicks) },
   };
+}
+
+// Mirrors the refs route's samplePicks sanitizer so optimistic UI state
+// matches what the server persists (bare-filename keys only).
+export function sanitizeSamplePicks(entries: IdentitySelection['sample_picks'] | undefined): IdentitySelection['sample_picks'] {
+  const out: NonNullable<IdentitySelection['sample_picks']> = {};
+  for (const [key, value] of Object.entries(entries ?? {})) {
+    if (!/^[^\\/:*?"<>|]{1,200}$/.test(key)) continue;
+    if (!value || typeof value !== 'object') continue;
+    const clean: IdentitySamplePick = {};
+    if (value.face_index === null || (Number.isInteger(value.face_index) && (value.face_index as number) >= 0 && (value.face_index as number) <= 32)) {
+      clean.face_index = value.face_index;
+    }
+    if (Array.isArray(value.twin_confirmed)) {
+      const marks = [...new Set(value.twin_confirmed.filter((n): n is number => Number.isInteger(n) && n >= 0 && n <= 32))].sort((a, b) => a - b);
+      if (marks.length > 0) clean.twin_confirmed = marks;
+    }
+    if (Object.keys(clean).length > 0) out[key] = clean;
+  }
+  return out;
 }
 
 function sanitizeEntries(entries: IdentitySelection['training_refs'] | undefined): IdentitySelection['training_refs'] {
@@ -321,4 +360,61 @@ export function normalizeRefPath(path: string): string {
 export function identityStepPrompt(path: string): { step: number | null; promptIdx: number | null } {
   const parsed = parseSampleFilename(path);
   return { step: parsed?.trainingStep ?? null, promptIdx: parsed?.sampleIndex ?? null };
+}
+
+// ------------------------------------------------- multi-person leakage (2e)
+
+export type FaceLeakLevel = 'resembles' | 'likely_duplicate';
+
+// Mirror of toolkit.identity_eval.leakage.RESEMBLES_MARGIN. Applied to each
+// model's OWN LOO band (never a shared scale); provisional pending 2a/11.7.
+// identity-eval.test.ts pins this value against the Python constant.
+export const LEAKAGE_RESEMBLES_MARGIN = 0.10;
+
+// Mirror of leakage.classify_level: >= loo -> likely duplicate, within
+// LEAKAGE_RESEMBLES_MARGIN below -> resembles (informational), else null.
+// Per model per source -- callers pass that model's own loo and mean.
+export function classifyFaceLevel(mean: number | null | undefined, loo: number | null | undefined): FaceLeakLevel | null {
+  if (mean == null || loo == null || !Number.isFinite(mean) || !Number.isFinite(loo)) return null;
+  if (mean >= loo) return 'likely_duplicate';
+  if (mean >= loo - LEAKAGE_RESEMBLES_MARGIN) return 'resembles';
+  return null;
+}
+
+// The subject-face pick of a sample, when it resolves a subject: only
+// ambiguous (multi-face) samples honour a pick, and the index must point
+// at a real face. Returns null for everything else (mirrors valid_pick).
+export function samplePickFor(sample: IdentitySampleResult, picks: Record<string, IdentitySamplePick> | null | undefined): IdentitySamplePick | null {
+  if (sample.status !== 'ambiguous' || !picks) return null;
+  const pick = picks[sample.filename];
+  if (!pick) return null;
+  const index = pick.face_index;
+  if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= sample.faces.length) return null;
+  return pick;
+}
+
+// Apply subject-face picks: a picked ambiguous sample becomes evaluated
+// with primary = the picked face's already-persisted scores (Phase 1 scored
+// every face; no re-run needed). Pure/immutable -- mirrors the Python
+// resolve_picks used by the checkpoint report so both sides agree.
+export function resolveSamplePicks(
+  samples: IdentitySampleResult[],
+  picks: Record<string, IdentitySamplePick> | null | undefined,
+): IdentitySampleResult[] {
+  return samples.map(sample => {
+    const pick = samplePickFor(sample, picks);
+    if (!pick) return sample;
+    const index = pick.face_index as number;
+    return {
+      ...sample,
+      status: 'evaluated',
+      primary: sample.faces[index].scores ?? null,
+      picked_subject: true,
+      subject_face_index: index,
+    };
+  });
+}
+
+export function twinMarked(pick: IdentitySamplePick | null, faceIndex: number): boolean {
+  return Array.isArray(pick?.twin_confirmed) && (pick?.twin_confirmed as number[]).includes(faceIndex);
 }

@@ -35,18 +35,20 @@ interface CompareReport {
   pairs?: unknown[];
 }
 
-// The report is stale when results, category tags or the loss log changed
-// after it was written (see reportFreshByMtimes for the WAL rationale), or
-// when its version predates the current builder (v2 added p90 for the
-// retention graph; v3 added the Phase 2d drift warnings -- a cached older
+// The report is stale when results, category tags, sample picks or the loss
+// log changed after it was written (see reportFreshByMtimes for the WAL
+// rationale), or when its version predates the current builder (v2 added
+// p90 for the retention graph; v3 added the Phase 2d drift warnings; v4
+// added Phase 2e leakage + subject-face pick resolution -- a cached older
 // report must be rebuilt, not served).
-const REPORT_VERSION = 3;
+const REPORT_VERSION = 4;
 
 async function reportIsFresh(context: IdentityJobContext, report: CompareReport | null): Promise<boolean> {
   if (!report || report.version !== REPORT_VERSION) return false;
-  const [resultsMtime, categoriesMtime, reportMtime, lossMtime, lossWalMtime] = await Promise.all([
+  const [resultsMtime, categoriesMtime, picksMtime, reportMtime, lossMtime, lossWalMtime] = await Promise.all([
     mtime(context.resultsPath),
     mtime(context.categoriesPath),
+    mtime(path.join(context.identityDir, 'selection.json')),
     mtime(context.reportPath),
     mtime(path.join(context.jobDir, 'loss_log.db')),
     mtime(path.join(context.jobDir, 'loss_log.db-wal')),
@@ -54,6 +56,7 @@ async function reportIsFresh(context: IdentityJobContext, report: CompareReport 
   return reportFreshByMtimes({
     results: resultsMtime,
     categories: categoriesMtime,
+    picks: picksMtime,
     loss: lossMtime,
     lossWal: lossWalMtime,
     report: reportMtime,

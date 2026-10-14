@@ -8,7 +8,10 @@ legacy scripts' ``*.jpg`` glob.
 
 Selections live in ``output/<job>/identity_eval/selection.json``: per-image
 exclusion toggles and explicit face picks for multi-face references (a
-multi-face reference never enters the reference set without one).
+multi-face reference never enters the reference set without one), plus the
+Phase 2e ``sample_picks`` section -- per-generated-sample subject-face picks
+and user twin marks (consumed by leakage post-processing, never by the
+scoring worker).
 """
 
 import json
@@ -148,7 +151,7 @@ def selection_path(identity_dir: str) -> str:
 
 
 def default_selection() -> dict:
-    return {'version': SELECTION_VERSION, 'training_refs': {}, 'external_refs': {}}
+    return {'version': SELECTION_VERSION, 'training_refs': {}, 'external_refs': {}, 'sample_picks': {}}
 
 
 def load_selection(path: str) -> dict:
@@ -160,6 +163,7 @@ def load_selection(path: str) -> dict:
             return default_selection()
         selection.setdefault('training_refs', {})
         selection.setdefault('external_refs', {})
+        selection.setdefault('sample_picks', {})
         return selection
     except (OSError, ValueError):
         return default_selection()
@@ -177,12 +181,18 @@ def save_selection(path: str, selection: dict) -> None:
 
 
 def prune_selection(selection: dict, training_paths: List[str], external_names: List[str]) -> dict:
-    """Drop entries for images that no longer exist; returns a new dict."""
+    """Drop entries for images that no longer exist; returns a new dict.
+
+    ``sample_picks`` (Phase 2e) is carried through untouched: it is keyed by
+    generated-sample filename, which refs discovery knows nothing about.
+    Entries for samples that were later deleted are harmless orphans.
+    """
     training_keys = {_normalize(p) for p in training_paths}
     external_keys = set(external_names)
     pruned = {
         'version': SELECTION_VERSION,
         'training_refs': {k: v for k, v in selection.get('training_refs', {}).items() if _normalize(k) in training_keys},
         'external_refs': {k: v for k, v in selection.get('external_refs', {}).items() if k in external_keys},
+        'sample_picks': selection.get('sample_picks', {}),
     }
     return pruned

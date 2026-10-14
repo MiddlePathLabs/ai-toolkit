@@ -20,6 +20,9 @@ export interface CheckpointCounts {
   ambiguous: number;
   no_face: number;
   failed: number;
+  // Phase 2e: ambiguous samples resolved by a subject-face pick (folded
+  // into `evaluated`; shown separately so the counts still add up visually)
+  picked?: number;
 }
 
 export interface CheckpointStepEntry {
@@ -32,6 +35,9 @@ export interface CheckpointStepEntry {
   train_vs_external?: Record<string, { training: number | null; external: number | null; gap: number | null }>;
   by_category: Record<string, Record<string, Partial<Record<IdentitySource | 'combined', CheckpointStats>>>>;
   strip: Record<string, Partial<Record<IdentitySource | 'combined', { f: string; s: number }[]>>>;
+  // Phase 2e: per-model per-source leakage rate (flagged / evaluable
+  // multi-person samples); only steps with evaluable multi-person samples
+  leakage?: Record<string, Partial<Record<IdentitySource | 'combined', { flagged: number; evaluable: number; rate: number | null }>>>;
 }
 
 export type PairVerdict = 'higher' | 'lower' | 'none' | 'insufficient';
@@ -94,6 +100,42 @@ export interface DriftReport {
   notes: string[];
 }
 
+// ------------------------------------------------------- leakage (Phase 2e)
+
+// One flagged non-target face of a multi-person sample. Levels are per
+// model per source (never a blend); user_twin comes exclusively from the
+// user's own mark -- the tool never asserts it.
+export interface LeakageFace {
+  filename: string;
+  sample_path?: string | null;
+  step: number | null;
+  is_raw: boolean;
+  subject_face: number;
+  face_index: number | null;
+  det_score: number | null;
+  user_twin: boolean;
+  levels: Record<string, Partial<Record<string, 'resembles' | 'likely_duplicate'>>>;
+  scores: Record<string, Partial<Record<string, { mean: number | null; max: number | null }>>>;
+  closest_ref?: Record<string, Partial<Record<string, { key: string | null; face_index: number | null; sim: number }>>> | null;
+}
+
+export interface LeakageStepRates {
+  step: number;
+  is_raw: boolean;
+  rates: Record<string, Partial<Record<string, { flagged: number; evaluable: number; rate: number | null }>>>;
+}
+
+export interface LeakageReport {
+  version: number;
+  margin: number;
+  thresholds: Record<string, Record<string, { loo: number; resembles_min: number }>>;
+  picks_used: number;
+  counts: { multi_face_samples: number; evaluable: number; unpicked_multi: number };
+  faces: LeakageFace[];
+  per_step: LeakageStepRates[];
+  notes: string[];
+}
+
 export interface CheckpointReport {
   version: number;
   job: string;
@@ -109,6 +151,7 @@ export interface CheckpointReport {
   pairs: PairComparison[];
   convergence: ConvergenceSummary | null;
   drift?: DriftReport | null;
+  leakage?: LeakageReport | null;
   notes: string[];
 }
 
@@ -287,16 +330,38 @@ function roundSigned(value: number): number {
 // absent). The loss log participates because training advances it (the
 // convergence panel) without touching results.json; lossWal covers WAL-mode
 // SQLite, whose writes land in the -wal sidecar without updating the main
-// db file's mtime until a checkpoint.
+// db file's mtime until a checkpoint. selection.json participates since
+// Phase 2e: subject-face picks/twin marks change the report (pick resolution
+// + leakage rates) without touching results.json.
 export function reportFreshByMtimes(parts: {
   results: number;
   categories: number;
+  picks: number;
   loss: number;
   lossWal: number;
   report: number;
 }): boolean {
   if (parts.results < 0 || parts.report < 0) return false;
-  return parts.report >= parts.results && parts.report >= parts.categories && parts.report >= parts.loss && parts.report >= parts.lossWal;
+  return (
+    parts.report >= parts.results &&
+    parts.report >= parts.categories &&
+    parts.report >= parts.picks &&
+    parts.report >= parts.loss &&
+    parts.report >= parts.lossWal
+  );
+}
+
+// --------------------------------------------------------- leakage labels
+
+// "2/5" cell for the checkpoint table's leak column (flagged/evaluable
+// multi-person samples for the selected model + source).
+export function leakageRateLabel(entry: { flagged: number; evaluable: number; rate: number | null } | undefined): string {
+  if (!entry) return '–';
+  return `${entry.flagged}/${entry.evaluable}`;
+}
+
+export function leakLevelLabel(level: 'resembles' | 'likely_duplicate'): string {
+  return level === 'likely_duplicate' ? 'possible duplicate' : 'resembles subject';
 }
 
 // ---------------------------------------------------------------- stripping

@@ -259,13 +259,18 @@ class TestSelection:
             'version': 1,
             'training_refs': {r'C:\x\1.jpg': {'excluded': True}, '/y/2.jpg': {'face_index': 1}},
             'external_refs': {'abc': {'excluded': False}},
+            'sample_picks': {'1791073894128__000001000_00_seed-42_steps-20.jpg': {'face_index': 1, 'twin_confirmed': [0]}},
         }
         save_selection(path, selection)
         loaded = load_selection(path)
         assert loaded['training_refs']['/y/2.jpg']['face_index'] == 1
+        assert loaded['sample_picks']['1791073894128__000001000_00_seed-42_steps-20.jpg']['face_index'] == 1
         pruned = prune_selection(loaded, ['/y/2.jpg'], ['abc'])
         assert set(pruned['training_refs']) == {'/y/2.jpg'}
         assert set(pruned['external_refs']) == {'abc'}
+        # sample picks are keyed by generated-sample filename, which refs
+        # discovery knows nothing about -- they must survive the prune
+        assert pruned['sample_picks'] == selection['sample_picks']
 
     def test_canonical_key_matches_ui_contract(self):
         # the panel writes / selectionForImage reads the same form in TS
@@ -277,7 +282,7 @@ class TestSelection:
     def test_corrupt_resets(self, tmp_path):
         path = str(tmp_path / 'selection.json')
         open(path, 'w').write('{not json')
-        assert load_selection(path) == {'version': 1, 'training_refs': {}, 'external_refs': {}}
+        assert load_selection(path) == {'version': 1, 'training_refs': {}, 'external_refs': {}, 'sample_picks': {}}
 
 
 # -------------------------------------------------------------------- cache

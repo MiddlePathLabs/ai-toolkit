@@ -20,6 +20,7 @@ import {
   fmtScore,
   fmtSigned,
   highestMedianSteps,
+  leakageRateLabel,
   pairInOrientation,
   promptIndicesInReport,
   retentionCategories,
@@ -377,6 +378,12 @@ export default function IdentityCheckpointSection({
             (decline, spread growth, memorization signature, pose dependence, near-copies) with links to the samples
             involved. They are suggestions to look, never conclusions — you make the call.
           </li>
+          <li>
+            <span className="font-medium">leak</span> = flagged / evaluable multi-person samples: how many of them put
+            a possible duplicate of the subject on another face (at or above the LOO band for the selected model, or
+            your own twin mark). Pick subject faces in the panel above to make samples evaluable; RAW and EMA rates
+            never mix.
+          </li>
         </ul>
       </details>
 
@@ -445,7 +452,7 @@ export default function IdentityCheckpointSection({
             <th className="text-left font-medium">Checkpoint</th>
             <th
               className="font-medium"
-              title="Sample counts: ok = one face, scored · amb = ambiguous, multiple faces · nf = no face · fail = error"
+              title="Sample counts: ok = one face, scored (+p more resolved by your subject-face picks) · amb = ambiguous, multiple faces, no pick yet · nf = no face · fail = error"
             >
               n ok/amb/nf/fail
             </th>
@@ -455,6 +462,14 @@ export default function IdentityCheckpointSection({
             >
               {modelName} med
             </th>
+            {report.steps.some(s => s.leakage) && (
+              <th
+                className="font-medium"
+                title="Multi-person leakage: flagged / evaluable samples for the selected model and source. Flagged = a non-subject face scored at or above the LOO band (or you marked it a twin); evaluable = multi-person samples with a picked subject face."
+              >
+                leak
+              </th>
+            )}
             {report.steps.some(s => s.train_vs_external) && (
               <th
                 className="font-medium"
@@ -469,6 +484,7 @@ export default function IdentityCheckpointSection({
           {report.steps.map(step => {
             const stats = step.stats?.[effectiveModel]?.[effectiveSource];
             const gap = step.train_vs_external?.[effectiveModel]?.gap;
+            const leakage = step.leakage?.[effectiveModel]?.[effectiveSource];
             const isBest = bestSteps.includes(stepValue(step));
             return (
               <tr
@@ -486,7 +502,30 @@ export default function IdentityCheckpointSection({
                   )}{' '}
                   {step.label}
                 </td>
-                <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">{countsLabel(step.counts)}</td>
+                <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">
+                  {countsLabel(step.counts)}
+                  {step.counts.picked ? (
+                    <span className="text-blue-500" title={`${step.counts.picked} ambiguous sample(s) resolved by a subject-face pick — their picked face joins ok`}>
+                      {' '}
+                      +{step.counts.picked}
+                    </span>
+                  ) : null}
+                </td>
+                {report.steps.some(s => s.leakage) && (
+                  <td
+                    className={classNames(
+                      'py-0.5 text-center',
+                      leakage?.flagged ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400',
+                    )}
+                    title={
+                      leakage
+                        ? `${leakage.flagged} of ${leakage.evaluable} evaluable multi-person sample(s) flagged (${modelName}, ${effectiveSource} refs; rate ${(leakage.rate ?? 0).toFixed(3)}) — possible duplication of the subject on other faces; review them in the panel's Multi-person samples section`
+                        : 'no evaluable multi-person samples at this checkpoint (pick subject faces in the panel to enable the rate)'
+                    }
+                  >
+                    {leakageRateLabel(leakage)}
+                  </td>
+                )}
                 <td
                   className={classNames('py-0.5 text-center', isBest && 'font-semibold text-gray-900 dark:text-gray-50')}
                   title={

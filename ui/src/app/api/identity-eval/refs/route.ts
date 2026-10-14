@@ -72,6 +72,9 @@ interface SelectionUpdate {
   jobId: string;
   trainingRefs?: Record<string, { excluded?: boolean; face_index?: number | null }>;
   externalRefs?: Record<string, { excluded?: boolean; face_index?: number | null }>;
+  // Phase 2e: per-generated-sample subject-face picks + user twin marks,
+  // keyed by sample filename (never a path -- no traversal surface)
+  samplePicks?: Record<string, { face_index?: number | null; twin_confirmed?: number[] }>;
   removeExternal?: string[];
 }
 
@@ -141,6 +144,7 @@ export async function POST(request: NextRequest) {
     version: number;
     training_refs: Record<string, unknown>;
     external_refs: Record<string, unknown>;
+    sample_picks?: Record<string, unknown>;
   }>(selectionPath)) ?? { version: 1, training_refs: {}, external_refs: {} };
 
   const sanitize = (entries: Record<string, { excluded?: boolean; face_index?: number | null }> | undefined) => {
@@ -157,9 +161,30 @@ export async function POST(request: NextRequest) {
     return out;
   };
 
+  // Sample picks are keyed by bare filename; reject anything carrying a
+  // path (the UI only sends basename keys, but the API must not trust that).
+  const sanitizeSamplePicks = (entries: SelectionUpdate['samplePicks'] | undefined) => {
+    const out: NonNullable<SelectionUpdate['samplePicks']> = {};
+    for (const [key, value] of Object.entries(entries ?? {})) {
+      if (!/^[^\\/:*?"<>|]{1,200}$/.test(key)) continue;
+      if (!value || typeof value !== 'object') continue;
+      const clean: { face_index?: number | null; twin_confirmed?: number[] } = {};
+      if (value.face_index === null || (Number.isInteger(value.face_index) && (value.face_index as number) >= 0 && (value.face_index as number) <= 32)) {
+        clean.face_index = value.face_index as number | null;
+      }
+      if (Array.isArray(value.twin_confirmed)) {
+        const marks = [...new Set(value.twin_confirmed.filter((n): n is number => Number.isInteger(n) && n >= 0 && n <= 32))].sort((a, b) => a - b);
+        if (marks.length > 0) clean.twin_confirmed = marks;
+      }
+      if (Object.keys(clean).length > 0) out[key] = clean;
+    }
+    return out;
+  };
+
   current.version = 1;
   current.training_refs = { ...current.training_refs, ...sanitize(body.trainingRefs) };
   current.external_refs = { ...current.external_refs, ...sanitize(body.externalRefs) };
+  current.sample_picks = { ...(current.sample_picks ?? {}), ...sanitizeSamplePicks(body.samplePicks) };
   await writeJsonFile(selectionPath, { ...current, updated_at: new Date().toISOString() });
   return NextResponse.json({ selection: current });
 }

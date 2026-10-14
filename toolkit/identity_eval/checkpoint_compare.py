@@ -37,7 +37,10 @@ import numpy as np
 # served with missing p90 fields.
 # v3: the report gained the Phase 2d drift block (warnings, never verdicts)
 # computed by ``drift.detect_drift`` over the same results document.
-REPORT_VERSION = 3
+# v4: Phase 2e leakage -- sample subject-face picks resolve ambiguous
+# samples into the stats/comparisons, steps gain per-model leakage rates,
+# and the report carries the ``leakage`` block (``leakage.detect_leakage``).
+REPORT_VERSION = 4
 BOOTSTRAP_RESAMPLES = 10_000
 MIN_PAIRS_FOR_VERDICT = 3
 
@@ -305,9 +308,27 @@ def build_checkpoint_report(
     categories: Optional[Dict[str, str]],
     prompt_texts: Optional[Dict[int, str]],
     convergence: Optional[dict],
+    picks: Optional[dict] = None,
 ) -> dict:
-    """Assemble the full checkpoint report from a results.json document."""
-    samples = results.get('samples') or []
+    """Assemble the full checkpoint report from a results.json document.
+
+    ``picks`` is the ``sample_picks`` section of selection.json (Phase 2e):
+    subject-face picks that resolve ambiguous multi-face samples into
+    evaluated ones *before* any grouping, so stats, strips, paired
+    comparisons and drift all see the same resolved view. The leakage
+    block is computed from the same inputs.
+    """
+    # Phase 2e lazy imports (leakage, like drift, reads helpers from this
+    # module; a top-level import would be circular)
+    from .leakage import detect_leakage, resolve_picks
+
+    resolved_samples, picks_used = resolve_picks(results.get('samples') or [], picks)
+    # detect_leakage re-resolves picks itself and must see the ORIGINAL
+    # statuses (resolution flips ambiguous -> evaluated, which would hide
+    # the picks from its own valid_pick lookup)
+    raw_results = results
+    results = {**results, 'samples': resolved_samples}
+    samples = resolved_samples
     sources = available_sources(samples)
     models = available_models(samples)
     categories = {str(k): v for k, v in (categories or {}).items()}
@@ -326,14 +347,20 @@ def build_checkpoint_report(
     has_raw = any(is_raw for _, is_raw in ordered_keys)
 
     step_entries = []
+    leakage_block = detect_leakage(raw_results, picks, models, sources)
+    step_leakage = {(item['step'], item['is_raw']): item['rates'] for item in leakage_block['per_step']}
     for group_key in ordered_keys:
         step, is_raw = group_key
         bucket = list(groups[group_key].values())
+        counts = count_statuses(bucket)
+        picked_here = sum(1 for s in bucket if s.get('picked_subject'))
+        if picked_here:
+            counts['picked'] = picked_here
         entry = {
             'step': step,
             'is_raw': is_raw,
             'label': group_label(step, is_raw, has_raw),
-            'counts': count_statuses(bucket),
+            'counts': counts,
             'n_prompts': len({key[1] for key in groups[group_key]}),
             'stats': {
                 model: {source: distribution_stats([v for v in (score_of(s, model, source) for s in bucket) if v is not None])
@@ -380,6 +407,11 @@ def build_checkpoint_report(
             }
             for cat, bucket_cat in sorted(by_category.items())
         }
+        # Phase 2e: per-checkpoint leakage rates (flagged / evaluable
+        # multi-person samples), per model per source; only steps with
+        # evaluable multi-person samples carry the block
+        if group_key in step_leakage:
+            entry['leakage'] = step_leakage[group_key]
         step_entries.append(entry)
 
     pairs = []
@@ -404,6 +436,8 @@ def build_checkpoint_report(
         notes.append('Training-ref vs external-ref gap is shown separately; a rising gap can indicate memorization (see drift detection, Phase 2d).')
     if prompt_texts:
         notes.append('Prompt texts were captured from the job config at report time; mid-run sample-config changes cannot be recovered from filenames.')
+    if picks_used:
+        notes.append(f"{picks_used} ambiguous multi-person sample(s) resolved by user subject-face picks (Phase 2e); their picked face's scores join the stats and comparisons.")
 
     report = {
         'version': REPORT_VERSION,
@@ -427,9 +461,12 @@ def build_checkpoint_report(
     }
     # Phase 2d drift warnings. Imported here, not at module top: drift reads
     # helpers from this module, so a top-level import would be circular.
+    # Drift sees the pick-resolved results document (a picked subject face
+    # is the sample's identity from here on).
     from .drift import detect_drift
 
     report['drift'] = detect_drift(results, report)
+    report['leakage'] = leakage_block
     return report
 
 

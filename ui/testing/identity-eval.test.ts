@@ -2,16 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildIdentityIndex,
+  classifyFaceLevel,
   groupSummariesByStep,
   identityFilenameKey,
   identityStepPrompt,
+  LEAKAGE_RESEMBLES_MARGIN,
   mergeSelection,
   normalizeRefPath,
   overlayInfo,
   rankDisagreements,
+  resolveSamplePicks,
+  samplePickFor,
   sampleScore,
   selectionForImage,
   sortPathsByScore,
+  twinMarked,
+  type IdentityFace,
   type IdentitySampleResult,
   type IdentitySelection,
 } from '../src/utils/identityEval';
@@ -237,4 +243,107 @@ test('ref path normalization matches the worker keys', () => {
   assert.equal(normalizeRefPath('C:\\DATA\\Sub\\Img.JPG'), 'c:/data/sub/img.jpg');
   assert.equal(normalizeRefPath('/data//sub/'), '/data/sub');
   assert.equal(normalizeRefPath('/data/sub'), '/data/sub');
+});
+
+// ------------------------------------------------- multi-person leakage (2e)
+
+const face = (index: number, arcface: number | null, sface: number | null): IdentityFace => ({
+  index,
+  bbox: [0, 0, 10, 10],
+  det_score: 0.9,
+  scores: {
+    arcface: arcface === null ? {} : { training: { mean: arcface, max: arcface + 0.02 } },
+    sface: sface === null ? {} : { training: { mean: sface, max: sface + 0.02 } },
+  },
+});
+
+test('leakage margin pinned to the Python constant and classify boundaries hold', () => {
+  // mirrors toolkit.identity_eval.leakage.RESEMBLES_MARGIN; keep in sync
+  assert.equal(LEAKAGE_RESEMBLES_MARGIN, 0.1);
+  assert.equal(classifyFaceLevel(0.58, 0.58), 'likely_duplicate');
+  assert.equal(classifyFaceLevel(0.65, 0.58), 'likely_duplicate');
+  assert.equal(classifyFaceLevel(0.58 - LEAKAGE_RESEMBLES_MARGIN, 0.58), 'resembles');
+  assert.equal(classifyFaceLevel(0.58 - LEAKAGE_RESEMBLES_MARGIN - 0.001, 0.58), null);
+  assert.equal(classifyFaceLevel(null, 0.58), null);
+  assert.equal(classifyFaceLevel(0.6, null), null);
+  // per model: same score, different band -> different level
+  assert.equal(classifyFaceLevel(0.585, 0.6), 'resembles');
+  assert.equal(classifyFaceLevel(0.585, 0.58), 'likely_duplicate');
+});
+
+test('resolveSamplePicks turns picked ambiguous samples into evaluated ones', () => {
+  const faces = [face(0, 0.6, 0.62), face(1, 0.4, 0.41)];
+  const ambiguous = sample({
+    filename: 'amb.jpg',
+    step: 1500,
+    status: 'ambiguous',
+    primary: null,
+    face_count: 2,
+    faces,
+  });
+  const solo = sample({ filename: 'solo.jpg', step: 1500 });
+  const picks = { 'amb.jpg': { face_index: 1, twin_confirmed: [0] } };
+  const resolved = resolveSamplePicks([ambiguous, solo], picks);
+  assert.equal(resolved[0].status, 'evaluated');
+  assert.equal(resolved[0].picked_subject, true);
+  assert.equal(resolved[0].subject_face_index, 1);
+  assert.deepEqual(resolved[0].primary, faces[1].scores);
+  // originals untouched, non-ambiguous samples untouched
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.equal(ambiguous.primary, null);
+  assert.equal(resolved[1], solo);
+  // invalid picks (out of range / null / missing) pass through
+  for (const bad of [{}, { face_index: null }, { face_index: 9 }, { face_index: '0' }] as never[]) {
+    assert.equal(resolveSamplePicks([ambiguous], { 'amb.jpg': bad })[0].status, 'ambiguous');
+  }
+  // summaries see the resolved view: the picked face joins the median
+  const summaries = groupSummariesByStep(resolved, 'training');
+  assert.equal(summaries[0].evaluated, 2);
+});
+
+test('samplePickFor only resolves ambiguous samples with an in-range index', () => {
+  const ambiguous = sample({ filename: 'amb.jpg', status: 'ambiguous', primary: null, face_count: 2, faces: [face(0, 0.5, 0.5), face(1, 0.5, 0.5)] });
+  assert.equal(samplePickFor(ambiguous, { 'amb.jpg': { face_index: 0 } })?.face_index, 0);
+  assert.equal(samplePickFor(ambiguous, { 'amb.jpg': { face_index: 2 } }), null);
+  assert.equal(samplePickFor(ambiguous, null), null);
+  assert.equal(samplePickFor(sample({ filename: 'solo.jpg' }), { 'solo.jpg': { face_index: 0 } }), null);
+});
+
+test('twinMarked reads the user marks only', () => {
+  const pick = { face_index: 0, twin_confirmed: [1, 2] };
+  assert.equal(twinMarked(pick, 1), true);
+  assert.equal(twinMarked(pick, 0), false);
+  assert.equal(twinMarked(null, 1), false);
+});
+
+test('mergeSelection carries and sanitizes sample picks like the route', () => {
+  const empty: IdentitySelection = { version: 1, training_refs: {}, external_refs: {} };
+  const withPick = mergeSelection(empty, {
+    samplePicks: {
+      '1791073894128__000001000_00_seed-42_steps-20.jpg': { face_index: 1, twin_confirmed: [0] },
+    },
+  });
+  assert.equal(withPick.sample_picks?.['1791073894128__000001000_00_seed-42_steps-20.jpg']?.face_index, 1);
+  // updates merge per filename, other entries survive
+  const updated = mergeSelection(withPick, {
+    samplePicks: {
+      '1791073894128__000001000_00_seed-42_steps-20.jpg': { face_index: null },
+      'other.jpg': { face_index: 0, twin_confirmed: [2, 1, 1] },
+    },
+  });
+  assert.equal(updated.sample_picks?.['1791073894128__000001000_00_seed-42_steps-20.jpg']?.face_index, null);
+  assert.deepEqual(updated.sample_picks?.['other.jpg']?.twin_confirmed, [1, 2]); // deduped + sorted
+  // path-like keys and invalid indices are dropped, never stored
+  const sanitized = mergeSelection(updated, {
+    samplePicks: {
+      '../escape.jpg': { face_index: 0 },
+      'a/b.jpg': { face_index: 0 },
+      'ok.jpg': { face_index: 99 },
+      'ok2.jpg': { face_index: -1 },
+    },
+  });
+  assert.equal('../escape.jpg' in (sanitized.sample_picks ?? {}), false);
+  assert.equal('a/b.jpg' in (sanitized.sample_picks ?? {}), false);
+  assert.equal('ok.jpg' in (sanitized.sample_picks ?? {}), false);
+  assert.equal('ok2.jpg' in (sanitized.sample_picks ?? {}), false);
 });
