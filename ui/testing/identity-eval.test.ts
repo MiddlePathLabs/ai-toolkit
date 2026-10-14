@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { chainOn } from '../src/utils/promiseChain';
 import {
   buildIdentityIndex,
   classifyFaceLevel,
@@ -314,6 +315,65 @@ test('twinMarked reads the user marks only', () => {
   assert.equal(twinMarked(pick, 1), true);
   assert.equal(twinMarked(pick, 0), false);
   assert.equal(twinMarked(null, 1), false);
+});
+
+// ------------------------------------------- selection-save serialization (review)
+
+// The refs route's selection update is a read-merge-write transaction over
+// one file; chainOn serializes those per path. These tests model the exact
+// transaction shape with an in-memory file to pin the no-lost-update
+// guarantee two concurrent pick saves need.
+
+// the chain entry's self-cleanup runs a few microtasks after the awaited
+// transaction settles -- drain before asserting map emptiness
+const drainMicrotasks = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test('chainOn serializes concurrent read-merge-write transactions (no lost update)', async () => {
+  const chains = new Map<string, Promise<unknown>>();
+  let selection: Record<string, { face_index: number }> = {};
+  const savePick = (filename: string, delayMs: number) =>
+    chainOn(chains, 'selection.json', async () => {
+      const current = { ...selection }; // read
+      await new Promise(resolve => setTimeout(resolve, delayMs)); // overlap window
+      selection = { ...current, [filename]: { face_index: 0 } }; // merge + write
+    });
+  await Promise.all([savePick('a.jpg', 5), savePick('b.jpg', 1)]);
+  assert.deepEqual(Object.keys(selection).sort(), ['a.jpg', 'b.jpg']);
+  await drainMicrotasks();
+  // chain entry removes itself once idle
+  assert.equal(chains.size, 0);
+});
+
+test('chainOn isolates failures: a rejecting transaction never blocks later ones', async () => {
+  const chains = new Map<string, Promise<unknown>>();
+  const order: string[] = [];
+  const failing = chainOn(chains, 'k', async () => {
+    order.push('failing');
+    throw new Error('boom');
+  });
+  await assert.rejects(failing, /boom/);
+  const after = chainOn(chains, 'k', async () => {
+    order.push('after');
+    return 42;
+  });
+  assert.equal(await after, 42);
+  assert.deepEqual(order, ['failing', 'after']);
+  await drainMicrotasks();
+  assert.equal(chains.size, 0);
+});
+
+test('chainOn keys are independent', async () => {
+  const chains = new Map<string, Promise<unknown>>();
+  const log: string[] = [];
+  const slow = chainOn(chains, 'a', async () => {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    log.push('slow-a');
+  });
+  const fast = chainOn(chains, 'b', async () => {
+    log.push('fast-b');
+  });
+  await Promise.all([slow, fast]);
+  assert.deepEqual(log, ['fast-b', 'slow-a']); // b did not queue behind a
 });
 
 test('mergeSelection carries and sanitizes sample picks like the route', () => {

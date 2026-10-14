@@ -452,7 +452,7 @@ export default function IdentityCheckpointSection({
             <th className="text-left font-medium">Checkpoint</th>
             <th
               className="font-medium"
-              title="Sample counts: ok = one face, scored (+p more resolved by your subject-face picks) · amb = ambiguous, multiple faces, no pick yet · nf = no face · fail = error"
+              title="Sample counts: ok = one face, scored — this already includes multi-person samples resolved by your subject-face picks (shown separately as “N picked”) · amb = ambiguous, multiple faces, no pick yet · nf = no face · fail = error"
             >
               n ok/amb/nf/fail
             </th>
@@ -505,9 +505,12 @@ export default function IdentityCheckpointSection({
                 <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">
                   {countsLabel(step.counts)}
                   {step.counts.picked ? (
-                    <span className="text-blue-500" title={`${step.counts.picked} ambiguous sample(s) resolved by a subject-face pick — their picked face joins ok`}>
+                    <span
+                      className="text-blue-500"
+                      title={`${step.counts.picked} of the ${step.counts.evaluated} evaluated samples are multi-person samples resolved by a subject-face pick — already counted in ok, not additional samples`}
+                    >
                       {' '}
-                      +{step.counts.picked}
+                      ({step.counts.picked} picked)
                     </span>
                   ) : null}
                 </td>

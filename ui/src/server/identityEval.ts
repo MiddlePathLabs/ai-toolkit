@@ -11,6 +11,7 @@ import prisma from './prisma';
 import { TOOLKIT_ROOT } from '@/paths';
 import { resolvePythonPath } from '../../cron/pythonPath';
 import { getTrainingFolder } from './settings';
+import { chainOn } from '@/utils/promiseChain';
 import type { Job } from '@prisma/client';
 
 export const WORKER_SCRIPT = path.join(TOOLKIT_ROOT, 'ui_scripts', 'identity_eval.py');
@@ -203,6 +204,38 @@ export async function writeJsonFile(filePath: string, payload: unknown): Promise
   const tmp = filePath + '.tmp';
   await fsp.writeFile(tmp, JSON.stringify(payload), 'utf-8');
   await fsp.rename(tmp, filePath);
+}
+
+// ------------------------------------------------------------------ selection
+
+export interface SelectionDocument {
+  version: number;
+  training_refs: Record<string, unknown>;
+  external_refs: Record<string, unknown>;
+  sample_picks?: Record<string, unknown>;
+}
+
+// One chain per selection file: concurrent saves (e.g. picking subject faces
+// on two samples in quick succession) must not interleave their
+// read-merge-write -- without serialization both read the same prior state
+// and the later write silently erases the earlier pick (atomic writes do not
+// help; the lost update is logical). Server-side only; the refs worker also
+// rewrites selection.json during discovery, which is a much rarer,
+// user-triggered window (refresh) than pick saves.
+const selectionTransactions = new Map<string, Promise<unknown>>();
+
+export function mutateSelectionFile(
+  selectionPath: string,
+  mutate: (current: SelectionDocument) => SelectionDocument,
+): Promise<SelectionDocument> {
+  return chainOn(selectionTransactions, selectionPath, async () => {
+    const current =
+      (await readJsonFile<SelectionDocument>(selectionPath)) ??
+      ({ version: 1, training_refs: {}, external_refs: {} } satisfies SelectionDocument);
+    const next = mutate(current);
+    await writeJsonFile(selectionPath, { ...next, updated_at: new Date().toISOString() });
+    return next;
+  });
 }
 
 export function isUnder(folder: string, target: string): boolean {

@@ -11,6 +11,7 @@ import path from 'path';
 import {
   getIdentityJobContext,
   getIdentityModelsDir,
+  mutateSelectionFile,
   readJsonFile,
   runIdentityWorker,
   writeJsonFile,
@@ -138,15 +139,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ removed, ...state });
   }
 
-  // selection update: merge over the current selection file, then persist
-  const selectionPath = path.join(context.identityDir, 'selection.json');
-  const current = (await readJsonFile<{
-    version: number;
-    training_refs: Record<string, unknown>;
-    external_refs: Record<string, unknown>;
-    sample_picks?: Record<string, unknown>;
-  }>(selectionPath)) ?? { version: 1, training_refs: {}, external_refs: {} };
-
+  // selection update: sanitized merges applied inside a serialized
+  // read-merge-write transaction per job (concurrent pick saves must not
+  // erase one another -- see mutateSelectionFile)
   const sanitize = (entries: Record<string, { excluded?: boolean; face_index?: number | null }> | undefined) => {
     const out: Record<string, { excluded?: boolean; face_index?: number | null }> = {};
     for (const [key, value] of Object.entries(entries ?? {})) {
@@ -181,10 +176,15 @@ export async function POST(request: NextRequest) {
     return out;
   };
 
-  current.version = 1;
-  current.training_refs = { ...current.training_refs, ...sanitize(body.trainingRefs) };
-  current.external_refs = { ...current.external_refs, ...sanitize(body.externalRefs) };
-  current.sample_picks = { ...(current.sample_picks ?? {}), ...sanitizeSamplePicks(body.samplePicks) };
-  await writeJsonFile(selectionPath, { ...current, updated_at: new Date().toISOString() });
-  return NextResponse.json({ selection: current });
+  const trainingRefs = sanitize(body.trainingRefs);
+  const externalRefs = sanitize(body.externalRefs);
+  const samplePicks = sanitizeSamplePicks(body.samplePicks);
+  const selection = await mutateSelectionFile(path.join(context.identityDir, 'selection.json'), current => ({
+    ...current,
+    version: 1,
+    training_refs: { ...current.training_refs, ...trainingRefs },
+    external_refs: { ...current.external_refs, ...externalRefs },
+    sample_picks: { ...(current.sample_picks ?? {}), ...samplePicks },
+  }));
+  return NextResponse.json({ selection });
 }
