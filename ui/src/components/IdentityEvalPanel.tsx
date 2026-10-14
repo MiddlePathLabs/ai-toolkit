@@ -42,29 +42,44 @@ function imageUrl(path: string): string {
   return `/api/img/${encodeFilePathForUrl(path)}`;
 }
 
-// CSS face crop: the image is scaled and positioned so the bbox fills the
-// box -- a real crop view without server-side thumbnails.
-function FaceCropThumb({ src, bbox, size = 72 }: { src: string; bbox: number[]; size?: number }) {
+// CSS face crop: the image is scaled so the bbox (plus a little margin)
+// covers the box and is centred on the bbox centre -- a real crop view
+// without server-side thumbnails. `max-w-none` is load-bearing: Tailwind's
+// preflight clamps imgs to 100% of the container, which squeezed the
+// scaled-up image horizontally into the box (the "squished face" bug).
+// A "no preview" state covers images that fail to load.
+function FaceCropThumb({ src, bbox, size = 72, margin = 0.25 }: { src: string; bbox: number[]; size?: number; margin?: number }) {
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [failed, setFailed] = useState(false);
   const [x1, y1, x2, y2] = bbox;
-  const scale = natural ? Math.min(size / Math.max(x2 - x1, 1), size / Math.max(y2 - y1, 1), 2.5) : 1;
+  const w = Math.max(x2 - x1, 1);
+  const h = Math.max(y2 - y1, 1);
+  // cover-fill with a zoom cap so tiny distant faces don't dissolve into
+  // pixels (a capped face letterboxes a hair instead of over-zooming)
+  const scale = natural ? Math.min(Math.max(size / w, size / h) * (1 + margin), 4) : 1;
   return (
     <div
       className="relative overflow-hidden rounded border border-gray-300 bg-gray-900 dark:border-gray-600"
       style={{ width: size, height: size }}
     >
-      {natural && (
-        <img
-          src={imageUrl(src)}
-          alt="reference face"
-          className="absolute origin-top-left"
-          style={{
-            width: natural.w * scale,
-            height: natural.h * scale,
-            left: -x1 * scale,
-            top: -y1 * scale,
-          }}
-        />
+      {failed ? (
+        <span className="absolute inset-0 flex items-center justify-center px-1 text-center text-[9px] leading-tight text-gray-500 dark:text-gray-400">
+          no preview
+        </span>
+      ) : (
+        natural && (
+          <img
+            src={imageUrl(src)}
+            alt="face crop"
+            className="absolute max-w-none origin-top-left"
+            style={{
+              width: natural.w * scale,
+              height: natural.h * scale,
+              left: size / 2 - (x1 + w / 2) * scale,
+              top: size / 2 - (y1 + h / 2) * scale,
+            }}
+          />
+        )
       )}
       <img
         src={imageUrl(src)}
@@ -74,6 +89,7 @@ function FaceCropThumb({ src, bbox, size = 72 }: { src: string; bbox: number[]; 
           const img = e.target as HTMLImageElement;
           setNatural({ w: img.naturalWidth, h: img.naturalHeight });
         }}
+        onError={() => setFailed(true)}
       />
     </div>
   );
@@ -346,7 +362,7 @@ function MultiPersonSamples({
                 className="flex w-full items-center gap-2 px-1.5 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
                 onClick={() => setOpenFile(open ? null : sample.filename)}
               >
-                {sample.faces[0] && <FaceCropThumb src={sample.path} bbox={sample.faces[0].bbox} size={28} />}
+                {sample.faces[0] && <FaceCropThumb src={sample.path} bbox={sample.faces[0].bbox} size={32} />}
                 <span className="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-200" title={sample.filename}>
                   step {sample.step?.toLocaleString() ?? '?'} · prompt {sample.prompt_idx ?? '?'}
                   {sample.is_raw ? ' · raw' : ''}
@@ -360,86 +376,112 @@ function MultiPersonSamples({
                 )}
               </button>
               {open && (
-                <div className="space-y-2 border-t border-gray-200 p-1.5 dark:border-gray-700">
-                  <div className="flex flex-wrap gap-3">
-                    {sample.faces.map(face => {
-                      const isSubject = face.index === subject;
-                      const levels = isSubject ? [] : levelsFor(face);
-                      const twin = !isSubject && pick ? twinMarked(pick, face.index) : false;
-                      const closest = !isSubject ? closestRefOf(face) : null;
-                      const scoreBits = (['arcface', 'sface'] as const)
-                        .map(model => {
-                          const entry = face.scores?.[model]?.[source];
-                          return entry?.mean != null ? `${model === 'arcface' ? 'A' : 'S'} ${entry.mean.toFixed(3)}${entry.max != null ? ` (max ${entry.max.toFixed(3)})` : ''}` : null;
-                        })
-                        .filter(Boolean)
-                        .join(' · ');
-                      return (
-                        <div key={face.index} className="w-[152px] space-y-1">
-                          <button
-                            type="button"
-                            onClick={() => onSavePick(sample, isSubject ? null : face.index)}
-                            className={classNames(
-                              'block rounded p-0 transition',
-                              isSubject ? 'ring-2 ring-blue-500' : twin ? 'ring-2 ring-purple-500' : 'opacity-90 hover:opacity-100',
-                            )}
-                            title={`${isSubject ? 'subject face — click to un-pick' : 'click to make this the subject face'}\n${scoreBits}`}
-                          >
-                            <FaceCropThumb src={sample.path} bbox={face.bbox} size={72} />
-                          </button>
-                          <div className="flex items-center justify-between gap-1">
-                            <span className={classNames('text-[10px]', isSubject ? 'font-medium text-blue-600 dark:text-blue-400' : 'text-gray-500 dark:text-gray-400')}>
-                              {isSubject ? 'subject' : `face ${face.index + 1}`}
+                <div className="space-y-1.5 border-t border-gray-200 p-1.5 dark:border-gray-700">
+                  <p className="text-[10px] text-gray-400 dark:text-gray-500">click a face to set it as the subject — the other faces are then checked for duplication</p>
+                  {sample.faces.map(face => {
+                    const isSubject = face.index === subject;
+                    const levels = isSubject ? [] : levelsFor(face);
+                    const twin = !isSubject && pick ? twinMarked(pick, face.index) : false;
+                    const closest = !isSubject ? closestRefOf(face) : null;
+                    const scoreBits = (['arcface', 'sface'] as const)
+                      .map(model => {
+                        const entry = face.scores?.[model]?.[source];
+                        return entry?.mean != null ? `${model === 'arcface' ? 'ArcFace' : 'SFace'} ${entry.mean.toFixed(3)}` : null;
+                      })
+                      .filter(Boolean)
+                      .join(' · ');
+                    return (
+                      <div
+                        key={face.index}
+                        className={classNames(
+                          'flex items-center gap-2 rounded border p-1.5',
+                          isSubject ? 'border-blue-400/60 bg-blue-500/5 dark:border-blue-500/40' : twin ? 'border-purple-400/50 dark:border-purple-500/40' : 'border-gray-200 dark:border-gray-700',
+                        )}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onSavePick(sample, isSubject ? null : face.index)}
+                          className={classNames(
+                            'block shrink-0 rounded p-0 transition',
+                            isSubject ? 'ring-2 ring-blue-500' : twin ? 'ring-2 ring-purple-500' : 'opacity-90 hover:opacity-100',
+                          )}
+                          title={`${isSubject ? 'subject face — click to un-pick' : 'click to make this the subject face'}\n${scoreBits}`}
+                        >
+                          <FaceCropThumb src={sample.path} bbox={face.bbox} size={64} />
+                        </button>
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className={classNames('text-xs', isSubject ? 'font-semibold text-blue-600 dark:text-blue-400' : 'font-medium text-gray-700 dark:text-gray-200')}>
+                              {isSubject ? 'Subject' : `Face ${face.index + 1}`}
                             </span>
                             {!isSubject && (
                               <button
                                 type="button"
                                 className={classNames(
-                                  'rounded border px-1 text-[10px]',
+                                  'rounded border px-1.5 py-0.5 text-[10px]',
                                   twin
                                     ? 'border-purple-400/70 bg-purple-500/10 text-purple-700 dark:text-purple-300'
                                     : 'border-gray-300 text-gray-500 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-800',
                                 )}
                                 disabled={subject == null}
-                                title={subject == null ? 'pick the subject face first' : twin ? 'your own mark — the tool never asserts a twin. click to unmark' : 'mark this face as a duplicated subject yourself'}
+                                title={subject == null ? 'set the subject face first' : twin ? 'your own mark — the tool never asserts a twin. Click to remove' : 'mark this face as a duplicated subject yourself'}
                                 onClick={() => onToggleTwin(sample, face.index)}
                               >
-                                {twin ? 'user-marked twin' : 'mark twin'}
+                                {twin ? '✓ your twin mark' : 'Mark as twin'}
                               </button>
                             )}
                           </div>
-                          {levels.map(({ model, level, mean, band }) => (
-                            <div
-                              key={model}
-                              className={classNames(
-                                'rounded border px-1 text-[10px] tabular-nums',
-                                level === 'likely_duplicate'
-                                  ? 'border-red-400/60 text-red-600 dark:text-red-400'
-                                  : 'border-amber-400/60 text-amber-700 dark:text-amber-300',
-                              )}
-                              title={`${model === 'arcface' ? 'ArcFace' : 'SFace'} mean ${mean.toFixed(3)} vs LOO band ${band.toFixed(3)} (${source} refs) — per model, never averaged`}
-                            >
-                              {model === 'arcface' ? 'A' : 'S'}: {leakLevelLabel(level)}
-                            </div>
-                          ))}
-                          {closest && (
-                            <div className="flex items-center gap-1" title={`closest reference by cosine (${closest.sim.toFixed(3)}) — compare them at full resolution`}>
-                              <FaceCropThumb src={closest.image.path} bbox={closest.bbox} size={36} />
-                              <span className="text-[10px] text-gray-400 dark:text-gray-500">closest ref {closest.sim.toFixed(3)}</span>
-                            </div>
-                          )}
-                          {!isSubject && levels.length === 0 && !twin && (
-                            <div className="text-[10px] text-gray-400 dark:text-gray-500">no flag</div>
+                          {isSubject ? (
+                            <p className="text-[10px] text-gray-500 dark:text-gray-400">
+                              the intended person — its scores represent the sample
+                            </p>
+                          ) : (
+                            (['arcface', 'sface'] as const).map(model => {
+                              const entry = levels.find(l => l.model === model);
+                              const mean = face.scores?.[model]?.[source]?.mean ?? null;
+                              return (
+                                <p
+                                  key={model}
+                                  className={classNames(
+                                    'truncate text-[11px] tabular-nums',
+                                    entry?.level === 'likely_duplicate'
+                                      ? 'text-red-600 dark:text-red-400'
+                                      : entry?.level === 'resembles'
+                                        ? 'text-amber-700 dark:text-amber-300'
+                                        : 'text-gray-500 dark:text-gray-400',
+                                  )}
+                                  title={
+                                    mean != null && entry
+                                      ? `mean ${mean.toFixed(3)} vs the ${model === 'arcface' ? 'ArcFace' : 'SFace'} LOO band ${entry.band.toFixed(3)} (${source} refs) — per model, never averaged`
+                                      : 'no score for this model/source'
+                                  }
+                                >
+                                  {model === 'arcface' ? 'ArcFace' : 'SFace'}{' '}
+                                  {mean != null ? mean.toFixed(3) : '–'} — {entry ? leakLevelLabel(entry.level) : 'below the band'}
+                                </p>
+                              );
+                            })
                           )}
                         </div>
-                      );
-                    })}
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-gray-500 dark:text-gray-400">
-                    <button type="button" className={controlClass} onClick={() => onOpenSample(sample.path)}>
+                        {closest && (
+                          <div className="shrink-0 text-center" title={`the single nearest reference photo by cosine (${closest.sim.toFixed(3)}) — compare at full resolution`}>
+                            <FaceCropThumb src={closest.image.path} bbox={closest.bbox} size={48} />
+                            <div className="mt-0.5 text-[9px] text-gray-400 dark:text-gray-500">closest ref {closest.sim.toFixed(2)}</div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  <div className="flex items-center gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      className={classNames(controlClass, 'shrink-0 whitespace-nowrap')}
+                      title="The crops above are for orientation only — judge possible duplicates from the full-resolution image"
+                      onClick={() => onOpenSample(sample.path)}
+                    >
                       Open full resolution
                     </button>
-                    <span>judge duplicates from the full image, not this crop</span>
+                    <span className="text-[10px] text-gray-400 dark:text-gray-500">judge duplicates from the full image, not the crops</span>
                   </div>
                 </div>
               )}
