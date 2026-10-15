@@ -2,9 +2,36 @@
 NOTE: This is experimental and under active development; expect breaking changes and bugs. Feedback welcome.
 """
 
-from typing import List
+from typing import List, Optional
+import re
+
 import torch
 from toolkit.optimizers.optimizer_utils import runtime_step_scale
+
+
+def tag_param_families(*modules) -> None:
+    """Tag every trainable parameter with its owning module's path
+    (``param._optim_family``), so Automagic3 can pool its lr votes per
+    module family instead of per param group. Family mode ("pattern") is
+    decided by the optimizer; the tag only carries the full module path.
+
+    Safe to call on None entries and on overlapping module trees -- a
+    parameter is tagged at most once (first owner wins, which is the
+    innermost module for nested trees).
+    """
+    for module in modules:
+        if module is None:
+            continue
+        if not isinstance(module, torch.nn.Module):
+            continue
+        seen = set()
+        for mod_name, mod in module.named_modules():
+            for p in mod.parameters(recurse=False):
+                if id(p) in seen or not p.requires_grad:
+                    continue
+                seen.add(id(p))
+                if not hasattr(p, "_optim_family"):
+                    p._optim_family = mod_name or module.__class__.__name__
 
 
 
@@ -21,8 +48,8 @@ class Automagic3(torch.optim.Optimizer):
     everything in between, which is treated as noise.
 
     Each element keeps a window of its last H (= ``polarity_history``,
-    default 4) update sign bits ("is the update positive", 1-bit packed) --
-    H/8 bytes per element (half a byte at the default), the only
+    default 16) update sign bits ("is the update positive", 1-bit packed) --
+    H/8 bytes per element (two bytes at the default), the only
     per-element optimizer state. A short window suffices because verdicts
     are pooled across the whole group: millions of voters make weak
     common-mode evidence visible long before any single element is
@@ -40,7 +67,7 @@ class Automagic3(torch.optim.Optimizer):
       else  any imperfect window          0  (noise)
 
     The two events are exact mirrors with IDENTICAL pure-noise probability
-    (2 of the 2^H possible windows each; ~0.8% per element at H=8), so equal
+    (2 of the 2^H possible windows each; ~0.006% per element at H=16), so equal
     weights balance exactly -- no correction factors, no tiers. Per element
     the events are rare, but the verdict is pooled over the whole group
     (millions of elements -> tens of thousands of voters per step even
@@ -73,6 +100,10 @@ class Automagic3(torch.optim.Optimizer):
     self-reinforcing without bound. One shared lr makes those opposing votes
     cancel in the pool instead of diverging, so only common-mode evidence
     ("the whole group's step is too small / too large") moves the lr.
+    With ``family_groups`` the pooling level rises one more notch: whole
+    module families (attention vs mlp vs text-fusion, say) each get a pool
+    and their own lr -- still above any coupled unit -- so the rate is not
+    one compromise across modules that train at genuinely different scales.
 
     With ``fused=True`` (default) the step is fused into the backward pass via
     ``register_post_accumulate_grad_hook``: each parameter is updated and its
@@ -115,13 +146,31 @@ class Automagic3(torch.optim.Optimizer):
     weight_decay : float
         Decoupled (AdamW-style) weight decay; 0 disables it.
     polarity_history : int
-        Sign-history window length H (2 to 64, default 4); H/8 bytes of
+        Sign-history window length H (2 to 64, default 16); H/8 bytes of
         state per element. Longer windows make the two vote events rarer
         and more decisive (probability 2^(1-H) each under noise -- a real
         trend's excess grows ~(1+rho)^H), so detection sharpens, at the
         cost of memory, an H-step reaction lag/warmup, and fewer voters
-        per step. Changing it on resume resets the histories cleanly (one
-        re-warmup of H steps).
+        per step. At H=8 ordinary gradient noise was measured to read as
+        overshoot, crawling the rate up ~4x within an epoch; 16 keeps the
+        controller quiet through noise. Changing it on resume resets the
+        histories cleanly (one re-warmup of H steps).
+    family_groups : bool
+        If True (default), parameters tagged with a module path
+        (``param._optim_family``, set by ``tag_param_families``) are pooled
+        into module FAMILIES by substring rules (``family_rules``, first
+        match wins, the rest form "other"): every family finds its own rate
+        instead of one compromise across all of them. A split only engages
+        when it produces two or more buckets; below that (and for any
+        untagged parameters) pooling falls back to the param group, exactly
+        like family_groups=False. Families are coupled-unit-safe: the rules
+        keep a module's LoRA A/B pair and any fused projection (Q/K/V)
+        inside one bucket. Family lrs live in the per-param ``lr`` state,
+        so checkpoints and resumes are unchanged.
+    family_rules : tuple or None
+        Override for the family rules: a tuple of ``(name, needles)``
+        where ``needles`` are lowercase substrings matched against the
+        tagged module path; the first matching rule names the family.
     fused : bool
         If True (default), each param is updated inside the backward pass the
         moment its grad is ready -- low peak VRAM, but it bypasses the trainer's
@@ -177,6 +226,18 @@ class Automagic3(torch.optim.Optimizer):
        (notably in bf16/fp16).
     """
 
+    # Module-family bucketing rules for family_groups=True: (family name,
+    # lowercase substrings of the tagged module path), first match wins, the
+    # rest form "other". Kept coarse and coupled-unit-safe: everything of one
+    # module family (a LoRA A/B pair, a fused QKV projection) lands in one
+    # bucket, mirroring the measured win from splitting attention vs mlp vs
+    # text-fusion rates instead of one compromise across all of them.
+    DEFAULT_FAMILY_RULES = (
+        ("txtfusion", ("txtfusion", "text_fusion", "text-fusion")),
+        ("attn", ("attn",)),
+        ("mlp", ("mlp",)),
+    )
+
     def __init__(
         self,
         params,
@@ -187,8 +248,10 @@ class Automagic3(torch.optim.Optimizer):
         eps: float = 1e-30,
         clip_threshold: float = 1.0,
         weight_decay: float = 0.0,
-        polarity_history: int = 8,  # sign-history window length (2-64)
+        polarity_history: int = 16,  # sign-history window length (2-64)
         fused: bool = True,
+        family_groups: bool = True,
+        family_rules: Optional[tuple] = None,
     ):
         if min_lr > max_lr:
             raise ValueError(
@@ -214,6 +277,10 @@ class Automagic3(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         self.fused = fused
+        self.family_groups = bool(family_groups)
+        self._family_rules = tuple(
+            family_rules if family_rules is not None else self.DEFAULT_FAMILY_RULES
+        )
         self._rebuild_group_index()
         self._hook_handles = []
         for group in self.param_groups:
@@ -326,6 +393,15 @@ class Automagic3(torch.optim.Optimizer):
         vals = (packed.unsqueeze(-1) >> shifts).bitwise_and_(1)
         return vals.view(-1)[:numel]
 
+    def _family_of(self, module_path: str) -> Optional[str]:
+        # Bucket a tagged module path into its family: first matching rule
+        # wins, anything else is "other".
+        lower = module_path.lower()
+        for name, needles in self._family_rules:
+            if any(needle in lower for needle in needles):
+                return name
+        return "other"
+
     def _rebuild_group_index(self) -> None:
         # param -> index of its param group, plus per-group vote accumulators
         # (weighted vote mass and total weight, gathered across every tensor
@@ -337,6 +413,30 @@ class Automagic3(torch.optim.Optimizer):
         }
         self._group_num: List = [None] * len(self.param_groups)
         self._group_den: List = [None] * len(self.param_groups)
+        # Module-family pools: tagged params vote and are nudged per family
+        # instead of per group. Needs two or more buckets to engage; below
+        # that (and for untagged params) everything stays on the group pool.
+        fam_ids: dict = {}
+        self._param_family_index: dict = {}
+        if getattr(self, "family_groups", True):
+            for p in self._param_group_index:
+                tag = getattr(p, "_optim_family", None)
+                if isinstance(tag, str) and tag:
+                    fam = self._family_of(tag)
+                    self._param_family_index[p] = fam_ids.setdefault(
+                        fam, len(fam_ids)
+                    )
+        if len(fam_ids) < 2:
+            self._param_family_index = {}
+        self._family_params: dict = {}
+        for p, fi in self._param_family_index.items():
+            self._family_params.setdefault(fi, []).append(p)
+        self._fam_num: List = [None] * len(self._family_params)
+        self._fam_den: List = [None] * len(self._family_params)
+        if self._family_params:
+            print(
+                f"Automagic3: per-family lr pools engaged: {sorted(fam_ids)}"
+            )
 
     @classmethod
     def _stochastic_copy_(cls, dst: torch.Tensor, src_fp32: torch.Tensor) -> None:
@@ -529,18 +629,25 @@ class Automagic3(torch.optim.Optimizer):
             w = update.abs().view(-1)
             num = (w * up).sum().sub_((w * down).sum())
             den = w.sum()
-            gi = self._param_group_index.get(p)
-            if gi is not None:
-                if self._group_num[gi] is None:
-                    self._group_num[gi] = num
-                    self._group_den[gi] = den
+            # Tagged params vote into their module-family pool; everything
+            # else into its param group's pool.
+            fi = self._param_family_index.get(p)
+            if fi is not None:
+                pools_num, pools_den, vi = self._fam_num, self._fam_den, fi
+            else:
+                gi = self._param_group_index.get(p)
+                pools_num, pools_den, vi = self._group_num, self._group_den, gi
+            if vi is not None and vi < len(pools_num):
+                if pools_num[vi] is None:
+                    pools_num[vi] = num
+                    pools_den[vi] = den
                 else:
-                    acc = self._group_num[gi]
+                    acc = pools_num[vi]
                     if num.device != acc.device:
                         num = num.to(acc.device)
                         den = den.to(acc.device)
                     acc.add_(num)
-                    self._group_den[gi].add_(den)
+                    pools_den[vi].add_(den)
 
         state["step"] += 1
 
@@ -594,20 +701,14 @@ class Automagic3(torch.optim.Optimizer):
         return loss
 
     def _apply_group_votes(self) -> None:
-        # ONE lr nudge per group per step, from the pooled vote of every
-        # element of every tensor in the group (see the class docstring on
-        # why pooling at group level is load-bearing). Each param's lr tensor
-        # receives the same multiplicative factor, so they stay identical --
-        # effectively a single group lr, stored per param only so it rides
-        # the normal state_dict machinery. All tensor ops: no GPU sync.
-        for gi, group in enumerate(self.param_groups):
-            num = self._group_num[gi]
-            if num is None:
-                continue
-            den = self._group_den[gi]
-            signal = num.div_(den.clamp_(min=1e-30)).clamp_(-1.0, 1.0)
-            factor = torch.exp(signal)
-            for p in group["params"]:
+        # ONE lr nudge per pool per step, from the pooled vote of every
+        # element of every tensor in the pool (see the class docstring on
+        # why pooling at group level is load-bearing; family pools are the
+        # same principle one level coarser than the whole network). Each
+        # param's lr tensor receives the same multiplicative factor as its
+        # poolmates. All tensor ops: no GPU sync.
+        def _nudge(factor: torch.Tensor, params) -> None:
+            for p in params:
                 st = self.state.get(p)
                 if st is None or "lr" not in st:
                     continue
@@ -617,9 +718,31 @@ class Automagic3(torch.optim.Optimizer):
                 # this is a numerical overflow guard only (decades outside the
                 # usable range); tighter user-set bounds act as hard rails on
                 # the controller.
+                group = self.param_groups[self._param_group_index[p]]
                 lr_t.mul_(f).clamp_(min=group["min_lr"], max=group["max_lr"])
+
+        for gi, group in enumerate(self.param_groups):
+            num = self._group_num[gi]
+            if num is None:
+                continue
+            den = self._group_den[gi]
+            signal = num.div_(den.clamp_(min=1e-30)).clamp_(-1.0, 1.0)
+            factor = torch.exp(signal)
+            _nudge(
+                factor,
+                (p for p in group["params"] if p not in self._param_family_index),
+            )
             self._group_num[gi] = None
             self._group_den[gi] = None
+        for fi, num in enumerate(self._fam_num):
+            if num is None:
+                continue
+            den = self._fam_den[fi]
+            signal = num.div_(den.clamp_(min=1e-30)).clamp_(-1.0, 1.0)
+            factor = torch.exp(signal)
+            _nudge(factor, self._family_params.get(fi, []))
+            self._fam_num[fi] = None
+            self._fam_den[fi] = None
 
     def get_learning_rates(self) -> List[float]:
         # Reporting helper: the (shared) lr of each param group.
@@ -631,6 +754,20 @@ class Automagic3(torch.optim.Optimizer):
                 if p in self.state and "lr" in self.state[p]
             ]
             out.append(float(torch.stack(lrs).mean()) if lrs else float(group["lr"]))
+        return out
+
+    def get_family_learning_rates(self) -> List[tuple]:
+        # Reporting helper for family pools: (family index, lr mean) per
+        # engaged family, empty when pooling is at group level.
+        out = []
+        for fi, params in self._family_params.items():
+            lrs = [
+                self.state[p]["lr"]
+                for p in params
+                if p in self.state and "lr" in self.state[p]
+            ]
+            if lrs:
+                out.append((fi, float(torch.stack(lrs).mean())))
         return out
 
     def get_avg_learning_rate(self) -> float:
@@ -652,12 +789,17 @@ class Automagic3(torch.optim.Optimizer):
             # One lr per group: unify the restored lrs to their geometric
             # median (they are already identical for checkpoints from this
             # version; older per-tensor checkpoints land on a sane middle).
-            lrs = [
-                st["lr"]
-                for p in group["params"]
-                if (st := self.state.get(p)) is not None
-                and isinstance(st.get("lr"), torch.Tensor)
-            ]
+            # With family pools engaged the lrs legitimately differ per
+            # family, so they are restored as saved instead.
+            unify = not self._param_family_index
+            lrs = []
+            if unify:
+                lrs = [
+                    st["lr"]
+                    for p in group["params"]
+                    if (st := self.state.get(p)) is not None
+                    and isinstance(st.get("lr"), torch.Tensor)
+                ]
             med = None
             if lrs:
                 dev = lrs[0].device

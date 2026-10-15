@@ -3276,6 +3276,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
+        if optimizer_type == 'automagic3':
+            # Tag trainable params with their module path so the optimizer can
+            # pool its lr votes per module family (attn / mlp / ...); inert for
+            # every other optimizer.
+            from toolkit.optimizers.automagic3 import tag_param_families
+
+            tag_param_families(
+                self.network,
+                getattr(self.sd, 'unet', None),
+                getattr(self.sd, 'refiner_unet', None),
+                *list(getattr(self.sd, 'text_encoders', None) or []),
+            )
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=self.train_config.optimizer_params)
         self.optimizer = optimizer
