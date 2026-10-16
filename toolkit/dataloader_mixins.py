@@ -522,6 +522,7 @@ class BucketsMixin:
             # budget so a mixed photo+clip dataset keeps photos at `resolution`
             # while clips stay cheap. This is the single sizing point for
             # items, so caches and training agree by construction.
+            clip_area_budget = False
             if (
                 getattr(file_item, 'is_video', False)
                 and getattr(item_config, 'clip_megapixels', None)
@@ -529,6 +530,7 @@ class BucketsMixin:
                 from toolkit.buckets import clip_target_resolution
 
                 resolution = clip_target_resolution(item_config.clip_megapixels)
+                clip_area_budget = True
                 if not getattr(self, '_clip_mp_notice_shown', False):
                     self._clip_mp_notice_shown = True
                     print_acc(
@@ -538,20 +540,33 @@ class BucketsMixin:
                     )
 
             if item_config.square_crop:
+                # a square crop takes the value directly as both crop dims,
+                # with none of the bucket-divisibility snapping the branch
+                # below applies. The dataset `resolution` is the user's own
+                # number and passes through as configured, but the clip
+                # budget is a sqrt(megapixels) with no divisibility
+                # structure -- floor it to the model's bucket grid
+                # (bucket_tolerance carries sd.get_bucket_divisibility()),
+                # e.g. H3 requires /32. Flooring keeps the budget a cap.
+                crop_resolution = resolution
+                if clip_area_budget:
+                    crop_resolution = max(
+                        bucket_tolerance, resolution - resolution % bucket_tolerance
+                    )
                 # we scale first so smallest size matches resolution
-                scale_factor_x = resolution / width
-                scale_factor_y = resolution / height
+                scale_factor_x = crop_resolution / width
+                scale_factor_y = crop_resolution / height
                 scale_factor = max(scale_factor_x, scale_factor_y)
                 file_item.scale_to_width = math.ceil(width * scale_factor)
                 file_item.scale_to_height = math.ceil(height * scale_factor)
-                file_item.crop_width = resolution
-                file_item.crop_height = resolution
+                file_item.crop_width = crop_resolution
+                file_item.crop_height = crop_resolution
                 if width > height:
-                    file_item.crop_x = int(file_item.scale_to_width / 2 - resolution / 2)
+                    file_item.crop_x = int(file_item.scale_to_width / 2 - crop_resolution / 2)
                     file_item.crop_y = 0
                 else:
                     file_item.crop_x = 0
-                    file_item.crop_y = int(file_item.scale_to_height / 2 - resolution / 2)
+                    file_item.crop_y = int(file_item.scale_to_height / 2 - crop_resolution / 2)
             else:
                 bucket_resolution = get_bucket_for_image_size(
                     width, height,

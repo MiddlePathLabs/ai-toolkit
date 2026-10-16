@@ -105,3 +105,39 @@ def test_unset_clip_megapixels_keeps_photos_and_clips_together(tmp_path):
     video_item = next(i for i in dataset.file_list if i.path == str(video))
     # without the override the clip stays under the 1 MP budget unscaled
     assert (video_item.crop_width, video_item.crop_height) == (1280, 720)
+
+
+def test_square_cropped_clips_snap_to_the_model_grid(tmp_path):
+    # the budget side, sqrt(0.25MP) = 500, is off H3's /32 grid; a square
+    # crop assigns it directly to both crop dims, so it must be floored to
+    # the model's bucket divisibility while keeping the area a cap
+    class _H3GridStub(_SizingStub):
+        def get_bucket_divisibility(self):
+            return 32
+
+    video = tmp_path / "clip.mp4"
+    _write_video(video)
+    photo = tmp_path / "still.png"
+    Image.new("RGB", (1400, 1400), (255, 0, 0)).save(photo)
+
+    config = DatasetConfig(
+        dataset_path=str(tmp_path),
+        resolution=1000,
+        square_crop=True,
+        clip_megapixels=0.25,
+        allow_uncaptioned=True,
+        num_frames=8,
+        num_workers=0,
+    )
+    dataset = AiToolkitDataset(config, sd=_H3GridStub())
+    items = {item.path: item for item in dataset.file_list}
+
+    video_item = items[str(video)]
+    assert (video_item.crop_width, video_item.crop_height) == (480, 480)
+    assert video_item.crop_width % 32 == 0 and video_item.crop_height % 32 == 0
+    assert video_item.crop_width * video_item.crop_height <= 0.25 * 1e6
+
+    # the dataset's own resolution passes through square crops as configured
+    # (only the clip budget gets snapped)
+    photo_item = items[str(photo)]
+    assert (photo_item.crop_width, photo_item.crop_height) == (1000, 1000)
