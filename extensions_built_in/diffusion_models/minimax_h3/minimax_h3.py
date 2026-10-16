@@ -182,6 +182,70 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
         self.enable_gradient_checkpointing(False)
 
 
+# Named training-adapter (assistant LoRA) choices for
+# model_kwargs.training_adapter / assistant_lora_path:
+#   circlestone  - Circlestone Labs' H3 image training adapter (rank 64,
+#                  ~0.62 GB); one file for fl2va and ref2va bases. Default for
+#                  training; sharper LoRAs and closer prompt-following from
+#                  photo sets (Fizgig v6.3.0 A/B).
+#   ostris       - Ostris' de-distillation adapter, best for video-heavy sets
+#                  (~3x faster look learning there); fl2va or ref2va file is
+#                  picked from model_kwargs.partition.
+#   off          - no training adapter.
+# Any other value is used as a path (local file, MODELS_PATH-relative name,
+# or "user/repo/file.safetensors" hub path).
+H3_TRAINING_ADAPTERS = {
+    "circlestone": (
+        "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
+        "minimax_h3_image_training_adapter.safetensors",
+    ),
+    "ostris_fl2va": (
+        "ostris/minimax_h3_training_adapter",
+        "minimax_h3_training_adapter_v1.safetensors",
+    ),
+    "ostris_ref2va": (
+        "ostris/minimax_h3_training_adapter",
+        "minimax_h3_ref2va_training_adapter_v1.safetensors",
+    ),
+}
+
+
+def resolve_h3_training_adapter(value, partition: str = "fl2va_pruned"):
+    """Map a training-adapter choice to a hub path; None means no adapter."""
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key in ("", "off", "none", "disabled"):
+        return None
+    if key == "ostris":
+        key = "ostris_ref2va" if str(partition).startswith("ref2va") else "ostris_fl2va"
+    hub = H3_TRAINING_ADAPTERS.get(key)
+    if hub is not None:
+        return f"{hub[0]}/{hub[1]}"
+    return str(value)
+
+
+def maybe_default_h3_training_adapter(model_config) -> bool:
+    """Default H3 *training* runs to the Circlestone adapter (Fizgig's
+    photo-default A/B) unless the config already names one or opts out via
+    model_kwargs.training_adapter = "off". Only the trainer calls this, so
+    inference/eval jobs never see the default."""
+    if model_config is None:
+        return False
+    if not str(getattr(model_config, "arch", "") or "").startswith("minimax_h3"):
+        return False
+    model_kwargs = getattr(model_config, "model_kwargs", None)
+    if not isinstance(model_kwargs, dict):
+        model_kwargs = {}
+    if model_kwargs.get("training_adapter") is not None:
+        return False
+    if getattr(model_config, "assistant_lora_path", None) is not None:
+        return False
+    model_kwargs["training_adapter"] = "circlestone"
+    model_config.model_kwargs = model_kwargs
+    return True
+
+
 class MinimaxH3Model(BaseModel):
     arch = "minimax_h3"
     # video flow shift; audio stays on AUDIO_SIGMA_SHIFT, remapped from this
@@ -282,6 +346,14 @@ class MinimaxH3Model(BaseModel):
             status_fn=self.print_and_status_update,
         )
 
+    def _effective_partition(self) -> str:
+        # The Ref2VA subclass overrides _partition() with its own default;
+        # use it where code runs on either class (adapter choice mapping).
+        getter = getattr(self, "_partition", None)
+        if callable(getter):
+            return str(getter())
+        return str(self.model_config.model_kwargs.get("partition", "fl2va_pruned"))
+
     def _dit_component(self) -> str:
         partition = str(
             self.model_config.model_kwargs.get("partition", "fl2va_pruned")
@@ -308,7 +380,12 @@ class MinimaxH3Model(BaseModel):
         from toolkit.lora_special import LoRASpecialNetwork
 
         self.print_and_status_update("Loading assistant LoRA")
-        lora_path = self.model_config.assistant_lora_path
+        lora_path = resolve_h3_training_adapter(
+            self.model_config.assistant_lora_path, self._effective_partition()
+        )
+        if lora_path is None:
+            # named "off" via assistant_lora_path or model_kwargs.training_adapter
+            return
         if not os.path.exists(lora_path):
             filename = os.path.basename(lora_path)
             found = find_file_recursive(os.path.join(MODELS_PATH, "loras"), filename)
@@ -583,7 +660,19 @@ class MinimaxH3Model(BaseModel):
 
         transformer = self._load_transformer()
 
-        # load assistant lora if specified (merged into the quantized weights)
+        # training adapter: model_kwargs.training_adapter names it
+        # (circlestone | ostris | off | path); "off" wins over any
+        # assistant_lora_path, an explicit assistant_lora_path wins over the
+        # trainer-injected default
+        adapter_choice = self.model_config.model_kwargs.get("training_adapter")
+        if adapter_choice is not None:
+            resolved = resolve_h3_training_adapter(
+                adapter_choice, self._effective_partition()
+            )
+            self.print_and_status_update(
+                f"[h3] training adapter: {resolved or 'off'} (model_kwargs.training_adapter={adapter_choice!r})"
+            )
+            self.model_config.assistant_lora_path = resolved
         if self.model_config.assistant_lora_path is not None:
             self.load_training_adapter(transformer)
         if self.model_config.preview_lora_path is not None:

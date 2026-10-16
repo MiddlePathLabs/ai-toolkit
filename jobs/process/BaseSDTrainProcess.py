@@ -2884,6 +2884,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             noise_scheduler=sampler,
         )
         
+        # MiniMax-H3 training runs default to the Circlestone training adapter
+        # (sharper LoRAs from photo sets); configs name another one or opt out
+        # via model_kwargs.training_adapter = "off". Inference jobs never pass
+        # through here, so sampling behaviour is unchanged.
+        from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
+            maybe_default_h3_training_adapter,
+        )
+
+        if maybe_default_h3_training_adapter(model_config_to_load):
+            print_acc(
+                "[h3] training adapter default: circlestone "
+                "(model_kwargs.training_adapter: circlestone | ostris | off | <path>)"
+            )
+
         self.hook_after_sd_init_before_load()
         # warm-start skip: when every text embedding can come from disk there is
         # no reason to load the (25 GB) text encoder up front. Models that opt
