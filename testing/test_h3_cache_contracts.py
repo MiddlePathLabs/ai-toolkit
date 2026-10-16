@@ -313,7 +313,7 @@ def test_bucketed_image_pair_fetch_uses_dataset_transform(tmp_path):
     Image.new("RGB", (8, 8), (0, 0, 255)).save(unconditional / "pair.png")
     config = DatasetConfig(
         dataset_path=str(images), unconditional_path=str(unconditional),
-        resolution=8, buckets=True, num_workers=0,
+        resolution=8, buckets=True, num_workers=0, allow_uncaptioned=True,
     )
     loader = get_dataloader_from_datasets(
         [config], batch_size=1, sd=_FrozenToyEncoderModel()
@@ -352,7 +352,8 @@ def test_multimodal_dataset_retains_audio_and_image_items(tmp_path, extension):
     model.is_multimodal_llm = True
     model.sample_rate = sample_rate
     dataset = AiToolkitDataset(
-        DatasetConfig(dataset_path=str(tmp_path), resolution=8, buckets=True),
+        DatasetConfig(dataset_path=str(tmp_path), resolution=8, buckets=True,
+                      allow_uncaptioned=True),
         sd=model,
     )
     items = {item.path: item for item in dataset.file_list}
@@ -394,7 +395,7 @@ def test_latent_preparation_hashes_repeated_source_once_and_rekeys_fresh_content
     config = DatasetConfig(
         dataset_path=str(tmp_path), resolution=8, buckets=False,
         cache_latents_to_disk=True, cache_latents_num_workers=1,
-        num_repeats=2, flip_x=True, flip_y=True,
+        num_repeats=2, flip_x=True, flip_y=True, allow_uncaptioned=True,
     )
     calls = []
     original = mixins.content_fingerprint

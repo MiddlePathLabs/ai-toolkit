@@ -1643,6 +1643,10 @@ class DatasetConfig:
         # if caption_ext doesnt start with a dot, add it
         if self.caption_ext and not self.caption_ext.startswith('.'):
             self.caption_ext = '.' + self.caption_ext
+        # fail fast on media with no caption (toolkit.dataloader_mixins.
+        # validate_dataset_captions) unless a blanket default_caption is set
+        # or the dataset opts out explicitly
+        self.allow_uncaptioned: bool = kwargs.get('allow_uncaptioned', False)
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)

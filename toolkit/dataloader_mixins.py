@@ -600,6 +600,81 @@ class BucketsMixin:
             print_acc(f'{len(self.buckets)} buckets made')
 
 
+def decode_caption_file(path: str) -> str:
+    """Read a caption sidecar tolerantly: UTF-8 first, then the encodings
+    Windows editors actually emit (UTF-16 with BOM, cp1252/latin-1), with a
+    named warning for anything that is not UTF-8 so a bad encoding degrades
+    one caption instead of killing the caching run with UnicodeDecodeError."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
+        print_acc(
+            f"Caption {path} is UTF-16 - decoded, but re-save it as UTF-8."
+        )
+        return raw.decode('utf-16')
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        pass
+    for encoding in ('cp1252', 'latin-1'):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        print_acc(
+            f"Caption {path} is not valid UTF-8 - decoded as {encoding}. "
+            f"Re-save it as UTF-8 to silence this warning."
+        )
+        return text
+    # latin-1 decodes any byte string, so this is unreachable; kept as a
+    # guard if the ladder above gains a stricter rung
+    return raw.decode('utf-8', errors='replace')
+
+
+def _caption_entry_exists(caption_dict: Union[dict, None], path: str) -> bool:
+    if caption_dict is None or path not in caption_dict:
+        return False
+    entry = caption_dict[path]
+    return isinstance(entry, str) or (isinstance(entry, dict) and "caption" in entry)
+
+
+def validate_dataset_captions(
+    source_items: list,
+    caption_dict: Union[dict, None],
+    dataset_config,
+    dataset_path: str,
+) -> None:
+    """Fail fast when media files would train on an empty caption. A missing
+    caption sidecar used to fall through to raw_caption='' silently; one
+    uncaptioned image could poison a whole run's caption grammar unnoticed.
+    Opt-outs: an explicit ``default_caption`` (a deliberate blanket caption),
+    ``caption_ext: null`` (caption support off), or
+    ``allow_uncaptioned: true`` on the dataset config."""
+    caption_ext = getattr(dataset_config, 'caption_ext', None)
+    if caption_ext is None:
+        return
+    if getattr(dataset_config, 'allow_uncaptioned', False):
+        return
+    if getattr(dataset_config, 'default_caption', None) is not None:
+        return
+    uncaptioned = [
+        item.path
+        for item in source_items
+        if not _caption_entry_exists(caption_dict, item.path)
+        and not os.path.exists(os.path.splitext(item.path)[0] + caption_ext)
+    ]
+    if not uncaptioned:
+        return
+    shown = [os.path.basename(p) for p in uncaptioned[:6]]
+    more = len(uncaptioned) - len(shown)
+    raise ValueError(
+        f"{len(uncaptioned)} file(s) in {dataset_path} have no caption: "
+        f"{', '.join(shown)}" + (f" ... and {more} more" if more > 0 else "")
+        + f". They would train on an empty caption. Caption them, or set "
+        f"default_caption / allow_uncaptioned: true in the dataset config."
+    )
+
+
 class CaptionProcessingDTOMixin:
     def __init__(self: 'FileItemDTO', *args, **kwargs):
         if hasattr(super(), '__init__'):
@@ -679,15 +754,12 @@ class CaptionProcessingDTOMixin:
             short_caption = None
 
             if os.path.exists(prompt_path):
-                with open(prompt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read()
-                    short_caption = None
-                    prompt = clean_caption(prompt)
-                    if short_caption is not None:
-                        short_caption = clean_caption(short_caption)
+                prompt = decode_caption_file(prompt_path)
+                short_caption = None
+                prompt = clean_caption(prompt)
 
-                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
-                        prompt = self.dataset_config.default_caption
+                if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                    prompt = self.dataset_config.default_caption
             else:
                 prompt = ''
                 if self.dataset_config.default_caption is not None:

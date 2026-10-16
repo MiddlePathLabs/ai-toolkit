@@ -25,6 +25,7 @@ from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingM
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.h3_audio_only import uses_h3_standalone_audio, validate_audio_only_caption_dropout
+from toolkit.dataloader_mixins import validate_dataset_captions
 from toolkit.h3_dopsd import assign_other_photo_pairs
 from toolkit.accelerator import get_accelerator
 
@@ -811,6 +812,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             )
         validate_audio_only_caption_dropout(
             dataset_config, has_audio_only=has_audio_only
+        )
+        # fail fast on files that would train on an empty caption
+        validate_dataset_captions(
+            source_items, caption_dict, dataset_config, dataset_path
         )
 
         # handle x axis flips
