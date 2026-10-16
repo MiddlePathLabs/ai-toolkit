@@ -26,6 +26,12 @@ def test_stance_disabled_keeps_compiled_graphs():
         assert _probe_runs_compiled() is True
 
 
+# without set_stance the helper is a no-op by design, so eager execution
+# cannot be observed on those torch versions
+@pytest.mark.skipif(
+    not hasattr(torch.compiler, "set_stance"),
+    reason="torch.compiler.set_stance unavailable",
+)
 def test_stance_enabled_runs_eager():
     assert _probe_runs_compiled() is True  # warm the compile cache
     with _force_eager_stance(True):
@@ -38,6 +44,6 @@ def test_stance_errors_degrade_to_plain_body(monkeypatch):
     def _boom(*args, **kwargs):
         raise RuntimeError("no stance on this torch")
 
-    monkeypatch.setattr(torch.compiler, "set_stance", _boom)
+    monkeypatch.setattr(torch.compiler, "set_stance", _boom, raising=False)
     with _force_eager_stance(True):
         assert _probe_runs_compiled() is True  # compiled as usual, no raise
