@@ -57,7 +57,11 @@ from toolkit.optimizer_runtime import (
     uses_adaptive_lr_step_scale,
 )
 from toolkit.h3_modality_routing import bind_modality_router
-from toolkit.h3_train_blocks import prepare_train_blocks, verify_train_blocks
+from toolkit.h3_train_blocks import (
+    prepare_h3_default_guards,
+    prepare_train_blocks,
+    verify_train_blocks,
+)
 from toolkit.h3_tread import bind_tread, read_tread_seed, set_tread_step
 from toolkit.category_stop import bind_category_stop, category_kinds, window_category_kinds
 from toolkit.low_noise_share import bind_low_noise_share
@@ -3036,6 +3040,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 
                 if hasattr(self.sd, 'target_lora_modules'):
                     network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
+
+                network_kwargs = prepare_h3_default_guards(
+                    self.network_config,
+                    self.sd,
+                    network_kwargs,
+                )
 
                 network_kwargs, train_block_indices = prepare_train_blocks(
                     self.network_config,

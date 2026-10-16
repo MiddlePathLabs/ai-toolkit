@@ -257,6 +257,15 @@ class NetworkConfig:
             train_blocks = str(train_blocks).strip() or None
         self.train_blocks: Optional[str] = train_blocks
 
+        # MiniMax-H3 default-scope opt-outs (toolkit/h3_train_blocks.py
+        # prepare_h3_default_guards): without a train_blocks window, the LoRA
+        # skips the token refiner and trunk blocks 0-5 unless raised here. The
+        # refiner's text rows enter at block 0 (a trainable one drags the
+        # backward through every block); blocks 0-5 deform anatomy and pull the
+        # dataset's colour into the render.
+        self.train_token_refiner: bool = kwargs.get('train_token_refiner', False)
+        self.train_low_blocks: bool = kwargs.get('train_low_blocks', False)
+
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
 

@@ -104,6 +104,51 @@ def _expand_named(spec: Any, layout: BlockLayout) -> Any:
     return layout.named.get(key, spec)
 
 
+def prepare_h3_default_guards(
+    network_config: Any,
+    sd: Any,
+    network_kwargs: dict,
+) -> dict:
+    """Default-safe LoRA scope on MiniMax-H3 when no ``train_blocks`` window is
+    set: the token refiner and trunk blocks 0-5 never carry a LoRA unless the
+    config asks for them (``network.train_token_refiner`` /
+    ``network.train_low_blocks``).
+
+    The refiner's text rows enter at block 0, so a trainable refiner drags the
+    backward through every block; training it also softened output and added
+    preview judder with no likeness gain (Fizgig v5.8.0, which froze it by
+    default for exactly these reasons). Blocks 0-5 deform anatomy and pull the
+    dataset's colour into the render (Fizgig v6.2.0's measured defaults pass:
+    likeness targets reached by epoch 8 instead of 15-21 once they were out).
+    The ``train_blocks`` path needs no guard -- it is scoped by block list and
+    always excludes the refiner.
+    """
+    if not is_h3_arch(_arch_of(sd)):
+        return network_kwargs
+    if getattr(network_config, "train_blocks", None) is not None:
+        return network_kwargs
+    ignore = list(network_kwargs.get("ignore_if_contains") or [])
+    added = []
+    if not getattr(network_config, "train_token_refiner", False):
+        if "token_refiner" not in ignore:
+            ignore.append("token_refiner")
+            added.append("the token refiner")
+    if not getattr(network_config, "train_low_blocks", False):
+        low = [f"blocks.{i}." for i in range(6)]
+        new = [w for w in low if w not in ignore]
+        if new:
+            ignore.extend(new)
+            added.append("blocks 0-5")
+    if added:
+        network_kwargs = dict(network_kwargs)
+        network_kwargs["ignore_if_contains"] = ignore
+        print_acc(
+            f"[h3-guards] default LoRA scope on MiniMax-H3 excludes {' and '.join(added)} "
+            f"(network.train_token_refiner / network.train_low_blocks to opt in)"
+        )
+    return network_kwargs
+
+
 def prepare_train_blocks(
     network_config: Any,
     sd: Any,
@@ -134,6 +179,12 @@ def prepare_train_blocks(
     if network_type in _UNSUPPORTED_NETWORK_TYPES:
         raise ValueError(
             f"network.train_blocks supports LoRA/LoKr networks, got type {network_type!r}"
+        )
+    if getattr(network_config, "train_token_refiner", False):
+        raise ValueError(
+            "network.train_blocks always excludes the token refiner (its text rows "
+            "enter at block 0 and would drag the backward through every block); "
+            "train it by removing train_blocks, not with train_token_refiner"
         )
     if network_kwargs.get("only_if_contains"):
         raise ValueError(
