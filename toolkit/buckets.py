@@ -14,6 +14,14 @@ def get_resolution(width, height):
     return square_resolution
 
 
+def clip_target_resolution(megapixels) -> int:
+    """The bucket-area budget for a clip pixel budget in megapixels: the side
+    of the square with that area (``get_bucket_for_image_size`` treats its
+    ``resolution`` as an area budget of resolution^2, so no extra rounding is
+    needed). Floored so a typo'd 0.0025 cannot degenerate the bucket."""
+    return max(64, int(math.sqrt(float(megapixels or 0) * 1e6)))
+
+
 def get_bucket_for_image_size(
     width: int, height: int, resolution: int = 512, divisibility: int = 8
 ) -> BucketResolution:

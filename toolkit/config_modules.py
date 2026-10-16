@@ -1647,6 +1647,14 @@ class DatasetConfig:
         # validate_dataset_captions) unless a blanket default_caption is set
         # or the dataset opts out explicitly
         self.allow_uncaptioned: bool = kwargs.get('allow_uncaptioned', False)
+        # Clip Target Megapixels: video items bucket to their own pixel budget
+        # (toolkit.buckets.clip_target_resolution) so mixed photo+clip datasets
+        # keep photos at `resolution` while clips stay cheap. None = clips use
+        # `resolution` like everything else.
+        clip_megapixels = kwargs.get('clip_megapixels', None)
+        self.clip_megapixels: Union[float, None] = (
+            float(clip_megapixels) if clip_megapixels else None
+        )
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)

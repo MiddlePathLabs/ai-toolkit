@@ -518,6 +518,25 @@ class BucketsMixin:
             width = int(file_item.width * item_config.scale)
             height = int(file_item.height * item_config.scale)
 
+            # Clip Target Megapixels: video items size to their own pixel
+            # budget so a mixed photo+clip dataset keeps photos at `resolution`
+            # while clips stay cheap. This is the single sizing point for
+            # items, so caches and training agree by construction.
+            if (
+                getattr(file_item, 'is_video', False)
+                and getattr(item_config, 'clip_megapixels', None)
+            ):
+                from toolkit.buckets import clip_target_resolution
+
+                resolution = clip_target_resolution(item_config.clip_megapixels)
+                if not getattr(self, '_clip_mp_notice_shown', False):
+                    self._clip_mp_notice_shown = True
+                    print_acc(
+                        f'  -  clip_megapixels={item_config.clip_megapixels}: '
+                        f'video items bucket to ~{resolution}px area budget '
+                        f'(photos stay at {item_config.resolution}px)'
+                    )
+
             if item_config.square_crop:
                 # we scale first so smallest size matches resolution
                 scale_factor_x = resolution / width
