@@ -53,7 +53,7 @@ class _H3:
         return ["blocks"]
 
 
-def _build_network(transformer, network_kwargs):
+def _build_network(transformer, network_kwargs, sd=None):
     for p in transformer.parameters():
         p.requires_grad_(False)
     config = NetworkConfig(type="lora", linear=4, linear_alpha=4)
@@ -69,8 +69,8 @@ def _build_network(transformer, network_kwargs):
         network_type="lora",
         transformer_only=True,
         is_transformer=True,
-        base_model=_H3(transformer),
-        target_lin_modules=["ToyH3Transformer"],
+        base_model=sd if sd is not None else _H3(transformer),
+        target_lin_modules=[type(transformer).__name__],
         **network_kwargs,
     )
     network.force_to("cpu", dtype=torch.float32)
@@ -176,4 +176,75 @@ def test_runtime_check_catches_upstream_trainable():
     verify_train_blocks(_H3(transformer), network, indices)
     transformer.blocks[3].fc1.weight.requires_grad_(True)  # something trainable upstream
     with pytest.raises(RuntimeError, match="block 19 requires grad"):
+        transformer(torch.randn(2, 8))
+
+
+# ------------------------------------------------------ Qwen-Image 2.1 layout
+
+class ToyQwenTransformer(nn.Module):
+    """Qwen-Image 2.1's layout: one flat `transformer_blocks` ModuleList
+    (32 trunk blocks, matching the real model's num_layers default)."""
+
+    def __init__(self, n=32):
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList([_Block() for _ in range(n)])
+        self.proj_out = nn.Linear(8, 8, bias=False)
+
+    def forward(self, x):
+        for block in self.transformer_blocks:
+            x = block(x)
+        return self.proj_out(x)
+
+
+class _Qwen:
+    arch = "qwen_image_2"
+    use_old_lokr_format = False
+
+    def __init__(self, transformer):
+        self.model = transformer
+
+    def get_transformer_block_names(self):
+        return ["transformer_blocks"]
+
+
+def test_qwen_identity_named_set_expands_to_10_14():
+    transformer = ToyQwenTransformer(32)
+    kwargs, indices = prepare_train_blocks(
+        _config("identity"), _Qwen(transformer), {}
+    )
+    assert indices == [10, 11, 12, 13, 14]
+    assert kwargs["only_if_contains"] == [f"transformer_blocks.{i}." for i in indices]
+
+
+def test_qwen_explicit_range_and_arch_guard():
+    transformer = ToyQwenTransformer(32)
+    _, indices = prepare_train_blocks(_config("3-5"), _Qwen(transformer), {})
+    assert indices == [3, 4, 5]
+    with pytest.raises(ValueError, match="minimax_h3"):
+        prepare_train_blocks(
+            _config("3-5"), SimpleNamespace(arch="krea2", model=transformer), {}
+        )
+
+
+def test_qwen_network_wraps_identity_window_only():
+    transformer = ToyQwenTransformer(32)
+    kwargs, indices = prepare_train_blocks(
+        _config("identity"), _Qwen(transformer), {}
+    )
+    network = _build_network(transformer, kwargs, sd=_Qwen(transformer))
+    verify_train_blocks(_Qwen(transformer), network, indices)
+    # the window's LoRA params (and only they) receive gradients
+    transformer(torch.randn(2, 8)).sum().backward()
+    assert all(p.grad is not None for p in network.parameters())
+
+
+def test_qwen_runtime_check_catches_upstream_trainable():
+    transformer = ToyQwenTransformer(32)
+    kwargs, indices = prepare_train_blocks(
+        _config("identity"), _Qwen(transformer), {}
+    )
+    network = _build_network(transformer, kwargs, sd=_Qwen(transformer))
+    verify_train_blocks(_Qwen(transformer), network, indices)
+    transformer.transformer_blocks[3].fc1.weight.requires_grad_(True)
+    with pytest.raises(RuntimeError, match="block 9 requires grad"):
         transformer(torch.randn(2, 8))
