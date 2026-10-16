@@ -134,7 +134,15 @@ def prepare_h3_default_guards(
             ignore.append("token_refiner")
             added.append("the token refiner")
     if not getattr(network_config, "train_low_blocks", False):
-        low = [f"blocks.{i}." for i in range(6)]
+        # Trunk-qualified: the refiner nests its own blocks.<i>. (two blocks,
+        # its whole attention/mlp surface), and the builder's filter is
+        # substring-based -- a bare "blocks.0." would also exclude
+        # token_refiner.blocks.0.* and silently kill the independent
+        # train_token_refiner opt-in. LoRA names carry the "lora_transformer"
+        # prefix ("transformer" in peft format); "transformer.blocks.<i>." is
+        # a substring of both prefix forms' trunk paths but never of the
+        # refiner's paths.
+        low = [f"transformer.blocks.{i}." for i in range(6)]
         new = [w for w in low if w not in ignore]
         if new:
             ignore.extend(new)

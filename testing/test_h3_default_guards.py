@@ -25,10 +25,10 @@ def test_h3_defaults_exclude_refiner_and_low_blocks():
     ignore = kwargs["ignore_if_contains"]
     assert "token_refiner" in ignore
     for i in range(6):
-        assert f"blocks.{i}." in ignore
+        assert f"transformer.blocks.{i}." in ignore
     # guard must not touch anything outside the window
-    assert "blocks.6." not in ignore
-    assert "blocks.20." not in ignore
+    assert "transformer.blocks.6." not in ignore
+    assert "transformer.blocks.20." not in ignore
 
 
 def test_opt_outs_leave_the_run_unscoped():
@@ -50,21 +50,57 @@ def test_train_blocks_window_bypasses_guards():
 
 
 def test_existing_ignore_entries_are_deduped():
-    kwargs = prepare_h3_default_guards(_nc(), _sd(), {"ignore_if_contains": ["token_refiner", "blocks.0."]})
+    kwargs = prepare_h3_default_guards(
+        _nc(), _sd(), {"ignore_if_contains": ["token_refiner", "transformer.blocks.0."]}
+    )
     ignore = kwargs["ignore_if_contains"]
     assert ignore.count("token_refiner") == 1
-    assert ignore.count("blocks.0.") == 1
-    assert "blocks.1." in ignore  # the rest still added
+    assert ignore.count("transformer.blocks.0.") == 1
+    assert "transformer.blocks.1." in ignore  # the rest still added
 
 
 def test_guard_words_match_dotted_module_paths_but_not_neighbors():
     # the words must hit the real clean_name form and nothing else
     assert "token_refiner" in "lora_transformer.token_refiner.blocks.0.ff"
-    assert "blocks.0." in "lora_transformer.blocks.0.attn.qkv"
-    assert "blocks.0." not in "lora_transformer.blocks.10.attn.qkv"
-    assert "blocks.0." not in "lora_transformer.blocks.20.mlp.fc1"
-    assert "blocks.5." in "lora_transformer.blocks.5.mlp.fc2"
-    assert "blocks.5." not in "lora_transformer.blocks.50.mlp.fc2"
+    assert "transformer.blocks.0." in "lora_transformer.blocks.0.attn.qkv"
+    assert "transformer.blocks.0." in "transformer.blocks.0.attn.qkv"  # peft prefix
+    assert "transformer.blocks.0." not in "lora_transformer.blocks.10.attn.qkv"
+    assert "transformer.blocks.0." not in "lora_transformer.blocks.20.mlp.fc1"
+    assert "transformer.blocks.5." in "lora_transformer.blocks.5.mlp.fc2"
+    assert "transformer.blocks.5." not in "lora_transformer.blocks.50.mlp.fc2"
+
+
+def test_refiner_opt_in_alone_still_excludes_only_trunk_low_blocks():
+    # train_token_refiner WITHOUT train_low_blocks: the refiner stays in and
+    # the low-block words must not reach its nested blocks.<i>. (the whole
+    # refiner trains through token_refiner.blocks.0/1)
+    nc = _nc(train_token_refiner=True, train_low_blocks=False)
+    kwargs = prepare_h3_default_guards(nc, _sd(), {})
+    ignore = kwargs["ignore_if_contains"]
+    assert "token_refiner" not in ignore
+    for i in range(6):
+        word = f"transformer.blocks.{i}."
+        assert word in ignore
+        assert word not in f"lora_transformer.token_refiner.blocks.{min(i, 1)}.attn.qkv_proj"
+
+
+def test_refiner_opt_in_wraps_the_refiner_end_to_end():
+    # through the real LoRA builder: the refiner opt-in alone must put
+    # adapters on token_refiner.blocks.0/1 while trunk blocks 0-5 stay out
+    from test_h3_train_blocks import ToyH3Transformer, _H3, _build_network
+    from toolkit.config_modules import NetworkConfig
+
+    transformer = ToyH3Transformer(8)
+    nc = NetworkConfig(type="lora", linear=4, linear_alpha=4, train_token_refiner=True)
+    kwargs = prepare_h3_default_guards(nc, _H3(transformer), {})
+    network = _build_network(transformer, kwargs)
+    id_to_path = {id(m): n for n, m in transformer.named_modules()}
+    paths = sorted(id_to_path[id(lora.orig_module_ref())] for lora in network.unet_loras)
+    assert any(p.startswith("token_refiner.blocks.0.") for p in paths)
+    assert any(p.startswith("token_refiner.blocks.1.") for p in paths)
+    low = tuple(f"blocks.{i}." for i in range(6))
+    assert not any(p.startswith(low) for p in paths)
+    assert any(p.startswith("blocks.6.") for p in paths)  # trunk above the window
 
 
 def test_train_blocks_with_refiner_opt_in_fails_closed():
