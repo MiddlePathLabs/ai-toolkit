@@ -753,7 +753,12 @@ class Automagic3(torch.optim.Optimizer):
                 for p in group["params"]
                 if p in self.state and "lr" in self.state[p]
             ]
-            out.append(float(torch.stack(lrs).mean()) if lrs else float(group["lr"]))
+            if lrs:
+                # a group may span devices; gather on one before stacking
+                dev = lrs[0].device
+                out.append(float(torch.stack([t.to(dev) for t in lrs]).mean()))
+            else:
+                out.append(float(group["lr"]))
         return out
 
     def get_family_learning_rates(self) -> List[tuple]:
@@ -767,7 +772,9 @@ class Automagic3(torch.optim.Optimizer):
                 if p in self.state and "lr" in self.state[p]
             ]
             if lrs:
-                out.append((fi, float(torch.stack(lrs).mean())))
+                # family pools span groups, so they can span devices too
+                dev = lrs[0].device
+                out.append((fi, float(torch.stack([t.to(dev) for t in lrs]).mean())))
         return out
 
     def get_avg_learning_rate(self) -> float:
