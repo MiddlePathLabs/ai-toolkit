@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import inspect
@@ -119,6 +120,33 @@ def _is_out_of_memory(error: BaseException) -> bool:
     if isinstance(error, torch.cuda.OutOfMemoryError):
         return True
     return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+
+
+@contextlib.contextmanager
+def _force_eager_stance(enabled: bool):
+    """Run the body with torch's ``force_eager`` compiler stance when enabled:
+    every torch.compile'd module executes its original eager code, so previews
+    never pay the first-call Dynamo/inductor build (minutes of Triton work per
+    new shape) that otherwise lands on the first sample after every start or
+    resume. Training steps outside the stance keep their compiled graphs.
+    Degrades to a no-op where the stance is unavailable (older torch)."""
+    if not enabled:
+        yield
+        return
+    stance = None
+    try:
+        stance = torch.compiler.set_stance("force_eager")
+        stance.__enter__()
+    except Exception:
+        stance = None
+    try:
+        yield
+    finally:
+        if stance is not None:
+            try:
+                stance.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -548,7 +576,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # per-sample seeding inside the fork keeps the samples themselves
         # deterministic.
         fork_devices = [self.device_torch] if self.device_torch.type == 'cuda' else []
-        with torch.random.fork_rng(devices=fork_devices):
+        with _force_eager_stance(
+            getattr(self, '_previews_force_eager', False)
+        ), torch.random.fork_rng(devices=fork_devices):
             try:
                 # if we have an ema, set it to validation mode
                 if self.ema is not None:
@@ -3449,6 +3479,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.model_config.compile:
             compiled_refs = []  # (block_list, index, original_block) for rollback on failure
             original_unet = self.sd.unet
+            self._previews_force_eager = False
             try:
                 inner_unet_check = unwrap_model(self.sd.unet)
                 is_unet_offloaded = hasattr(inner_unet_check, '_memory_manager')
@@ -3629,6 +3660,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             dynamic=compile_dynamic,
                             fullgraph=compile_fullgraph,
                         )
+
+                # previews run uncompiled so the first sample after every start
+                # or resume does not pay the Dynamo/inductor build (see
+                # _force_eager_stance); training keeps its compiled graphs
+                self._previews_force_eager = True
+                print_acc(
+                    "Previews run uncompiled (torch force_eager stance) to skip "
+                    "the first-preview Triton recompile stall."
+                )
 
                 if is_unet_quantized and not is_unet_offloaded:
                     # once compiled, dynamo guards hold weakrefs to the params;
