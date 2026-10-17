@@ -33,6 +33,12 @@ from toolkit.optimizer_runtime import (
     optimizer_step_was_skipped,
     window_sample_coefficients,
 )
+from toolkit.identity_isolation_training import (
+    dop_selected,
+    isolation_batch_category,
+    preservation_mse,
+    validate_isolation_training,
+)
 from toolkit.h3_audio_only import is_audio_only_batch
 from toolkit.h3_dopsd import (
     decomposed_teacher_loss,
@@ -570,6 +576,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         
+        validate_isolation_training(self)
         if self.train_config.diff_output_preservation:
             # datasets can have their own trigger words, the global one is copied to them if not set
             has_dataset_trigger = any(
@@ -586,6 +593,7 @@ class SDTrainer(BaseSDTrainProcess):
             if self.network_config is None:
                 raise ValueError("blank_prompt_preservation requires a network to be set")
         
+        self._prior_without_preservation = self.do_prior_prediction or self.train_config.do_prior_divergence
         if self.train_config.blank_prompt_preservation or self.train_config.diff_output_preservation:
             # always do a prior prediction when doing output preservation
             self.do_prior_prediction = True
@@ -813,19 +821,30 @@ class SDTrainer(BaseSDTrainProcess):
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
-        if self.sample_config is not None and self.sample_config.samples is not None and len(self.sample_config.samples) > 0:
+        sample_configs = [self.sample_config]
+        if getattr(self, "isolation_config", None) is not None:
+            first = getattr(self, "first_sample_config", None)
+            if first is not None and first is not self.sample_config:
+                sample_configs.append(first)
+        sample_items = [
+            (config, index)
+            for config in sample_configs if config is not None
+            for index in range(len(config.samples or []))
+        ]
+        if sample_items:
             # cache all the samples
             self.sd.sample_prompts_cache = []
             sample_folder = os.path.join(self.save_root, 'samples')
             output_path = os.path.join(sample_folder, 'test.jpg')
-            for i in range(len(self.sample_config.prompts)):
-                sample_item = self.sample_config.samples[i]
-                prompt = self.sample_config.prompts[i]
-                
+            for sample_config, i in sample_items:
+                sample_item = sample_config.samples[i]
+                prompt = sample_config.prompts[i]
                 if self.trigger_word is not None:
                     prompt = self.sd.inject_trigger_into_prompt(
                         prompt, self.trigger_word, add_if_not_present=False
                     )
+                if getattr(self, "isolation_config", None) is not None:
+                    prompt = self.isolation_config.training_caption(prompt)
 
                 # needed so we can autoparse the prompt to handle flags
                 gen_img_config = GenerateImageConfig(
@@ -947,6 +966,10 @@ class SDTrainer(BaseSDTrainProcess):
                     'unconditional': negative
                 })
         
+        if getattr(self, "isolation_config", None) is not None and len(sample_configs) > 1:
+            count = len(self.sample_config.samples or [])
+            self._isolation_first_sample_cache = self.sd.sample_prompts_cache[count:]
+            self.sd.sample_prompts_cache = self.sd.sample_prompts_cache[:count]
 
     def before_dataset_load(self):
         self.assistant_adapter = None
@@ -2906,7 +2929,7 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.cached_trigger_embeds is None:
                         self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
                         self._save_static_embed(trigger_path, self.cached_trigger_embeds)
-                if self.train_config.diff_output_preservation:
+                if self.train_config.diff_output_preservation and self.isolation_config is None:
                     self.cached_dop_class_embeds = self._load_static_embed(dop_path)
                     if self.cached_dop_class_embeds is None:
                         self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
@@ -4746,6 +4769,10 @@ class SDTrainer(BaseSDTrainProcess):
                     guidance_embedding_scale=guidance_embedding_scale,
                     rescale_cfg=self.train_config.cfg_rescale,
                     batch=batch,
+                    **({
+                        "detach_unconditional": False,
+                        "bypass_guidance_embedding": self.train_config.bypass_guidance_embedding,
+                    } if getattr(self, "isolation_config", None) is not None else {}),
                     **pred_kwargs  # adapter residuals in here
                 )
                 prior_pred = prior_pred.detach()
@@ -4764,6 +4791,58 @@ class SDTrainer(BaseSDTrainProcess):
             if self.network is not None:
                 self.network.is_active = was_network_active
         return prior_pred
+
+    def _preservation_prompts(self, prompts, file_items):
+        isolation = getattr(self, "isolation_config", None)
+        if isolation is not None and isolation.subjects:
+            return [isolation.preservation_caption(prompt) for prompt in prompts]
+        result = []
+        for prompt, item in zip(prompts, file_items):
+            trigger = item.trigger_word if item.trigger_word is not None else self.trigger_word
+            result.append(prompt.replace(trigger, self.train_config.diff_output_preservation_class) if trigger is not None else prompt)
+        return result
+
+    def _cached_preservation_embeds(self, batch, dtype):
+        cached = batch.dop_prompt_embeds
+        if cached is None:
+            if getattr(self, "isolation_config", None) is not None:
+                raise ValueError("identity_isolation requires per-item dop_prompt_embeds; rebuild the text embedding cache")
+            return self.cached_dop_class_embeds
+        if getattr(self, "isolation_config", None) is not None:
+            values = cached.text_embeds
+            if isinstance(values, (tuple, list)):
+                count = len(values) if values[0].ndim == 2 else values[0].shape[0]
+            else:
+                count = values.shape[0]
+            if count != len(batch.file_items):
+                raise ValueError("identity_isolation requires one preservation conditioning per batch item; rebuild the text embedding cache")
+        return cached.clone().detach().to(self.device_torch, dtype=dtype)
+
+    def _preservation_prediction_loss(
+        self, *, noisy_latents, timesteps, preservation_embeds,
+        unconditional_embeds, batch, pred_kwargs, prior_pred, multiplier,
+    ):
+        prediction = self.predict_noise(
+            noisy_latents=noisy_latents,
+            timesteps=timesteps,
+            conditional_embeds=preservation_embeds,
+            unconditional_embeds=unconditional_embeds,
+            batch=batch,
+            **pred_kwargs,
+        )
+        isolation = getattr(self, "isolation_config", None) is not None
+        raw, weighted = preservation_mse(prediction, prior_pred, multiplier, isolation=isolation)
+        self.additional_logs["loss/preservation"] = weighted.item()
+        if isolation:
+            count = int(noisy_latents.shape[0])
+            self._isolation_dop_pass_count = getattr(self, "_isolation_dop_pass_count", 0) + 1
+            self._isolation_preservation_samples = getattr(self, "_isolation_preservation_samples", 0) + count
+            self._isolation_preservation_raw = getattr(self, "_isolation_preservation_raw", 0.0) + raw.item() * count
+            self._isolation_preservation_weighted = getattr(self, "_isolation_preservation_weighted", 0.0) + weighted.item() * count
+            self.additional_logs["isolation/preservation_raw"] = self._isolation_preservation_raw / self._isolation_preservation_samples
+            self.additional_logs["isolation/preservation_weighted"] = self._isolation_preservation_weighted / self._isolation_preservation_samples
+            self.additional_logs["isolation/preservation_pass_count"] = self._isolation_dop_pass_count
+        return prediction, weighted
 
     def before_unet_predict(self):
         pass
@@ -4853,6 +4932,17 @@ class SDTrainer(BaseSDTrainProcess):
         # only; the returned loss stays unscaled for logging.
         if getattr(self.sd, 'is_llm', False):
             return self.train_llm_accumulation(batch, accum_scale=accum_scale)
+        do_dop = dop_selected(
+            getattr(self, "isolation_config", None),
+            self.completed_update_id,
+            self.train_config.diff_output_preservation,
+        )
+        if getattr(self, "isolation_config", None) is not None:
+            do_dop = getattr(self, "_isolation_dop_selected", do_dop)
+            if batch.unconditional_latents is not None or self.do_guided_loss:
+                raise ValueError("identity_isolation does not support guided training batches")
+            if do_dop and any(getattr(item, "prior_reg", False) for item in batch.file_items):
+                raise ValueError("identity_isolation DOP cannot share the prior_reg reference caption")
         self._mem_diag('step_start')
         with torch.no_grad():
             self.timer.start('preprocess_batch')
@@ -5181,15 +5271,8 @@ class SDTrainer(BaseSDTrainProcess):
                                     [unconditional_embeds] * noisy_latents.shape[0]
                                 )
 
-                            if self.train_config.diff_output_preservation:
-                                if batch.dop_prompt_embeds is not None:
-                                    # cached to disk with the trigger word replaced per dataset
-                                    self.diff_output_preservation_embeds = batch.dop_prompt_embeds.clone().detach().to(
-                                        self.device_torch, dtype=dtype
-                                    )
-                                else:
-                                    # no per item cache, fall back to the class only embeds
-                                    self.diff_output_preservation_embeds = self.cached_dop_class_embeds
+                            if do_dop:
+                                self.diff_output_preservation_embeds = self._cached_preservation_embeds(batch, dtype)
 
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
@@ -5257,17 +5340,9 @@ class SDTrainer(BaseSDTrainProcess):
                                 if isinstance(self.adapter, CustomAdapter):
                                     self.adapter.is_unconditional_run = False
                             
-                            if self.train_config.diff_output_preservation:
-                                # datasets can have their own trigger words, replace per item
-                                def replace_trigger_with_class(prompt, file_item):
-                                    trigger = file_item.trigger_word if file_item.trigger_word is not None else self.trigger_word
-                                    if trigger is None:
-                                        return prompt
-                                    return prompt.replace(trigger, self.train_config.diff_output_preservation_class)
-                                dop_prompts = [replace_trigger_with_class(p, fi) for p, fi in zip(conditioned_prompts, batch.file_items)]
-                                dop_prompts_2 = None
-                                if prompt_2 is not None:
-                                    dop_prompts_2 = [replace_trigger_with_class(p, fi) for p, fi in zip(prompt_2, batch.file_items)]
+                            if do_dop:
+                                dop_prompts = self._preservation_prompts(conditioned_prompts, batch.file_items)
+                                dop_prompts_2 = self._preservation_prompts(prompt_2, batch.file_items) if prompt_2 is not None else None
                                 self.diff_output_preservation_embeds = self.sd.encode_prompt(
                                     dop_prompts, dop_prompts_2,
                                     dropout_prob=self.train_config.prompt_dropout_prob,
@@ -5471,12 +5546,17 @@ class SDTrainer(BaseSDTrainProcess):
                 )
                 saved_control_tensor_list = None
                 settings = getattr(self.sd, "dopsd_settings", None)
+                prior_requested = self.do_prior_prediction
+                if getattr(self, "isolation_config", None) is not None:
+                    prior_requested = self._prior_without_preservation or do_dop or self.train_config.blank_prompt_preservation
+                    if do_dop and (do_guidance_prior or do_inverted_masked_prior or do_reg_prior):
+                        raise ValueError("identity_isolation preservation conflicts with an unrelated reference-caption objective")
                 if ((
-                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm or dopsd_teacher_now):
+                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or prior_requested or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm or dopsd_teacher_now):
                     with self.timer('prior predict'):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
-                        if self.train_config.diff_output_preservation:
+                        if do_dop:
                             prior_embeds_to_use = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                         
                         if self.train_config.blank_prompt_preservation:
@@ -5703,7 +5783,7 @@ class SDTrainer(BaseSDTrainProcess):
                         prior_to_calculate_loss = prior_pred
                         # if we are doing diff_output_preservation and not noing inverted masked prior
                         # then we need to send none here so it will not target the prior
-                        doing_preservation = self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation
+                        doing_preservation = do_dop or self.train_config.blank_prompt_preservation
                         if doing_preservation and not do_inverted_masked_prior:
                             prior_to_calculate_loss = None
                         
@@ -5718,9 +5798,9 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                     self._mem_diag('after_loss')
 
-                    if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
+                    if do_dop or self.train_config.blank_prompt_preservation:
                         with torch.no_grad():
-                            if self.train_config.diff_output_preservation:
+                            if do_dop:
                                 preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                             elif self.train_config.blank_prompt_preservation:
                                 blank_embeds = self.cached_blank_embeds.clone().detach().to(
@@ -5729,18 +5809,18 @@ class SDTrainer(BaseSDTrainProcess):
                                 preservation_embeds = concat_prompt_embeds(
                                     [blank_embeds] * noisy_latents.shape[0]
                                 )
-                        preservation_pred = self.predict_noise(
+                        multiplier = self.train_config.diff_output_preservation_multiplier if do_dop else self.train_config.blank_prompt_preservation_multiplier
+                        preservation_pred, preservation_loss = self._preservation_prediction_loss(
                             noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
                             timesteps=timesteps,
-                            conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                            preservation_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
                             unconditional_embeds=unconditional_embeds,
                             batch=batch,
-                            **pred_kwargs
+                            pred_kwargs=pred_kwargs,
+                            prior_pred=prior_pred,
+                            multiplier=multiplier,
                         )
-                        multiplier = self.train_config.diff_output_preservation_multiplier if self.train_config.diff_output_preservation else self.train_config.blank_prompt_preservation_multiplier
-                        preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
                         self.additional_logs['loss/normal'] = loss.item()
-                        self.additional_logs['loss/preservation'] = preservation_loss.item()
 
                         # preserve the audio stream of joint audio models too.
                         # Both passes ran on the same noisy audio, so this holds
@@ -6199,6 +6279,32 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_grad_norm_depth = None
         self._last_grad_cos_diff_depth = None
 
+    def _prepare_isolation_window(self, batches, *, window_start):
+        config = getattr(self, "isolation_config", None)
+        if config is None:
+            return
+        previous = None if window_start else getattr(self, "_isolation_window_category", None)
+        self._isolation_window_category = isolation_batch_category(config, batches, previous)
+        if not window_start:
+            return
+        self._isolation_dop_selected = dop_selected(
+            config, self.completed_update_id, self.train_config.diff_output_preservation
+        )
+        self._isolation_dop_pass_count = 0
+        self._isolation_preservation_samples = 0
+        self._isolation_preservation_raw = 0.0
+        self._isolation_preservation_weighted = 0.0
+        for key in ("loss/normal", "loss/preservation", "isolation/preservation_raw", "isolation/preservation_weighted"):
+            self.additional_logs.pop(key, None)
+        self.additional_logs.update({
+            "isolation/dop_selected": float(self._isolation_dop_selected),
+            "isolation/dop_interval": config.dop_interval if config.dop_enabled else 1,
+            "isolation/update_id": int(self.completed_update_id),
+            "isolation/preservation_pass_count": 0,
+            "isolation/category_composite": float(self._isolation_window_category == "composite"),
+            "isolation/category_mixed": float(self._isolation_window_category == "mixed"),
+        })
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = [item for item in batch if item is not None]
@@ -6219,6 +6325,8 @@ class SDTrainer(BaseSDTrainProcess):
             not bool(getattr(self, "_optimizer_window_active", False))
             and not flush_only
         )
+        if getattr(self, "isolation_config", None) is not None:
+            self._prepare_isolation_window(batch_list, window_start=window_start)
         if window_start:
             self.optimizer.zero_grad()
             # Accelerated optimizers may retain authoritative gradients in

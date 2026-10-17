@@ -890,6 +890,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             return []
         paths = [file_item.get_text_embedding_path(recalculate=True)]
         config = self.dataset_config
+        if getattr(file_item.dataset_config, "identity_isolation", None) is not None:
+            config = file_item.dataset_config
         if config.diff_output_preservation:
             paths.append(file_item.get_dop_text_embedding_path(recalculate=True))
         if config.caption_dropout_rate > 0:
@@ -1043,6 +1045,16 @@ def get_dataloader_from_datasets(
             split_configs = preprocess_dataset_raw_config([dataset_option])
             for x in split_configs:
                 dataset_config_list.append(DatasetConfig(**x))
+    isolation_configs = [
+        config.identity_isolation for config in dataset_config_list
+        if config.identity_isolation is not None
+    ]
+    if isolation_configs:
+        if any(config.num_workers != 0 for config in dataset_config_list):
+            raise ValueError("identity_isolation requires num_workers: 0 for resumable sampling")
+        stateful_sampler = True
+        if pool_datasets and any(config.composites and config.composite_lr_multiplier != 1 for config in isolation_configs):
+            raise ValueError("identity_isolation composite LR requires pool_datasets: false")
 
     for config in dataset_config_list:
         if config.type != 'image':

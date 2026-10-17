@@ -411,7 +411,7 @@ def get_batch_signature(config: 'DatasetConfig') -> tuple:
         num_control_paths = len(control_path)
     else:
         num_control_paths = 1
-    return (
+    signature = (
         num_control_paths,
         tuple(config.controls),
         config.control_from_same_folder,
@@ -437,6 +437,10 @@ def get_batch_signature(config: 'DatasetConfig') -> tuple:
         config.diff_output_preservation,
         len(config.extra_values),
     )
+    isolation = getattr(config, "identity_isolation", None)
+    if isolation is not None:
+        return signature + ("identity_isolation", isolation.signature, config.isolation_category)
+    return signature
 
 
 class BucketsMixin:
@@ -811,7 +815,10 @@ class CaptionProcessingDTOMixin:
             # replace this dataset's trigger word with the preservation class.
             # do it on the final caption so token order matches the normal caption
             self.caption_dop = self.caption
-            if self.trigger_word is not None:
+            isolation = getattr(self.dataset_config, "identity_isolation", None)
+            if isolation is not None and isolation.subjects:
+                self.caption_dop = isolation.preservation_caption(self.caption)
+            elif self.trigger_word is not None:
                 self.caption_dop = self.caption.replace(
                     self.trigger_word, self.dataset_config.diff_output_preservation_class
                 )
@@ -895,7 +902,8 @@ class CaptionProcessingDTOMixin:
             rand = random.random()
             if rand < self.dataset_config.caption_dropout_rate:
                 # drop the caption
-                return ''
+                isolation = getattr(self.dataset_config, "identity_isolation", None)
+                return self.get_dropout_caption() if isolation is not None else ''
 
         # tag-style token ops (dropout / shuffle) split on commas; anything else keeps the
         # text exactly as written (splitting and re-joining with ", " doubled the space after
@@ -932,6 +940,18 @@ class CaptionProcessingDTOMixin:
 
         # join back together
         caption = ', '.join(token_list) if token_list is not None else raw_caption
+        isolation = getattr(self.dataset_config, "identity_isolation", None)
+        if isolation is not None:
+            if self.dataset_config.isolation_category == "composite":
+                trigger = None
+                add_if_not_present = False
+            elif trigger is not None:
+                transformed_trigger = isolation.training_caption(trigger)
+                if transformed_trigger != trigger and transformed_trigger.casefold() in caption.casefold():
+                    trigger = None
+                    add_if_not_present = False
+                elif trigger.casefold() in caption.casefold():
+                    add_if_not_present = False
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
         if self.dataset_config.random_triggers and not self.dataset_config.cache_text_embeddings:
@@ -953,8 +973,8 @@ class CaptionProcessingDTOMixin:
             token_list = [t.strip() for t in caption.split(',')]
             random.shuffle(token_list)
             caption = ', '.join(token_list)
-        if caption == '':
-            pass
+        if isolation is not None:
+            caption = isolation.training_caption(caption)
         return caption
 
 class AudioProcessingDTOMixin:
@@ -3168,6 +3188,10 @@ class TextEmbeddingFileItemDTOMixin:
             ("model_identity", self._cache_model_identity),
             ("encoder_recipe", "selected-layer-natural-length-v2"),
         ])
+        isolation = getattr(self.dataset_config, "identity_isolation", None)
+        if isolation is not None:
+            item["identity_isolation"] = isolation.signature
+            item["identity_isolation_caption_version"] = 1
         if dopsd_other_ref_key:
             item["dopsd_other_ref"] = str(dopsd_other_ref_key)
             item["source_content_fingerprint"] = self.source_content_fingerprint
@@ -3301,14 +3325,21 @@ class TextEmbeddingFileItemDTOMixin:
     def get_dropout_caption(self: 'FileItemDTO'):
         # when encoding live, dropped captions still get the trigger word injected
         # downstream (add_if_not_present when not a reg image), so match that here
+        isolation = getattr(self.dataset_config, "identity_isolation", None)
+        if isolation is not None and self.dataset_config.isolation_category == "composite":
+            return ''
+        caption = ''
         if self.trigger_word is not None and not self.is_reg:
-            return inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
-        return ''
+            caption = inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
+        return isolation.training_caption(caption) if isolation is not None else caption
 
     def get_dop_dropout_caption(self: 'FileItemDTO'):
         # live encoding replaces the trigger word with the preservation class on the
         # dropped caption (class only), so the cached DOP dropout caption must match
         dropout_caption = self.get_dropout_caption()
+        isolation = getattr(self.dataset_config, "identity_isolation", None)
+        if isolation is not None and isolation.subjects:
+            return isolation.preservation_caption(dropout_caption)
         if self.trigger_word is not None:
             return dropout_caption.replace(
                 self.trigger_word, self.dataset_config.diff_output_preservation_class

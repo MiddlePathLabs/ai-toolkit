@@ -1626,6 +1626,21 @@ class DatasetConfig:
         self.default_caption: str = kwargs.get('default_caption', None)
         # trigger word for just this dataset
         self.trigger_word: str = kwargs.get('trigger_word', None)
+        isolation = kwargs.get('identity_isolation')
+        self.identity_isolation_raw = isolation
+        self.identity_isolation = None
+        if isolation is not None:
+            from toolkit.identity_isolation import IsolationConfig
+            parsed = isolation if isinstance(isolation, IsolationConfig) else IsolationConfig(isolation)
+            if parsed.active:
+                self.identity_isolation = parsed
+        self.isolation_category = kwargs.get('isolation_category', 'normal')
+        self.isolation_subject_index = kwargs.get('isolation_subject_index')
+        self.isolation_cache_identity = kwargs.get('isolation_cache_identity')
+        self.isolation_dataset_index = kwargs.get('isolation_dataset_index')
+        self.isolation_original_count = kwargs.get('isolation_original_count')
+        self.isolation_raw_repeats = kwargs.get('isolation_raw_repeats', kwargs.get('num_repeats', 1))
+        self.isolation_balance_multiplier = kwargs.get('isolation_balance_multiplier', 1)
         # set automatically from the train config when diff output preservation is enabled.
         # the dataset trigger word is replaced with the class in the caption for DOP embeddings
         self.diff_output_preservation: bool = kwargs.get('diff_output_preservation', False)

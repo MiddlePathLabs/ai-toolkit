@@ -74,6 +74,7 @@ RULE_TEMPORARY_SAFETY = "admission.temporary_safety_block"
 RULE_TURBO_WARNING = "admission.krea_turbo_warning"
 RULE_UNCERTIFIED_RUNTIME = "admission.runtime_deferred"
 RULE_RESUME_DETERMINISM = "admission.resume_determinism"
+RULE_IDENTITY_ISOLATION = "admission.identity_isolation"
 
 
 # Mirror of toolkit.config_modules.ASSISTANT_LORA_ARCHS (this module must stay
@@ -444,6 +445,20 @@ def _validate_perceptual_compat(process: Mapping[str, Any], p: str, collector: _
 def _validate_process(process: Mapping[str, Any], process_index: int, collector: _Collector) -> dict[str, Any]:
     p = f"config.process[{process_index}]"
     process = _validate_perceptual_compat(process, p, collector)
+    if process.get("identity_isolation") is not None:
+        from toolkit.identity_isolation_data import resolve_isolation_settings
+
+        try:
+            isolation, isolation_train, _ = resolve_isolation_settings(process)
+            if isolation is not None:
+                process = {**process, "train": isolation_train}
+        except (TypeError, ValueError) as error:
+            collector.add(
+                RULE_IDENTITY_ISOLATION,
+                [f"{p}.identity_isolation"],
+                str(error),
+                "Resolve the Isolation component or legacy DOP conflict; use Inspect datasets for source/asset preflight.",
+            )
     train = _mapping(process.get("train"))
     model = _mapping(process.get("model"))
     network_raw = process.get("network")

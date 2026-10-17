@@ -97,6 +97,11 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     DecoratorConfig
 from toolkit.admission import raise_for_process_admission
 from toolkit.perceptual_config_compat import normalize_perceptual_config
+from toolkit.identity_isolation_data import configure_isolation, isolation_exposure_report
+from toolkit.identity_isolation_training import (
+    isolation_lr_multiplier,
+    validate_isolation_optimizer,
+)
 from toolkit import force_hf_hub_progress_bars
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
@@ -170,6 +175,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 for k, dst, legacy, existing in _compat.conflicts
             ))
         self.config = _compat.process
+        self.isolation_config = configure_isolation(self.config)
         self.accelerator: Accelerator = get_accelerator()
         if self.accelerator.is_local_main_process:
             transformers.utils.logging.set_verbosity_warning()
@@ -294,7 +300,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for raw_dataset in raw_datasets:
                 dataset = DatasetConfig(**raw_dataset)
                 # handle trigger word per dataset
-                if dataset.trigger_word is None and self.trigger_word is not None:
+                if (
+                    dataset.trigger_word is None
+                    and self.trigger_word is not None
+                    and dataset.isolation_category != "composite"
+                ):
                     dataset.trigger_word = self.trigger_word
                 is_caching = dataset.cache_latents or dataset.cache_latents_to_disk
                 if not is_caching:
@@ -417,10 +427,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def sample(self, step=None, is_first=False):
         python_rng_state = random.getstate()
+        original_sample_cache = getattr(self.sd, "sample_prompts_cache", None)
+        first_cache = getattr(self, "_isolation_first_sample_cache", None)
+        if is_first and first_cache is not None:
+            self.sd.sample_prompts_cache = first_cache
         try:
             return self._sample(step=step, is_first=is_first)
         finally:
             random.setstate(python_rng_state)
+            self.sd.sample_prompts_cache = original_sample_cache
 
     def _sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
@@ -486,6 +501,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 prompt = self.sd.inject_trigger_into_prompt(
                     prompt, self.trigger_word, add_if_not_present=False
                 )
+            if self.isolation_config is not None:
+                prompt = self.isolation_config.training_caption(prompt)
 
             extra_args = {}
             if self.adapter_config is not None and self.adapter_config.test_img_path is not None:
@@ -1848,6 +1865,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             apply_scale *= category_stop.step_scale(
                 kinds, self.completed_update_id
             )
+        isolation_scale = isolation_lr_multiplier(self)
+        apply_scale *= isolation_scale
+        if getattr(self, "isolation_config", None) is not None:
+            self.additional_logs["isolation/lr_multiplier"] = isolation_scale
+            opt = unwrap_runtime_optimizer(self.optimizer)
+            for index, group in enumerate(opt.param_groups):
+                self.additional_logs[f"isolation/effective_lr_group_{index}"] = float(group["lr"]) * apply_scale
         active = None
         router = getattr(self, "modality_router", None)
         if router is not None:
@@ -2204,7 +2228,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         )
 
                     # make sure trigger is in the prompts if not a regularization run
-                    if self.trigger_word is not None:
+                    if self.trigger_word is not None and getattr(self, "isolation_config", None) is None:
                         prompt = self.sd.inject_trigger_into_prompt(
                             prompt,
                             trigger=self.trigger_word,
@@ -3349,6 +3373,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             optimizer, optimizer_type=optimizer_type
         )
         self.optimizer_runtime.validate_for_train_config(self.train_config)
+        validate_isolation_optimizer(
+            self.isolation_config, optimizer, self.optimizer_runtime
+        )
         if uses_adaptive_lr_step_scale(self.train_config):
             print_acc(
                 f"[adaptive-lr] lr mode: {self.optimizer_runtime.optimizer_label} "
@@ -3458,6 +3485,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 stateful_sampler=stateful_sampler,
                 pool_datasets=self.train_config.pool_datasets,
             )
+        if self.isolation_config is not None:
+            print_acc("[identity-isolation exposure] " + json.dumps(
+                isolation_exposure_report(self.config, self.data_loader), sort_keys=True
+            ))
+            if self.train_config.diff_output_preservation:
+                interval = self.isolation_config.dop_interval if self.isolation_config.dop_enabled else 1
+                print_acc(
+                    f"[identity-isolation DOP] interval={interval} "
+                    f"weight={self.train_config.diff_output_preservation_multiplier:g}; "
+                    "counter=completed_update_id (successful optimizer updates), "
+                    "first selected window=0, skipped updates retain phase"
+                )
         if self._resume_state is not None:
             self._restore_resume_loader_state()
 
