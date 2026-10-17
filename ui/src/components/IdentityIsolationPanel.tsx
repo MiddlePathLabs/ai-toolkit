@@ -28,12 +28,28 @@ type Exposure = {
     expected_sample_exposures: number;
   }[];
 };
+type TriggerCheck = {
+  encoder?: string;
+  ok?: boolean;
+  subjects?: {
+    subject_index: number;
+    trigger: string;
+    class_name: string;
+    joined: string;
+    pieces: string[];
+    start_pieces?: string[];
+    ok: boolean;
+    notes: string[];
+    suggestions: string[];
+  }[];
+};
 type Preview = {
   caption?: Caption;
   captions?: Caption[];
   resolved?: unknown;
   exposure?: Exposure;
   composites?: { path: string; subject_index: number; caption: string; thumbnail: string }[];
+  trigger_check?: TriggerCheck;
 };
 const inputClass =
   'w-full text-sm px-3 py-1 bg-gray-950 dark:bg-gray-800 border border-gray-700 rounded-sm text-gray-100';
@@ -126,6 +142,61 @@ function ExposurePreview({ exposure }: { exposure: Exposure }) {
   );
 }
 
+function TriggerCheckPreview({
+  check,
+  onApplySuggestion,
+}: {
+  check: TriggerCheck;
+  onApplySuggestion: (subjectIndex: number, trigger: string) => void;
+}) {
+  if (!check.subjects?.length) return <p className="text-sm">No trigger check result.</p>;
+  return (
+    <section className="space-y-3 text-sm">
+      <h3 className="font-medium">
+        Trigger word check
+        {check.encoder ? <span className="text-gray-400 font-normal"> — {check.encoder}</span> : null}
+      </h3>
+      {check.subjects.map(subject => (
+        <div key={subject.subject_index} className="border-t border-gray-700 pt-2">
+          <p>
+            Subject {subject.subject_index + 1}:{' '}
+            <span className="font-mono">
+              {subject.trigger} + {subject.class_name}
+            </span>{' '}
+            → <span className="font-mono">{subject.joined}</span>
+            {subject.pieces?.length ? (
+              <span className="text-gray-400"> (read as {subject.pieces.join(' | ')})</span>
+            ) : null}
+          </p>
+          <p className={subject.ok ? 'text-green-400' : 'text-red-400'}>
+            {subject.ok ? 'Joins cleanly.' : 'Does not join cleanly.'}
+          </p>
+          {subject.notes.map(note => (
+            <p key={note} className="text-gray-400">
+              {note}
+            </p>
+          ))}
+          {subject.suggestions.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 mt-1">
+              <span className="text-gray-400">Clean alternatives:</span>
+              {subject.suggestions.map(word => (
+                <button
+                  key={word}
+                  type="button"
+                  className={`${buttonClass} font-mono`}
+                  onClick={() => onApplySuggestion(subject.subject_index, word)}
+                >
+                  {word}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </section>
+  );
+}
+
 export default function IdentityIsolationPanel({
   process,
   onChange,
@@ -160,7 +231,7 @@ export default function IdentityIsolationPanel({
   const updateSubject = (index: number, patch: Partial<IdentityIsolationSubject>) => {
     update({ subjects: subjects.map((subject, i) => (i === index ? { ...subject, ...patch } : subject)) });
   };
-  const run = async (action: 'caption' | 'inspect' | 'prepare') => {
+  const run = async (action: 'caption' | 'inspect' | 'prepare' | 'trigger_check') => {
     const id = ++requestId.current;
     setPending(action);
     setError('');
@@ -326,10 +397,14 @@ export default function IdentityIsolationPanel({
             <button type="button" className={buttonClass} disabled={!!pending} onClick={() => run('prepare')}>
               Prepare composites (local assets only)
             </button>
+            <button type="button" className={buttonClass} disabled={!!pending} onClick={() => run('trigger_check')}>
+              Check trigger words
+            </button>
           </div>
           <p className="text-sm text-gray-400">
             Inspect does not generate files. Prepare explicitly writes composites to the generated directory using
-            existing local assets only; it never downloads models or assets or starts training.
+            existing local assets only; it never downloads models or assets or starts training. Check reads the locally
+            cached training tokenizer to verify the joined trigger and class words stay whole; it never fetches.
           </p>
           {pending && (
             <p role="status" className="text-sm">
@@ -348,6 +423,12 @@ export default function IdentityIsolationPanel({
             </div>
           ))}
           {preview?.exposure !== undefined && <ExposurePreview exposure={preview.exposure} />}
+          {preview?.trigger_check !== undefined && (
+            <TriggerCheckPreview
+              check={preview.trigger_check}
+              onApplySuggestion={(subjectIndex, trigger) => updateSubject(subjectIndex, { trigger })}
+            />
+          )}
           {preview?.composites?.map(item => (
             <figure key={item.path} className="border-t border-gray-700 pt-3">
               {item.thumbnail.startsWith('data:image/png;base64,') && (

@@ -22,8 +22,12 @@ def inspect_request(payload):
     if not isinstance(process, dict):
         raise ValueError("process must contain one training process configuration")
     action = payload.get("action", "inspect")
-    if action not in {"inspect", "prepare", "caption"}:
-        raise ValueError("action must be inspect, prepare, or caption")
+    if action not in {"inspect", "prepare", "caption", "trigger_check"}:
+        raise ValueError("action must be inspect, prepare, caption, or trigger_check")
+    if action == "trigger_check":
+        from toolkit.identity_isolation_trigger_check import check_triggers
+
+        return check_triggers(process)
     config = IsolationConfig(process.get("identity_isolation"))
     if action == "caption":
         text = payload.get("caption", "")

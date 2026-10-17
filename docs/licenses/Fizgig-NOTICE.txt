@@ -3,7 +3,9 @@ Copyright 2026 Peter Neill
 
 Portions of toolkit/identity_isolation.py and
  toolkit/identity_isolation_composites.py are adapted from Fizgig v8.4.0
-(src/fizgig/families/multi_person.py). Licensed under the Apache License,
+(src/fizgig/families/multi_person.py), and
+ toolkit/identity_isolation_trigger_check.py from Fizgig v8.4.2
+(src/fizgig/families/trigger_check.py). Licensed under the Apache License,
 Version 2.0. A copy is included in Fizgig-Apache-2.0.txt.
 
 Adaptations: explicit component configuration, deterministic multi-subject

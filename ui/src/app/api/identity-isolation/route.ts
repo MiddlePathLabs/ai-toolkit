@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
 import { resolvePythonPath } from '@/server/admission';
+import { TOOLKIT_ROOT } from '@/paths';
 
 export const runtime = 'nodejs';
 export const maxDuration = 125;
@@ -10,15 +11,14 @@ type BridgeResponse = { ok: true; result: Record<string, unknown> } | { ok: fals
 
 function runBridge(payload: unknown): Promise<BridgeResponse> {
   const python = resolvePythonPath();
-  const root = path.resolve('@', '..', '..');
   let resolve!: (result: BridgeResponse) => void;
   let reject!: (error: Error) => void;
   const promise = new Promise<BridgeResponse>((onResolve, onReject) => {
     resolve = onResolve;
     reject = onReject;
   });
-  const child = spawn(python, [path.join(root, 'ui_scripts', 'identity_isolation.py')], {
-    cwd: root,
+  const child = spawn(python, [path.join(TOOLKIT_ROOT, 'ui_scripts', 'identity_isolation.py')], {
+    cwd: TOOLKIT_ROOT,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     shell: false,
@@ -83,7 +83,7 @@ export async function POST(request: NextRequest) {
   }
   const body = payload as Record<string, unknown>;
   if (
-    !['caption', 'inspect', 'prepare'].includes(String(body.action)) ||
+    !['caption', 'inspect', 'prepare', 'trigger_check'].includes(String(body.action)) ||
     !body.process ||
     typeof body.process !== 'object' ||
     Array.isArray(body.process) ||
@@ -92,7 +92,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        error: 'Use action caption, inspect, or prepare; process must be an object and caption must be text.',
+        error:
+          'Use action caption, inspect, prepare, or trigger_check; process must be an object and caption must be text.',
       },
       { status: 400 },
     );
