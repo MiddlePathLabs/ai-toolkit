@@ -1,0 +1,25 @@
+Fizgig — Klein 9B LoRA Trainer & Workbench
+Copyright 2026 Peter Neill
+
+Portions of toolkit/identity_isolation.py and
+ toolkit/identity_isolation_composites.py are adapted from Fizgig v8.4.0
+(src/fizgig/families/multi_person.py). Licensed under the Apache License,
+Version 2.0. A copy is included in Fizgig-Apache-2.0.txt.
+
+Adaptations: explicit component configuration, deterministic multi-subject
+mapping validation, cross-folder conditioning, explicit offline asset workflow,
+content-addressed caches, stronger integrity checks, and AI-Toolkit integration.
+These changes are not statements of endorsement by Fizgig's author.
+
+Differential Output Preservation originates from AI-Toolkit, Ostris, LLC,
+licensed under MIT; this port extends AI-Toolkit's existing implementation.
+
+Separate asset attribution (assets are not distributed in this repository):
+Fizgig multi-person strangers, ShootTheSound / Peter Neill
+https://huggingface.co/datasets/ShootTheSound/fizgig-multi-person-strangers
+Revision 8aeb77502234781cb5dca524994c80efcaa51024
+CC BY 4.0: https://creativecommons.org/licenses/by/4.0/
+32 synthetic portraits generated with Qwen Image 2.1 base, 25 steps, CFG 3,
+seeds 1000-1031. Attribution and licensing are declared by the pinned asset card.
+Generated composites crop/resize these portraits and pair them with the user's
+own images. User-provided images have separate ownership and licensing.
