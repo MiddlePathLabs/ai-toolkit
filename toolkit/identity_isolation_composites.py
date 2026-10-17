@@ -268,7 +268,9 @@ def _square(path: Path) -> Image.Image:
         )
 
 
-def _render(folder: Path, config, index: int, rows: list[dict], source: dict) -> None:
+def _render(
+    folder: Path, config, index: int, rows: list[dict], source: dict, assets_dir: Path
+) -> None:
     subject = config.subjects[index]
     trigger = subject["trigger"]
     if config.fused_captions:
@@ -282,7 +284,7 @@ def _render(folder: Path, config, index: int, rows: list[dict], source: dict) ->
         mine = rng.choice(photos)
         left = rng.random() < 0.5
         a = _square(Path(source["folder_path"]) / mine)
-        b = _square(Path(config.stranger_asset_dir) / stranger["file"])
+        b = _square(assets_dir / stranger["file"])
         with Image.new("RGB", (2 * PANEL, PANEL)) as sheet:
             sheet.paste(a if left else b, (0, 0))
             sheet.paste(b if left else a, (PANEL, 0))
@@ -416,7 +418,7 @@ def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
         else:
             temporary = Path(tempfile.mkdtemp(prefix=".identity-isolation-", dir=root))
             try:
-                _render(temporary, config, index, rows, snapshots[index])
+                _render(temporary, config, index, rows, snapshots[index], assets_dir)
                 # Never publish an output if its inputs changed during preparation.
                 if (
                     snapshots != [_source_snapshot(p) for p in sources]

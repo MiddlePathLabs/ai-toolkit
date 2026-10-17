@@ -91,7 +91,7 @@ def test_disk_training_and_preservation_embeds_match_live_multi_identity_conditi
     assert source.with_suffix(".txt").read_text(encoding="utf-8") == caption
 
 
-def test_process_preserves_unrelated_global_trigger_but_never_injects_it_into_composites(
+def test_unrelated_dataset_with_disabled_inheritance_never_injects_global_trigger(
     tmp_path, monkeypatch
 ):
     from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
@@ -128,12 +128,15 @@ def test_process_preserves_unrelated_global_trigger_but_never_injects_it_into_co
         "train": {"optimizer": "adamw", "resume_mode": "weights_only"},
         "datasets": [
             {
+                # the unrelated dataset cannot inherit the unmapped process
+                # trigger under isolation DOP; an empty string disables it
                 "folder_path": str(folder),
                 "num_workers": 0,
                 "resolution": 32,
                 "caption_dropout_rate": 0,
+                **({} if index == 0 else {"trigger_word": ""}),
             }
-            for folder in folders[:2]
+            for index, folder in enumerate(folders[:2])
         ],
         "identity_isolation": {
             "preset": "full",
@@ -152,7 +155,7 @@ def test_process_preserves_unrelated_global_trigger_but_never_injects_it_into_co
     trainer = BaseSDTrainProcess(0, job, process)
     assert [dataset.trigger_word for dataset in trainer.dataset_configs] == [
         "zwxem",
-        "globalmark",
+        "",
         None,
     ]
     assert [dataset.isolation_category for dataset in trainer.dataset_configs] == [

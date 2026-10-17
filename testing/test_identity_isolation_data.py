@@ -494,6 +494,33 @@ def test_unmatched_dataset_receives_global_subject_mapping_without_owner_injecti
     assert item.get_dropout_caption() == item.get_dop_dropout_caption() == ""
 
 
+@pytest.mark.parametrize("dataset_trigger", [None, "globalmark", "person0", ""])
+def test_dop_validates_process_trigger_only_when_inherited(tmp_path, dataset_trigger):
+    process = _process(tmp_path, dop_enabled=True)
+    process["trigger_word"] = "globalmark"
+    folder = _source(tmp_path, "unrelated", 1, "a scene without identity words")
+    process["datasets"].append(
+        {
+            "folder_path": str(folder),
+            "num_workers": 0,
+            "resolution": 32,
+            "trigger_word": dataset_trigger,
+        }
+    )
+    if dataset_trigger in (None, "globalmark"):
+        with pytest.raises(ValueError, match="unmapped dataset trigger_word"):
+            configure_isolation(process)
+    else:
+        configure_isolation(process)
+        item = _item(process["datasets"][-1])
+        expected = (
+            "a person a scene without identity words"
+            if dataset_trigger
+            else "a scene without identity words"
+        )
+        assert item.caption_dop == expected
+
+
 def test_pooled_buckets_partition_explicit_categories_not_filenames(tmp_path):
     from testing.test_h3_cache_contracts import _FrozenToyEncoderModel
     from toolkit.data_loader import get_dataloader_from_datasets

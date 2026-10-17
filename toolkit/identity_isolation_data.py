@@ -322,6 +322,8 @@ def configure_isolation(process_config, *, prepare=True):
         dataset.setdefault("isolation_category", "normal")
         if train.get("diff_output_preservation"):
             trigger = dataset.get("trigger_word")
+            if trigger is None:
+                trigger = process_config.get("trigger_word")
             if (
                 config.subjects
                 and trigger

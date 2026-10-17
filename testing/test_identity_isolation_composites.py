@@ -113,6 +113,33 @@ def test_exact_rng_dimensions_caption_order_and_placement(recipe):
     assert manifest["inputs"]["assets"]["revision"] == pin.revision
 
 
+def test_render_uses_verified_assets_after_working_directory_changes(
+    recipe, tmp_path, monkeypatch
+):
+    config, _ = recipe
+    monkeypatch.chdir(tmp_path)
+    config.stranger_asset_dir = "strangers"
+    config.composite_count = 1
+    expected = _output_bytes(_prepare(recipe)[0]["folder_path"])
+    config.generated_dir = str(tmp_path / "other-generated")
+    other_cwd = tmp_path / "other-cwd"
+    unverified_assets = other_cwd / "strangers"
+    unverified_assets.mkdir(parents=True)
+    for index in range(3):
+        Image.new("RGB", (120, 80), "black").save(
+            unverified_assets / f"stranger_{index:02d}.png"
+        )
+    square = composites._square
+
+    def change_cwd(path):
+        monkeypatch.chdir(other_cwd)
+        return square(path)
+
+    monkeypatch.setattr(composites, "_square", change_cwd)
+    actual = _output_bytes(_prepare(recipe)[0]["folder_path"])
+    assert actual == expected
+
+
 def test_center_square_crop_ignores_outer_borders(recipe):
     config, _ = recipe
     source = Path(config.subjects[0]["folder_path"])

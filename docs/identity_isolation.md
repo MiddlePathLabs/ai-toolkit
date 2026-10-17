@@ -70,6 +70,13 @@ Explicit component fields override preset defaults. `balance_subjects` defaults 
 
 Isolation `seed` controls compositor randomness only; it does not reseed the existing training/sampling RNG. Use the process-level `training_seed` for the training run and the normal sample seed settings for previews. Checkpointed sampler/RNG state governs continuation.
 
+### Trigger inheritance and verified asset paths
+
+With subject mappings and DOP enabled, every nonempty effective dataset trigger must match a configured subject trigger. Validation includes the process-level `trigger_word` when a dataset's trigger is absent or `null`. An explicit dataset trigger overrides the process trigger; an empty string disables inheritance. Map the inherited trigger or override it on unrelated datasets before inspection or training.
+
+Composite preparation resolves `stranger_asset_dir` once and uses that absolute directory for verification, rendering, and the post-render input check. A working-directory change during rendering cannot redirect portrait reads to an unverified relative directory.
+
+
 ## Example Krea 2 process
 
 Substitute your actual model and folders. Do not use symbolic angle-bracket values unchanged. This is a process block to place under `config.process` in an ordinary `job: extension` configuration. Keep your normal save/sample/device configuration.
