@@ -12,6 +12,12 @@ This fork tracks `upstream/main` closely (merged periodically; run `git rev-list
 > [!NOTE]
 > The perceptual anchors, weight/gradient noising, rose optimizer, and auto-masking features were ported from [BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) (MIT licensed) and adapted to work with Krea 2 (and, for the VAE anchor and auto-masking, Qwen-Image 2.1) on top of this fork's newer upstream base. Full credit to that project for the original implementation.
 
+### LoRA Identity Isolation (Krea 2 / Raw)
+
+Opt-in Fizgig v8.4.0 mechanism port: subject-specific fused captions, explicit preparation of pinned stranger composites, multi-trigger conditioning for the existing DOP implementation, successful-update-window DOP cadence, approximate repeat balancing, and category-homogeneous composite optimizer LR scaling. The UI exposes Off, DOP only, Full Isolation, component overrides, and caption/composite/exposure previews. Off leaves independently configured legacy DOP intact; ordinary runs never download stranger assets.
+
+Composite LR scaling is restricted to exercised AdamW/ROSE update paths with both accumulation settings at 1; active Isolation requires zero-worker loaders. Synthetic/local validation is not proof of full Krea training correctness or improved identity separation. See [usage and manual validation](docs/identity_isolation.md), [example configuration](config/examples/train_lora_krea2_identity_isolation.yaml), [reference audit/deviations](docs/identity_isolation_reference.md), and the [user-run experiment plan](docs/identity_isolation_experiments.md). Real-data training and A/B experiments remain user-run.
+
 ### Perceptual anchor training (Krea 2; partly Qwen-Image 2.1)
 
 Auxiliary losses that can anchor a Krea 2 LoRA to structural ground truth; they do not guarantee identity/geometry usefulness without the required model weights and runtime evidence. Each anchor can be enabled independently only when its dependency/admission gate is satisfied, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):

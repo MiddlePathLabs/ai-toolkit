@@ -447,6 +447,28 @@ export interface SliderConfig {
   anchor_class?: string | null;
 }
 
+export interface IdentityIsolationSubject {
+  folder_path: string;
+  trigger: string;
+  class_name: string;
+}
+
+export interface IdentityIsolationConfig {
+  preset?: 'off' | 'dop_only' | 'full';
+  fused_captions?: boolean;
+  composites?: boolean;
+  composite_count?: number;
+  composite_lr_multiplier?: number;
+  dop_enabled?: boolean;
+  dop_interval?: number;
+  dop_weight?: number;
+  balance_subjects?: boolean;
+  stranger_asset_dir?: string;
+  generated_dir?: string;
+  seed?: number;
+  subjects?: IdentityIsolationSubject[];
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -456,6 +478,7 @@ export interface ProcessConfig {
   device: string;
   network?: NetworkConfig;
   slider?: SliderConfig;
+  identity_isolation?: IdentityIsolationConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];
   train: TrainConfig;

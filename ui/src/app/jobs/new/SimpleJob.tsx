@@ -24,6 +24,7 @@ import {
   AdvancedFold,
 } from '@/components/formInputs';
 import Card from '@/components/Card';
+import IdentityIsolationPanel from '@/components/IdentityIsolationPanel';
 import { X, Copy, Wand2, SquareDashed, Info } from 'lucide-react';
 import { openDoc } from '@/components/DocModal';
 import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePromptsModal';
@@ -1576,6 +1577,12 @@ export default function SimpleJob({
               </div>
             </div>
           </Card>
+        </div>
+        <div>
+          <IdentityIsolationPanel
+            process={jobConfig.config.process[0]}
+            onChange={value => setJobConfig(value, 'config.process[0].identity_isolation')}
+          />
         </div>
         {(modelArch?.additionalSections?.includes('depth_consistency') ||
           modelArch?.additionalSections?.includes('normal_id') ||

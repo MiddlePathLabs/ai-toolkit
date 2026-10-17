@@ -1,0 +1,85 @@
+# Replace all <...> values with your actual local paths before use.
+# This configuration does not prepare/download stranger assets.
+# Manual procedure: docs/identity_isolation.md. No effectiveness claim.
+job: extension
+config:
+  name: krea2_identity_isolation_manual
+  process:
+    - type: diffusion_trainer
+      training_folder: output
+      device: cuda
+      training_seed: 42
+      network:
+        type: lora
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: bf16
+        save_every: 100
+        max_step_saves_to_keep: 3
+      model:
+        arch: krea2
+        name_or_path: <local-Krea-2-Raw-checkpoint>
+        quantize: true
+        model_kwargs:
+          text_encoder_path: <local-Qwen3-VL-4B-Instruct-directory>
+          vae_path: <local-Qwen-Image-VAE-directory>
+      train:
+        steps: 1000
+        batch_size: 1
+        gradient_accumulation: 1
+        gradient_accumulation_steps: 1
+        optimizer: adamw
+        lr: 0.0001
+        lr_scheduler: constant
+        noise_scheduler: flowmatch
+        dtype: bf16
+        cache_text_embeddings: true
+        pool_datasets: false
+      identity_isolation:
+        preset: full
+        subjects:
+          - folder_path: <subject-one-folder>
+            trigger: zwxem
+            class_name: woman
+          - folder_path: <subject-two-folder>
+            trigger: qrxt
+            class_name: man
+        balance_subjects: false
+        fused_captions: true
+        composites: true
+        composite_count: 16
+        composite_lr_multiplier: 2.0
+        dop_enabled: true
+        dop_interval: 2
+        dop_weight: 2.0
+        stranger_asset_dir: <prepared-pinned-stranger-directory>
+        generated_dir: <separate-generated-directory>
+        seed: 42
+      datasets:
+        - folder_path: <subject-one-folder>
+          caption_ext: txt
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: true
+          resolution: [512, 1024]
+          num_repeats: 1
+          num_workers: 0
+        - folder_path: <subject-two-folder>
+          caption_ext: txt
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: true
+          resolution: [512, 1024]
+          num_repeats: 1
+          num_workers: 0
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 1024
+        height: 1024
+        seed: 104729
+        walk_seed: false
+        prompts:
+          - "zwxem, a woman in a park, close-up portrait, face visible"
+          - "a man with round glasses on the left, and zwxem, a woman on the right, two people side by side"
+          - "zwxem, a woman on the left and qrxt, a man on the right, two friends at a cafe"
+          - "a woman and a man at a cafe, both faces visible"
