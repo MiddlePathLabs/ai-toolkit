@@ -3500,6 +3500,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self._resume_state is not None:
             self._restore_resume_loader_state()
 
+        # a fresh text-embedding cache leaves the text encoder on the gpu (the
+        # datasets don't restore placement: that would bounce it per dataset).
+        # Park it once here, before accelerator.prepare brings the unet up.
+        if (
+            self.is_caching_text_embeddings
+            and self.model_config.low_vram
+            and self.sd.text_encoder is not None
+        ):
+            self.sd.text_encoder_to('cpu')
+
         flush()
         self.last_save_step = self.step_num
         ### HOOK ###
