@@ -9,8 +9,11 @@
 """Adapted from Fizgig families/multi_person.py (v8.4.0), by Peter Neill.
 
 AI-Toolkit adaptation: offline-only preparation, verified pinned assets,
-content-addressed atomic caches and explicit download command. The crop, RNG
-sequence, panel layout and stranger-first caption recipe are preserved.
+content-addressed atomic caches and explicit download command. The panel
+layout and stranger-first caption recipe are preserved; the v8.4 center
+square crop is replaced by face-aware panels (SCRFD/YuNet detection via the
+identity-eval detector, face-centered square with margin) plus a usability
+pool so a panel never publishes without a clear, unambiguous face.
 
 Optional portraits: ShootTheSound/fizgig-multi-person-strangers, revision
 8aeb77502234781cb5dca524994c80efcaa51024, CC-BY-4.0,
@@ -43,6 +46,8 @@ from typing import TYPE_CHECKING
 from PIL import Image
 from PIL import __version__ as PILLOW_VERSION
 
+import numpy as np
+
 if TYPE_CHECKING:
     from toolkit.identity_isolation import IsolationConfig
 
@@ -55,7 +60,25 @@ TAIL = "two people side by side, two close-up portraits"
 MANIFEST_FILE = "identity_isolation_manifest.json"
 PROVENANCE_FILE = "identity_isolation_provenance.json"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-_RECIPE_VERSION = "fizgig-v8.4.0-center-square-rgb-lanczos-v1"
+_RECIPE_VERSION = "fizgig-v8.5.1-face-square-frontal-v1"
+# Face-aware paneling: square side = FACE_MARGIN x face height (a face is
+# ~45% of the panel at 2.2, matching the "close-up portraits" caption tail),
+# a source face must be at least MIN_FACE_PX tall before upscale, and a
+# second face taller than RIVAL_FACE_RATIO x the largest makes the photo
+# ambiguous for identity pairing, so it is excluded from the pool.
+FACE_MARGIN = 2.2
+MIN_FACE_PX = 96
+RIVAL_FACE_RATIO = 0.6
+# Subject panels also require a frontal-ish face, estimated from the
+# detector's 5 landmarks: |nose_x - eye_midpoint_x| / interocular distance
+# stays small while both eyes are visible and grows toward/past 1 in
+# profile, where the far-eye landmark also collapses toward the nose. A
+# yaw proxy above MAX_YAW_PROXY (~50-55 degrees) or interocular below
+# MIN_INTEROCULAR_RATIO x face width rejects the photo; mild three-quarter
+# views (~35-40 degrees) still pass. Stranger panels are exempt: the pinned
+# portraits are close-ups and pose variety there is harmless.
+MAX_YAW_PROXY = 0.62
+MIN_INTEROCULAR_RATIO = 0.12
 # SHA256 LFS object identities from the pinned HF tree; no image download needed.
 _IMAGE_DIGESTS = (
     "d12e2abebcf981c3ae8808c13831838cbbaf21fda163026e7ea18ff7b86c3d61",
@@ -257,34 +280,147 @@ def _reject_overlap(source: dict, assets: dict) -> None:
             )
 
 
-def _square(path: Path) -> Image.Image:
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        width, height = image.size
-        side = min(width, height)
-        left, top = (width - side) // 2, (height - side) // 2
-        return image.crop((left, top, left + side, top + side)).resize(
-            (PANEL, PANEL), Image.Resampling.LANCZOS
-        )
+def _build_detector():
+    """SCRFD (buffalo_l) via the identity-eval detector, YuNet fallback.
+
+    Preparation stays offline: discovery never downloads weights, so a
+    machine without buffalo_l/YuNet fails fast with placement instructions
+    instead of silently regressing to the v8.4 center crop.
+    """
+    try:
+        from toolkit.identity_eval.detector import FaceDetector
+    except Exception as error:  # noqa: BLE001 -- optional eval extras
+        raise ValueError(
+            f"Identity isolation composites require the identity-eval face "
+            f"detector stack: {error}"
+        ) from error
+    try:
+        return FaceDetector(device="cpu")
+    except Exception as error:  # noqa: BLE001
+        raise ValueError(
+            "Identity isolation composites require a face detector (buffalo_l "
+            f"or YuNet, see docs/identity_eval.md): {error}"
+        ) from error
+
+
+def _usable_face(
+    detector, image: Image.Image, require_frontal: bool = False
+) -> tuple[list[int] | None, str | None]:
+    """Largest-face usability check for one RGB image.
+
+    Returns an int bbox (x1, y1, x2, y2) clamped to the image, or a stable
+    rejection reason. ``detector.detect`` receives BGR (the identity-eval
+    contract) and returns area-sorted faces already score-thresholded.
+    ``require_frontal`` adds the landmark yaw gate for subject panels.
+    """
+    bgr = np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
+    faces = detector.detect(bgr).faces
+    if not faces:
+        return None, "no_face"
+    x1, y1, x2, y2 = (float(v) for v in faces[0].bbox)
+    face_h = min(y2, image.height) - max(y1, 0.0)
+    if face_h < MIN_FACE_PX:
+        return None, "small_face"
+    if len(faces) > 1:
+        other = faces[1].bbox
+        other_h = min(float(other[3]), image.height) - max(float(other[1]), 0.0)
+        if other_h >= RIVAL_FACE_RATIO * face_h:
+            return None, "rival_face"
+    if require_frontal:
+        kps = np.asarray(faces[0].kps, dtype=np.float32).reshape(-1, 2)
+        interocular = abs(float(kps[1, 0]) - float(kps[0, 0]))
+        face_w = max(x2 - x1, 1.0)
+        if interocular < MIN_INTEROCULAR_RATIO * face_w:
+            return None, "profile_face"
+        eye_mid_x = (float(kps[0, 0]) + float(kps[1, 0])) / 2
+        yaw = (float(kps[2, 0]) - eye_mid_x) / max(interocular, 1e-6)
+        if abs(yaw) > MAX_YAW_PROXY:
+            return None, "profile_face"
+    box = [
+        int(round(max(0.0, min(x1, image.width)))),
+        int(round(max(0.0, min(y1, image.height)))),
+        int(round(max(0.0, min(x2, image.width)))),
+        int(round(max(0.0, min(y2, image.height)))),
+    ]
+    return box, None
+
+
+def _face_square(width: int, height: int, bbox) -> tuple[int, int, int, int] | None:
+    """Face-centered square crop box, clamped to the image bounds.
+
+    The square keeps the detected face fully inside it as long as the face
+    lies inside the image: centering on the face then clamping only shifts
+    the window toward the image interior.
+    """
+    x1 = max(0.0, min(float(bbox[0]), width))
+    y1 = max(0.0, min(float(bbox[1]), height))
+    x2 = max(x1, min(float(bbox[2]), width))
+    y2 = max(y1, min(float(bbox[3]), height))
+    face_h = y2 - y1
+    if face_h <= 0 or x2 - x1 <= 0:
+        return None
+    side = int(min(FACE_MARGIN * face_h, width, height))
+    left = max(0, min(int(round((x1 + x2) / 2 - side / 2)), width - side))
+    top = max(0, min(int(round((y1 + y2) / 2 - side / 2)), height - side))
+    return left, top, left + side, top + side
+
+
+def _panel(image: Image.Image, bbox) -> Image.Image:
+    """512 close-up panel cropped around the detected face."""
+    square = _face_square(image.width, image.height, bbox)
+    if square is None:
+        raise ValueError(f"Degenerate face box {bbox} for {image.size} image")
+    return image.crop(square).resize((PANEL, PANEL), Image.Resampling.LANCZOS)
+
+
+def _face_pool(
+    detector, folder: Path, names: list[str], require_frontal: bool = False
+) -> dict:
+    """Usability pool for one image folder: face box per usable photo."""
+    usable = []
+    rejected: dict[str, int] = {}
+    for name in names:
+        with Image.open(folder / name) as image:
+            box, reason = _usable_face(detector, image, require_frontal)
+        if box is None:
+            rejected[reason] = rejected.get(reason, 0) + 1
+        else:
+            usable.append({"file": name, "face": box})
+    return {"usable": usable, "rejected": rejected}
 
 
 def _render(
-    folder: Path, config, index: int, rows: list[dict], source: dict, assets_dir: Path
+    folder: Path,
+    config,
+    index: int,
+    strangers: list[dict],
+    source: dict,
+    assets_dir: Path,
+    subject_pool: list[dict],
 ) -> None:
+    """Render composites from usable faces only.
+
+    Both sides cycle a shuffled usability pool without replacement per pass,
+    so subject photo diversity is maximal for the requested count; every
+    published panel contains one clear face by construction.
+    """
     subject = config.subjects[index]
     trigger = subject["trigger"]
     if config.fused_captions:
         trigger = "".join(trigger.split()) + subject["class_name"].split()[-1].lower()
     rng = random.Random(config.seed * 1000 + index)
-    order = list(range(len(rows)))
-    rng.shuffle(order)
-    photos = sorted(source["images"])
+    stranger_order = list(range(len(strangers)))
+    subject_order = list(range(len(subject_pool)))
+    rng.shuffle(stranger_order)
+    rng.shuffle(subject_order)
     for k in range(config.composite_count):
-        stranger = rows[order[k % len(order)]]
-        mine = rng.choice(photos)
+        stranger = strangers[stranger_order[k % len(stranger_order)]]
+        mine = subject_pool[subject_order[k % len(subject_order)]]
         left = rng.random() < 0.5
-        a = _square(Path(source["folder_path"]) / mine)
-        b = _square(assets_dir / stranger["file"])
+        with Image.open(Path(source["folder_path"]) / mine["file"]) as image:
+            a = _panel(image.convert("RGB"), mine["face"])
+        with Image.open(assets_dir / stranger["file"]) as image:
+            b = _panel(image.convert("RGB"), stranger["face"])
         with Image.new("RGB", (2 * PANEL, PANEL)) as sheet:
             sheet.paste(a if left else b, (0, 0))
             sheet.paste(b if left else a, (PANEL, 0))
@@ -355,7 +491,7 @@ def _reuse_cache(folder: Path, identity: str, inputs: dict, count: int) -> None:
         ) from error
 
 
-def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
+def _prepare_composites(config, pin: _AssetPin, detector=None) -> list[dict]:
     if not config.composites:
         return []
     if not 1 <= len(config.subjects) <= 4 or config.composite_count < 1:
@@ -393,6 +529,37 @@ def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
     snapshots = [_source_snapshot(source) for source in sources]
     for snapshot in snapshots:
         _reject_overlap(snapshot, assets)
+    if detector is None:
+        detector = _build_detector()
+    stranger_pool = _face_pool(detector, assets_dir, [row["file"] for row in rows])
+    if not stranger_pool["usable"]:
+        raise ValueError(
+            "No pinned stranger portrait has a usable face; the asset set is "
+            "damaged or the detector is misbehaving"
+        )
+    subject_pools = []
+    for snapshot in snapshots:
+        pool = _face_pool(
+            detector,
+            Path(snapshot["folder_path"]),
+            sorted(snapshot["images"]),
+            require_frontal=True,
+        )
+        if not pool["usable"]:
+            raise ValueError(
+                f"No usable face-forward photo for subject {snapshot['folder_path']} "
+                f"(rejections: {pool['rejected']}). Composites need at least one "
+                "photo with a detected face at least "
+                f"{MIN_FACE_PX}px tall, no rival face of comparable size, and a "
+                "frontal-ish head pose for subject panels."
+            )
+        subject_pools.append(pool)
+    usable_strangers = []
+    by_file = {entry["file"]: entry for entry in stranger_pool["usable"]}
+    for row in rows:
+        entry = by_file.get(row["file"])
+        if entry:
+            usable_strangers.append({**row, "face": entry["face"]})
     mapping = [
         {**s, "folder_path": str(path)} for s, path in zip(config.subjects, sources)
     ]
@@ -400,6 +567,18 @@ def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
         "recipe": _RECIPE_VERSION,
         "panel": PANEL,
         "pillow": PILLOW_VERSION,
+        "detector": detector.det_sig,
+        "face_recipe": {
+            "margin": FACE_MARGIN,
+            "min_face_px": MIN_FACE_PX,
+            "rival_ratio": RIVAL_FACE_RATIO,
+            "max_yaw_proxy": MAX_YAW_PROXY,
+            "min_interocular_ratio": MIN_INTEROCULAR_RATIO,
+        },
+        "face_pools": {
+            "strangers": stranger_pool,
+            "subjects": subject_pools,
+        },
         "mapping": mapping,
         "sources": snapshots,
         "assets": assets,
@@ -418,7 +597,15 @@ def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
         else:
             temporary = Path(tempfile.mkdtemp(prefix=".identity-isolation-", dir=root))
             try:
-                _render(temporary, config, index, rows, snapshots[index], assets_dir)
+                _render(
+                    temporary,
+                    config,
+                    index,
+                    usable_strangers,
+                    snapshots[index],
+                    assets_dir,
+                    subject_pools[index]["usable"],
+                )
                 # Never publish an output if its inputs changed during preparation.
                 if (
                     snapshots != [_source_snapshot(p) for p in sources]
@@ -453,7 +640,11 @@ def _prepare_composites(config, pin: _AssetPin) -> list[dict]:
 
 
 def prepare_composites(config: IsolationConfig) -> list[dict]:
-    """Prepare offline, content-verified stranger composites without touching sources."""
+    """Prepare offline, content-verified, face-aware stranger composites.
+
+    The detector is built lazily inside preparation, after asset and source
+    validation, so configuration errors never depend on model availability.
+    """
     return _prepare_composites(config, _ASSET_PIN)
 
 

@@ -5,10 +5,65 @@ import random
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from PIL import Image
 
 from toolkit import identity_isolation_composites as composites
+from toolkit.identity_eval.detector import DetectedFace, DetectionResult
+
+
+class _StubDetector:
+    """Single-face stub honoring the identity-eval detector contract.
+
+    The synthetic tiles have no real faces; the stub "detects" one spanning
+    the tile minus a 2px border, which is at least MIN_FACE_PX tall for the
+    fixture sizes. ``min_height`` flips tiles below it to no-face mode.
+    """
+
+    def __init__(self, det_sig="stub:v1", min_height=0, bbox=None, nose_x_ratio=None):
+        self.det_sig = det_sig
+        self.min_height = min_height
+        self.bbox = bbox
+        self.nose_x_ratio = nose_x_ratio
+
+    def _kps(self, width, height):
+        nose_x = self.nose_x_ratio * width if self.nose_x_ratio else 0.5 * width
+        return np.array(
+            [
+                [0.35 * width, 0.40 * height],
+                [0.65 * width, 0.40 * height],
+                [nose_x, 0.55 * height],
+                [0.42 * width, 0.72 * height],
+                [0.58 * width, 0.72 * height],
+            ],
+            dtype=np.float32,
+        )
+
+    def detect(self, img_bgr):
+        height, width = img_bgr.shape[:2]
+        if height < self.min_height:
+            return DetectionResult(faces=[])
+        if self.bbox is None:
+            bbox = (2.0, 2.0, float(width - 2), float(height - 2))
+        else:
+            x1, y1, x2, y2 = self.bbox
+            bbox = (
+                float(min(x1, width)),
+                float(min(y1, height)),
+                float(min(x2, width)),
+                float(min(y2, height)),
+            )
+        return DetectionResult(
+            faces=[
+                DetectedFace(
+                    index=0,
+                    bbox=bbox,
+                    kps=self._kps(width, height),
+                    det_score=1.0,
+                )
+            ]
+        )
 
 
 def _write_json(path, value):
@@ -29,19 +84,20 @@ def _fixture_pin(folder, revision="synthetic-fixture-v1"):
 
 
 @pytest.fixture
-def recipe(tmp_path):
+def recipe(tmp_path, monkeypatch):
+    monkeypatch.setattr(composites, "_build_detector", lambda: _StubDetector())
     source = tmp_path / "subject"
     assets = tmp_path / "strangers"
     source.mkdir()
     assets.mkdir()
-    Image.new("RGB", (180, 100), "blue").save(source / "a.png")
-    Image.new("RGB", (100, 180), "red").save(source / "z.png")
+    Image.new("RGB", (180, 120), "blue").save(source / "a.png")
+    Image.new("RGB", (120, 180), "red").save(source / "z.png")
     (source / "a.txt").write_text("zxy, a woman smiling", encoding="utf-8")
     (source / "z.txt").write_text("zxy, a woman sitting", encoding="utf-8")
     rows = []
     for index, color in enumerate(("lime", "yellow", "magenta")):
         name = f"stranger_{index:02d}.png"
-        Image.new("RGB", (120, 80), color).save(assets / name)
+        Image.new("RGB", (200, 200), color).save(assets / name)
         rows.append({"file": name, "description": f"a synthetic stranger {index}"})
     _write_json(assets / "strangers.json", rows)
     (assets / "README.md").write_text(
@@ -80,11 +136,14 @@ def test_exact_rng_dimensions_caption_order_and_placement(recipe):
     folder = Path(_prepare(recipe)[0]["folder_path"])
     rows = json.loads((Path(config.stranger_asset_dir) / "strangers.json").read_text())
     rng = random.Random(config.seed * 1000)
-    order = list(range(len(rows)))
-    rng.shuffle(order)
+    stranger_order = list(range(len(rows)))
+    subject_names = ["a.png", "z.png"]  # sorted(source images)
+    subject_order = list(range(len(subject_names)))
+    rng.shuffle(stranger_order)
+    rng.shuffle(subject_order)
     for k in range(config.composite_count):
-        stranger = rows[order[k % len(order)]]
-        source_name = rng.choice(["a.png", "z.png"])
+        stranger = rows[stranger_order[k % len(stranger_order)]]
+        mine = subject_names[subject_order[k % len(subject_order)]]
         left = rng.random() < 0.5
         me, them = ("left", "right") if left else ("right", "left")
         caption = (folder / f"fizgig_mp_{k:02d}.txt").read_text(encoding="utf-8")
@@ -95,22 +154,38 @@ def test_exact_rng_dimensions_caption_order_and_placement(recipe):
         with Image.open(folder / f"fizgig_mp_{k:02d}.png") as image:
             assert image.size == (1024, 512)
             assert image.mode == "RGB"
-            with Image.open(
-                Path(config.subjects[0]["folder_path"]) / source_name
-            ) as source:
-                assert image.getpixel((256 if left else 768, 256)) == source.getpixel(
-                    (50, 50)
-                )
-            with Image.open(
-                Path(config.stranger_asset_dir) / stranger["file"]
-            ) as other:
-                assert image.getpixel((768 if left else 256, 256)) == other.getpixel(
-                    (50, 50)
-                )
+            panels = (
+                (mine, Path(config.subjects[0]["folder_path"]), 0 if left else 512),
+                (stranger["file"], Path(config.stranger_asset_dir), 512 if left else 0),
+            )
+            for name, base, panel_x in panels:
+                with Image.open(base / name) as source:
+                    # The stub "face" spans the tile minus 2px; solid tiles
+                    # make the panel-center pixel equal the square-center one.
+                    square = composites._face_square(
+                        source.width,
+                        source.height,
+                        (2, 2, source.width - 2, source.height - 2),
+                    )
+                    assert image.getpixel((panel_x + 256, 256)) == source.getpixel(
+                        ((square[0] + square[2]) // 2, (square[1] + square[3]) // 2)
+                    )
     manifest = json.loads((folder / composites.MANIFEST_FILE).read_text())
-    assert manifest["inputs"]["assets"]["repo"] == "synthetic-test-fixture"
-    assert manifest["inputs"]["assets"]["license"] == "synthetic-test-fixture"
-    assert manifest["inputs"]["assets"]["revision"] == pin.revision
+    inputs = manifest["inputs"]
+    assert inputs["assets"]["repo"] == "synthetic-test-fixture"
+    assert inputs["assets"]["license"] == "synthetic-test-fixture"
+    assert inputs["assets"]["revision"] == pin.revision
+    assert inputs["recipe"] == composites._RECIPE_VERSION
+    assert inputs["detector"] == "stub:v1"
+    assert inputs["face_recipe"] == {
+        "margin": composites.FACE_MARGIN,
+        "min_face_px": composites.MIN_FACE_PX,
+        "rival_ratio": composites.RIVAL_FACE_RATIO,
+        "max_yaw_proxy": composites.MAX_YAW_PROXY,
+        "min_interocular_ratio": composites.MIN_INTEROCULAR_RATIO,
+    }
+    assert len(inputs["face_pools"]["subjects"][0]["usable"]) == 2
+    assert len(inputs["face_pools"]["strangers"]["usable"]) == 3
 
 
 def test_render_uses_verified_assets_after_working_directory_changes(
@@ -129,23 +204,30 @@ def test_render_uses_verified_assets_after_working_directory_changes(
         Image.new("RGB", (120, 80), "black").save(
             unverified_assets / f"stranger_{index:02d}.png"
         )
-    square = composites._square
+    square = composites._panel
 
-    def change_cwd(path):
+    def change_cwd(image, bbox):
         monkeypatch.chdir(other_cwd)
-        return square(path)
+        return square(image, bbox)
 
-    monkeypatch.setattr(composites, "_square", change_cwd)
+    monkeypatch.setattr(composites, "_panel", change_cwd)
     actual = _output_bytes(_prepare(recipe)[0]["folder_path"])
     assert actual == expected
 
 
-def test_center_square_crop_ignores_outer_borders(recipe):
+def test_face_square_keeps_high_face_fully_in_frame(recipe, monkeypatch):
+    """The v8.4 center crop clipped faces near the frame top; the face
+    square must keep the whole face inside the panel whatever its position."""
     config, _ = recipe
+    # The stub "detects" the painted face, not the whole tile.
+    monkeypatch.setattr(
+        composites, "_build_detector", lambda: _StubDetector(bbox=(100, 20, 300, 220))
+    )
     source = Path(config.subjects[0]["folder_path"])
+    # Face-colored rect near the top of a tall image; center-crop would clip it.
     for name in ("a.png", "z.png"):
-        with Image.new("RGB", (200, 100), "black") as image:
-            image.paste("red", (50, 0, 150, 100))
+        with Image.new("RGB", (400, 1000), "black") as image:
+            image.paste("red", (100, 20, 300, 220))
             image.save(source / name)
     folder = Path(_prepare(recipe)[0]["folder_path"])
     for k in range(config.composite_count):
@@ -153,8 +235,95 @@ def test_center_square_crop_ignores_outer_borders(recipe):
         left = "zxywoman on the left" in caption
         with Image.open(folder / f"fizgig_mp_{k:02d}.png") as image:
             x = 0 if left else 512
-            assert image.getpixel((x, 0)) == (255, 0, 0)
-            assert image.getpixel((x + 511, 511)) == (255, 0, 0)
+            # The face (100..300 x 20..220 in a 400x1000 source) maps to the
+            # panel via the stub-detected box; its mapped region must be red
+            # across its full extent, including the very top pixel row of the
+            # face -- the exact failure of the old center crop.
+            square = composites._face_square(400, 1000, (100, 20, 300, 220))
+            top, bottom = square[1], square[3]
+            side = square[2] - square[0]
+            face_top = int(20 / (bottom - top) * composites.PANEL)
+            face_bottom = int(220 / (bottom - top) * composites.PANEL)
+            face_left = int((100 - square[0]) / side * composites.PANEL)
+            face_right = int((300 - square[0]) / side * composites.PANEL)
+            # Sample the face interior only: boundary pixels sit under the
+            # LANCZOS transition band.
+            for py in (face_top + 6, (face_top + face_bottom) // 2, face_bottom - 7):
+                for px in (face_left + 6, (face_left + face_right) // 2, face_right - 7):
+                    assert image.getpixel((x + px, py)) == (255, 0, 0), (k, px, py)
+
+
+def test_face_square_geometry_unit():
+    face = (100, 20, 300, 220)  # 200x200 face in a 400x1000 image
+    square = composites._face_square(400, 1000, face)
+    assert square == (0, 0, 400, 400)
+    assert square[1] <= face[1] and face[3] <= square[3]
+    # Margin shrinks to the short image side but keeps the face centered.
+    wide = composites._face_square(1000, 300, (100, 50, 300, 250))
+    assert wide == (50, 0, 350, 300)
+    assert composites._face_square(100, 100, (50, 50, 50, 50)) is None
+
+
+def test_usable_face_rejects_small_and_rival_faces():
+    detector = _StubDetector()
+    good, reason = composites._usable_face(detector, Image.new("RGB", (400, 400), "red"))
+    assert reason is None and good == [2, 2, 398, 398]
+    small, reason = composites._usable_face(
+        detector, Image.new("RGB", (80, 80), "red")
+    )
+    assert small is None and reason == "small_face"
+
+    class _Rival(_StubDetector):
+        def detect(self, img_bgr):
+            result = super().detect(img_bgr)
+            rival = DetectedFace(
+                index=1,
+                bbox=(2.0, 100.0, float(img_bgr.shape[1] - 2), 400.0),
+                kps=np.zeros((5, 2), dtype=np.float32),
+                det_score=1.0,
+            )
+            return DetectionResult(faces=[result.faces[0], rival])
+
+    box, reason = composites._usable_face(
+        _Rival(), Image.new("RGB", (400, 402), "red")
+    )
+    assert box is None and reason == "rival_face"
+
+
+def test_frontal_gate_rejects_profile_poses_for_subjects_only():
+    frontal = _StubDetector()
+    profile = _StubDetector(nose_x_ratio=0.9)  # yaw proxy ~1.33
+    image = Image.new("RGB", (400, 400), "red")
+    box, reason = composites._usable_face(frontal, image, require_frontal=True)
+    assert reason is None and box == [2, 2, 398, 398]
+    box, reason = composites._usable_face(profile, image, require_frontal=True)
+    assert box is None and reason == "profile_face"
+    # Stranger panels skip the pose gate.
+    box, reason = composites._usable_face(profile, image, require_frontal=False)
+    assert reason is None and box == [2, 2, 398, 398]
+
+
+def test_faceless_subject_pool_fails_closed(recipe, monkeypatch):
+    config, _ = recipe
+    # Strangers (200px) stay usable; both subject tiles (120/180px) go blind.
+    monkeypatch.setattr(
+        composites, "_build_detector", lambda: _StubDetector(min_height=190)
+    )
+    with pytest.raises(ValueError, match="No usable face-forward photo"):
+        _prepare(recipe)
+    assert not Path(config.generated_dir).exists()
+
+
+def test_detector_signature_participates_in_cache_identity(recipe, monkeypatch):
+    first = _prepare(recipe)[0]
+    before = _output_bytes(first["folder_path"])
+    monkeypatch.setattr(
+        composites, "_build_detector", lambda: _StubDetector(det_sig="stub:v2")
+    )
+    second = _prepare(recipe)[0]
+    assert second["cache_identity"] != first["cache_identity"]
+    assert second["folder_path"] != first["folder_path"]
+    assert _output_bytes(first["folder_path"]) == before
 
 
 def test_source_images_and_caption_bytes_are_untouched(recipe):
@@ -179,7 +348,7 @@ def test_subject_index_offsets_rng_and_returns_metadata(recipe):
     source = Path(config.subjects[0]["folder_path"])
     other = source.with_name("second")
     other.mkdir()
-    Image.new("RGB", (100, 100), "cyan").save(other / "a.png")
+    Image.new("RGB", (120, 120), "cyan").save(other / "a.png")
     config.subjects.append(
         {"folder_path": str(other), "trigger": "abc", "class_name": "man"}
     )
@@ -189,7 +358,7 @@ def test_subject_index_offsets_rng_and_returns_metadata(recipe):
     rng = random.Random(config.seed * 1000 + 1)
     order = list(range(3))
     rng.shuffle(order)
-    rng.choice(["a.png"])
+    rng.shuffle([0])  # single-photo subject pool: no-op, consumes nothing
     left = rng.random() < 0.5
     caption = (Path(results[1]["folder_path"]) / "fizgig_mp_00.txt").read_text()
     assert caption.startswith(
@@ -232,7 +401,7 @@ def test_changed_input_creates_distinct_cache_without_modifying_old_cache(
     source = Path(config.subjects[0]["folder_path"])
     if changed == "image":
         # Content rather than timestamps identifies the input.
-        Image.new("RGB", (180, 100), "orange").save(source / "a.png")
+        Image.new("RGB", (180, 120), "orange").save(source / "a.png")
     elif changed == "caption":
         (source / "a.txt").write_bytes(b"different caption bytes, ignored by recipe")
     elif changed == "mapping":
@@ -254,7 +423,7 @@ def test_all_subject_mappings_participate_in_each_cache(recipe):
     source = Path(config.subjects[0]["folder_path"])
     second = source.with_name("second")
     second.mkdir()
-    Image.new("RGB", (30, 30), "white").save(second / "a.png")
+    Image.new("RGB", (120, 120), "white").save(second / "a.png")
     config.subjects.append(
         {"folder_path": str(second), "trigger": "abc", "class_name": "man"}
     )
