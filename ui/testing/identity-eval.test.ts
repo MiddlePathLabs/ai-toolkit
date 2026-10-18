@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { chainOn } from '../src/utils/promiseChain';
 import {
+  absentPickFor,
+  absenceVerdict,
   buildIdentityIndex,
   classifyFaceLevel,
   groupSummariesByStep,
@@ -15,6 +17,7 @@ import {
   resolveSamplePicks,
   samplePickFor,
   sampleScore,
+  sanitizeSamplePicks,
   selectionForImage,
   sortPathsByScore,
   twinMarked,
@@ -406,4 +409,69 @@ test('mergeSelection carries and sanitizes sample picks like the route', () => {
   assert.equal('a/b.jpg' in (sanitized.sample_picks ?? {}), false);
   assert.equal('ok.jpg' in (sanitized.sample_picks ?? {}), false);
   assert.equal('ok2.jpg' in (sanitized.sample_picks ?? {}), false);
+});
+
+// --------------------------------------------- subject-absent marks (Phase 2f)
+
+test('sanitizeSamplePicks keeps subject_absent exclusive of a face pick', () => {
+  const cleaned = sanitizeSamplePicks({
+    'gone.jpg': { subject_absent: true },
+    'conflict.jpg': { subject_absent: true, face_index: 2, twin_confirmed: [1] },
+    'kept.jpg': { face_index: 1 },
+    'explicit-off.jpg': { subject_absent: false, face_index: 0 },
+  }) ?? {};
+  // absent marks win and carry no face/twin data
+  assert.deepEqual(cleaned['gone.jpg'], { subject_absent: true });
+  assert.deepEqual(cleaned['conflict.jpg'], { subject_absent: true });
+  assert.deepEqual(cleaned['kept.jpg'], { face_index: 1 });
+  // subject_absent: false is not stored -- face_index alone is the state
+  assert.deepEqual(cleaned['explicit-off.jpg'], { face_index: 0 });
+});
+
+test('absentPickFor applies to face-bearing evaluated/ambiguous samples only', () => {
+  const solo = sample({ filename: 'solo.jpg', faces: [face(0, 0.2, 0.2)] });
+  const multi = sample({ filename: 'multi.jpg', status: 'ambiguous', primary: null, face_count: 2, faces: [face(0, 0.2, 0.2), face(1, 0.3, 0.3)] });
+  const noFace = sample({ filename: 'none.jpg', status: 'failed', primary: null, faces: [] });
+  const picks = { 'solo.jpg': { subject_absent: true }, 'multi.jpg': { subject_absent: true }, 'none.jpg': { subject_absent: true } } as never;
+  assert.equal(absentPickFor(solo, picks)?.subject_absent, true); // single-face samples are markable
+  assert.equal(absentPickFor(multi, picks)?.subject_absent, true);
+  assert.equal(absentPickFor(noFace, picks), null); // no faces -> never
+  assert.equal(absentPickFor(solo, null), null);
+  assert.equal(absentPickFor(solo, { 'solo.jpg': { face_index: 0 } }), null); // a pick is not an absent mark
+});
+
+test('resolveSamplePicks excludes absent-marked samples from likeness stats', () => {
+  const stranger = sample({ filename: 'stranger.jpg', step: 1000, primary: mean(0.2, 0.2), faces: [face(0, 0.2, 0.2)] });
+  const subject = sample({ filename: 'subject.jpg', step: 1000, primary: mean(0.6, 0.6) });
+  const resolved = resolveSamplePicks([stranger, subject], { 'stranger.jpg': { subject_absent: true } });
+  assert.equal(resolved[0].status, 'subject_absent');
+  assert.equal(resolved[0].subject_absent, true);
+  assert.equal(resolved[0].primary, null); // its stranger score must never join a median
+  assert.equal(resolved[1], subject);
+  // summaries: absent is its own bucket, not evaluated/ambiguous/failed
+  const summaries = groupSummariesByStep(resolved, 'training');
+  assert.equal(summaries[0].evaluated, 1);
+  assert.equal(summaries[0].absent, 1);
+  assert.equal(summaries[0].ambiguous, 0);
+  assert.equal(summaries[0].failed, 0);
+  assert.equal(summaries[0].medianArcface, 0.6);
+  // un-marking returns the sample to its original state
+  const restored = resolveSamplePicks([stranger], { 'stranger.jpg': { face_index: null } });
+  assert.equal(restored[0].status, 'evaluated');
+  assert.equal(restored[0].subject_absent, undefined);
+});
+
+test('absenceVerdict judges faces against the LOO band per model', () => {
+  const loo = 0.58;
+  const clean = sample({ filename: 'clean.jpg', faces: [face(0, 0.3, 0.3)] });
+  const borderline = sample({ filename: 'border.jpg', faces: [face(0, loo - 0.05, loo - 0.05)] });
+  const leaked = sample({ filename: 'leak.jpg', faces: [face(0, 0.3, 0.3), face(1, loo + 0.02, 0.3)] });
+  const unscored = sample({ filename: 'none.jpg', faces: [face(0, null, null)] });
+  assert.equal(absenceVerdict(clean, 'arcface', 'training', loo), 'clean');
+  assert.equal(absenceVerdict(borderline, 'arcface', 'training', loo), 'borderline');
+  // leaked is decided by any face reaching the band, per model independently
+  assert.equal(absenceVerdict(leaked, 'arcface', 'training', loo), 'leaked');
+  assert.equal(absenceVerdict(leaked, 'sface', 'training', loo), 'clean');
+  assert.equal(absenceVerdict(unscored, 'arcface', 'training', loo), null); // no verdict, not pass
+  assert.equal(absenceVerdict(clean, 'arcface', 'training', null), null); // no band -> no verdict
 });

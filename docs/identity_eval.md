@@ -314,6 +314,54 @@ Storage and plumbing:
 - Wording is test-enforced: "confirmed" and "clone" never appear in the
   leakage block, and the twin level is only ever shown as user-marked.
 
+## Subject-absent samples / trigger adherence (Phase 2f)
+
+No-trigger control prompts (the prompt deliberately does *not* ask for your
+subject) render other people — "no match" is the correct outcome, not a
+likeness failure. The pick model is tri-state:
+
+- **pending** — no pick entry (or `face_index: null`): the sample behaves as
+  before ("needs pick" when multi-face, auto-subject when single-face).
+- **picked** — `face_index: N`: the picked face is the subject (Phase 2e).
+- **subject-absent** — `subject_absent: true`: you state that *no one in the
+  picture is the subject*. Mutually exclusive with a face pick; the
+  sanitizers (refs route + client) drop `face_index`/`twin_confirmed` from an
+  absent entry.
+
+An absent mark applies to any face-bearing sample (single- or multi-face);
+failed/no-face samples cannot be marked. Resolution is instant
+post-processing like a pick: the sample flips to the client-side
+`subject_absent` status with `primary` cleared, so it leaves the likeness
+medians, overlays, sorting, checkpoint stats and paired comparisons — a
+stranger's low score no longer pollutes the likeness mean (previously a
+single-face no-trigger sample was silently auto-counted as the subject).
+
+What replaces it is the **trigger adherence** check, LOO-anchored per model
+per source exactly like leakage: for every absent-marked sample, does any
+face reach the model's own LOO band anyway?
+
+- **leaked** — some face scored at or above the band: the subject likely
+  appeared despite the prompt not asking for them (adherence failure).
+- **borderline** — some face within the `0.10` resembles band below it.
+- **clean** — every scored face is clearly below the band (strangers, as
+  intended). A model that scored no face reports **unscored**, never clean.
+
+Surfaces: the panel's **Trigger adherence** section (marked samples with
+verdict chips + a prompt-# filter to batch-mark no-trigger prompts), the
+"no one is the subject" button in the Multi-person samples section, the
+summary table's `abs` bucket (`ok/amb/abs/fail`), the checkpoint table's
+`absent` count, and the report's `leakage.adherence` block
+(`marked` + per model/source `{scored, leaked, borderline, clean,
+unscored}`). Absent multi-face samples no longer count as `unpicked_multi`;
+they leave the leakage rate entirely (leakage is about non-subject faces
+duplicating a picked subject — meaningless without one).
+
+Report version 5 (v4 reports rebuild on first load after this change);
+leakage block version 2. Both TS mirrors (`resolveSamplePicks`,
+`absentPickFor`, `absenceVerdict` in `ui/src/utils/identityEval.ts`) and the
+Python originals (`leakage.absent_pick`, `resolve_picks`, the adherence
+block) are test-pinned to stay in lockstep.
+
 ## Code map
 
 - `toolkit/identity_eval/` — `detector.py` (SCRFD/YuNet), `arcface.py`,

@@ -513,6 +513,15 @@ export default function IdentityCheckpointSection({
                       ({step.counts.picked} picked)
                     </span>
                   ) : null}
+                  {step.counts.subject_absent ? (
+                    <span
+                      className="text-sky-600 dark:text-sky-400"
+                      title={`${step.counts.subject_absent} sample(s) you marked "subject not in this picture" (no-trigger prompts) — excluded from the stats above and checked by the leakage report's adherence block instead`}
+                    >
+                      {' '}
+                      ({step.counts.subject_absent} absent)
+                    </span>
+                  ) : null}
                 </td>
                 {report.steps.some(s => s.leakage) && (
                   <td
@@ -557,6 +566,40 @@ export default function IdentityCheckpointSection({
         ▲ = highest median — strong evidence, not a verdict. Confirm with the paired comparison before calling a
         checkpoint better.
       </p>
+
+      {/* trigger adherence (Phase 2f): subject-absent samples, report side */}
+      {report.leakage?.adherence && report.leakage.adherence.marked > 0 && (
+        <div className="rounded border border-gray-300 p-1.5 text-xs dark:border-gray-600">
+          <span className="font-medium" title="Samples you marked 'the subject is not in this picture' (no-trigger prompts). leaked = a face still reached the LOO band — the subject appeared anyway.">
+            Trigger adherence
+          </span>{' '}
+          <span className="text-gray-500 dark:text-gray-400">
+            {report.leakage.adherence.marked} subject-absent sample(s)
+          </span>
+          <div className="mt-1 space-y-0.5">
+            {Object.entries(report.leakage.adherence.models).map(([model, bySource]) => {
+              const entry = bySource[effectiveSource];
+              if (!entry) return null;
+              const name = model === 'arcface' ? 'ArcFace' : model === 'sface' ? 'SFace' : model;
+              return (
+                <p
+                  key={model}
+                  className="tabular-nums text-gray-600 dark:text-gray-300"
+                  title={`${name}, ${effectiveSource} refs — per model, never averaged. leaked = a face at or above the LOO band; borderline = within ${report.leakage?.margin ?? 0.1} below it; clean = all scored faces clearly below.`}
+                >
+                  {name}: {entry.leaked} leaked · {entry.borderline} borderline · {entry.clean} clean
+                  {entry.unscored > 0 ? ` · ${entry.unscored} unscored` : ''}
+                  {entry.leaked > 0 ? (
+                    <span className="text-red-600 dark:text-red-400"> — the subject appears on no-trigger prompts</span>
+                  ) : entry.clean > 0 ? (
+                    <span className="text-emerald-600 dark:text-emerald-400"> — no-trigger prompts render strangers</span>
+                  ) : null}
+                </p>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* distribution strips per checkpoint */}
       <ScoreStrip steps={report.steps} model={effectiveModel} source={effectiveSource} loo={loo} onOpenSample={onOpenSample} />

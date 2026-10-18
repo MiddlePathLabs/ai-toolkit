@@ -399,4 +399,4 @@ class TestIntegrity:
         assert report['drift']['version'] == drift.DRIFT_VERSION
         assert report['drift']['signals'] == []
         assert report['drift']['notes']
-        assert cc.REPORT_VERSION == 4
+        assert cc.REPORT_VERSION == 5

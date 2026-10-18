@@ -23,6 +23,9 @@ export interface CheckpointCounts {
   // Phase 2e: ambiguous samples resolved by a subject-face pick (folded
   // into `evaluated`; shown separately so the counts still add up visually)
   picked?: number;
+  // Phase 2f: samples you marked "subject not in this picture" (excluded
+  // from stats; checked by the leakage report's adherence block instead)
+  subject_absent?: number;
 }
 
 export interface CheckpointStepEntry {
@@ -125,12 +128,22 @@ export interface LeakageStepRates {
   rates: Record<string, Partial<Record<string, { flagged: number; evaluable: number; rate: number | null }>>>;
 }
 
+// Trigger adherence over samples you marked "subject absent": per model per
+// source, does any face reach the LOO band anyway (leaked), fall in the
+// resembles band (borderline), or stay clearly below it (clean). 'unscored'
+// samples carry no verdict for that pair — never counted as clean.
+export interface AdherenceBlock {
+  marked: number;
+  models: Record<string, Partial<Record<string, { scored: number; leaked: number; borderline: number; clean: number; unscored: number }>>>;
+}
+
 export interface LeakageReport {
   version: number;
   margin: number;
   thresholds: Record<string, Record<string, { loo: number; resembles_min: number }>>;
   picks_used: number;
-  counts: { multi_face_samples: number; evaluable: number; unpicked_multi: number };
+  counts: { multi_face_samples: number; evaluable: number; unpicked_multi: number; subject_absent: number };
+  adherence?: AdherenceBlock | null;
   faces: LeakageFace[];
   per_step: LeakageStepRates[];
   notes: string[];

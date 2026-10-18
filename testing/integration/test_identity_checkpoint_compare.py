@@ -72,7 +72,8 @@ class TestStats:
 
     def test_report_version_pinned_for_route_cache(self):
         # the compare route rebuilds any report whose version differs
-        assert cc.REPORT_VERSION == 4
+        # (v5: Phase 2f subject-absent marks + adherence block)
+        assert cc.REPORT_VERSION == 5
 
     def test_count_statuses_splits_no_face_from_failed(self):
         samples = [
@@ -81,7 +82,7 @@ class TestStats:
             make_sample(1, 2, 1, status='failed', warnings=['unreadable image file']),
             make_sample(1, 3, 1, status='ambiguous'),
         ]
-        assert cc.count_statuses(samples) == {'evaluated': 1, 'ambiguous': 1, 'no_face': 1, 'failed': 1}
+        assert cc.count_statuses(samples) == {'evaluated': 1, 'ambiguous': 1, 'no_face': 1, 'failed': 1, 'subject_absent': 0}
 
 
 class TestPairing:

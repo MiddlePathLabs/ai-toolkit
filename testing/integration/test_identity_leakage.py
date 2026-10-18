@@ -149,6 +149,77 @@ class TestResolvePicks:
         assert used == 0 and resolved[0] is sample
 
 
+class TestSubjectAbsent:
+    """Phase 2f: subject_absent marks ("no one in the picture is the subject")."""
+
+    def test_absent_mark_flips_sample_out_of_stats(self):
+        multi = make_multi_sample(1000, 0, 42, [make_face(0, 0.6, 0.62), make_face(1, 0.4, 0.41)])
+        solo = make_solo_sample(1000, 1, 42, arcface=0.6, sface=0.62)
+        picks = {multi['filename']: {'subject_absent': True}, solo['filename']: {'subject_absent': True}}
+        resolved, used = leakage.resolve_picks([multi, solo], picks)
+        # an absent mark is not a subject pick: picks_used stays 0
+        assert used == 0
+        for original, marked in zip((multi, solo), resolved):
+            assert marked['status'] == 'subject_absent'
+            assert marked['primary'] is None
+            assert marked['subject_absent'] is True
+            assert 'picked_subject' not in marked
+            assert original['status'] in ('ambiguous', 'evaluated')  # originals untouched
+
+    def test_absent_mark_outranks_a_stale_face_pick(self):
+        multi = make_multi_sample(1000, 0, 42, [make_face(0, 0.6, 0.62), make_face(1, 0.4, 0.41)])
+        picks = {multi['filename']: {'subject_absent': True, 'face_index': 1, 'twin_confirmed': [0]}}
+        resolved, used = leakage.resolve_picks([multi], picks)
+        assert used == 0
+        assert resolved[0]['status'] == 'subject_absent'
+
+    def test_failed_and_faceless_samples_never_absent(self):
+        no_face = make_solo_sample(1000, 0, 42)
+        no_face['status'] = 'failed'
+        no_face['faces'] = []
+        no_face['primary'] = None
+        resolved, used = leakage.resolve_picks([no_face], {no_face['filename']: {'subject_absent': True}})
+        assert used == 0
+        assert resolved[0] is no_face  # passes through unchanged
+
+    def test_absent_multi_is_not_unpicked_and_not_evaluable(self):
+        sample = make_multi_sample(1000, 0, 42, [make_face(0, 0.6, 0.62), make_face(1, 0.59, 0.61)])
+        block = detect([sample], {sample['filename']: {'subject_absent': True}})
+        assert block['counts']['multi_face_samples'] == 1
+        assert block['counts']['evaluable'] == 0
+        assert block['counts']['unpicked_multi'] == 0  # resolved, not awaiting a pick
+        assert block['counts']['subject_absent'] == 1
+        assert block['per_step'] == []
+        assert any('subject-absent' in note for note in block['notes'])
+
+    def test_adherence_block_judges_faces_against_the_band_per_model(self):
+        leaked = make_solo_sample(1000, 0, 42, arcface=0.59, sface=0.2)   # arcface >= band
+        clean = make_solo_sample(1000, 1, 42, arcface=0.2, sface=0.2)     # both far below
+        picks = {leaked['filename']: {'subject_absent': True}, clean['filename']: {'subject_absent': True}}
+        block = detect([leaked, clean], picks)
+        assert block['adherence']['marked'] == 2
+        training = block['adherence']['models']
+        assert training['arcface']['training'] == {'scored': 2, 'leaked': 1, 'borderline': 0, 'clean': 1, 'unscored': 0}
+        assert training['sface']['training']['leaked'] == 0
+        assert training['sface']['training']['clean'] == 2
+        # no marks -> no adherence block at all (old reports stay shape-stable)
+        assert detect([leaked], {})['adherence'] is None
+
+    def test_absent_solo_leaves_report_stats_and_gets_its_own_bucket(self):
+        good = make_solo_sample(1000, 0, 42, arcface=0.6, sface=0.62)
+        stranger = make_solo_sample(1000, 1, 42, arcface=0.2, sface=0.21)
+        picks = {stranger['filename']: {'subject_absent': True}}
+        report = build([good, stranger], picks)
+        step = report['steps'][0]
+        # the stranger's 0.2 must not drag the median: only the subject sample counts
+        assert step['counts']['evaluated'] == 1
+        assert step['counts']['subject_absent'] == 1
+        assert step['stats']['arcface']['training']['n'] == 1
+        assert step['stats']['arcface']['training']['median'] == pytest.approx(0.6)
+        assert report['leakage']['adherence']['marked'] == 1
+        assert report['leakage']['counts']['subject_absent'] == 1
+
+
 class TestDetectLeakage:
     def test_equal_embedding_face_is_likely_duplicate(self):
         # non-target face as close to the references as they are to each other

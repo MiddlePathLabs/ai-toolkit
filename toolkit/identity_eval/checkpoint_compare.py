@@ -40,13 +40,17 @@ import numpy as np
 # v4: Phase 2e leakage -- sample subject-face picks resolve ambiguous
 # samples into the stats/comparisons, steps gain per-model leakage rates,
 # and the report carries the ``leakage`` block (``leakage.detect_leakage``).
-REPORT_VERSION = 4
+# v5: Phase 2f subject-absent marks -- samples you marked "the subject is
+# not in this picture" leave stats/comparisons with their own status bucket
+# and are judged by the leakage block's ``adherence`` section instead.
+REPORT_VERSION = 5
 BOOTSTRAP_RESAMPLES = 10_000
 MIN_PAIRS_FOR_VERDICT = 3
 
 STATUS_EVALUATED = 'evaluated'
 STATUS_AMBIGUOUS = 'ambiguous'
 STATUS_FAILED = 'failed'
+STATUS_ABSENT = 'subject_absent'
 NO_FACE_WARNING = 'no face detected'
 
 
@@ -84,12 +88,14 @@ def group_label(step: int, is_raw: bool, has_raw: bool) -> str:
 
 
 def count_statuses(samples: Sequence[dict]) -> Dict[str, int]:
-    """evaluated / ambiguous / no_face / failed.
+    """evaluated / ambiguous / no_face / failed / subject_absent.
 
     Phase 1 folds no-face detections into ``failed`` with a warning; the
-    checkpoint table splits them back out for readable counts.
+    checkpoint table splits them back out for readable counts. Phase 2f
+    subject-absent samples carry their own bucket (they are excluded from
+    stats, not failed).
     """
-    counts = {STATUS_EVALUATED: 0, STATUS_AMBIGUOUS: 0, 'no_face': 0, STATUS_FAILED: 0}
+    counts = {STATUS_EVALUATED: 0, STATUS_AMBIGUOUS: 0, 'no_face': 0, STATUS_FAILED: 0, STATUS_ABSENT: 0}
     for sample in samples:
         status = sample.get('status')
         if status == STATUS_FAILED and any(NO_FACE_WARNING in w for w in sample.get('warnings') or []):
@@ -356,6 +362,9 @@ def build_checkpoint_report(
         picked_here = sum(1 for s in bucket if s.get('picked_subject'))
         if picked_here:
             counts['picked'] = picked_here
+        absent_here = sum(1 for s in bucket if s.get('subject_absent'))
+        if absent_here:
+            counts['subject_absent'] = absent_here
         entry = {
             'step': step,
             'is_raw': is_raw,

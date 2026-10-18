@@ -8,6 +8,7 @@ const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
   evaluated: { dot: 'bg-emerald-500', text: 'text-white/90' },
   ambiguous: { dot: 'bg-amber-500', text: 'text-amber-100' },
   failed: { dot: 'bg-red-500', text: 'text-red-100' },
+  subject_absent: { dot: 'bg-sky-500', text: 'text-sky-100' },
 };
 
 interface IdentityScoreOverlayProps {

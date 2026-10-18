@@ -38,7 +38,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 # v1: initial Phase 2e block -- resolved picks, three flag levels, per-step
 # rates, closest-reference passthrough.
-LEAKAGE_VERSION = 1
+# v2: Phase 2f subject-absent marks -- ``subject_absent: true`` picks flip a
+# face-bearing sample out of the stats entirely and feed the adherence block
+# (does the subject appear anyway on a no-trigger prompt?).
+LEAKAGE_VERSION = 2
 # Provisional width of the informational "resembles" band, applied to each
 # model's own LOO band (per model, so never a shared scale). Pending 2a/11.7.
 RESEMBLES_MARGIN = 0.10
@@ -48,6 +51,7 @@ MAX_RESEMBLES_LISTED = 40
 
 STATUS_AMBIGUOUS = 'ambiguous'
 STATUS_EVALUATED = 'evaluated'
+STATUS_ABSENT = 'subject_absent'
 LEVEL_DUPLICATE = 'likely_duplicate'
 LEVEL_RESEMBLES = 'resembles'
 
@@ -86,6 +90,22 @@ def valid_pick(sample: dict, picks: Optional[dict]) -> Optional[dict]:
     return pick
 
 
+def absent_pick(sample: dict, picks: Optional[dict]) -> Optional[dict]:
+    """The sample's pick entry when you marked the subject absent, else None.
+
+    Applies to any face-bearing sample (single- or multi-face); failed
+    samples have no faces, so they can never be marked. Mirrors the UI's
+    absentPickFor.
+    """
+    faces = sample.get('faces') or []
+    if not faces or sample.get('status') not in (STATUS_EVALUATED, STATUS_AMBIGUOUS):
+        return None
+    pick = (picks or {}).get(sample.get('filename') or '')
+    if isinstance(pick, dict) and pick.get('subject_absent') is True:
+        return pick
+    return None
+
+
 def _resolved_copy(sample: dict, pick: dict) -> dict:
     picked = dict(sample)
     picked['status'] = STATUS_EVALUATED
@@ -95,18 +115,37 @@ def _resolved_copy(sample: dict, pick: dict) -> dict:
     return picked
 
 
+def _absent_copy(sample: dict) -> dict:
+    """A subject-absent sample leaves likeness stats entirely: no primary,
+    its own status, and a marker. Its faces still carry scores, so the
+    adherence block can ask whether the subject appeared anyway."""
+    marked = dict(sample)
+    marked['status'] = STATUS_ABSENT
+    marked['primary'] = None
+    marked['subject_absent'] = True
+    marked.pop('picked_subject', None)
+    marked.pop('subject_face_index', None)
+    return marked
+
+
 def resolve_picks(samples: Sequence[dict], picks: Optional[dict]) -> Tuple[List[dict], int]:
-    """Apply subject-face picks to a results sample list.
+    """Apply subject-face picks and subject-absent marks to a sample list.
 
     A picked ambiguous sample becomes ``evaluated`` with ``primary`` set to
     the picked face's already-persisted per-model scores (Phase 1 scores
     every face), carrying ``picked_subject`` / ``subject_face_index``
-    markers. Unpicked samples pass through unchanged; the input list is
-    never mutated. Returns ``(resolved_samples, picks_used)``.
+    markers. An absent-marked face-bearing sample becomes
+    ``subject_absent`` with ``primary`` cleared, so medians, strips and
+    paired comparisons skip it. Unmarked samples pass through unchanged;
+    the input list is never mutated. Returns ``(resolved_samples,
+    picks_used)`` where picks_used counts subject-face picks only.
     """
     resolved: List[dict] = []
     used = 0
     for sample in samples:
+        if absent_pick(sample, picks) is not None:
+            resolved.append(_absent_copy(sample))
+            continue
         pick = valid_pick(sample, picks)
         if pick is None:
             resolved.append(sample)
@@ -146,11 +185,12 @@ def detect_leakage(
     """
     raw_samples = results.get('samples') or []
     resolved, picks_used = resolve_picks(raw_samples, picks)
-    # (resolved view, pick) pairs -- the pick is looked up on the RAW record
-    # (resolution flips status away from ambiguous) while the resolved copy
-    # supplies the scored-subject view downstream
-    samples: List[Tuple[dict, Optional[dict]]] = [
-        (res, valid_pick(raw, picks)) for raw, res in zip(raw_samples, resolved)
+    # (resolved view, pick, absent) triples -- the pick/absent lookups run on
+    # the RAW record (resolution flips status away from ambiguous/evaluated)
+    # while the resolved copy supplies the scored-subject view downstream
+    samples: List[Tuple[dict, Optional[dict], bool]] = [
+        (res, valid_pick(raw, picks), absent_pick(raw, picks) is not None)
+        for raw, res in zip(raw_samples, resolved)
     ]
     refsets = results.get('refsets') or {}
 
@@ -172,10 +212,14 @@ def detect_leakage(
     unpicked_multi = 0
     no_loo_pairs = set()
 
-    for sample, pick in samples:
+    for sample, pick, absent in samples:
         if len(sample.get('faces') or []) < 2:
             continue
         filename = sample.get('filename') or ''
+        if absent:
+            # resolved-absent, not awaiting a pick; its faces are judged by
+            # the adherence block instead of the leakage rate
+            continue
         if pick is None:
             unpicked_multi += 1
             continue
@@ -246,6 +290,43 @@ def detect_leakage(
     truncated = max(0, len(resembles_only) - MAX_RESEMBLES_LISTED)
     faces += resembles_only[:MAX_RESEMBLES_LISTED]
 
+    # Trigger adherence: for every subject-absent sample (any face count),
+    # does any face reach the LOO band anyway? leaked = the subject likely
+    # appeared despite the prompt not asking for them; borderline = in the
+    # resembles band; clean = all scored faces clearly strangers. Per model
+    # per source, never averaged; a model that scored nothing is 'unscored',
+    # never clean.
+    absent_count = sum(1 for _, _, absent in samples if absent)
+    adherence_models: Dict[str, Dict[str, dict]] = {}
+    for sample, _, absent in samples:
+        if not absent:
+            continue
+        for model in models:
+            for source in sources:
+                loo = _loo_for(refsets, source, model)
+                entry = adherence_models.setdefault(model, {}).setdefault(
+                    source, {'scored': 0, 'leaked': 0, 'borderline': 0, 'clean': 0, 'unscored': 0}
+                )
+                verdict: Optional[str] = None
+                saw_score = False
+                for face in sample.get('faces') or []:
+                    mean = (((face.get('scores') or {}).get(model) or {}).get(source) or {}).get('mean')
+                    if mean is None:
+                        continue
+                    saw_score = True
+                    level = classify_level(float(mean), loo)
+                    if level == LEVEL_DUPLICATE:
+                        verdict = 'leaked'
+                        break
+                    if level == LEVEL_RESEMBLES and verdict is None:
+                        verdict = 'borderline'
+                if saw_score:
+                    entry['scored'] += 1
+                    entry[verdict or 'clean'] += 1
+                else:
+                    entry['unscored'] += 1
+    adherence = {'marked': absent_count, 'models': adherence_models} if absent_count else None
+
     per_step_list = []
     for (step, is_raw), by_model in sorted(per_step.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         rates: Dict[str, Dict[str, dict]] = {}
@@ -269,6 +350,11 @@ def detect_leakage(
     ]
     if picks_used:
         notes.append(f'{picks_used} multi-person sample(s) scored via a user-picked subject face; per-face scores were already stored, no re-run needed.')
+    if absent_count:
+        notes.append(
+            f'{absent_count} sample(s) marked subject-absent (no-trigger prompts): excluded from likeness stats; '
+            "checked for trigger adherence instead -- 'leaked' means a face still reached the LOO band."
+        )
     if unpicked_multi:
         notes.append(f'{unpicked_multi} multi-person sample(s) have no subject-face pick yet; pick the subject in the panel to include them in the leakage rate.')
     if no_loo_pairs:
@@ -286,10 +372,12 @@ def detect_leakage(
         'thresholds': thresholds,
         'picks_used': picks_used,
         'counts': {
-            'multi_face_samples': sum(1 for s, _ in samples if len(s.get('faces') or []) >= 2),
-            'evaluable': sum(1 for _, p in samples if p is not None),
+            'multi_face_samples': sum(1 for s, _, _ in samples if len(s.get('faces') or []) >= 2),
+            'evaluable': sum(1 for _, p, _ in samples if p is not None),
             'unpicked_multi': unpicked_multi,
+            'subject_absent': absent_count,
         },
+        'adherence': adherence,
         'faces': faces,
         'per_step': per_step_list,
         'notes': notes,

@@ -11,6 +11,8 @@ import { FaPlay, FaStop, FaTrash } from 'react-icons/fa';
 import type { Job } from '@prisma/client';
 import type { IdentityEvalApi } from '@/hooks/useIdentityEval';
 import {
+  absentPickFor,
+  absenceVerdict,
   classifyFaceLevel,
   groupSummariesByStep,
   normalizeRefPath,
@@ -269,6 +271,7 @@ function MultiPersonSamples({
   results,
   source,
   onSavePick,
+  onMarkAbsent,
   onToggleTwin,
   onOpenSample,
 }: {
@@ -279,6 +282,7 @@ function MultiPersonSamples({
   results: IdentityEvalApi['results'];
   source: IdentitySource | 'combined';
   onSavePick: (sample: IdentitySampleResult, faceIndex: number | null) => void;
+  onMarkAbsent: (sample: IdentitySampleResult, absent: boolean) => void;
   onToggleTwin: (sample: IdentitySampleResult, faceIndex: number) => void;
   onOpenSample: (path: string) => void;
 }) {
@@ -344,11 +348,12 @@ function MultiPersonSamples({
       <div className="space-y-1.5">
         {multi.map(sample => {
           const pick = samplePickFor(sample, picks);
-          const subject = pick?.face_index ?? null;
+          const absent = absentPickFor(sample, picks) !== null;
+          const subject = absent ? null : (pick?.face_index ?? null);
           const open = openFile === sample.filename;
           // "flagged" keeps the checkpoint rate's meaning (possible duplicate
           // or user twin mark); resembles-level faces get their own count
-          const nonSubject = sample.faces.filter(f => f.index !== subject);
+          const nonSubject = subject == null ? sample.faces : sample.faces.filter(f => f.index !== subject);
           const flagged = nonSubject.filter(
             f => levelsFor(f).some(l => l.level === 'likely_duplicate') || (pick ? twinMarked(pick, f.index) : false),
           ).length;
@@ -367,7 +372,14 @@ function MultiPersonSamples({
                   step {sample.step?.toLocaleString() ?? '?'} · prompt {sample.prompt_idx ?? '?'}
                   {sample.is_raw ? ' · raw' : ''}
                 </span>
-                {subject == null ? (
+                {absent ? (
+                  <span
+                    className="shrink-0 rounded border border-sky-400/60 px-1 text-[10px] text-sky-700 dark:text-sky-300"
+                    title="You marked the subject as not in this picture — the sample is excluded from likeness summaries and checked for trigger adherence instead"
+                  >
+                    no subject · excluded
+                  </span>
+                ) : subject == null ? (
                   <span className="shrink-0 rounded border border-amber-400/60 px-1 text-[10px] text-amber-700 dark:text-amber-300">needs pick</span>
                 ) : (
                   <span className="shrink-0 rounded border border-emerald-400/50 px-1 text-[10px] text-emerald-700 dark:text-emerald-300">
@@ -377,7 +389,11 @@ function MultiPersonSamples({
               </button>
               {open && (
                 <div className="space-y-1.5 border-t border-gray-200 p-1.5 dark:border-gray-700">
-                  <p className="text-[10px] text-gray-400 dark:text-gray-500">click a face to set it as the subject — the other faces are then checked for duplication</p>
+                  <p className="text-[10px] text-gray-400 dark:text-gray-500">
+                    {absent
+                      ? 'marked as subject-absent — click a face to pick a subject after all'
+                      : 'click a face to set it as the subject — the other faces are then checked for duplication'}
+                  </p>
                   {sample.faces.map(face => {
                     const isSubject = face.index === subject;
                     const levels = isSubject ? [] : levelsFor(face);
@@ -472,7 +488,7 @@ function MultiPersonSamples({
                       </div>
                     );
                   })}
-                  <div className="flex items-center gap-2 pt-0.5">
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
                     <button
                       type="button"
                       className={classNames(controlClass, 'shrink-0 whitespace-nowrap')}
@@ -480,6 +496,23 @@ function MultiPersonSamples({
                       onClick={() => onOpenSample(sample.path)}
                     >
                       Open full resolution
+                    </button>
+                    <button
+                      type="button"
+                      className={classNames(
+                        'shrink-0 whitespace-nowrap rounded border px-2 py-1 text-sm',
+                        absent
+                          ? 'border-sky-400/70 bg-sky-500/10 text-sky-700 dark:text-sky-300'
+                          : 'border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800',
+                      )}
+                      title={
+                        absent
+                          ? 'Click to un-mark — the sample returns to needing a subject pick'
+                          : 'Mark that none of these faces is your subject (e.g. a prompt without the trigger). The sample leaves the likeness summaries and joins the trigger-adherence check instead.'
+                      }
+                      onClick={() => onMarkAbsent(sample, !absent)}
+                    >
+                      {absent ? '✓ no one is the subject' : 'No one is the subject'}
                     </button>
                     <span className="text-[10px] text-gray-400 dark:text-gray-500">judge duplicates from the full image, not the crops</span>
                   </div>
@@ -490,6 +523,168 @@ function MultiPersonSamples({
         })}
       </div>
     </div>
+  );
+}
+
+// Samples you marked "the subject is not in this picture" (no-trigger /
+// trigger-adherence prompts), plus the picker for marking more. Verdicts
+// reuse the leakage anchoring per model per source: any face at or above
+// the LOO band means the subject likely appeared anyway (leaked); in the
+// resembles band is borderline; all scored faces below is clean.
+function TriggerAdherence({
+  samples,
+  picks,
+  results,
+  source,
+  onMarkAbsent,
+  onOpenSample,
+}: {
+  samples: IdentitySampleResult[];
+  picks: IdentitySelection['sample_picks'] | null | undefined;
+  results: { refsets?: Partial<Record<IdentitySource | 'combined', { loo?: Record<string, number | null> } | null>> };
+  source: IdentitySource | 'combined';
+  onMarkAbsent: (sample: IdentitySampleResult, absent: boolean) => void;
+  onOpenSample: (path: string) => void;
+}) {
+  const [filter, setFilter] = useState('');
+  // raw statuses: absentPickFor wants evaluated/ambiguous (pre-resolution)
+  const eligible = useMemo(
+    () => samples.filter(s => s.faces.length > 0 && (s.status === 'evaluated' || s.status === 'ambiguous')),
+    [samples],
+  );
+  const marked = useMemo(() => eligible.filter(s => absentPickFor(s, picks)), [eligible, picks]);
+  const promptFilter = useMemo(() => {
+    const ids = new Set<number>();
+    for (const match of filter.matchAll(/\d+/g)) {
+      const value = Number(match[0]);
+      if (Number.isInteger(value)) ids.add(value);
+    }
+    return ids;
+  }, [filter]);
+  const candidates = useMemo(() => {
+    if (promptFilter.size === 0) return [];
+    return eligible
+      .filter(s => s.prompt_idx != null && promptFilter.has(s.prompt_idx) && absentPickFor(s, picks) === null)
+      .sort((a, b) => (b.step ?? 0) - (a.step ?? 0) || a.filename.localeCompare(b.filename))
+      .slice(0, 40);
+  }, [eligible, picks, promptFilter]);
+
+  const loo = (model: string) => results?.refsets?.[source]?.loo?.[model] ?? null;
+  const verdictChip = (sample: IdentitySampleResult, model: 'arcface' | 'sface') => {
+    const verdict = absenceVerdict(sample, model, source, loo(model));
+    if (verdict == null) return <span key={model} className="text-gray-400 dark:text-gray-500">{model === 'arcface' ? 'ArcFace' : 'SFace'} –</span>;
+    const tone =
+      verdict === 'leaked'
+        ? 'text-red-600 dark:text-red-400'
+        : verdict === 'borderline'
+          ? 'text-amber-700 dark:text-amber-300'
+          : 'text-emerald-700 dark:text-emerald-300';
+    return (
+      <span key={model} className={classNames('tabular-nums', tone)} title={`best face vs the ${model === 'arcface' ? 'ArcFace' : 'SFace'} LOO band ${loo(model)?.toFixed(3) ?? '?'} — leaked = a face reached the band despite no trigger`}>
+        {model === 'arcface' ? 'ArcFace' : 'SFace'} {verdict}
+      </span>
+    );
+  };
+  const summaryFor = (model: 'arcface' | 'sface') => {
+    const counts = { leaked: 0, borderline: 0, clean: 0, unscored: 0 };
+    for (const sample of marked) {
+      const verdict = absenceVerdict(sample, model, source, loo(model));
+      if (verdict == null) counts.unscored += 1;
+      else counts[verdict] += 1;
+    }
+    return counts;
+  };
+
+  const row = (sample: IdentitySampleResult, isMarked: boolean) => (
+    <div key={sample.filename} className="flex items-center gap-2 rounded border border-gray-200 p-1.5 dark:border-gray-700">
+      {sample.faces[0] && <FaceCropThumb src={sample.path} bbox={sample.faces[0].bbox} size={32} />}
+      <button
+        type="button"
+        className="min-w-0 flex-1 truncate text-left text-xs text-gray-700 hover:underline dark:text-gray-200"
+        title={`${sample.filename}\nstep ${sample.step?.toLocaleString() ?? '?'} · prompt ${sample.prompt_idx ?? '?'} · ${sample.faces.length} face(s) — click to open`}
+        onClick={() => onOpenSample(sample.path)}
+      >
+        step {sample.step?.toLocaleString() ?? '?'} · prompt {sample.prompt_idx ?? '?'} · {sample.faces.length} face{sample.faces.length > 1 ? 's' : ''}
+      </button>
+      {isMarked && (
+        <span className="flex shrink-0 items-center gap-2 text-[10px]">
+          {verdictChip(sample, 'arcface')}
+          {verdictChip(sample, 'sface')}
+        </span>
+      )}
+      <button
+        type="button"
+        className={classNames(
+          'shrink-0 whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px]',
+          isMarked
+            ? 'border-sky-400/70 bg-sky-500/10 text-sky-700 dark:text-sky-300'
+            : 'border-gray-300 text-gray-500 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-800',
+        )}
+        title={isMarked ? 'Un-mark — the sample returns to the likeness summaries' : 'Mark: the subject is not in this picture'}
+        onClick={() => onMarkAbsent(sample, !isMarked)}
+      >
+        {isMarked ? '✓ absent' : 'mark absent'}
+      </button>
+    </div>
+  );
+
+  return (
+    <details className="space-y-2 rounded border border-gray-300 p-2 dark:border-gray-600">
+      <summary className="cursor-pointer select-none text-xs font-semibold" title="Samples where the prompt does not ask for your subject (e.g. no-trigger controls) — a correct render contains no match. Marking one excludes it from likeness summaries and checks whether the subject appeared anyway.">
+        Trigger adherence {marked.length > 0 ? `· ${marked.length} marked` : ''}
+      </summary>
+      <p className="text-[10px] text-gray-500 dark:text-gray-400">
+        Mark samples where <span className="font-medium">no one in the picture is your subject</span> (a prompt without the trigger should render the
+        base model&apos;s person, not yours). Marked samples leave the likeness summaries; their faces are then checked against the LOO band —
+        <span className="text-red-600 dark:text-red-400"> leaked</span> = a face reached the band anyway,{' '}
+        <span className="text-amber-700 dark:text-amber-300">borderline</span> = within 0.1 below it,{' '}
+        <span className="text-emerald-700 dark:text-emerald-300">clean</span> = all faces clearly strangers. Per model, never averaged.
+      </p>
+      {marked.length > 0 ? (
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 text-[10px] text-gray-500 dark:text-gray-400">
+              <span className="font-medium text-gray-600 dark:text-gray-300">Marked samples</span>
+              {(['arcface', 'sface'] as const).map(model => {
+                const counts = summaryFor(model);
+                const scored = counts.leaked + counts.borderline + counts.clean;
+                return scored > 0 ? (
+                  <span key={model}>
+                    {model === 'arcface' ? 'ArcFace' : 'SFace'}: {counts.leaked} leaked · {counts.borderline} borderline · {counts.clean} clean
+                    {counts.unscored > 0 ? ` · ${counts.unscored} unscored` : ''}
+                  </span>
+                ) : null;
+              })}
+            </div>
+            {marked.map(sample => row(sample, true))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-[10px] text-gray-400 dark:text-gray-500">nothing marked yet</p>
+      )}
+      <div className="space-y-1 border-t border-gray-200 pt-1.5 dark:border-gray-700">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            placeholder="prompt #s to mark, e.g. 9 10 11"
+            className={classNames(controlClass, 'min-w-0 flex-1 text-xs')}
+            title="List the prompt indices whose samples are no-trigger controls; every face-bearing sample of those prompts is listed for marking"
+          />
+        </div>
+        {promptFilter.size > 0 && (
+          <div className="space-y-1">
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">
+              {candidates.length > 0
+                ? `unmarked samples of prompt ${[...promptFilter].sort((a, b) => a - b).join(', ')} (latest first, up to 40)`
+                : `no unmarked face-bearing samples for prompt ${[...promptFilter].sort((a, b) => a - b).join(', ')}`}
+            </p>
+            {candidates.map(sample => row(sample, false))}
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -557,6 +752,13 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
       samplePicks: { [sample.filename]: { face_index: existing.face_index, ...(sorted.length > 0 ? { twin_confirmed: sorted } : {}) } },
     });
   };
+  // "the subject is not in this picture" — replaces any face pick; un-marking
+  // returns the sample to pending (face_index null), never to a stale pick
+  const handleMarkAbsent = (sample: IdentitySampleResult, absent: boolean) => {
+    identity.saveSelection({
+      samplePicks: { [sample.filename]: absent ? { subject_absent: true } : { face_index: null } },
+    });
+  };
 
   const handleRun = () => {
     const doStart = () => identity.startRun({ samples: samplePaths, deviceMode });
@@ -622,6 +824,7 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
             <li>
               Sample counts: <span className="font-medium">ok</span> = one face, scored ·{' '}
               <span className="font-medium">amb</span> = ambiguous, multiple faces found ·{' '}
+              <span className="font-medium">abs</span> = marked subject-absent (no-trigger prompt) ·{' '}
               <span className="font-medium">fail</span> = no face or error.
             </li>
             <li>
@@ -787,7 +990,20 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
             results={results}
             source={activeSource}
             onSavePick={handleSaveSamplePick}
+            onMarkAbsent={handleMarkAbsent}
             onToggleTwin={handleToggleTwin}
+            onOpenSample={onOpenSample}
+          />
+        )}
+
+        {/* trigger adherence: samples where the subject is deliberately absent */}
+        {results && results.samples.length > 0 && (
+          <TriggerAdherence
+            samples={results.samples}
+            picks={samplePicks}
+            results={results}
+            source={activeSource}
+            onMarkAbsent={handleMarkAbsent}
             onOpenSample={onOpenSample}
           />
         )}
@@ -816,9 +1032,9 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
                   </th>
                   <th
                     className="font-medium"
-                    title="Sample counts: ok = one face, scored · amb = ambiguous, multiple faces found · fail = no face or error"
+                    title="Sample counts: ok = one face, scored · amb = ambiguous, multiple faces found · abs = you marked the subject absent (no-trigger prompt) · fail = no face or error"
                   >
-                    ok/amb/fail
+                    ok/amb/abs/fail
                   </th>
                 </tr>
               </thead>
@@ -858,7 +1074,8 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
                         {looSface !== null && <span className="text-gray-400"> ({looSface.toFixed(3)})</span>}
                       </td>
                       <td className="py-0.5 text-center text-gray-500 dark:text-gray-400">
-                        {row.evaluated}/{row.ambiguous}/{row.failed}
+                        {row.evaluated}/{row.ambiguous}
+                        <span className={row.absent > 0 ? 'text-sky-600 dark:text-sky-400' : ''}>/{row.absent}</span>/{row.failed}
                       </td>
                     </tr>
                   );
@@ -869,7 +1086,7 @@ export default function IdentityEvalPanel({ job, identity, samplePaths, onClose,
               Numbers in parentheses are the leave-one-out (LOO) reference band: each reference photo scored against
               the others — how similar real photos of this person are to each other. It is a same-person baseline, not
               an upper bound: a generated face that captures the shared identity can score above it. ▲ marks the
-              highest median; medians exclude ambiguous and failed samples.
+              highest median; medians exclude ambiguous, failed and subject-absent samples.
             </p>
             {latestSummary && latestSummary.highest.length > 0 && (
               <div className="flex flex-wrap items-center gap-1 text-xs">

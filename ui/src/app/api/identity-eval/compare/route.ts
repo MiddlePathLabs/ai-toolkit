@@ -39,9 +39,10 @@ interface CompareReport {
 // log changed after it was written (see reportFreshByMtimes for the WAL
 // rationale), or when its version predates the current builder (v2 added
 // p90 for the retention graph; v3 added the Phase 2d drift warnings; v4
-// added Phase 2e leakage + subject-face pick resolution -- a cached older
-// report must be rebuilt, not served).
-const REPORT_VERSION = 4;
+// added Phase 2e leakage + subject-face pick resolution; v5 added Phase 2f
+// subject-absent marks + the adherence block -- a cached older report must
+// be rebuilt, not served).
+const REPORT_VERSION = 5;
 
 async function reportIsFresh(context: IdentityJobContext, report: CompareReport | null): Promise<boolean> {
   if (!report || report.version !== REPORT_VERSION) return false;

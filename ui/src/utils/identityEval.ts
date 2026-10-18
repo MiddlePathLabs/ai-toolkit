@@ -4,7 +4,10 @@
 import { parseSampleFilename } from './sampleImages';
 
 export type IdentitySource = 'training' | 'external';
-export type IdentitySampleStatus = 'evaluated' | 'ambiguous' | 'failed';
+// 'subject_absent' is client-side only (the worker never writes it):
+// resolveSamplePicks flips a face-bearing sample to it when you mark the
+// subject as not in the picture (trigger-adherence prompts).
+export type IdentitySampleStatus = 'evaluated' | 'ambiguous' | 'failed' | 'subject_absent';
 
 export interface IdentityModelScores {
   mean: number | null;
@@ -44,6 +47,8 @@ export interface IdentitySampleResult {
   // never writes them)
   picked_subject?: boolean;
   subject_face_index?: number;
+  // set on the resolved copy when you marked the subject as absent
+  subject_absent?: boolean;
 }
 
 export interface IdentityRefset {
@@ -89,6 +94,10 @@ export interface IdentityRefs {
 export interface IdentitySamplePick {
   face_index?: number | null;
   twin_confirmed?: number[];
+  // Confirmed "the subject is not in this picture" (no-trigger /
+  // trigger-adherence prompts). Mutually exclusive with a face pick: the
+  // sanitizers drop face_index/twin_confirmed when this is true.
+  subject_absent?: boolean;
 }
 
 export interface IdentitySelection {
@@ -142,7 +151,7 @@ export function overlayInfo(
   ].filter(Boolean);
   return {
     status: sample.status,
-    label: label || (sample.status === 'ambiguous' ? 'ambiguous' : sample.status === 'failed' ? 'failed' : 'pending'),
+    label: label || (sample.status === 'ambiguous' ? 'ambiguous' : sample.status === 'failed' ? 'failed' : sample.status === 'subject_absent' ? 'no subject' : 'pending'),
     tooltip: tooltipBits.join(' '),
     arcfaceMean,
     sfaceMean,
@@ -163,6 +172,8 @@ export interface IdentityStepSummary {
   evaluated: number;
   failed: number;
   ambiguous: number;
+  // samples you marked "subject not in the picture" (client-side resolution)
+  absent: number;
   medianArcface: number | null;
   medianSface: number | null;
   // Model the highest/lowest lists are ranked by: ArcFace when it scored
@@ -212,6 +223,7 @@ export function groupSummariesByStep(
         evaluated: evaluated.length,
         failed: bucket.filter(s => s.status === 'failed').length,
         ambiguous: bucket.filter(s => s.status === 'ambiguous').length,
+        absent: bucket.filter(s => s.status === 'subject_absent').length,
         medianArcface: median(arcfaceScores),
         medianSface: median(sfaceScores),
         rankModel: model,
@@ -308,6 +320,12 @@ export function sanitizeSamplePicks(entries: IdentitySelection['sample_picks'] |
     if (!/^[^\\/:*?"<>|]{1,200}$/.test(key)) continue;
     if (!value || typeof value !== 'object') continue;
     const clean: IdentitySamplePick = {};
+    if (value.subject_absent === true) {
+      // an absent mark cannot coexist with a subject face or twin marks
+      clean.subject_absent = true;
+      out[key] = clean;
+      continue;
+    }
     if (value.face_index === null || (Number.isInteger(value.face_index) && (value.face_index as number) >= 0 && (value.face_index as number) <= 32)) {
       clean.face_index = value.face_index;
     }
@@ -393,15 +411,30 @@ export function samplePickFor(sample: IdentitySampleResult, picks: Record<string
   return pick;
 }
 
-// Apply subject-face picks: a picked ambiguous sample becomes evaluated
-// with primary = the picked face's already-persisted scores (Phase 1 scored
-// every face; no re-run needed). Pure/immutable -- mirrors the Python
+// The pick of a sample you marked "subject not in this picture": applies to
+// any face-bearing sample (single- or multi-face), never to failed ones.
+// Returns null for everything else (mirrors Python absent_pick).
+export function absentPickFor(sample: IdentitySampleResult, picks: Record<string, IdentitySamplePick> | null | undefined): IdentitySamplePick | null {
+  if (!picks || sample.faces.length === 0) return null;
+  if (sample.status !== 'evaluated' && sample.status !== 'ambiguous') return null;
+  const pick = picks[sample.filename];
+  return pick?.subject_absent === true ? pick : null;
+}
+
+// Apply subject-face picks and subject-absent marks: a picked ambiguous
+// sample becomes evaluated with primary = the picked face's already-persisted
+// scores (Phase 1 scored every face; no re-run needed); an absent-marked
+// sample becomes 'subject_absent' with no primary, so it leaves the likeness
+// summaries and ranks entirely. Pure/immutable -- mirrors the Python
 // resolve_picks used by the checkpoint report so both sides agree.
 export function resolveSamplePicks(
   samples: IdentitySampleResult[],
   picks: Record<string, IdentitySamplePick> | null | undefined,
 ): IdentitySampleResult[] {
   return samples.map(sample => {
+    if (absentPickFor(sample, picks)) {
+      return { ...sample, status: 'subject_absent', primary: null, picked_subject: undefined, subject_face_index: undefined, subject_absent: true };
+    }
     const pick = samplePickFor(sample, picks);
     if (!pick) return sample;
     const index = pick.face_index as number;
@@ -417,4 +450,37 @@ export function resolveSamplePicks(
 
 export function twinMarked(pick: IdentitySamplePick | null, faceIndex: number): boolean {
   return Array.isArray(pick?.twin_confirmed) && (pick?.twin_confirmed as number[]).includes(faceIndex);
+}
+
+// -------------------------------------------------- trigger adherence (2f)
+//
+// For a sample you marked "subject absent": does any face in it reach the
+// same-person band anyway? That would mean the subject leaked in despite the
+// prompt not asking for them. Same LOO anchoring and margin as leakage --
+// per model per source, never averaged.
+
+export type AbsenceVerdict = 'leaked' | 'borderline' | 'clean';
+
+// Worst level across the sample's faces for one model/source: any face at or
+// above the LOO band -> leaked (the subject likely appeared anyway); any face
+// in the resembles band -> borderline; all faces scored below -> clean.
+// null when the model scored no face for this source (no verdict, not pass).
+export function absenceVerdict(
+  sample: IdentitySampleResult,
+  model: string,
+  source: IdentitySource | 'combined',
+  loo: number | null,
+): AbsenceVerdict | null {
+  if (loo == null) return null;
+  let sawScore = false;
+  let worst: AbsenceVerdict | null = null;
+  for (const face of sample.faces) {
+    const mean = face.scores?.[model]?.[source]?.mean ?? null;
+    if (mean == null) continue;
+    sawScore = true;
+    const level = classifyFaceLevel(mean, loo);
+    if (level === 'likely_duplicate') return 'leaked';
+    if (level === 'resembles') worst = 'borderline';
+  }
+  return sawScore ? (worst ?? 'clean') : null;
 }

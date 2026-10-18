@@ -74,8 +74,9 @@ interface SelectionUpdate {
   trainingRefs?: Record<string, { excluded?: boolean; face_index?: number | null }>;
   externalRefs?: Record<string, { excluded?: boolean; face_index?: number | null }>;
   // Phase 2e: per-generated-sample subject-face picks + user twin marks,
-  // keyed by sample filename (never a path -- no traversal surface)
-  samplePicks?: Record<string, { face_index?: number | null; twin_confirmed?: number[] }>;
+  // keyed by sample filename (never a path -- no traversal surface);
+  // subject_absent marks "the subject is not in this picture"
+  samplePicks?: Record<string, { face_index?: number | null; twin_confirmed?: number[]; subject_absent?: boolean }>;
   removeExternal?: string[];
 }
 
@@ -163,7 +164,13 @@ export async function POST(request: NextRequest) {
     for (const [key, value] of Object.entries(entries ?? {})) {
       if (!/^[^\\/:*?"<>|]{1,200}$/.test(key)) continue;
       if (!value || typeof value !== 'object') continue;
-      const clean: { face_index?: number | null; twin_confirmed?: number[] } = {};
+      const clean: { face_index?: number | null; twin_confirmed?: number[]; subject_absent?: boolean } = {};
+      if (value.subject_absent === true) {
+        // an absent mark cannot coexist with a subject face or twin marks
+        clean.subject_absent = true;
+        out[key] = clean;
+        continue;
+      }
       if (value.face_index === null || (Number.isInteger(value.face_index) && (value.face_index as number) >= 0 && (value.face_index as number) <= 32)) {
         clean.face_index = value.face_index as number | null;
       }
