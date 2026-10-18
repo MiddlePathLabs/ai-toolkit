@@ -27,7 +27,7 @@ def inspect_request(payload):
     if action == "trigger_check":
         from toolkit.identity_isolation_trigger_check import check_triggers
 
-        return check_triggers(process)
+        return {"trigger_check": check_triggers(process)}
     config = IsolationConfig(process.get("identity_isolation"))
     if action == "caption":
         text = payload.get("caption", "")

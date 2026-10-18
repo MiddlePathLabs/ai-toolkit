@@ -381,6 +381,7 @@ def configure_isolation(process_config, *, prepare=True):
                     caption_ext=".txt",
                     default_caption=None,
                     num_repeats=1,
+                    flip_x=False,
                     isolation_category="composite",
                     isolation_raw_repeats=1,
                     isolation_balance_multiplier=1,

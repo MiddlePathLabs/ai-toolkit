@@ -166,6 +166,12 @@ python ui_scripts/identity_isolation.py --request <your-request.json>
 
 `caption` reports original/training/preservation text with no dataset access. `inspect` validates your configured source folders and reports caption/exposure previews without generating composites or downloading assets. `prepare` explicitly builds/verifies generated composites using already-prepared assets and returns representative composite thumbnails/captions. Inspect all generated sheets yourself, not only thumbnails. Preview prompt transformations use the same policy as training; finished LoRA inference prompts should use fused strings unless the inference client applies this transform.
 
+### Composite augmentation and trigger-check responses
+
+Generated composite datasets disable horizontal flipping even when their source datasets enable `flip_x`. This preserves the identities assigned to “left” and “right” in composite captions. Source datasets retain their configured flip behavior.
+
+The `trigger_check` bridge action returns `{"ok": true, "result": {"trigger_check": ...}}`. The nested result contains the encoder, overall verdict, and per-subject token pieces, warnings, and suggestions consumed by the panel.
+
 ### Composite face eligibility
 
 Preparation checks every detection after the largest-area face, rejecting the photo if any rival reaches 60% of the primary face's visible height. Subject photos must also pass the frontal-pose gate.

@@ -194,7 +194,8 @@ def test_bridge_action_trigger_check(tmp_path, monkeypatch):
     )
     process = _krea_process(tmp_path, [("subject-one", "zwxem", "woman")])
     result = inspect_request({"action": "trigger_check", "process": process})
-    assert result["ok"] is True
-    assert result["subjects"][0]["joined"] == "zwxemwoman"
+    check = result["trigger_check"]
+    assert check["ok"] is True
+    assert check["subjects"][0]["joined"] == "zwxemwoman"
     with pytest.raises(ValueError, match="action must be"):
         inspect_request({"action": "nonsense", "process": process})

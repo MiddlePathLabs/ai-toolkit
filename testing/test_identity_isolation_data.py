@@ -275,13 +275,19 @@ def test_composites_clone_preprocessing_and_resolution_but_not_trigger_or_repeat
 ):
     process = _process(tmp_path, composites=True, balance_subjects=True)
     process["datasets"][0].update(
-        resolution=[16, 32], num_repeats=3, cache_latents_to_disk=True, random_crop=True
+        resolution=[16, 32],
+        num_repeats=3,
+        cache_latents_to_disk=True,
+        random_crop=True,
+        flip_x=True,
     )
     configure_isolation(process, prepare=False)
     source, composite = process["datasets"][0], process["datasets"][2]
     assert composite["resolution"] == source["resolution"]
     assert composite["cache_latents_to_disk"] is True
     assert composite["random_crop"] is True
+    assert source["flip_x"] is True
+    assert composite["flip_x"] is False
     assert composite["num_repeats"] == 1
     assert composite["trigger_word"] is None
     assert composite["isolation_category"] == "composite"
