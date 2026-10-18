@@ -166,6 +166,12 @@ python ui_scripts/identity_isolation.py --request <your-request.json>
 
 `caption` reports original/training/preservation text with no dataset access. `inspect` validates your configured source folders and reports caption/exposure previews without generating composites or downloading assets. `prepare` explicitly builds/verifies generated composites using already-prepared assets and returns representative composite thumbnails/captions. Inspect all generated sheets yourself, not only thumbnails. Preview prompt transformations use the same policy as training; finished LoRA inference prompts should use fused strings unless the inference client applies this transform.
 
+### Composite face eligibility
+
+Preparation checks every detection after the largest-area face, rejecting the photo if any rival reaches 60% of the primary face's visible height. Subject photos must also pass the frontal-pose gate.
+
+Square crops must contain the entire clamped face box. Photos whose face cannot fit an in-bounds square are excluded from the usability pool with reason `face_crop`; preparation does not pad or publish clipped faces. The `face-square-frontal-v2` recipe uses a new cache identity, so caches built before these checks are not reused.
+
 ## Cache and exposure semantics
 
 Generated composite directory names hash source image contents, captions, mappings, pinned assets, seed/count, and compositor/preprocessing version. Source/input changes produce a different generated dataset identity. Missing, unexpected, or changed recipe outputs at an existing identity are errors, not silent cache hits. Explicitly allowlisted Toolkit latent/text/perceptual cache directories and `.aitk_size.json` are excluded from recipe outputs so training does not invalidate its own composites. Do not edit generated sheets/captions in place; keep source changes in the source folder and generate a new identity.

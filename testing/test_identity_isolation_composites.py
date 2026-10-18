@@ -16,9 +16,9 @@ from toolkit.identity_eval.detector import DetectedFace, DetectionResult
 class _StubDetector:
     """Single-face stub honoring the identity-eval detector contract.
 
-    The synthetic tiles have no real faces; the stub "detects" one spanning
-    the tile minus a 2px border, which is at least MIN_FACE_PX tall for the
-    fixture sizes. ``min_height`` flips tiles below it to no-face mode.
+    The synthetic tiles have no real faces; the stub "detects" a square face
+    inside a 2px border, at least MIN_FACE_PX tall for the fixture sizes.
+    ``min_height`` flips tiles below it to no-face mode.
     """
 
     def __init__(self, det_sig="stub:v1", min_height=0, bbox=None, nose_x_ratio=None):
@@ -45,7 +45,8 @@ class _StubDetector:
         if height < self.min_height:
             return DetectionResult(faces=[])
         if self.bbox is None:
-            bbox = (2.0, 2.0, float(width - 2), float(height - 2))
+            side = float(min(width, height) - 2)
+            bbox = (2.0, 2.0, side, side)
         else:
             x1, y1, x2, y2 = self.bbox
             bbox = (
@@ -165,7 +166,7 @@ def test_exact_rng_dimensions_caption_order_and_placement(recipe):
                     square = composites._face_square(
                         source.width,
                         source.height,
-                        (2, 2, source.width - 2, source.height - 2),
+                        (2, 2, min(source.size) - 2, min(source.size) - 2),
                     )
                     assert image.getpixel((panel_x + 256, 256)) == source.getpixel(
                         ((square[0] + square[2]) // 2, (square[1] + square[3]) // 2)
@@ -264,6 +265,27 @@ def test_face_square_geometry_unit():
     assert composites._face_square(100, 100, (50, 50, 50, 50)) is None
 
 
+@pytest.mark.parametrize(
+    "size,bbox",
+    [
+        ((200, 500), (10, 50, 190, 450)),
+        ((500, 200), (50, 10, 450, 190)),
+    ],
+)
+def test_face_pool_rejects_faces_that_cannot_fit_square(tmp_path, size, bbox):
+    Image.new("RGB", size, "red").save(tmp_path / "face.png")
+    assert composites._face_square(*size, bbox) is None
+    pool = composites._face_pool(_StubDetector(bbox=bbox), tmp_path, ["face.png"])
+    assert pool == {"usable": [], "rejected": {"face_crop": 1}}
+
+
+def test_face_square_keeps_wide_face():
+    bbox = (50, 200, 450, 300)
+    square = composites._face_square(500, 500, bbox)
+    assert square[0] <= bbox[0] and square[2] >= bbox[2]
+    assert square[1] <= bbox[1] and square[3] >= bbox[3]
+
+
 def test_usable_face_rejects_small_and_rival_faces():
     detector = _StubDetector()
     good, reason = composites._usable_face(detector, Image.new("RGB", (400, 400), "red"))
@@ -288,6 +310,38 @@ def test_usable_face_rejects_small_and_rival_faces():
         _Rival(), Image.new("RGB", (400, 402), "red")
     )
     assert box is None and reason == "rival_face"
+
+
+@pytest.mark.parametrize("require_frontal", [False, True])
+@pytest.mark.parametrize("rival_height", [119, 120, 180])
+def test_usable_face_checks_rivals_after_smaller_height_detection(
+    require_frontal, rival_height
+):
+    class _Rivals(_StubDetector):
+        def detect(self, img_bgr):
+            primary = super().detect(img_bgr).faces[0]
+            rivals = [
+                DetectedFace(
+                    index=index,
+                    bbox=bbox,
+                    kps=np.zeros((5, 2), dtype=np.float32),
+                    det_score=1.0,
+                )
+                for index, bbox in enumerate(
+                    [(220, 0, 420, 100), (440, 0, 520, rival_height)], start=1
+                )
+            ]
+            return DetectionResult(faces=[primary, *rivals])
+
+    result = composites._usable_face(
+        _Rivals(bbox=(0, 0, 200, 200)),
+        Image.new("RGB", (600, 400)),
+        require_frontal=require_frontal,
+    )
+    if rival_height >= 120:
+        assert result == (None, "rival_face")
+    else:
+        assert result == ([0, 0, 200, 200], None)
 
 
 def test_frontal_gate_rejects_profile_poses_for_subjects_only():

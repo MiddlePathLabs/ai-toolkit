@@ -40,6 +40,7 @@ import random
 import shutil
 import tempfile
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,11 +61,11 @@ TAIL = "two people side by side, two close-up portraits"
 MANIFEST_FILE = "identity_isolation_manifest.json"
 PROVENANCE_FILE = "identity_isolation_provenance.json"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-_RECIPE_VERSION = "fizgig-v8.5.1-face-square-frontal-v1"
-# Face-aware paneling: square side = FACE_MARGIN x face height (a face is
-# ~45% of the panel at 2.2, matching the "close-up portraits" caption tail),
-# a source face must be at least MIN_FACE_PX tall before upscale, and a
-# second face taller than RIVAL_FACE_RATIO x the largest makes the photo
+_RECIPE_VERSION = "fizgig-v8.5.1-face-square-frontal-v2"
+# Face-aware paneling: square side targets FACE_MARGIN x face height (a face
+# is ~45% of the panel at 2.2), expanding to fit its width where necessary.
+# A source face must be at least MIN_FACE_PX tall before upscale. Any other
+# face at least RIVAL_FACE_RATIO x the largest face's height makes the photo
 # ambiguous for identity pairing, so it is excluded from the pool.
 FACE_MARGIN = 2.2
 MIN_FACE_PX = 96
@@ -321,8 +322,8 @@ def _usable_face(
     face_h = min(y2, image.height) - max(y1, 0.0)
     if face_h < MIN_FACE_PX:
         return None, "small_face"
-    if len(faces) > 1:
-        other = faces[1].bbox
+    for face in faces[1:]:
+        other = face.bbox
         other_h = min(float(other[3]), image.height) - max(float(other[1]), 0.0)
         if other_h >= RIVAL_FACE_RATIO * face_h:
             return None, "rival_face"
@@ -346,12 +347,7 @@ def _usable_face(
 
 
 def _face_square(width: int, height: int, bbox) -> tuple[int, int, int, int] | None:
-    """Face-centered square crop box, clamped to the image bounds.
-
-    The square keeps the detected face fully inside it as long as the face
-    lies inside the image: centering on the face then clamping only shifts
-    the window toward the image interior.
-    """
+    """Face-centered in-bounds square, or None if it cannot hold the face."""
     x1 = max(0.0, min(float(bbox[0]), width))
     y1 = max(0.0, min(float(bbox[1]), height))
     x2 = max(x1, min(float(bbox[2]), width))
@@ -359,9 +355,11 @@ def _face_square(width: int, height: int, bbox) -> tuple[int, int, int, int] | N
     face_h = y2 - y1
     if face_h <= 0 or x2 - x1 <= 0:
         return None
-    side = int(min(FACE_MARGIN * face_h, width, height))
+    side = min(ceil(max(FACE_MARGIN * face_h, x2 - x1)), width, height)
     left = max(0, min(int(round((x1 + x2) / 2 - side / 2)), width - side))
     top = max(0, min(int(round((y1 + y2) / 2 - side / 2)), height - side))
+    if left > x1 or top > y1 or left + side < x2 or top + side < y2:
+        return None
     return left, top, left + side, top + side
 
 
@@ -369,7 +367,7 @@ def _panel(image: Image.Image, bbox) -> Image.Image:
     """512 close-up panel cropped around the detected face."""
     square = _face_square(image.width, image.height, bbox)
     if square is None:
-        raise ValueError(f"Degenerate face box {bbox} for {image.size} image")
+        raise ValueError(f"Face box {bbox} cannot fit an in-bounds square for {image.size}")
     return image.crop(square).resize((PANEL, PANEL), Image.Resampling.LANCZOS)
 
 
@@ -382,6 +380,8 @@ def _face_pool(
     for name in names:
         with Image.open(folder / name) as image:
             box, reason = _usable_face(detector, image, require_frontal)
+            if box is not None and _face_square(image.width, image.height, box) is None:
+                box, reason = None, "face_crop"
         if box is None:
             rejected[reason] = rejected.get(reason, 0) + 1
         else:
