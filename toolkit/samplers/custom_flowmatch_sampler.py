@@ -57,8 +57,10 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             pass
 
     def get_weights_for_timesteps(self, timesteps: torch.Tensor, v2=False, timestep_type="linear", x0_pred=False) -> torch.Tensor:
-        # Get the indices of the timesteps
-        step_indices = [(self.timesteps == t).nonzero().item()
+        # Get the indices of the timesteps. Stochastic train grids (sigmoid,
+        # trunc_logit_normal) can repeat a timestep; take the first match so a
+        # duplicate resolves deterministically instead of raising.
+        step_indices = [(self.timesteps == t).nonzero().view(-1)[0].item()
                         for t in timesteps]
 
         # Get the weights for the timesteps
@@ -77,13 +79,11 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         return weights
 
     def get_sigmas(self, timesteps: torch.Tensor, n_dim, dtype, device) -> torch.Tensor:
-        sigmas = self.sigmas.to(device=device, dtype=dtype)
-        schedule_timesteps = self.timesteps.to(device)
-        timesteps = timesteps.to(device)
-        step_indices = [(schedule_timesteps == t).nonzero().item()
-                        for t in timesteps]
-
-        sigma = sigmas[step_indices].flatten()
+        # flow-match sigma is the timestep on the training grid by construction
+        # (add_noise uses timesteps / num_train_timesteps). A lookup into
+        # self.sigmas by exact timestep match cannot resolve the repeated
+        # values stochastic train grids (sigmoid, trunc_logit_normal) contain.
+        sigma = (timesteps / self.config.num_train_timesteps).to(device=device, dtype=dtype).reshape(-1)
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
 
@@ -251,17 +251,27 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             # the distribution is noise-tilted (median sigma ~0.8), unlike 'sigmoid'
             # (loc 0, scale 1, untruncated, unsnapped, no uniform tail).
             total = int(self.config.num_train_timesteps)
-            u = torch.rand((num_timesteps, 2), device=device)
-            mix, pos = u[:, 0], u[:, 1]
+            # drawn and computed on the CPU in float64: MPS has no float64 tensors,
+            # and the truncated tail needs float64's range. The result moves to the
+            # requested device at the end.
+            u = torch.rand((num_timesteps, 2))
+            mix, pos = u[:, 0], u[:, 1].double()
 
             def cdf(x):
-                # P(S <= x) for the untruncated sigmoid(-N(logit_loc, logit_scale^2))
-                return 1.0 - 0.5 * math.erfc(-((math.log((1.0 - x) / x) - logit_loc) / logit_scale) / math.sqrt(2.0))
+                # P(S <= x) for the untruncated sigmoid(-N(logit_loc, logit_scale^2)),
+                # in survival-function form. 1 - Phi(...) cancels to 0 in the far
+                # tail (extreme loc/cutoff put F(cutoff) below float64 only near
+                # 1e-300); erfc keeps it representable down to double precision.
+                return 0.5 * math.erfc(
+                    (math.log((1.0 - x) / x) - logit_loc) / (logit_scale * math.sqrt(2.0))
+                )
 
             f_cutoff = cdf(float(sigma_cutoff))
-            p = (pos.clamp_min(1e-12) * f_cutoff).double()
-            z = logit_loc + logit_scale * torch.special.ndtri(1.0 - p)
-            s = torch.sigmoid(-z.to(device)).float()
+            p = (pos * f_cutoff).clamp_min(1e-300)
+            # inverse through the same survival side: F(s) = p with s = sigmoid(-Z)
+            # gives logit(s) = logit_scale * ndtri(p) - logit_loc. ndtri(p), not
+            # ndtri(1 - p): 1 - p rounds to 1 for small p and returns inf.
+            s = torch.sigmoid(logit_scale * torch.special.ndtri(p) - logit_loc)
             # rescale [0, cutoff] -> [0, 1], then snap up to the grid cell j/total
             snapped = (s / float(sigma_cutoff) * total).ceil().clamp(1, total)
             uniform = (pos * total).floor() + 1.0

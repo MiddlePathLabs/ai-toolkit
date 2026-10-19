@@ -3039,7 +3039,9 @@ class SDTrainer(BaseSDTrainProcess):
             latents_item = latent_chunks[i]
             noise_item = noise_chunks[i]
             with torch.no_grad():
-                timestep_idx = [(train_timesteps == t).nonzero().item() for t in timesteps_item][0]
+                # stochastic train grids can repeat a timestep; first match
+                # resolves duplicates deterministically instead of raising
+                timestep_idx = [(train_timesteps == t).nonzero().view(-1)[0].item() for t in timesteps_item][0]
                 single_step_timestep_schedule = [timesteps_item.squeeze().item()]
                 # extract the sigma idx for our midpoint timestep
                 sigmas = train_sigmas[timestep_idx:timestep_idx + 1].to(self.device_torch)

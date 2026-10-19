@@ -2101,6 +2101,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return params
 
     def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
+        if getattr(self.sd, 'is_flow_matching', False):
+            # flow-match sigma is the timestep on the training grid by
+            # construction (add_noise uses timesteps / num_train_timesteps).
+            # A lookup into scheduler.sigmas by exact timestep match cannot
+            # resolve the repeated values stochastic train grids contain.
+            total = self.sd.noise_scheduler.config.num_train_timesteps
+            sigma = (timesteps / total).to(device=self.device, dtype=dtype).reshape(-1)
+            while len(sigma.shape) < n_dim:
+                sigma = sigma.unsqueeze(-1)
+            return sigma
+
         sigmas = self.sd.noise_scheduler.sigmas.to(device=self.device, dtype=dtype)
         schedule_timesteps = self.sd.noise_scheduler.timesteps.to(self.device)
         timesteps = timesteps.to(self.device)
