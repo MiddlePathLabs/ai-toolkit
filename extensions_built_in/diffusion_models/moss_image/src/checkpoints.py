@@ -49,6 +49,11 @@ QWEN35_9B_REPO = "Qwen/Qwen3.5-9B"
 VENDOR_VAE_FILE = "vae/diffusion_pytorch_model.safetensors"
 VENDOR_TRANSFORMER_INDEX = "transformer/diffusion_pytorch_model.safetensors.index.json"
 COMFY_VAE_FILE = "vae/flux2-vae.safetensors"
+# the vendor's small decoder: same FLUX.2 encoder (identical latents), but a
+# MOSS developer notes the small decoder "helps eliminate some strange
+# artifacts and spots" the full decoder shows — prefer it for fresh installs;
+# an already-downloaded full file keeps winning (local candidates resolve first)
+COMFY_VAE_SMALL_FILE = "vae/flux2-vae_small.safetensors"
 
 # variant -> (files in the repack, extra local-only candidates). The merged
 # vendor SFT is the bf16 SFT the repack does not ship.
@@ -192,7 +197,10 @@ def comfy_vae_file(
     status_fn: Optional[Callable[[str], None]] = None,
 ) -> str:
     return resolve_comfy_candidates(
-        [COMFY_VAE_FILE], repo_id=COMFY_REPO, hf_token=hf_token, status_fn=status_fn
+        [COMFY_VAE_SMALL_FILE, COMFY_VAE_FILE],
+        repo_id=COMFY_REPO,
+        hf_token=hf_token,
+        status_fn=status_fn,
     )
 
 
