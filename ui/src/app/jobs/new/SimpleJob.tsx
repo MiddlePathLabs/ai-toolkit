@@ -1087,6 +1087,7 @@ export default function SimpleJob({
                         { value: 'linear', label: 'Linear' },
                         { value: 'shift', label: 'Shift' },
                         { value: 'weighted', label: 'Weighted' },
+                        { value: 'trunc_logit_normal', label: 'Truncated Logit-Normal' },
                       ]}
                     />
                   )}

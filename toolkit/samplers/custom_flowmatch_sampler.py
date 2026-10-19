@@ -113,6 +113,10 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         latents=None,
         patch_size=1,
         shift_override=None,
+        logit_loc=-1.09,
+        logit_scale=0.95,
+        sigma_cutoff=0.95,
+        uniform_frac=0.01,
     ):
         # shift_override replaces self.shift for this training grid only (see
         # toolkit/low_noise_share.py). The scheduler's own shift is untouched.
@@ -120,6 +124,14 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             raise ValueError(
                 f"shift_override needs a shift timestep type, got {timestep_type!r}"
             )
+        if timestep_type == 'trunc_logit_normal':
+            # the trunc_logit_normal params only apply to that timestep type
+            if not 0.0 < float(sigma_cutoff) < 1.0:
+                raise ValueError(f"sigma_cutoff must be in (0, 1), got {sigma_cutoff!r}")
+            if float(logit_scale) <= 0.0:
+                raise ValueError(f"logit_scale must be positive, got {logit_scale!r}")
+            if not 0.0 <= float(uniform_frac) < 1.0:
+                raise ValueError(f"uniform_frac must be in [0, 1), got {uniform_frac!r}")
         self.timestep_type = timestep_type
         if timestep_type == 'linear' or timestep_type == 'weighted':
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
@@ -227,7 +239,36 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             timesteps, _ = torch.sort(timesteps, descending=True)
 
             timesteps = timesteps.to(torch.int)
-            self.timesteps = timesteps.to(device=device)
+            self.timesteps = timesteps.to(device)
+            return timesteps
+        elif timestep_type == 'trunc_logit_normal':
+            # MOSS-Image's pretraining sigma draw (technical report Appendix A.2, Table 6):
+            # sigma = sigmoid(-Z) with Z ~ N(logit_loc, logit_scale^2), truncated to
+            # sigma <= sigma_cutoff by inverse CDF, rescaled by / sigma_cutoff onto the
+            # full grid, snapped to the nearest-above j/num_train_timesteps cell, with a
+            # uniform_frac share of uniform draws mixed in. Defaults are the report's
+            # final pretraining stage (loc -1.09, scale 0.95, cutoff 0.95, 1% uniform);
+            # the distribution is noise-tilted (median sigma ~0.8), unlike 'sigmoid'
+            # (loc 0, scale 1, untruncated, unsnapped, no uniform tail).
+            total = int(self.config.num_train_timesteps)
+            u = torch.rand((num_timesteps, 2), device=device)
+            mix, pos = u[:, 0], u[:, 1]
+
+            def cdf(x):
+                # P(S <= x) for the untruncated sigmoid(-N(logit_loc, logit_scale^2))
+                return 1.0 - 0.5 * math.erfc(-((math.log((1.0 - x) / x) - logit_loc) / logit_scale) / math.sqrt(2.0))
+
+            f_cutoff = cdf(float(sigma_cutoff))
+            p = (pos.clamp_min(1e-12) * f_cutoff).double()
+            z = logit_loc + logit_scale * torch.special.ndtri(1.0 - p)
+            s = torch.sigmoid(-z.to(device)).float()
+            # rescale [0, cutoff] -> [0, 1], then snap up to the grid cell j/total
+            snapped = (s / float(sigma_cutoff) * total).ceil().clamp(1, total)
+            uniform = (pos * total).floor() + 1.0
+            steps = torch.where(mix < float(uniform_frac), uniform, snapped)
+            timesteps, _ = torch.sort(steps, descending=True)
+            timesteps = timesteps.to(torch.int)
+            self.timesteps = timesteps.to(device)
             return timesteps
         else:
             raise ValueError(f"Invalid timestep type: {timestep_type}")

@@ -438,12 +438,21 @@ def get_guided_loss_polarity(
             timestep_type = 'linear' if linear_timesteps else None
             if timestep_type is None:
                 timestep_type = train_config.timestep_type
-            
+
+            logit_kwargs = {}
+            if timestep_type == 'trunc_logit_normal':
+                logit_kwargs = {
+                    'logit_loc': train_config.timestep_logit_loc,
+                    'logit_scale': train_config.timestep_logit_scale,
+                    'sigma_cutoff': train_config.timestep_sigma_cutoff,
+                    'uniform_frac': train_config.timestep_uniform_frac,
+                }
             sd.noise_scheduler.set_train_timesteps(
                 1000,
                 device=device,
                 timestep_type=timestep_type,
-                latents=conditional_latents
+                latents=conditional_latents,
+                **logit_kwargs,
             )
             target_pos = (noise - conditional_latents).detach()
             target_neg = (noise - unconditional_latents).detach()

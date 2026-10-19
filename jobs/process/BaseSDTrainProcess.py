@@ -2352,6 +2352,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     shift_kwargs = {}
                     if self._low_noise_shift is not None:
                         shift_kwargs['shift_override'] = self._low_noise_shift
+                    logit_kwargs = {}
+                    if timestep_type == 'trunc_logit_normal':
+                        logit_kwargs = {
+                            'logit_loc': self.train_config.timestep_logit_loc,
+                            'logit_scale': self.train_config.timestep_logit_scale,
+                            'sigma_cutoff': self.train_config.timestep_sigma_cutoff,
+                            'uniform_frac': self.train_config.timestep_uniform_frac,
+                        }
                     self.sd.noise_scheduler.set_train_timesteps(
                         num_train_timesteps,
                         device=self.device_torch,
@@ -2359,6 +2367,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         latents=latents,
                         patch_size=patch_size,
                         **shift_kwargs,
+                        **logit_kwargs,
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(

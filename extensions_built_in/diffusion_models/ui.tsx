@@ -1865,7 +1865,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       // vendor defaults: CFG 3 with block 22 skipped on the negative branch
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
-      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].train.timestep_type": ["trunc_logit_normal", "sigmoid"],
       // sampling: the CFG negative branch skips these DiT blocks (zero-based)
       "config.process[0].model.model_kwargs": [
         {
@@ -1909,7 +1909,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       // vendor defaults: CFG 3 with block 22 skipped on the negative branch
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
-      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].train.timestep_type": ["trunc_logit_normal", "sigmoid"],
       // sampling: the CFG negative branch skips these DiT blocks (zero-based)
       "config.process[0].model.model_kwargs": [
         {
@@ -1953,7 +1953,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].sample.height": [1024, 1024],
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
-      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].train.timestep_type": ["trunc_logit_normal", "sigmoid"],
       // edit: references as clean t=0 latents + in the prompt; kv_cache:
       // references attend only to themselves, so sampling computes their K/V
       // once (must be trained that way)
@@ -2007,7 +2007,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].sample.height": [1024, 1024],
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
-      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].train.timestep_type": ["trunc_logit_normal", "sigmoid"],
       // edit: references as clean t=0 latents + in the prompt; kv_cache:
       // references attend only to themselves, so sampling computes their K/V
       // once (must be trained that way)

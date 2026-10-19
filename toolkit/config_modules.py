@@ -866,7 +866,14 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, trunc_logit_normal, next_sample, weighted, one_step
+        # 'trunc_logit_normal' params; defaults are MOSS-Image's final pretraining
+        # stage (technical report Appendix A.2, Table 6): truncated logit-normal
+        # sigma draw + 1% uniform, snapped to the training grid
+        self.timestep_logit_loc = kwargs.get('timestep_logit_loc', -1.09)
+        self.timestep_logit_scale = kwargs.get('timestep_logit_scale', 0.95)
+        self.timestep_sigma_cutoff = kwargs.get('timestep_sigma_cutoff', 0.95)
+        self.timestep_uniform_frac = kwargs.get('timestep_uniform_frac', 0.01)
         
         self.first_timestep_chance = kwargs.get('first_timestep_chance', 0.0)
         
