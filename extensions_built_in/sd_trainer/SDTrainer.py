@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig
+from toolkit.config_modules import GenerateImageConfig, DepthConsistencyConfig, NormalIDConfig, BodyProportionConfig, FaceIDConfig, SubjectMaskConfig, BodyShapeConfig, VAEAnchorConfig, ShareConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.dto import DTO
@@ -705,6 +705,22 @@ class SDTrainer(BaseSDTrainProcess):
             self.subject_mask_config: Optional[SubjectMaskConfig] = SubjectMaskConfig(**_subject_mask_raw)
         else:
             self.subject_mask_config = None
+
+        _share_raw = self.get_conf('share', None)
+        if _share_raw is not None:
+            self.share_config: Optional[ShareConfig] = ShareConfig(**_share_raw)
+        else:
+            self.share_config = None
+        if self.share_config is not None and self.share_config.enabled:
+            from toolkit.training_share import validate_share_setup
+
+            validate_share_setup(self.share_config, self.train_config, self.datasets_reg is not None)
+            if self.share_config.role == 'helper':
+                # the helper's samples would come from a half-trained trajectory;
+                # only the lead's checkpoints and samples are the run's artifacts
+                if not self.train_config.disable_sampling:
+                    self.train_config.disable_sampling = True
+                    print_acc("[share] helper role: sampling disabled")
 
         _body_shape_raw = self.get_conf('body_shape', None)
         if _body_shape_raw is not None:

@@ -8,6 +8,7 @@ import random
 import shutil
 from collections import OrderedDict
 import os
+import time
 import re
 import traceback
 import tempfile
@@ -281,6 +282,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             raw_datasets = preprocess_dataset_raw_config(raw_datasets)
         self.datasets = None
         self.datasets_reg = None
+        # two-GPU training share state (toolkit/training_share.py); set up in
+        # run() when a share config is present, None otherwise
+        self._share = None
         self.dataset_configs: List[DatasetConfig] = []
         self.params = []
         
@@ -3843,6 +3847,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # make sure all params require grad
         self.ensure_params_requires_grad(force=True)
 
+        self._share = self._share_setup(dataloader)
+
 
         ###################################################################
         # TRAIN LOOP
@@ -3899,6 +3905,51 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
         self.done_hook()
 
+    def _share_setup(self, dataloader):
+        """Build the training-share state from the process config (None when off).
+
+        Lead: refuse a stale share dir, snapshot the current LoRA, open round 1.
+        Helper: block for the lead's round-1 start and adopt it (this also
+        replaces the helper's random LoRA init before its first step).
+        """
+        cfg = getattr(self, 'share_config', None)
+        if cfg is None or not cfg.enabled:
+            return None
+        from toolkit.training_share import ShareState, collect_item_paths, validate_share_setup
+
+        keys = collect_item_paths(dataloader)
+        if not keys:
+            raise ValueError("training share: no dataset items found to split")
+        validate_share_setup(cfg, self.train_config, self.datasets_reg is not None, n_items=len(keys))
+        share = ShareState(
+            cfg.role, cfg.dir, cfg.frac, cfg.seed,
+            launch_id=f"{os.getpid()}_{int(time.time())}",
+            timeout_s=cfg.timeout_s, log=print_acc,
+            total_steps=self.train_config.steps,
+        )
+        share.set_keys(keys)
+        share.bind(self.network)
+        if cfg.role == 'lead':
+            # A combine must precede every save and sample, and rounds close
+            # cleanly at whole-round step counts: snap the lead's cadences to
+            # multiples of its per-round step share (constant for fixed N/frac).
+            round_len = share.my_target_steps(1)
+            for config_obj, attrs in ((self.save_config, ('save_every',)),
+                                      (self.sample_config, ('sample_every', 'sample_start_step'))):
+                for attr in attrs:
+                    v = int(getattr(config_obj, attr, 0) or 0)
+                    if not v:
+                        continue
+                    snapped = max(round_len, (v // round_len) * round_len)
+                    if snapped != v:
+                        setattr(config_obj, attr, snapped)
+                        print_acc(
+                            f"[share] {attr} {v} snapped to {snapped} (a round boundary; "
+                            f"every save/sample must hold both halves)"
+                        )
+        share.hook_begin()
+        return share
+
     def _run_training_loop(
         self, optimizer, dataloader, dataloader_reg,
         dataloader_iterator, dataloader_iterator_reg,
@@ -3919,6 +3970,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
             self.step_num = step
             set_tread_step(self.sd, self.step_num)
+            if self._share is not None:
+                # the helper blocks here between rounds until the lead's merged
+                # LoRA arrives (or the lead finished)
+                self._share.hook_step_top()
+                if self._share.stop_loop:
+                    break
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:
@@ -3964,6 +4021,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # category_stop mode 'stop': retired categories never reach the
                         # forward pass. Bounded so a dataset with nothing left fails loudly.
                         skipped_here = 0
+                        share_skipped_here = 0
                         while True:
                             try:
                                 with self.timer('get_batch'):
@@ -3980,6 +4038,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         self.grad_accumulation_step = 0
                                 with self.timer('get_batch'):
                                     batch = next(dataloader_iterator)
+                            if self._share is not None and not self._share.owns(
+                                [str(fi.path) for fi in (getattr(batch, 'file_items', None) or [])]
+                            ):
+                                # the other GPU trains this item this round; skip it.
+                                # Bounded like category_stop so a split that owns nothing
+                                # of a full pass fails loudly instead of spinning.
+                                share_skipped_here += 1
+                                try:
+                                    share_cap = 2 * len(dataloader) + 2
+                                except TypeError:
+                                    share_cap = 100000
+                                if share_skipped_here > share_cap:
+                                    raise RuntimeError(
+                                        f"training share: fetched a full epoch at step {step} without one "
+                                        f"item owned by this side; the split is degenerate"
+                                    )
+                                continue
                             if self.category_stop is None or not self.category_stop.should_skip(batch, step):
                                 break
                             skipped_here += 1
@@ -4127,6 +4202,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if isinstance(batch, DataLoaderBatchDTO):
                     with self.timer('batch_cleanup'):
                         batch.cleanup()
+
+                if self._share is not None:
+                    # rounds close between steps, before the save/sample blocks
+                    # below, so checkpoints and samples always hold both halves.
+                    # Step start_step is skipped like the save/sample blocks
+                    # below skip it (its step % save_every == 0 is spurious).
+                    _share_save = is_save_step and self.step_num != self.start_step
+                    _share_sample = is_sample_step and self.step_num != self.start_step
+                    _nxt = step + 1
+                    _share_hold = (
+                        _nxt < self.train_config.steps
+                        and _nxt != self.start_step
+                        and (
+                            (self.save_config.save_every and _nxt % self.save_config.save_every == 0)
+                            or (
+                                self.sample_config.sample_every
+                                and not self.train_config.disable_sampling
+                                and _nxt >= self.sample_config.sample_start_step
+                                and _nxt % self.sample_config.sample_every == 0
+                            )
+                        )
+                    )
+                    self._share.hook_end_of_step(
+                        step, _share_save, _share_sample,
+                        is_last_step=(step + 1 >= self.train_config.steps),
+                        hold=_share_hold,
+                    )
+                    if self._share.stop_loop:
+                        break
 
                 # don't do on first step
                 if self.step_num != self.start_step:

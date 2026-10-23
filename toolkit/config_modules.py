@@ -1422,6 +1422,46 @@ class FaceIDConfig:
             )
 
 
+class ShareConfig:
+    """Two-GPU training share (slice 1): a helper GPU trains a fixed ``frac``
+    share of the dataset each round on its own copy of the LoRA and the lead
+    merges the two weight deltas every round (Fizgig-style delta-combine).
+
+    Process-level config (read through ``self.get_conf('share')``). Two
+    processes run the same recipe from the same dataset: the LEAD keeps the
+    output folder, checkpoints and samples; the HELPER (its own config/name,
+    second GPU) trains its share and posts fp32 weight deltas into
+    ``share.dir``. Step budgets keep the pair comparable to a solo run at the
+    same total image count: lead trains ``round(steps * frac)`` steps and the
+    helper ``steps - that``; each side's LR schedule runs over its own budget,
+    which reproduces the solo LR trajectory at any fixed frac.
+
+    Requires batch_size 1, gradient_accumulation 1, EMA off and no
+    ``datasets_reg`` (validated with the other configs at trainer init).
+    Slice 1 assumes both processes see identical dataset paths (one machine).
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.role: str = str(kwargs.get('role', 'lead'))
+        self.dir: str = kwargs.get('dir', None)
+        # the HELPER's share of the dataset items each round
+        self.frac: float = float(kwargs.get('frac', 0.5))
+        self.seed: int = int(kwargs.get('seed', 42))
+        self.timeout_s: float = float(kwargs.get('timeout_s', 900.0))
+
+        if not self.enabled:
+            return
+        if self.role not in ('lead', 'helper'):
+            raise ValueError(f"share.role must be 'lead' or 'helper', got {self.role!r}")
+        if not self.dir:
+            raise ValueError("share.dir is required when share is enabled (a folder both processes see)")
+        if not 0.0 < self.frac < 1.0:
+            raise ValueError(f"share.frac must be in (0, 1), got {self.frac}")
+        if self.timeout_s <= 0:
+            raise ValueError(f"share.timeout_s must be > 0, got {self.timeout_s}")
+
+
 class BodyShapeConfig:
     """Body-shape auxiliary loss via a frozen HybrIK ResNet-34 perceptor.
 
