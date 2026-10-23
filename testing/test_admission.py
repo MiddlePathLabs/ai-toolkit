@@ -342,6 +342,101 @@ def test_qwen_rgba_without_vae_anchor_is_not_blocked():
     assert RULE_QWEN_RGBA_ANCHOR not in ids
 
 
+def test_qwen_rgba_with_non_vae_aux_anchor_is_blocked():
+    # The other perceptual aux anchors also decode the predicted x0 as RGB;
+    # RGBA hands them 4-channel pixels, so the RGBA rule covers them too.
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "datasets": [{"dataset_path": "images", "identity_loss_weight": 0.1}],
+    }
+    result = collect_admission_diagnostics({"process": [process]})
+    assert RULE_QWEN_RGBA_ANCHOR in _ids(result)
+    fields = next(
+        item["fields"] for item in result["diagnostics"] if item["rule_id"] == RULE_QWEN_RGBA_ANCHOR
+    )
+    assert any("identity_loss_weight" in f for f in fields)
+    assert not any("vae_anchor" in f for f in fields)
+
+
+def test_qwen_rgba_aux_rule_ignores_process_weight_overridden_to_zero():
+    # a positive process weight overridden to zero on every non-reg dataset
+    # never reaches the decode; the RGBA rule must not treat the process
+    # default as proof the anchor executes
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "face_id": {"identity_loss_weight": 0.1},
+        "datasets": [{"dataset_path": "images", "identity_loss_weight": 0.0}],
+    }
+    ids = _ids(collect_admission_diagnostics({"process": [process]}))
+    assert RULE_QWEN_RGBA_ANCHOR not in ids
+
+
+def test_qwen_rgba_aux_rule_ignores_reg_only_activation():
+    # reg rows never reach the differentiable decode; a reg-only positive
+    # override is not an executing anchor
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "datasets": [
+            {"dataset_path": "images", "identity_loss_weight": 0.0},
+            {"dataset_path": "reg", "is_reg": True, "identity_loss_weight": 0.1},
+        ],
+    }
+    ids = _ids(collect_admission_diagnostics({"process": [process]}))
+    assert RULE_QWEN_RGBA_ANCHOR not in ids
+
+
+def test_qwen_rgba_vae_rule_uses_effective_non_reg_weights():
+    # the VAE-anchor RGBA/backend checks share the effective-weight scoping:
+    # a global weight overridden to zero everywhere is inert
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "vae_anchor": {"loss_weight": 0.1, "vae_model_path": "missing.safetensors"},
+        "datasets": [{"dataset_path": "images", "vae_anchor_loss_weight": 0.0}],
+    }
+    result = collect_admission_diagnostics({"process": [process]})
+    assert {RULE_QWEN_RGBA_ANCHOR, RULE_VAE_ANCHOR}.isdisjoint(_ids(result))
+
+
+def test_qwen_rgba_with_both_vae_and_non_vae_aux_lists_both():
+    # vae_anchor keeps its own dedicated RGBA finding; the non-vae anchors get
+    # theirs without duplicating the vae fields.
+    process = {
+        "model": {
+            "name_or_path": "Comfy-Org/Qwen-Image-2.1",
+            "arch": "qwen_image_2",
+            "model_kwargs": {"rgba": True},
+        },
+        "train": {"optimizer": "adamw", "loss_type": "mse", "batch_size": 1},
+        "datasets": [{"dataset_path": "images", "depth_loss_weight": 0.1}],
+        "vae_anchor": {"loss_weight": 0.1, "vae_model_path": "missing.safetensors"},
+    }
+    result = collect_admission_diagnostics({"process": [process]})
+    findings = [item for item in result["diagnostics"] if item["rule_id"] == RULE_QWEN_RGBA_ANCHOR]
+    listed = [f for item in findings for f in item["fields"]]
+    assert any("vae_anchor" in f for f in listed)
+    assert any("depth_loss_weight" in f for f in listed)
+
+
 def test_temporary_safety_blocks_are_scoped_to_enabled_paths():
     process = _process(
         model={

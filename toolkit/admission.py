@@ -756,8 +756,14 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
     # implementation/checkpoint availability check.
     vae_raw = _mapping(process.get("vae_anchor"))
     if (krea or qwen21) and (process.get("vae_anchor") is not None or any("vae_anchor_loss_weight" in ds for ds in datasets)):
-        effective_vae = _positive(vae_raw.get("loss_weight", 0.0)) or any(
-            _positive(ds.get("vae_anchor_loss_weight", vae_raw.get("loss_weight", 0.0))) for ds in datasets
+        # Effective = positive weight on a non-reg dataset (override wins,
+        # else inherit the process weight). Reg rows never reach the
+        # differentiable decode, and a process weight overridden to zero on
+        # every non-reg dataset activates nothing at runtime.
+        effective_vae = any(
+            _positive(ds.get("vae_anchor_loss_weight", vae_raw.get("loss_weight", 0.0)))
+            for ds in datasets
+            if not _bool(ds.get("is_reg", False))
         )
         if effective_vae:
             if qwen21 and _bool(model_kwargs.get("rgba")):
@@ -790,6 +796,46 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                     "Checkpoint keys, channel layout, feature hooks and frozen encoder recipe require loading the matching implementation.",
                     "The VAE-anchor final guard must verify all required keys and the expected feature recipe before cache setup.",
                 )
+    # The other perceptual aux anchors (depth, normal, body proportion, face
+    # identity, body shape) also decode the predicted x0 through the training
+    # VAE on Qwen-Image 2.1; RGBA decoding hands them 4-channel pixels their
+    # perceptors (DA2/Sapiens/ViTPose/SCRFD+ArcFace/HybrIK) cannot consume.
+    # Like the VAE anchor above, only effective positive weights on non-reg
+    # datasets count: a positive process weight overridden to zero on every
+    # non-reg dataset, or a reg-only activation, never reaches the decode.
+    if qwen21 and _bool(model_kwargs.get("rgba")):
+        aux_rgba_fields = []
+        for aux_name, aux_weight_key in (
+            ("depth_consistency", "depth_loss_weight"),
+            ("normal_id", "normal_loss_weight"),
+            ("body_proportion", "body_proportion_loss_weight"),
+            ("face_id", "identity_loss_weight"),
+            ("body_shape", "body_shape_loss_weight"),
+        ):
+            aux_raw = _mapping(process.get(aux_name))
+            aux_proc_w = aux_raw.get(aux_weight_key, 0.0)
+            active_indices = [
+                index
+                for index, ds in enumerate(datasets)
+                if not _bool(ds.get("is_reg", False))
+                and _positive(ds.get(aux_weight_key, aux_proc_w))
+            ]
+            if not active_indices:
+                continue
+            if _positive(aux_proc_w):
+                aux_rgba_fields.append(f"{p}.{aux_name}")
+            aux_rgba_fields.extend(
+                f"{p}.datasets[{index}].{aux_weight_key}"
+                for index in active_indices
+                if aux_weight_key in datasets[index]
+            )
+        if aux_rgba_fields:
+            collector.add(
+                RULE_QWEN_RGBA_ANCHOR,
+                [f"{p}.model.model_kwargs.rgba"] + aux_rgba_fields,
+                "The perceptual aux anchors decode the predicted x0 through the training VAE as RGB; RGBA decoding hands them 4-channel pixels their perceptors cannot consume.",
+                "Turn off model.model_kwargs.rgba or disable the affected anchors (set each anchor's effective loss weight to 0 on every non-reg dataset).",
+            )
     if _nonempty(model.get("accuracy_recovery_adapter")) and _nonempty(model.get("assistant_lora_path")):
         collector.add(
             RULE_KREA_CONFLICT,

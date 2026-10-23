@@ -98,11 +98,83 @@ def depth_active_for_dataset(
     return float(dataset_weight or 0.0) > 0.0
 
 
+def _preflight_qwen_differentiable_decode(
+    anchor_label: str,
+    dataset_noun: str,
+    disable_hint: str,
+    arch: Optional[str],
+    low_vram: bool,
+    dataset_configs: List,
+    active_for_dataset,
+    decode_pixel_limit: Optional[int],
+    max_active_bucket_pixels: Optional[int],
+) -> None:
+    """Qwen-Image 2.1 fail-closed guards shared by every aux-anchor preflight.
+
+    The Qwen-Image 2.1 VAE decodes tiles above its differentiable pixel limit
+    and always under ``low_vram``; tiled decode cannot carry the aux anchors'
+    decode gradient (``_decode_rgba`` raises mid-step). Preflight rejects
+    those configurations up front -- against the exact bucket geometry when
+    the loaders have built buckets, else the dataset resolution fallback.
+    ``active_for_dataset`` must be the weight-based, reg-exempt predicate: reg
+    rows never reach the differentiable decode (every live anchor loss skips
+    them), and a positive weight overridden to zero on every non-reg dataset
+    never decodes either -- so when no dataset is effectively active the
+    guard is fully inert, including the low_vram rejection.
+    """
+    if arch != 'qwen_image_2':
+        return
+    if not any(active_for_dataset(dc) for dc in dataset_configs):
+        return
+    if low_vram:
+        raise ValueError(
+            f'{anchor_label} for Qwen-Image 2.1 requires model.low_vram: false '
+            '(low_vram forces tiled VAE decode, which cannot carry the '
+            "anchor's gradient)."
+        )
+    if decode_pixel_limit is None:
+        return
+    if max_active_bucket_pixels is not None:
+        if max_active_bucket_pixels > decode_pixel_limit:
+            raise ValueError(
+                f'{anchor_label} for Qwen-Image 2.1 requires an untiled '
+                f'differentiable decode, but a {dataset_noun} dataset has a '
+                f'{max_active_bucket_pixels}-pixel bucket, above the '
+                f'{decode_pixel_limit}-pixel tile threshold. Lower the '
+                'dataset resolution (buckets at 1024x1024 or below stay '
+                'untiled) or disable the anchor on that dataset '
+                f'({disable_hint}).'
+            )
+        return
+    for dc in dataset_configs:
+        if not active_for_dataset(dc):
+            continue
+        # resolution may be a single int or a bucket-resolution list; the
+        # largest entry governs the tile threshold
+        raw_resolution = getattr(dc, 'resolution', 0) or 0
+        if isinstance(raw_resolution, (list, tuple)):
+            entries = [int(v) for v in raw_resolution if int(v) > 0]
+            resolution = max(entries) if entries else 0
+        else:
+            resolution = int(raw_resolution)
+        if resolution > 0 and resolution * resolution > decode_pixel_limit:
+            raise ValueError(
+                f'{anchor_label} for Qwen-Image 2.1 requires an untiled '
+                f'differentiable decode, but a {dataset_noun} dataset runs '
+                f'at resolution {resolution}, above the '
+                f'{decode_pixel_limit}-pixel tile threshold. Lower the '
+                'resolution (1024 or below stays untiled) or disable the '
+                f'anchor on that dataset ({disable_hint}).'
+            )
+
+
 def preflight_depth_consistency(
     depth_consistency_config: Optional[DepthConsistencyConfig],
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[DepthConsistencyConfig]:
     """Resolve the effective depth-consistency config and run backend preflight.
 
@@ -162,11 +234,27 @@ def preflight_depth_consistency(
             )
         _augments = getattr(dc, 'augments', None) or []
         if len(_augments) > 0:
-            raise ValueError(
-                "Depth-active datasets cannot use a non-empty augments list in "
-                "Phase 2; the GT depth cache requires deterministic bucket "
-                f"transforms (remove augments, got {_augments!r})."
-            )
+                raise ValueError(
+                    "Depth-active datasets cannot use a non-empty augments list in "
+                    "Phase 2; the GT depth cache requires deterministic bucket "
+                    f"transforms (remove augments, got {_augments!r})."
+                )
+
+    # Qwen-Image 2.1 tiled-decode guards: only when depth actually decodes
+    # under gradient. preview_only forces every sample onto the no-grad
+    # preview path (depth_objective is ANDed with `not preview_only`; the
+    # preview decode runs under set_grad_enabled(False)), where tiling is a
+    # valid path -- so preview-only runs are exempt regardless of weights.
+    # Otherwise the helper itself skips configs with no effectively active
+    # non-reg dataset (all overrides zero, or reg-only activation).
+    if not bool(getattr(config, 'preview_only', False)):
+        _preflight_qwen_differentiable_decode(
+            'Depth-consistency loss', 'depth', 'depth_loss_weight: 0',
+            arch, low_vram, dataset_configs,
+            lambda dc: not getattr(dc, 'is_reg', False)
+                       and depth_active_for_dataset(config, dc),
+            decode_pixel_limit, max_active_bucket_pixels,
+        )
 
     return config
 
@@ -196,6 +284,8 @@ def preflight_normal_id(
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[NormalIDConfig]:
     """Resolve the effective normal-id config. Returns None when normal is off.
 
@@ -231,6 +321,18 @@ def preflight_normal_id(
     if arch == 'krea2' and low_vram:
         raise ValueError('Normal-anchor loss for Krea 2 requires model.low_vram: false.')
 
+    # Qwen-Image 2.1 tiled-decode guards: preview-only runs decode without
+    # grad (set_grad_enabled(False)), where tiling is valid -- exempt. The
+    # helper skips configs with no effectively active non-reg dataset.
+    if not bool(getattr(config, 'preview_only', False)):
+        _preflight_qwen_differentiable_decode(
+            'Normal-anchor loss', 'normal', 'normal_loss_weight: 0',
+            arch, low_vram, dataset_configs,
+            lambda dc: not getattr(dc, 'is_reg', False)
+                       and normal_active_for_dataset(config, dc),
+            decode_pixel_limit, max_active_bucket_pixels,
+        )
+
     return config
 
 
@@ -254,6 +356,8 @@ def preflight_body_proportion(
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[BodyProportionConfig]:
     """Resolve the effective body-proportion config. Returns None when inactive.
 
@@ -277,6 +381,13 @@ def preflight_body_proportion(
         raise ValueError(
             'Body-proportion loss for Krea 2 requires model.low_vram: false.'
         )
+    _preflight_qwen_differentiable_decode(
+        'Body-proportion loss', 'body-proportion', 'body_proportion_loss_weight: 0',
+        arch, low_vram, dataset_configs,
+        lambda dc: not getattr(dc, 'is_reg', False)
+                   and body_proportion_active_for_dataset(config, dc),
+        decode_pixel_limit, max_active_bucket_pixels,
+    )
     return config
 
 
@@ -298,6 +409,8 @@ def preflight_face_id(
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[FaceIDConfig]:
     """Resolve the effective face-id config. Returns None when inactive.
 
@@ -319,6 +432,13 @@ def preflight_face_id(
         return config
     if arch == 'krea2' and low_vram:
         raise ValueError('Face-identity loss for Krea 2 requires model.low_vram: false.')
+    _preflight_qwen_differentiable_decode(
+        'Face-identity loss', 'face-identity', 'identity_loss_weight: 0',
+        arch, low_vram, dataset_configs,
+        lambda dc: not getattr(dc, 'is_reg', False)
+                   and face_identity_active_for_dataset(config, dc),
+        decode_pixel_limit, max_active_bucket_pixels,
+    )
     return config
 
 
@@ -339,6 +459,8 @@ def preflight_body_shape(
     dataset_configs: List,
     arch: Optional[str],
     low_vram: bool,
+    decode_pixel_limit: Optional[int] = None,
+    max_active_bucket_pixels: Optional[int] = None,
 ) -> Optional[BodyShapeConfig]:
     _dataset_bs_active = any(
         body_shape_active_for_dataset(body_shape_config, dc) for dc in dataset_configs
@@ -353,6 +475,13 @@ def preflight_body_shape(
         return config
     if arch == 'krea2' and low_vram:
         raise ValueError('Body-shape loss for Krea 2 requires model.low_vram: false.')
+    _preflight_qwen_differentiable_decode(
+        'Body-shape loss', 'body-shape', 'body_shape_loss_weight: 0',
+        arch, low_vram, dataset_configs,
+        lambda dc: not getattr(dc, 'is_reg', False)
+                   and body_shape_active_for_dataset(config, dc),
+        decode_pixel_limit, max_active_bucket_pixels,
+    )
     return config
 
 
@@ -451,43 +580,16 @@ def preflight_vae_anchor(
         return config
     if arch == 'krea2' and low_vram:
         raise ValueError('VAE-anchor loss for Krea 2 requires model.low_vram: false.')
-    if arch == 'qwen_image_2':
-        # The Qwen-Image 2.1 VAE decode tiles above the pixel limit and always
-        # under low_vram, and tiled decode cannot carry the anchor's decode
-        # gradient -- the live loss needs an untiled one-shot decode.
-        if low_vram:
-            raise ValueError(
-                'VAE-anchor loss for Qwen-Image 2.1 requires model.low_vram: false '
-                '(low_vram forces tiled VAE decode, which cannot carry the '
-                "anchor's gradient)."
-            )
-        if decode_pixel_limit is not None:
-            if max_active_bucket_pixels is not None:
-                if max_active_bucket_pixels > decode_pixel_limit:
-                    raise ValueError(
-                        'VAE-anchor loss for Qwen-Image 2.1 requires an untiled '
-                        f'differentiable decode, but a vae-anchor dataset has a '
-                        f'{max_active_bucket_pixels}-pixel bucket, above the '
-                        f'{decode_pixel_limit}-pixel tile threshold. Lower the '
-                        'dataset resolution (buckets at 1024x1024 or below stay '
-                        'untiled) or disable the anchor on that dataset '
-                        '(vae_anchor_loss_weight: 0).'
-                    )
-            else:
-                for dc in dataset_configs:
-                    if not vae_anchor_active_for_dataset(config, dc):
-                        continue
-                    resolution = int(getattr(dc, 'resolution', 0) or 0)
-                    if resolution > 0 and resolution * resolution > decode_pixel_limit:
-                        raise ValueError(
-                            'VAE-anchor loss for Qwen-Image 2.1 requires an untiled '
-                            f'differentiable decode, but a vae-anchor dataset runs '
-                            f'at resolution {resolution}, above the '
-                            f'{decode_pixel_limit}-pixel tile threshold. Lower the '
-                            'resolution (1024 or below stays untiled) or disable '
-                            'the anchor on that dataset '
-                            '(vae_anchor_loss_weight: 0).'
-                        )
+    # Qwen-Image 2.1: the VAE decode tiles above the pixel limit and always
+    # under low_vram, and tiled decode cannot carry the anchor's decode
+    # gradient -- the live loss needs an untiled one-shot decode.
+    # (vae_anchor_active_for_dataset already exempts reg datasets.)
+    _preflight_qwen_differentiable_decode(
+        'VAE-anchor loss', 'vae-anchor', 'vae_anchor_loss_weight: 0',
+        arch, low_vram, dataset_configs,
+        lambda dc: vae_anchor_active_for_dataset(config, dc),
+        decode_pixel_limit, max_active_bucket_pixels,
+    )
     return config
 
 
@@ -2686,11 +2788,44 @@ class SDTrainer(BaseSDTrainProcess):
                 "video items are present in the training or reg datasets. "
                 "Remove the video datasets or disable these features."
             )
+        # Shared Qwen-Image 2.1 differentiable-decode preflight inputs: the
+        # arch's pixel limit (qwen_image_2 tiles above it) and the exact bucket
+        # geometry the loaders already built, per aux anchor's active datasets.
+        _aux_decode_pixel_limit = getattr(
+            self.sd, 'get_differentiable_decode_pixel_limit', lambda: None
+        )()
+
+        def _aux_max_active_bucket_pixels(active_for_dataset_fn):
+            if _aux_decode_pixel_limit is None:
+                return None
+            best = None
+            for loader in (self.data_loader, self.data_loader_reg):
+                if loader is None:
+                    continue
+                for dataset in get_dataloader_datasets(loader):
+                    if not active_for_dataset_fn(dataset.dataset_config):
+                        continue
+                    for bucket in getattr(dataset, 'buckets', {}).values():
+                        pixels = bucket.width * bucket.height
+                        if best is None or pixels > best:
+                            best = pixels
+            return best
+
+        def _aux_active(not_reg_active_fn):
+            # reg rows never reach the differentiable decode, so reg datasets
+            # are exempt from the per-anchor bucket scan (matches the
+            # preflight-internal resolution fallback).
+            return lambda dc: not getattr(dc, 'is_reg', False) and not_reg_active_fn(dc)
+
         self.depth_consistency_config = preflight_depth_consistency(
             self.depth_consistency_config,
             self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(_aux_active(
+                lambda dc: depth_active_for_dataset(self.depth_consistency_config, dc)
+            )),
         )
         # Fresh start for a re-run / reattempt: preview cadence counts DEPTH
         # steps, so a stale counter would desync the tile cadence.
@@ -2708,6 +2843,10 @@ class SDTrainer(BaseSDTrainProcess):
             self.normal_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(_aux_active(
+                lambda dc: normal_active_for_dataset(self.normal_config, dc)
+            )),
         )
         self._normal_step_count = 0
         if self._normal_should_cache():
@@ -2717,6 +2856,10 @@ class SDTrainer(BaseSDTrainProcess):
             self.body_proportion_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(_aux_active(
+                lambda dc: body_proportion_active_for_dataset(self.body_proportion_config, dc)
+            )),
         )
         if self._body_proportion_should_cache():
             self._cache_body_proportion_gt_pass()
@@ -2726,6 +2869,10 @@ class SDTrainer(BaseSDTrainProcess):
             self.face_id_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(_aux_active(
+                lambda dc: face_identity_active_for_dataset(self.face_id_config, dc)
+            )),
         )
         if self._face_identity_should_cache():
             self._cache_face_identity_gt_pass()
@@ -2734,35 +2881,24 @@ class SDTrainer(BaseSDTrainProcess):
             self.body_shape_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(_aux_active(
+                lambda dc: body_shape_active_for_dataset(self.body_shape_config, dc)
+            )),
         )
         if self._body_shape_should_cache():
             self._cache_body_shape_gt_pass()
-        # VAE-anchor preflight + GT caching pass. For archs that expose a
-        # differentiable-decode pixel limit (qwen_image_2 tiles above it),
-        # preflight the exact bucket geometry the loaders already built.
-        _va_pixel_limit = getattr(
-            self.sd, 'get_differentiable_decode_pixel_limit', lambda: None
-        )()
-        _va_max_bucket_pixels = None
-        if _va_pixel_limit is not None:
-            for loader in (self.data_loader, self.data_loader_reg):
-                if loader is None:
-                    continue
-                for dataset in get_dataloader_datasets(loader):
-                    if not vae_anchor_active_for_dataset(
-                        self.vae_anchor_config, dataset.dataset_config
-                    ):
-                        continue
-                    for bucket in getattr(dataset, 'buckets', {}).values():
-                        pixels = bucket.width * bucket.height
-                        if _va_max_bucket_pixels is None or pixels > _va_max_bucket_pixels:
-                            _va_max_bucket_pixels = pixels
+        # VAE-anchor preflight + GT caching pass. Same shared Qwen-Image 2.1
+        # differentiable-decode inputs as the other anchors (the bucket scan
+        # reuses vae_anchor_active_for_dataset, which already exempts reg).
         self.vae_anchor_config = preflight_vae_anchor(
             self.vae_anchor_config, self.dataset_configs,
             getattr(self.sd.model_config, 'arch', None),
             self.model_config.low_vram,
-            _va_pixel_limit,
-            _va_max_bucket_pixels,
+            _aux_decode_pixel_limit,
+            _aux_max_active_bucket_pixels(
+                lambda dc: vae_anchor_active_for_dataset(self.vae_anchor_config, dc)
+            ),
         )
         if self._vae_anchor_should_cache():
             self._cache_vae_anchor_gt_pass()
