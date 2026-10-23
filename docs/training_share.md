@@ -69,16 +69,20 @@ time each round (the helper reports steps/seconds in its delta metadata) and
 moves `frac` toward equal wall-clock — the slower card gets the smaller share —
 smoothed 50% and banded to ±0.15 of the configured value. The helper then takes
 its split AND its learning rate from the lead's round job (per-round LR handoff,
-Fizgig-style) instead of its own scheduler, and its loop budget is auto-doubled
-(it stops on `final.json`). Fixed-frac runs are unchanged.
+Fizgig-style) instead of its own scheduler. The lead publishes its actual step
+budget; the helper's loop allowance covers one full helper share per lead step,
+including early save/sample round closures and the configured initial split.
+This conservative allowance is not a target image count: the helper stops on
+`final.json`. Fixed-frac runs are unchanged.
 
 Adaptive on this box (PRO 6000 lead + 5090 helper): round 1 measured 2.21 vs
 2.77 s/it, frac settled at ~0.50 within two rounds, and the lead's per-round
 idle wait fell from 10–25s to ~2s.
 
 Required (fail-fast at startup): `train.batch_size 1`, `train.gradient_accumulation 1`,
-EMA off, no `datasets_reg`, at least 4 dataset items, both processes on the same
-fork commit and identical dataset paths (slice 1 assumes one machine).
+`train.gradient_accumulation_steps 1`, EMA off, no `datasets_reg`, at least 4 dataset
+items, both processes on the same fork commit and identical dataset paths (slice 1
+assumes one machine). Partial optimizer accumulation windows cannot be exchanged.
 
 ## Runbook
 
@@ -126,6 +130,12 @@ lossless — validated live: the helper missed round 1 (still loading), the lead
 absorbed its 31 items (round target 25→37), the helper rejoined and round 2
 merged cleanly; a solo run with the helper dead from the start finished all
 150 steps with streak-3+ closes costing 0s of waiting.
+
+A late helper skips retired rounds and adopts an available newer start. An
+all-excluded initial round posts a zero delta before waiting for more work.
+If pruning leaves an orphan job without its start, adoption still checks for
+newer rounds, completion and timeout. Delta writes racing with retirement are
+discarded; write errors for live rounds still fail.
 
 Two semantics to know: the lead's step budget is FIXED (the training loop's
 range is built once, so absorption displaces later lead-share rounds rather

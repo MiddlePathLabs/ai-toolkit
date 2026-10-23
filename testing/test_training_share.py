@@ -355,27 +355,52 @@ def test_next_frac_gives_the_slower_card_the_smaller_share():
     assert next_frac(1.0, 0.0, 0.5, 0.5) == 0.5
 
 
-def test_adaptive_helper_budget_covers_the_banded_worst_case():
-    # reviewer's case 1: center 0.1 pins frac at the band ceiling 0.25
-    # (min(0.1+0.15, 0.75)); 100 items, lead 900 -> 12 rounds x 25 helper
-    # steps = 300. The old flat x2 of the helper's own 100 gave 200 and the
-    # helper ran dry at step 200 with the lead still waiting.
-    assert adaptive_helper_budget(100, 900, 0.1) == 300
-    # reviewer's case 2: small-N rounding. 4 items at center 0.5 can draw a
-    # 3-vs-1 split every round: 20 lead steps = 20 rounds x 3 helper steps =
-    # 60 (the observed need was 48; the old x2 gave 40).
-    assert adaptive_helper_budget(4, 20, 0.5) == 60
-    # the bound must dominate every frac next_frac can actually produce
-    for center in (0.05, 0.1, 0.25, 0.5, 0.75, 0.9):
-        n, lead_steps = 40, 2000
-        budget = adaptive_helper_budget(n, lead_steps, center)
-        for t_lead, t_helper in ((1.0, 4.0), (4.0, 1.0), (1.0, 1.0)):
-            frac = center
-            for _ in range(200):
-                frac = next_frac(t_lead, t_helper, frac, center)
-                helper_n = len(split_for_round(42, 1, _keys(n), frac))
-                needed = -(-lead_steps // max(n - helper_n, 1)) * helper_n
-                assert budget >= needed
+@pytest.mark.parametrize(
+    "n,center,lead_steps,save_every",
+    [(100, 0.1, 900, 0), (100, 0.5, 300, 50), (4, 0.5, 20, 2),
+     (100, 0.9, 225, 0), (4, 0.5, 8, 1)],
+)
+def test_adaptive_budget_funds_complete_helper_shares(
+    tmp_path, monkeypatch, n, center, lead_steps, save_every,
+):
+    import toolkit.training_share as ts
+
+    monkeypatch.setattr(ts.time, "time", lambda: 1000.0)
+    lead, helper = _states(tmp_path, n=n, frac=center)
+    lead.adaptive = helper.adaptive = True
+    lead.catch_up = helper.catch_up = False
+    lead.timeout_s = helper.timeout_s = 0
+    lead.total_steps = lead_steps
+    lead.hook_begin()
+    helper.hook_begin()
+    allowance = adaptive_helper_budget(n, helper.lead_steps, center)
+    start = lead._current_sd()["weight"]
+    helper_steps = 0
+    prepared_round = 0
+    for step in range(lead_steps):
+        if prepared_round != lead.round_no:
+            prepared_round = lead.round_no
+            assert helper.round_no == lead.round_no and not helper._waiting
+            for _ in range(helper.my_target_steps(helper.round_no)):
+                assert helper_steps < allowance, "helper exhausted before completing its assigned share"
+                with torch.no_grad():
+                    helper._network.weight.add_(1)
+                helper_steps += 1
+                helper._round_t0 = 999.9
+                helper.hook_end_of_step(
+                    helper_steps - 1, False, False, helper_steps == allowance,
+                )
+        lead._round_t0 = 900.0
+        old_round = lead.round_no
+        lead.hook_end_of_step(
+            step, bool(save_every and step and step % save_every == 0), False,
+            step + 1 == lead_steps,
+            hold=bool(save_every and step + 1 < lead_steps and (step + 1) % save_every == 0),
+        )
+        if old_round != lead.round_no or not lead.running:
+            helper.hook_step_top()
+    assert helper.stop_loop and not helper.running
+    assert torch.allclose(lead._current_sd()["weight"], start + helper_steps)
 
 
 def test_adaptive_roundtrip_over_files(tmp_path):
@@ -554,21 +579,192 @@ def test_write_delta_discards_a_retired_round(tmp_path):
     assert os.path.exists(os.path.join(str(tmp_path / "b"), "share", "round_000001", "delta.safetensors"))
 
 
-def test_write_delta_tolerates_the_lead_pruning_mid_write(tmp_path, monkeypatch):
-    # the lead can prune the round dir between our liveness check and the
-    # atomic rename; that must discard the delta, not crash the helper
+@pytest.mark.parametrize("phase", ["serialize", "rename"])
+def test_write_delta_tolerates_the_lead_pruning_mid_write(tmp_path, monkeypatch, phase):
+    import safetensors
+    import safetensors.torch
     import toolkit.training_share as ts
 
     lead, helper = _states(tmp_path)
     lead.hook_begin()
     helper.hook_begin()
+    rd = os.path.join(helper.share_dir, "round_000001")
+    failures = []
 
-    def pruned_mid_write(path, sd, metadata=None):
-        raise FileNotFoundError(3, "round dir pruned mid-write")
+    if phase == "serialize":
+        original = safetensors.torch.save_file
 
-    monkeypatch.setattr(ts, "_save_sd", pruned_mid_write)
-    helper.write_delta(1, {"weight": torch.zeros(6, 6)})  # must not raise
-    assert not os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001", "delta.safetensors"))
+        def pruned_mid_write(*args, **kwargs):
+            lead.prune_round(1)
+            try:
+                return original(*args, **kwargs)
+            except safetensors.SafetensorError as exc:
+                failures.append(exc)
+                raise
+
+        monkeypatch.setattr(safetensors.torch, "save_file", pruned_mid_write)
+    else:
+        original = ts._replace
+
+        def pruned_mid_write(path):
+            lead.prune_round(1)
+            try:
+                return original(path)
+            except FileNotFoundError as exc:
+                failures.append(exc)
+                raise
+
+        monkeypatch.setattr(ts, "_replace", pruned_mid_write)
+
+    helper.write_delta(1, compute_delta(helper._current_sd(), helper._start_sd))
+    assert len(failures) == 1
+    assert not os.path.exists(rd)
+
+
+@pytest.mark.parametrize("phase", ["serialize", "rename"])
+def test_write_delta_propagates_live_round_failures(tmp_path, monkeypatch, phase):
+    from safetensors import SafetensorError
+    import toolkit.training_share as ts
+
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+    rd = os.path.join(helper.share_dir, "round_000001")
+    path = os.path.join(rd, "delta.safetensors")
+    if phase == "serialize":
+        os.mkdir(path + ".tmp")
+        error = SafetensorError
+    else:
+        original = ts._replace
+
+        def missing_temporary_file(path):
+            os.remove(path + ".tmp")
+            original(path)
+
+        monkeypatch.setattr(ts, "_replace", missing_temporary_file)
+        error = FileNotFoundError
+
+    with pytest.raises(error):
+        helper.write_delta(1, compute_delta(helper._current_sd(), helper._start_sd))
+    assert os.path.isfile(os.path.join(rd, "job.json"))
+    assert os.path.isfile(os.path.join(rd, "start.safetensors"))
+    assert not os.path.exists(path)
+
+
+@pytest.mark.parametrize("outcome", ["newer", "final", "timeout"])
+def test_wait_start_recovers_from_an_orphan_job(tmp_path, monkeypatch, outcome):
+    import toolkit.training_share as ts
+
+    lead, helper = _states(tmp_path)
+    lead.adaptive = helper.adaptive = True
+    lead.frac = 0.6
+    lead.total_steps = 12
+    lead._optimizer = SimpleNamespace(param_groups=[{"lr": 0.2}])
+    helper._optimizer = SimpleNamespace(param_groups=[{"lr": 0.9}])
+    lead._owed = set(lead.keys)
+    lead.hook_begin()
+    orphan = os.path.join(helper.share_dir, "round_000001")
+    os.remove(os.path.join(orphan, "start.safetensors"))
+    helper.timeout_s = 1.0
+    clock = [0.0]
+    retries = []
+    monkeypatch.setattr(ts.time, "time", lambda: clock[0])
+
+    def advance(seconds):
+        retries.append(seconds)
+        assert len(retries) <= 4, "orphan start retries bypassed the deadline"
+        assert helper.frac == 0.4
+        assert helper._optimizer.param_groups[0]["lr"] == 0.9
+        assert not helper._budget_checked and helper.lead_steps == 0
+        assert not helper._excluded
+        clock[0] += seconds
+        if outcome == "newer":
+            lead.frac = 0.5
+            lead._optimizer.param_groups[0]["lr"] = 0.3
+            lead._owed.clear()
+            lead.open_round(2, lead._current_sd())
+        elif outcome == "final":
+            lead.write_final()
+
+    monkeypatch.setattr(ts.time, "sleep", advance)
+    if outcome == "timeout":
+        with pytest.raises(ShareTimeout, match="no start"):
+            helper.wait_start(1)
+        assert clock[0] == 1.0
+    else:
+        start, job = helper.wait_start(1)
+        if outcome == "newer":
+            assert helper.round_no == 2 and job["round"] == 2
+            for key, value in lead._current_sd().items():
+                assert torch.equal(start[key], value)
+            assert helper.frac == 0.5
+            assert helper._optimizer.param_groups[0]["lr"] == 0.3
+            assert helper._budget_checked and helper.lead_steps == 12
+            assert not helper._excluded
+        else:
+            assert start is None and job is None
+    assert retries
+    assert os.path.isfile(os.path.join(orphan, "job.json"))
+    assert not os.path.exists(os.path.join(orphan, "start.safetensors"))
+    if outcome != "newer":
+        assert helper.round_no == 0 and helper.frac == 0.4
+        assert helper._optimizer.param_groups[0]["lr"] == 0.9
+        assert not helper._budget_checked and helper.lead_steps == 0
+        assert not helper._excluded
+
+
+def test_late_initial_helper_zeroes_empty_round_then_rejoins_and_finishes(tmp_path, monkeypatch):
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    start = lead._current_sd()
+    lead.prune_round(1)
+    lead._owed = set(lead.helper_keys(2))
+    lead.open_round(2, start)
+    lead._begin_round(2)
+    helper.hook_begin()
+    rd2 = os.path.join(helper.share_dir, "round_000002")
+    assert helper.round_no == 2 and helper.running and helper._waiting
+    assert helper.my_target_steps(2) == 0
+    assert not any(helper.owns([key]) for key in helper.keys)
+    assert not os.path.exists(os.path.join(rd2, "delta.safetensors"))
+    with torch.no_grad():
+        lead._network.weight += 0.25
+    published = []
+    original = helper.write_delta
+
+    def complete_empty_round(round_no, delta, seconds=0.0):
+        original(round_no, delta, seconds)
+        if round_no == 2:
+            saved_delta, meta = lead._read_delta(2)
+            published.append((saved_delta, meta))
+            for _ in range(lead.my_target_steps(2)):
+                lead.hook_end_of_step(0, False, False, False)
+
+    monkeypatch.setattr(helper, "write_delta", complete_empty_round)
+    helper.hook_step_top()
+    assert len(published) == 1
+    delta, meta = published[0]
+    assert meta["steps"] == 0 and meta["seconds"] == 0
+    assert all(torch.count_nonzero(value).item() == 0 for value in delta.values())
+    assert not os.path.exists(rd2)
+    assert helper.round_no == lead.round_no == 3
+    assert helper.running and not helper._waiting and not helper.stop_loop
+    assert helper.my_target_steps(3) > 0
+    assert torch.allclose(helper._current_sd()["weight"], start["weight"] + 0.25)
+    assert torch.equal(helper._current_sd()["bias"], start["bias"])
+
+    with torch.no_grad():
+        lead._network.weight += 0.125
+        helper._network.weight -= 0.5
+    for _ in range(helper.my_target_steps(3)):
+        helper.hook_end_of_step(0, False, False, False)
+    for step in range(lead.my_target_steps(3)):
+        lead.hook_end_of_step(0, False, False, step == lead.my_target_steps(3) - 1)
+    assert torch.allclose(lead._current_sd()["weight"], start["weight"] - 0.125)
+    assert torch.equal(lead._current_sd()["bias"], start["bias"])
+    assert os.path.isfile(os.path.join(helper.share_dir, "final.json"))
+    helper.hook_step_top()
+    assert helper.stop_loop and not helper.running
 
 
 def test_late_helper_skips_retired_rounds_to_rejoin(tmp_path):

@@ -3927,9 +3927,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             cfg.role, cfg.dir, cfg.frac, cfg.seed,
             launch_id=f"{os.getpid()}_{int(time.time())}",
             timeout_s=cfg.timeout_s, log=print_acc,
-            # the handshake budget check is a fixed-frac concept; adaptive
-            # helpers carry 0 so it is skipped
-            total_steps=0 if cfg.adaptive else self.train_config.steps,
+            # Adaptive helpers skip the fixed-frac budget handshake, but the
+            # lead must publish its real budget to size their loop allowance.
+            total_steps=0 if cfg.adaptive and cfg.role == 'helper' else self.train_config.steps,
             adaptive=cfg.adaptive,
             catch_up=cfg.catch_up,
         )
@@ -3955,24 +3955,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         )
         share.hook_begin()
         if cfg.adaptive and cfg.role == 'helper':
-            # adaptive: the helper's actual step total drifts with frac (banded
-            # to +/-0.15), so its loop budget covers the worst banded split of
-            # the LEAD's published budget and it stops on the lead's
-            # final.json; its LR comes from the lead's round job, so its own
-            # scheduler is neutralized (the scheduler was already built with
-            # the planned total, which the loop budget must not change). A
-            # flat x2 of the helper's own budget is NOT a bound: center 0.1
-            # pins frac at 0.25 (2.5x the configured share) and small
-            # datasets round the split further (4 items can draw 3-vs-1).
+            # The helper's allowance covers a full share for every lead step,
+            # including rounds closed early by saves/samples. It exits on
+            # final.json, not its planned schedule; LR comes from the lead.
             planned = self.train_config.steps
             self.train_config.steps = max(
-                adaptive_helper_budget(len(keys), share.lead_steps or planned, cfg.frac),
+                adaptive_helper_budget(len(keys), share.lead_steps, cfg.frac),
                 planned,
             )
             self.lr_scheduler = None
             print_acc(
                 f"[share] adaptive helper: loop budget {planned} -> {self.train_config.steps} steps "
-                f"(lead budget {share.lead_steps}; worst banded split; stops on final.json)"
+                f"(lead budget {share.lead_steps}; worst round count; stops on final.json)"
             )
         return share
 

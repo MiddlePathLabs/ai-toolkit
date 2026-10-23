@@ -44,7 +44,10 @@ import hashlib
 import json
 import os
 import time
-from typing import Callable, Dict, Iterable, List, Optional, Set
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set
+
+if TYPE_CHECKING:
+    import torch
 
 START_FILE = "start.safetensors"
 DELTA_FILE = "delta.safetensors"
@@ -217,25 +220,20 @@ def next_frac(t_lead: float, t_helper: float, current: float, center: float,
 
 
 def adaptive_helper_budget(n_items: int, lead_steps: int, center: float) -> int:
-    """An adaptive helper's loop budget that is guaranteed to outlive the lead.
+    """Bound helper steps even when every lead step closes a round.
 
-    next_frac clamps every round's helper share into
-    [max(center-BAND, FRAC_MIN), min(center+BAND, FRAC_MAX)] and
-    split_for_round rounds it to [1, n_items-1] whole items. Worst case the
-    helper trains ``helper_max`` items per round for every ``lead_min`` the
-    lead trains, over ceil(lead_steps/lead_min) rounds. A flat multiple of
-    the planned budget is NOT a bound: with center 0.1 the band pins frac at
-    0.25 (2.5x the configured share), and small datasets round the split
-    further (4 items at center 0.5 can draw 3 helper items per 1 lead item).
+    Saves/samples may close a round before the lead's full item share, so
+    there can be up to ``lead_steps`` rounds. Each needs at most the rounded
+    maximum helper split. Include the configured first round, which can
+    exceed the adaptive ceiling. The helper stops on final.json; this is an
+    allowance, not a target image count.
     """
-    f_hi = min(float(center) + ADAPTIVE_BAND, ADAPTIVE_FRAC_MAX)
+    f_hi = max(float(center), min(float(center) + ADAPTIVE_BAND, ADAPTIVE_FRAC_MAX))
     if n_items >= 2:
         helper_max = min(max(round(n_items * f_hi), 1), n_items - 1)
     else:
         helper_max = 1
-    lead_min = max(n_items - helper_max, 1)
-    rounds = -(-int(lead_steps) // lead_min)  # ceil
-    return rounds * helper_max
+    return int(lead_steps) * helper_max
 
 
 def round_dir(share_dir: str, round_no: int) -> str:
@@ -421,8 +419,11 @@ class ShareState:
         concurrently with this write) instead of crashing the helper or
         resurrecting an orphan round dir.
         """
+        from safetensors import SafetensorError
+
         rd = round_dir(self.share_dir, round_no)
-        if not os.path.exists(os.path.join(rd, JOB_FILE)):
+        if (not os.path.exists(os.path.join(rd, JOB_FILE))
+                or not os.path.exists(os.path.join(rd, START_FILE))):
             self._log(
                 f"[share] round {round_no}: retired by the lead before our delta landed; discarding it"
             )
@@ -432,8 +433,12 @@ class ShareState:
                 os.path.join(rd, DELTA_FILE), delta,
                 metadata={"round": int(round_no), "steps": int(self.steps_this_round), "seconds": round(seconds, 1)},
             )
-        except FileNotFoundError:
-            # the lead pruned the round dir mid-write; the delta is dead on arrival
+        except (OSError, SafetensorError):
+            if (os.path.exists(os.path.join(rd, JOB_FILE))
+                    and os.path.exists(os.path.join(rd, START_FILE))
+                    and self._latest_live_round() <= round_no
+                    and not os.path.exists(os.path.join(self.share_dir, FINAL_FILE))):
+                raise
             self._log(
                 f"[share] round {round_no}: retired by the lead while writing our delta; discarding it"
             )
@@ -477,7 +482,8 @@ class ShareState:
         deadline = time.time() + self.deadline_s()
         announced = False
         while True:
-            if not os.path.exists(job_path):
+            if (not os.path.exists(job_path)
+                    or not os.path.exists(os.path.join(round_dir(self.share_dir, round_no), START_FILE))):
                 live = self._latest_live_round()
                 if live > round_no:
                     self._log(
@@ -485,10 +491,8 @@ class ShareState:
                         f"skipping ahead -- this side's unfinished rounds are lost"
                     )
                     round_no = live
-                    self.round_no = live
                     job_path = os.path.join(round_dir(self.share_dir, round_no), JOB_FILE)
                     announced = False
-                    continue
             if os.path.exists(job_path):
                 try:
                     job = _read_json(job_path)
@@ -505,9 +509,11 @@ class ShareState:
                     if self.adaptive:
                         if not 0.0 < job_frac < 1.0:
                             raise ShareProtocolError(f"[share] round {round_no}: bad adaptive frac in job: {job}")
-                        self.frac = job_frac
                     elif abs(job_frac - self.frac) > 1e-9:
                         raise ShareProtocolError(f"[share] frac mismatch with the lead: {job}")
+                    start = _load_sd(os.path.join(round_dir(self.share_dir, round_no), START_FILE))
+                    if self.adaptive:
+                        self.frac = job_frac
                     if not self._budget_checked:
                         lead_steps = int(job.get("steps") or 0)
                         self.lead_steps = lead_steps
@@ -535,14 +541,13 @@ class ShareState:
                             for g, lr in zip(groups, lrs):
                                 g["lr"] = float(lr)
                     self._excluded = set(job.get("excluded") or [])
-                    start = _load_sd(os.path.join(round_dir(self.share_dir, round_no), START_FILE))
                 except FileNotFoundError:
-                    # the lead closed and pruned this round while we were adopting
-                    # it; rescan (the skip-ahead above lands us on the live round)
-                    time.sleep(0.5)
-                    continue
-                self.round_no = round_no
-                return start, job
+                    # A pruned start or orphan job must still respect final/deadline
+                    # and rescan for a newer round on the next retry.
+                    pass
+                else:
+                    self.round_no = round_no
+                    return start, job
             if os.path.exists(final_path):
                 return None, None
             if time.time() >= deadline:
@@ -610,6 +615,7 @@ class ShareState:
             self._start_sd = start
             self._begin_round(self.round_no)
             self.running = True
+            self._waiting = self.my_target_steps(self.round_no) <= 0
             self._log(f"[share] round {self.round_no}: helper with {len(self.keys)} items, helper share {self.frac:.0%}")
 
     def hook_step_top(self) -> None:
