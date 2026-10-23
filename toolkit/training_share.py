@@ -13,9 +13,13 @@ weight changes every round:
     its own live weights with that delta; both continue from the merged point.
 
 Slice 1 scope: one helper, fixed frac, both processes on one machine sharing a
-folder (identical dataset paths). A missed delta raises (the round dir is kept
-for diagnosis); degrade-to-solo and helper catch-up are out of scope. Mid-round
-resume of a share run is not supported -- restart the arm.
+folder (identical dataset paths). With catch-up (default) a round whose delta
+misses its deadline no longer kills the run: the lead absorbs the helper's
+items into its own side of the next round (the helper sees them as `excluded`),
+and after SOLO_AFTER_MISSES consecutive misses it trains solo without sitting
+out deadlines while still consuming a delta that shows up (a slow-but-alive
+helper rejoins). Set catch_up=False to restore fail-fast. Mid-round resume of
+a share run is not supported -- restart the arm.
 
 Protocol files under ShareConfig.dir:
 
@@ -46,6 +50,9 @@ JOB_FILE = "job.json"
 FINAL_FILE = "final.json"
 
 MIN_DEADLINE_S = 300.0
+# after this many consecutive missed rounds the lead stops sitting out deadlines
+# (it still consumes a delta that shows up, so a slow-but-alive helper rejoins)
+SOLO_AFTER_MISSES = 3
 
 
 class ShareTimeout(RuntimeError):
@@ -227,6 +234,7 @@ class ShareState:
         self, role: str, share_dir: str, frac: float, seed: int, launch_id: str,
         timeout_s: float = 900.0, log: Callable[[str], None] = print,
         total_steps: int = 0, adaptive: bool = False, frac_center: Optional[float] = None,
+        catch_up: bool = True,
     ):
         if role not in ("lead", "helper"):
             raise ValueError(f"share role must be 'lead' or 'helper', got {role!r}")
@@ -235,6 +243,7 @@ class ShareState:
         self.frac = float(frac)                 # current round's helper share
         self.frac_center = float(frac_center if frac_center is not None else frac)
         self.adaptive = bool(adaptive)
+        self.catch_up = bool(catch_up)
         self.seed = int(seed)
         self.launch_id = str(launch_id)
         self.timeout_s = float(timeout_s)
@@ -258,6 +267,12 @@ class ShareState:
         self._waiting = False
         self._budget_checked = False
         self.combined_done = 0                 # images trained across both sides
+        # catch-up: items the helper failed to train (a missed round) that the
+        # lead folds into its own side of the next round's filter; the helper
+        # sees them as `excluded` in the job so nothing trains twice
+        self._owed: Set[str] = set()
+        self._excluded: Set[str] = set()
+        self._consecutive_missed = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -279,20 +294,32 @@ class ShareState:
         return self._helper_keys_cache
 
     def owns(self, paths: Iterable[str]) -> bool:
-        """True when every path in a fetched batch belongs to this side this round."""
+        """True when every path in a fetched batch belongs to this side this round.
+
+        Owed items (a missed round's helper share) count as the LEAD's even
+        when the round's split draws them for the helper; the helper sees them
+        as `excluded` from the job file, so an item never trains twice.
+        """
         if not self.running:
             return True
         helper = self.helper_keys(self.round_no)
         for p in paths:
-            is_helpers = str(p) in helper
-            if is_helpers != (self.role == "helper"):
-                return False
+            k = str(p)
+            is_helpers = k in helper and k not in self._excluded
+            if self.role == "helper":
+                if not is_helpers:
+                    return False
+            else:
+                if is_helpers and k not in self._owed:
+                    return False
         return True
 
     def my_target_steps(self, round_no: int) -> int:
         """How many optimizer steps this side trains in the round (its item share)."""
-        n_helper = len(self.helper_keys(round_no))
-        return n_helper if self.role == "helper" else max(len(self.keys) - n_helper, 1)
+        helper = self.helper_keys(round_no)
+        if self.role == "helper":
+            return len(helper - self._excluded)
+        return max(len(self.keys) - len(helper - self._owed), 1)
 
     # ------------------------------------------------------------------ files
 
@@ -310,6 +337,9 @@ class ShareState:
             "launch": self.launch_id, "n_items": len(self.keys),
             "steps": self.total_steps, "adaptive": self.adaptive,
             "combined": self.combined_done,
+            # items the helper must not train this round (the lead is absorbing
+            # them after a missed round); empty on a healthy run
+            "excluded": sorted(self._owed),
         }
         if self.adaptive and self._optimizer is not None:
             # per-round LR handoff: the helper holds the lead's rate for the
@@ -328,6 +358,13 @@ class ShareState:
                 f"[share] round {round_no}: no delta from the helper within {self.deadline_s():.0f}s "
                 f"({path}); the round dir is preserved for diagnosis"
             )
+        return self._read_delta(round_no)
+
+    def _read_delta(self, round_no: int):
+        """(delta, meta) if the round's delta file exists, else (None, None)."""
+        path = os.path.join(round_dir(self.share_dir, round_no), DELTA_FILE)
+        if not os.path.exists(path):
+            return None, None
         job = _read_json(os.path.join(round_dir(self.share_dir, round_no), JOB_FILE))
         if int(job.get("round", -1)) != int(round_no):
             raise ShareProtocolError(f"[share] round {round_no}: job.json is from another round: {job}")
@@ -336,8 +373,10 @@ class ShareState:
         return _load_sd(path), meta
 
     def write_delta(self, round_no: int, delta: Dict, seconds: float = 0.0) -> None:
+        rd = round_dir(self.share_dir, round_no)
+        os.makedirs(rd, exist_ok=True)   # the lead may have pruned it while we trained
         _save_sd(
-            os.path.join(round_dir(self.share_dir, round_no), DELTA_FILE), delta,
+            os.path.join(rd, DELTA_FILE), delta,
             metadata={"round": int(round_no), "steps": int(self.steps_this_round), "seconds": round(seconds, 1)},
         )
 
@@ -398,6 +437,7 @@ class ShareState:
                     if len(lrs) == len(groups):
                         for g, lr in zip(groups, lrs):
                             g["lr"] = float(lr)
+                self._excluded = set(job.get("excluded") or [])
                 return _load_sd(os.path.join(round_dir(self.share_dir, round_no), START_FILE)), job
             if os.path.exists(final_path):
                 return None, None
@@ -467,22 +507,32 @@ class ShareState:
             self._log(f"[share] round 1: helper with {len(self.keys)} items, helper share {self.frac:.0%}")
 
     def hook_step_top(self) -> None:
-        """Top of a step. The helper blocks here between rounds until the next start (or final)."""
-        if not self.running or self.role != "helper":
+        """Top of a step. The helper blocks here between rounds until the next start (or final).
+
+        A round whose every helper item is excluded (the lead absorbing a big
+        miss) leaves the helper nothing to train: it posts a zero delta
+        immediately and waits for the following round instead of tripping the
+        fetch loop's degenerate-split guard.
+        """
+        while self.running and self.role == "helper" and self._waiting:
+            start, _job = self.wait_start(self.round_no)
+            if start is None:
+                self._log("[share] the lead finished; stopping")
+                self.running = False
+                self.stop_loop = True
+                return
+            self._load_into_network(start)
+            self._start_sd = start
+            self._waiting = False
+            self._round_t0 = time.time()
+            if self.my_target_steps(self.round_no) <= 0:
+                self._log(f"[share] round {self.round_no}: nothing for this side (all excluded) - zero delta")
+                self.write_delta(self.round_no, compute_delta(self._current_sd(), self._start_sd), seconds=0.0)
+                self._begin_round(self.round_no + 1)
+                self._waiting = True
+                continue
+            self._log(f"[share] round {self.round_no}: from the lead's merged LoRA")
             return
-        if not self._waiting:
-            return
-        start, _job = self.wait_start(self.round_no)
-        if start is None:
-            self._log("[share] the lead finished; stopping")
-            self.running = False
-            self.stop_loop = True
-            return
-        self._load_into_network(start)
-        self._start_sd = start
-        self._waiting = False
-        self._round_t0 = time.time()
-        self._log(f"[share] round {self.round_no}: from the lead's merged LoRA")
 
     def hook_end_of_step(
         self, step: int, is_save_step: bool, is_sample_step: bool, is_last_step: bool,
@@ -511,32 +561,68 @@ class ShareState:
             return
         took = time.time() - (self._round_t0 or time.time())
         if self.role == "lead":
-            t_wait0 = time.time()
-            delta, meta = self.wait_delta(self.round_no)
-            waited = time.time() - t_wait0
-            merged = merge(self._current_sd(), delta)
-            self._load_into_network(merged)
+            delta = meta = None
+            if self.catch_up and self._consecutive_missed >= SOLO_AFTER_MISSES:
+                # helper presumed gone: don't sit out another deadline. A delta
+                # that arrived while we trained is still used, and the helper
+                # rejoins for the next round.
+                delta, meta = self._read_delta(self.round_no)
+                waited = 0.0
+            else:
+                t_wait0 = time.time()
+                try:
+                    delta, meta = self.wait_delta(self.round_no)
+                except ShareTimeout:
+                    if not self.catch_up:
+                        raise
+                    waited = time.time() - t_wait0
+                else:
+                    waited = time.time() - t_wait0
+            if delta is None:
+                # a missed round: the helper's items trained zero times. Owe
+                # them to our side of the next round (the job's `excluded`
+                # keeps the helper off them). The lead's fixed step budget
+                # still governs when the run ends -- the loop's range is fixed
+                # at entry, so absorption displaces later lead-share rounds
+                # rather than extending the run.
+                missed = self.helper_keys(self.round_no)
+                self._owed = set(missed)
+                self._consecutive_missed += 1
+                self._last_round_seconds = took + waited
+                self.combined_done += self.steps_this_round
+                self._log(
+                    f"[share] round {self.round_no}: MISSED ({self.steps_this_round}/{target} steps here, "
+                    f"waited {waited:.0f}s, streak {self._consecutive_missed}) - absorbing "
+                    f"{len(missed)} helper items here next round"
+                    + ("; training solo until the helper delivers a delta"
+                       if self._consecutive_missed >= SOLO_AFTER_MISSES else "")
+                )
+            else:
+                self._consecutive_missed = 0
+                self._owed = set()   # prior owed items had their absorption round
+                merged = merge(self._current_sd(), delta)
+                self._load_into_network(merged)
+                self._last_round_seconds = took + waited
+                helper_steps = int(meta.get("steps") or 0)
+                self.combined_done += self.steps_this_round + helper_steps
+                self._log(
+                    f"[share] round {self.round_no}: combined ({self.steps_this_round}/{target} steps here, "
+                    f"round {took:.0f}s, waited {waited:.0f}s)"
+                )
+                if (self.adaptive and self.steps_this_round and helper_steps
+                        and float(meta.get("seconds") or 0) > 0):
+                    # equal wall-clock per round needs the slower card on the
+                    # smaller share; re-measure every round, smoothed and banded
+                    t_lead = took / self.steps_this_round
+                    t_helper = float(meta["seconds"]) / helper_steps
+                    new_frac = next_frac(t_lead, t_helper, self.frac, self.frac_center)
+                    if abs(new_frac - self.frac) > 1e-4:
+                        self._log(
+                            f"[share] frac {self.frac:.3f} -> {new_frac:.3f} "
+                            f"(lead {t_lead:.2f} s/it, helper {t_helper:.2f} s/it)"
+                        )
+                    self.frac = new_frac
             self.prune_round(self.round_no)
-            self._last_round_seconds = took + waited
-            helper_steps = int(meta.get("steps") or 0)
-            self.combined_done += self.steps_this_round + helper_steps
-            self._log(
-                f"[share] round {self.round_no}: combined ({self.steps_this_round}/{target} steps here, "
-                f"round {took:.0f}s, waited {waited:.0f}s)"
-            )
-            if (self.adaptive and self.steps_this_round and helper_steps
-                    and float(meta.get("seconds") or 0) > 0):
-                # equal wall-clock per round needs the slower card on the
-                # smaller share; re-measure every round, smoothed and banded
-                t_lead = took / self.steps_this_round
-                t_helper = float(meta["seconds"]) / helper_steps
-                new_frac = next_frac(t_lead, t_helper, self.frac, self.frac_center)
-                if abs(new_frac - self.frac) > 1e-4:
-                    self._log(
-                        f"[share] frac {self.frac:.3f} -> {new_frac:.3f} "
-                        f"(lead {t_lead:.2f} s/it, helper {t_helper:.2f} s/it)"
-                    )
-                self.frac = new_frac
             if is_last_step:
                 self.write_final()
                 self.running = False

@@ -1454,6 +1454,13 @@ class ShareConfig:
         # banded to +/-0.15 of the configured frac; the helper takes its split
         # and LR from the lead's round job instead of its own config
         self.adaptive: bool = bool(kwargs.get('adaptive', False))
+        # catch_up: a round whose delta misses its deadline no longer kills the
+        # run -- the lead absorbs the helper's items into its own side of the
+        # next round. The lead's fixed step budget still governs the run's end
+        # (absorption displaces later lead-share rounds). After 3 consecutive
+        # misses it trains solo but keeps letting a returning helper rejoin.
+        # False restores the fail-fast behavior.
+        self.catch_up: bool = bool(kwargs.get('catch_up', True))
 
         if not self.enabled:
             return

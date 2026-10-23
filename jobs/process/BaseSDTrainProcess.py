@@ -3942,6 +3942,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # helpers carry 0 so it is skipped
             total_steps=0 if cfg.adaptive else self.train_config.steps,
             adaptive=cfg.adaptive,
+            catch_up=cfg.catch_up,
         )
         share.bind(self.network, optimizer)
         share.set_keys(keys)

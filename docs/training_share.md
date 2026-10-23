@@ -93,9 +93,12 @@ fork commit and identical dataset paths (slice 1 assumes one machine).
 6. Done when the lead writes `final.json`, the no-suffix `<name>.safetensors`
    completion marker appears, and the share dir contains only `final.json`.
 
-Failure behavior (slice 1): a delta/start that misses its deadline
-(`max(300s, 3x last round)` capped at `timeout_s`) raises and preserves the round
-dir. Mid-round resume is not supported — delete the share dir and restart both sides.
+Failure behavior: a delta/start that misses its deadline (`max(300s, 3x last
+round)` capped at `timeout_s`) is absorbed by catch-up (default on — see the
+roadmap section). Set `share.catch_up: false` to restore fail-fast. Mid-round
+resume is not supported — delete the share dir and restart both sides. Launch
+long-running sides as processes that outlive their spawning shell (a shell's
+orphan cleanup can silently kill a backgrounded trainer minutes in).
 
 ## Files
 
@@ -110,16 +113,26 @@ dir. Mid-round resume is not supported — delete the share dir and restart both
 
 **Adaptive frac — SHIPPED** (see Config above).
 
-**Helper catch-up / degrade-to-solo (slice 2, designed not built):** today a
-missed delta deadline kills the run. The design: on timeout the lead marks the
-round's helper-owned items as *owed*, folds them into its own side of the next
-round's filter (on top of its regular share, so every image still trains), and
-carries on; the helper's late delta is already ignored (round-number guard) and
-it rejoins at the next start. The lead needs loop-budget headroom for the extra
-steps (inflate like the adaptive helper, ×1.25). Systematic failure needs an
-escape: after N consecutive owed rounds the lead owes everything — which IS
-degrade-to-solo, the same mechanism with the whole dataset owed. Estimated ~80
-lines plus tests, all lead-side; the helper needs no changes.
+**Helper catch-up / degrade-to-solo — SHIPPED.** `share.catch_up` (default
+true): a round whose delta misses its deadline no longer kills the run. The
+lead marks the round's helper items as *owed*, folds them into its own side of
+the next round's filter, and publishes them as `excluded` in the job so the
+helper stays off them (nothing trains twice; a round that leaves the helper
+nothing posts a zero delta instead of tripping the degenerate-split guard).
+After 3 consecutive misses the lead trains solo WITHOUT sitting out further
+deadlines (round closes check for an already-present delta, so a slow-but-alive
+helper rejoins by delivering on time once). A transient miss is nearly
+lossless — validated live: the helper missed round 1 (still loading), the lead
+absorbed its 31 items (round target 25→37), the helper rejoined and round 2
+merged cleanly; a solo run with the helper dead from the start finished all
+150 steps with streak-3+ closes costing 0s of waiting.
+
+Two semantics to know: the lead's step budget is FIXED (the training loop's
+range is built once, so absorption displaces later lead-share rounds rather
+than extending the run — a dead-helper run finishes slightly under-trained
+instead of crashing), and repayment is statistical (owed items are served by
+the fetch filter over the next full pass — the same wrap-around looseness that
+exists in healthy rounds).
 
 **Cross-machine transport (slice 3, designed not built):** the file protocol is
 already transport-agnostic — an SMB/NFS mount of `share.dir` works as-is. The

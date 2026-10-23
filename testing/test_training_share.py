@@ -260,6 +260,7 @@ def test_helper_budget_funding_every_round_passes(tmp_path):
 
 def test_missing_delta_times_out(tmp_path):
     lead, _ = _states(tmp_path)
+    lead.catch_up = False   # fail-fast path (catch_up default absorbs instead)
     lead.timeout_s = 0.5
     lead.hook_begin()
     lead._begin_round(1)  # already begun; keep the round open
@@ -401,3 +402,111 @@ def test_fixed_frac_rejects_job_frac_drift(tmp_path):
     helper._waiting = True
     with pytest.raises(ShareProtocolError, match="frac mismatch"):
         helper.hook_step_top()
+
+
+# ------------------------------------------------------------------ catch-up
+
+
+def test_catch_up_absorbs_a_missed_round(tmp_path):
+    lead, _helper = _states(tmp_path)
+    lead.catch_up = True
+    lead.timeout_s = 0.3
+    lead.hook_begin()
+    for _ in range(lead.my_target_steps(1)):
+        lead.hook_end_of_step(0, False, False, False)
+    # the round closed on a miss instead of raising
+    assert lead.round_no == 2 and lead._consecutive_missed == 1
+    owed = split_for_round(42, 1, _keys(10), 0.4)
+    assert lead._owed == owed                       # the helper's round-1 items
+    # the next job excludes them so the helper stays off them
+    job2 = json.load(open(os.path.join(str(tmp_path / "share"), "round_000002", "job.json")))
+    assert job2["excluded"] == sorted(owed)
+    # and the lead's round-2 share grew to cover them
+    helper2 = split_for_round(42, 2, _keys(10), 0.4)
+    assert lead.my_target_steps(2) == 10 - len(helper2 - owed)
+    # owed items are lead-owned this round no matter where the redrawn split
+    # places them (and the helper, symmetrically, excludes them)
+    for k in owed:
+        assert lead.owns([k])
+
+
+def test_catch_up_disabled_still_raises(tmp_path):
+    lead, _helper = _states(tmp_path)
+    lead.catch_up = False
+    lead.timeout_s = 0.3
+    lead.hook_begin()
+    with pytest.raises(ShareTimeout):
+        for _ in range(lead.my_target_steps(1)):
+            lead.hook_end_of_step(0, False, False, False)
+
+
+def test_solo_streak_skips_the_deadline_and_rejoins_on_a_delta(tmp_path):
+    from safetensors.torch import save_file
+
+    lead, _helper = _states(tmp_path)
+    lead.catch_up = True
+    lead.timeout_s = 0.3
+    lead.hook_begin()
+    for _round in range(3):  # rounds 1-3 all miss
+        for _ in range(lead.my_target_steps(lead.round_no)):
+            lead.hook_end_of_step(0, False, False, False)
+    assert lead._consecutive_missed == 3
+    # the 4th miss must not sit out a deadline: close is immediate
+    lead.timeout_s = 9999.0
+    t0 = time.time()
+    for _ in range(lead.my_target_steps(lead.round_no)):
+        lead.hook_end_of_step(0, False, False, False)
+    assert time.time() - t0 < 2.0
+    assert lead._consecutive_missed == 4
+    # a delta that shows up is consumed and the streak resets
+    rd = os.path.join(str(tmp_path / "share"), f"round_{lead.round_no:06d}")
+    save_file(
+        {k: torch.zeros_like(v) for k, v in lead._start_sd.items()},
+        os.path.join(rd, "delta.safetensors"),
+        metadata={"round": str(lead.round_no), "steps": "4", "seconds": "10"},
+    )
+    for _ in range(lead.my_target_steps(lead.round_no)):
+        lead.hook_end_of_step(0, False, False, False)
+    assert lead._consecutive_missed == 0 and not lead._owed
+
+
+def test_helper_excludes_owed_items_and_zero_deltas_an_empty_round(tmp_path):
+    from safetensors.torch import save_file
+
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+    keys = _keys(10)
+    excluded = sorted(split_for_round(42, 2, keys, 0.4))  # everything the helper would own
+    rd = os.path.join(str(tmp_path / "share"), "round_000002")
+    os.makedirs(rd)
+    save_file(lead._current_sd(), os.path.join(rd, "start.safetensors"))
+    with open(os.path.join(rd, "job.json"), "w") as f:
+        json.dump({"round": 2, "frac": 0.4, "seed": 42, "n_items": 10, "steps": 0,
+                   "adaptive": False, "excluded": excluded}, f)
+    helper._begin_round(2)
+    helper._waiting = True
+    # partial exclusion shrinks the share and flips ownership of excluded items
+    helper._excluded = {excluded[0]}
+    assert not helper.owns([excluded[0]])
+    assert helper.my_target_steps(2) == len(split_for_round(42, 2, keys, 0.4)) - 1
+    helper._excluded = set(excluded)
+    # round 3 will never come in this test: final.json releases the helper's
+    # wait after it posts round 2's zero delta
+    with open(os.path.join(str(tmp_path / "share"), "final.json"), "w") as f:
+        json.dump({"launch": "x"}, f)
+    helper.hook_step_top()
+    # nothing to train: a zero delta is posted and the helper moved on
+    assert helper.round_no == 3 and helper.stop_loop and not helper.running
+    assert os.path.exists(os.path.join(rd, "delta.safetensors"))
+
+
+def test_write_delta_recreates_a_pruned_round_dir(tmp_path):
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+    import shutil
+
+    shutil.rmtree(os.path.join(str(tmp_path / "share"), "round_000001"), ignore_errors=True)
+    helper.write_delta(1, compute_delta(helper._current_sd(), helper._start_sd))
+    assert os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001", "delta.safetensors"))
