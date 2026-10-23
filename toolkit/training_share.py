@@ -155,15 +155,42 @@ def _read_json(path: str) -> dict:
         return json.load(f)
 
 
-def _save_sd(path: str, sd: Dict[str, "torch.Tensor"]) -> None:
+def _save_sd(path: str, sd: Dict[str, "torch.Tensor"], metadata: Optional[dict] = None) -> None:
     from safetensors.torch import save_file
 
-    save_file({k: v.contiguous() for k, v in sd.items()}, path + ".tmp")
+    meta = {k: str(v) for k, v in (metadata or {}).items()}
+    save_file({k: v.contiguous() for k, v in sd.items()}, path + ".tmp", metadata=meta)
     _replace(path)
 
 
 def _load_sd(path: str) -> Dict[str, "torch.Tensor"]:
     from safetensors.torch import load_file
+
+    return load_file(path)
+
+
+def _load_meta(path: str) -> dict:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        return dict(f.metadata() or {})
+
+
+def next_frac(t_lead: float, t_helper: float, current: float, center: float,
+              band: float = 0.15, smooth: float = 0.5) -> float:
+    """Adaptive share: the helper's fraction for the next round.
+
+    ``t_*`` are per-step times; equal wall-clock per round needs
+    n/L = t_lead/t_helper, i.e. frac = t_lead / (t_lead + t_helper) -- the
+    SLOWER card gets the SMALLER share. Smoothed toward the measurement and
+    clamped to a band around the configured center so plan budgets stay
+    meaningful.
+    """
+    if t_lead <= 0 or t_helper <= 0:
+        return current
+    raw = t_lead / (t_lead + t_helper)
+    smoothed = (1.0 - smooth) * current + smooth * raw
+    return min(max(smoothed, center - band, 0.25), center + band, 0.75)
 
     return load_file(path)
 
@@ -199,13 +226,15 @@ class ShareState:
     def __init__(
         self, role: str, share_dir: str, frac: float, seed: int, launch_id: str,
         timeout_s: float = 900.0, log: Callable[[str], None] = print,
-        total_steps: int = 0,
+        total_steps: int = 0, adaptive: bool = False, frac_center: Optional[float] = None,
     ):
         if role not in ("lead", "helper"):
             raise ValueError(f"share role must be 'lead' or 'helper', got {role!r}")
         self.role = role
         self.share_dir = share_dir
-        self.frac = float(frac)
+        self.frac = float(frac)                 # current round's helper share
+        self.frac_center = float(frac_center if frac_center is not None else frac)
+        self.adaptive = bool(adaptive)
         self.seed = int(seed)
         self.launch_id = str(launch_id)
         self.timeout_s = float(timeout_s)
@@ -223,13 +252,18 @@ class ShareState:
         self._start_sd: Optional[dict] = None   # this side's round-start snapshot
         self._helper_keys_cache: Optional[Set[str]] = None
         self._cache_round = -1
+        self._cache_frac = -1.0
         self._network = None
+        self._optimizer = None
         self._waiting = False
+        self._budget_checked = False
+        self.combined_done = 0                 # images trained across both sides
 
     # ------------------------------------------------------------------ setup
 
-    def bind(self, network) -> None:
+    def bind(self, network, optimizer=None) -> None:
         self._network = network
+        self._optimizer = optimizer
 
     def set_keys(self, keys: Iterable[str]) -> None:
         self.keys = sorted({str(k) for k in keys})
@@ -237,9 +271,11 @@ class ShareState:
     # ------------------------------------------------------------------ split
 
     def helper_keys(self, round_no: int) -> Set[str]:
-        if self._helper_keys_cache is None or round_no != self._cache_round:
+        if (self._helper_keys_cache is None or round_no != self._cache_round
+                or self.frac != self._cache_frac):
             self._helper_keys_cache = split_for_round(self.seed, round_no, self.keys, self.frac)
             self._cache_round = round_no
+            self._cache_frac = self.frac
         return self._helper_keys_cache
 
     def owns(self, paths: Iterable[str]) -> bool:
@@ -269,13 +305,21 @@ class ShareState:
             )
         os.makedirs(rd, exist_ok=True)
         _save_sd(os.path.join(rd, START_FILE), start_sd)
-        _write_json(os.path.join(rd, JOB_FILE), {
+        job = {
             "round": int(round_no), "frac": self.frac, "seed": self.seed,
             "launch": self.launch_id, "n_items": len(self.keys),
-            "steps": self.total_steps,
-        })
+            "steps": self.total_steps, "adaptive": self.adaptive,
+            "combined": self.combined_done,
+        }
+        if self.adaptive and self._optimizer is not None:
+            # per-round LR handoff: the helper holds the lead's rate for the
+            # round instead of stepping its own schedule (whose step count no
+            # longer tracks plan when frac adapts)
+            job["lrs"] = [float(g["lr"]) for g in self._optimizer.param_groups]
+        _write_json(os.path.join(rd, JOB_FILE), job)
 
-    def wait_delta(self, round_no: int) -> Dict:
+    def wait_delta(self, round_no: int):
+        """The helper's delta plus its metadata dict ({steps, seconds})."""
         path = os.path.join(round_dir(self.share_dir, round_no), DELTA_FILE)
         if not wait_for_file(path, self.deadline_s(), on_wait=lambda: self._log(
             f"[share] round {round_no}: waiting for the helper's delta"
@@ -287,17 +331,24 @@ class ShareState:
         job = _read_json(os.path.join(round_dir(self.share_dir, round_no), JOB_FILE))
         if int(job.get("round", -1)) != int(round_no):
             raise ShareProtocolError(f"[share] round {round_no}: job.json is from another round: {job}")
-        return _load_sd(path)
+        meta = _load_meta(path)
+        meta = {k: (float(v) if k in ("steps", "seconds") else v) for k, v in meta.items()}
+        return _load_sd(path), meta
 
-    def write_delta(self, round_no: int, delta: Dict) -> None:
-        _save_sd(os.path.join(round_dir(self.share_dir, round_no), DELTA_FILE), delta)
+    def write_delta(self, round_no: int, delta: Dict, seconds: float = 0.0) -> None:
+        _save_sd(
+            os.path.join(round_dir(self.share_dir, round_no), DELTA_FILE), delta,
+            metadata={"round": int(round_no), "steps": int(self.steps_this_round), "seconds": round(seconds, 1)},
+        )
 
-    def wait_start(self, round_no: int) -> Optional[Dict]:
-        """Block for the lead's round start. Returns the state dict, or None when the lead finished.
+    def wait_start(self, round_no: int):
+        """Block for the lead's round start. Returns (state_dict, job), or (None, None) when the lead finished.
 
-        ``final.json`` is watched for while waiting, so a helper that still has
-        step budget left is released promptly when the lead finishes instead of
-        sitting out its whole deadline.
+        Under adaptive sharing the helper ADOPTS the round's frac (and the
+        lead's LRs) from the job file; the config frac is only the round-1
+        value. ``final.json`` is watched for while waiting, so a helper that
+        still has step budget left is released promptly when the lead
+        finishes instead of sitting out its whole deadline.
         """
         job_path = os.path.join(round_dir(self.share_dir, round_no), JOB_FILE)
         final_path = os.path.join(self.share_dir, FINAL_FILE)
@@ -313,26 +364,43 @@ class ShareState:
                         f"[share] dataset mismatch: the lead trains {job.get('n_items')} items, "
                         f"this side sees {len(self.keys)}"
                     )
-                if abs(float(job.get("frac", self.frac)) - self.frac) > 1e-9 or int(job.get("seed", self.seed)) != self.seed:
-                    raise ShareProtocolError(f"[share] frac/seed mismatch with the lead: {job}")
-                lead_steps = int(job.get("steps") or 0)
-                if self.total_steps and lead_steps:
-                    # the helper must outlive every lead round: rounds x its share.
-                    # A helper that runs out first leaves the lead waiting on a
-                    # delta that can never arrive (it just times out later).
-                    n = len(self.helper_keys(1))
-                    lead_share = max(len(self.keys) - n, 1)
-                    rounds_needed = -(-lead_steps // lead_share)  # ceil
-                    needed = rounds_needed * n
-                    if self.total_steps < needed:
-                        raise ShareProtocolError(
-                            f"[share] helper budget too small: the lead's {lead_steps} steps at "
-                            f"{lead_share}/round need {rounds_needed} rounds x {n} helper steps = {needed}; "
-                            f"this helper has {self.total_steps}. Set helper train.steps to {needed}."
-                        )
-                return _load_sd(os.path.join(round_dir(self.share_dir, round_no), START_FILE))
+                if int(job.get("seed", self.seed)) != self.seed:
+                    raise ShareProtocolError(f"[share] seed mismatch with the lead: {job}")
+                job_frac = float(job.get("frac", self.frac))
+                if self.adaptive:
+                    if not 0.0 < job_frac < 1.0:
+                        raise ShareProtocolError(f"[share] round {round_no}: bad adaptive frac in job: {job}")
+                    self.frac = job_frac
+                elif abs(job_frac - self.frac) > 1e-9:
+                    raise ShareProtocolError(f"[share] frac mismatch with the lead: {job}")
+                if not self._budget_checked:
+                    lead_steps = int(job.get("steps") or 0)
+                    if self.total_steps and lead_steps and not self.adaptive:
+                        # the helper must outlive every lead round: rounds x its share.
+                        # A helper that runs out first leaves the lead waiting on a
+                        # delta that can never arrive (it just times out later).
+                        # (adaptive runs skip this: the helper's loop budget is
+                        # inflated by the trainer and it stops on final.json)
+                        n = len(self.helper_keys(1))
+                        lead_share = max(len(self.keys) - n, 1)
+                        rounds_needed = -(-lead_steps // lead_share)  # ceil
+                        needed = rounds_needed * n
+                        if self.total_steps < needed:
+                            raise ShareProtocolError(
+                                f"[share] helper budget too small: the lead's {lead_steps} steps at "
+                                f"{lead_share}/round need {rounds_needed} rounds x {n} helper steps = {needed}; "
+                                f"this helper has {self.total_steps}. Set helper train.steps to {needed}."
+                            )
+                    self._budget_checked = True
+                lrs = job.get("lrs") if self.adaptive else None
+                if lrs and self._optimizer is not None:
+                    groups = self._optimizer.param_groups
+                    if len(lrs) == len(groups):
+                        for g, lr in zip(groups, lrs):
+                            g["lr"] = float(lr)
+                return _load_sd(os.path.join(round_dir(self.share_dir, round_no), START_FILE)), job
             if os.path.exists(final_path):
-                return None
+                return None, None
             if time.time() >= deadline:
                 raise ShareTimeout(
                     f"[share] round {round_no}: no start from the lead within {self.deadline_s():.0f}s"
@@ -389,7 +457,7 @@ class ShareState:
             self.running = True
             self._log(f"[share] round 1: lead with {len(self.keys)} items, helper share {self.frac:.0%}")
         else:
-            start = self.wait_start(1)
+            start, _job = self.wait_start(1)
             if start is None:
                 raise ShareProtocolError("[share] the lead finished before round 1 started")
             self._load_into_network(start)
@@ -404,7 +472,7 @@ class ShareState:
             return
         if not self._waiting:
             return
-        start = self.wait_start(self.round_no)
+        start, _job = self.wait_start(self.round_no)
         if start is None:
             self._log("[share] the lead finished; stopping")
             self.running = False
@@ -444,16 +512,31 @@ class ShareState:
         took = time.time() - (self._round_t0 or time.time())
         if self.role == "lead":
             t_wait0 = time.time()
-            delta = self.wait_delta(self.round_no)
+            delta, meta = self.wait_delta(self.round_no)
             waited = time.time() - t_wait0
             merged = merge(self._current_sd(), delta)
             self._load_into_network(merged)
             self.prune_round(self.round_no)
             self._last_round_seconds = took + waited
+            helper_steps = int(meta.get("steps") or 0)
+            self.combined_done += self.steps_this_round + helper_steps
             self._log(
                 f"[share] round {self.round_no}: combined ({self.steps_this_round}/{target} steps here, "
                 f"round {took:.0f}s, waited {waited:.0f}s)"
             )
+            if (self.adaptive and self.steps_this_round and helper_steps
+                    and float(meta.get("seconds") or 0) > 0):
+                # equal wall-clock per round needs the slower card on the
+                # smaller share; re-measure every round, smoothed and banded
+                t_lead = took / self.steps_this_round
+                t_helper = float(meta["seconds"]) / helper_steps
+                new_frac = next_frac(t_lead, t_helper, self.frac, self.frac_center)
+                if abs(new_frac - self.frac) > 1e-4:
+                    self._log(
+                        f"[share] frac {self.frac:.3f} -> {new_frac:.3f} "
+                        f"(lead {t_lead:.2f} s/it, helper {t_helper:.2f} s/it)"
+                    )
+                self.frac = new_frac
             if is_last_step:
                 self.write_final()
                 self.running = False
@@ -464,7 +547,7 @@ class ShareState:
         else:
             if not self.delta_written:
                 delta = compute_delta(self._current_sd(), self._start_sd)
-                self.write_delta(self.round_no, delta)
+                self.write_delta(self.round_no, delta, seconds=took)
                 self.delta_written = True
                 self._last_round_seconds = took
             if is_last_step:

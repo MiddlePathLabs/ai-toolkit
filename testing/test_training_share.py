@@ -1,4 +1,6 @@
+import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,8 +11,10 @@ from toolkit.training_share import (
     ShareProtocolError,
     ShareState,
     ShareTimeout,
+    _load_meta,
     compute_delta,
     merge,
+    next_frac,
     split_for_round,
     state_dict_fp32,
     validate_share_setup,
@@ -318,3 +322,82 @@ def test_validate_share_setup_rejects_incompatible_recipes():
     # the golden recipe's shape passes, and None/off is a no-op
     validate_share_setup(_share_cfg(), TrainConfig(batch_size=1, gradient_accumulation=1), has_reg_datasets=False, n_items=26)
     validate_share_setup(None, TrainConfig(batch_size=4), has_reg_datasets=True)
+
+
+# ------------------------------------------------------------------ adaptive
+
+
+def test_next_frac_gives_the_slower_card_the_smaller_share():
+    # helper 2x slower per step -> helper share shrinks toward t_lead/(t_l+t_h)
+    f = next_frac(t_lead=1.0, t_helper=2.0, current=0.5, center=0.5)
+    assert f == pytest.approx(0.5 * 0.5 + 0.5 * (1.0 / 3.0))  # smoothed toward 0.333
+    # repeated application converges into the band, never beyond it
+    frac = 0.5
+    for _ in range(50):
+        frac = next_frac(1.0, 4.0, frac, 0.5)
+    assert frac == pytest.approx(0.35, abs=0.01)  # band floor = 0.5 - 0.15
+    # lead slower -> helper share grows, clamped to the band ceiling
+    frac = 0.5
+    for _ in range(50):
+        frac = next_frac(4.0, 1.0, frac, 0.5)
+    assert frac == pytest.approx(0.65, abs=0.01)
+    # degenerate timings leave the share alone
+    assert next_frac(0.0, 2.0, 0.5, 0.5) == 0.5
+    assert next_frac(1.0, 0.0, 0.5, 0.5) == 0.5
+
+
+def test_adaptive_roundtrip_over_files(tmp_path):
+    # helper reports steps/seconds in delta metadata; lead adapts frac and
+    # publishes it (plus its LRs) in the next round's job; helper adopts both
+    lead = ShareState("lead", str(tmp_path / "s"), 0.5, 42, "l", log=lambda m: None, adaptive=True)
+    helper = ShareState("helper", str(tmp_path / "s"), 0.5, 42, "l", log=lambda m: None, adaptive=True)
+    for st in (lead, helper):
+        st.set_keys(_keys(10))
+    fake_opt = torch.optim.SGD(torch.nn.Linear(4, 4).parameters(), lr=0.1)
+    lead.bind(_net(1), fake_opt)
+    helper.bind(_net(2), torch.optim.SGD(torch.nn.Linear(4, 4).parameters(), lr=0.9))
+
+    lead.hook_begin()
+    helper.hook_begin()
+    assert helper._optimizer.param_groups[0]["lr"] == pytest.approx(0.1)  # lead's round-1 LR adopted
+
+    # round 1: helper "trains" slowly relative to the lead
+    with torch.no_grad():
+        helper._network.weight += 0.5
+    helper._round_t0 = time.time() - 4.0  # pretend the round took 4s
+    for _ in range(helper.my_target_steps(1)):
+        helper.hook_end_of_step(0, False, False, False)
+    delta_meta = _load_meta(os.path.join(str(tmp_path / "s"), "round_000001", "delta.safetensors"))
+    assert int(delta_meta["steps"]) == 5 and float(delta_meta["seconds"]) >= 3.9
+
+    lead._round_t0 = time.time() - 1.0  # the lead's same round took 1s
+    for _ in range(lead.my_target_steps(1) - 1):
+        lead.hook_end_of_step(0, False, False, False)
+    lead.hook_end_of_step(0, False, False, False)
+    assert lead.round_no == 2
+    assert lead.frac < 0.5  # helper slower (4s for 5 steps vs 1s for 5) -> smaller helper share
+    job2 = json.load(open(os.path.join(str(tmp_path / "s"), "round_000002", "job.json")))
+    assert abs(job2["frac"] - lead.frac) < 1e-9 and job2["adaptive"] is True
+    assert isinstance(job2["lrs"], list) and len(job2["lrs"]) == len(fake_opt.param_groups)
+
+    helper.hook_step_top()
+    assert helper.frac == pytest.approx(lead.frac)
+    assert helper._optimizer.param_groups[0]["lr"] == pytest.approx(job2["lrs"][0])
+    # the helper's round-2 target moved with the adopted frac
+    assert helper.my_target_steps(2) == len(split_for_round(42, 2, _keys(10), helper.frac))
+
+
+def test_fixed_frac_rejects_job_frac_drift(tmp_path):
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+    # a job frac that differs from this side's config is a protocol error
+    # unless adaptive is on
+    job_path = os.path.join(str(tmp_path / "share"), "round_000002", "job.json")
+    os.makedirs(os.path.dirname(job_path))
+    with open(job_path, "w") as f:
+        json.dump({"round": 2, "frac": 0.9, "seed": 42, "n_items": len(_keys(10)), "steps": 0}, f)
+    helper._begin_round(2)
+    helper._waiting = True
+    with pytest.raises(ShareProtocolError, match="frac mismatch"):
+        helper.hook_step_top()

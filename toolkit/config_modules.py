@@ -1449,6 +1449,11 @@ class ShareConfig:
         self.frac: float = float(kwargs.get('frac', 0.5))
         self.seed: int = int(kwargs.get('seed', 42))
         self.timeout_s: float = float(kwargs.get('timeout_s', 900.0))
+        # adaptive: the lead re-measures both sides' per-step time each round and
+        # moves frac toward equal wall-clock (slower card -> smaller share),
+        # banded to +/-0.15 of the configured frac; the helper takes its split
+        # and LR from the lead's round job instead of its own config
+        self.adaptive: bool = bool(kwargs.get('adaptive', False))
 
         if not self.enabled:
             return

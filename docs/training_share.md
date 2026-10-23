@@ -60,8 +60,21 @@ Process-level `share` block (both configs, same `dir`/`frac`/`seed`):
 
 ```json
 "share": {"enabled": true, "role": "lead", "dir": "<workspace>/share_run",
-           "frac": 0.5535714285714286, "seed": 42, "timeout_s": 900}
+           "frac": 0.5535714285714286, "seed": 42, "timeout_s": 900,
+           "adaptive": false}
 ```
+
+`adaptive: true` (lead and helper both): the lead measures both sides' per-step
+time each round (the helper reports steps/seconds in its delta metadata) and
+moves `frac` toward equal wall-clock — the slower card gets the smaller share —
+smoothed 50% and banded to ±0.15 of the configured value. The helper then takes
+its split AND its learning rate from the lead's round job (per-round LR handoff,
+Fizgig-style) instead of its own scheduler, and its loop budget is auto-doubled
+(it stops on `final.json`). Fixed-frac runs are unchanged.
+
+Adaptive on this box (PRO 6000 lead + 5090 helper): round 1 measured 2.21 vs
+2.77 s/it, frac settled at ~0.50 within two rounds, and the lead's per-round
+idle wait fell from 10–25s to ~2s.
 
 Required (fail-fast at startup): `train.batch_size 1`, `train.gradient_accumulation 1`,
 EMA off, no `datasets_reg`, at least 4 dataset items, both processes on the same
@@ -93,9 +106,39 @@ dir. Mid-round resume is not supported — delete the share dir and restart both
 - `testing/test_training_share.py` — CPU unit tests
 - Workspace configs: `<workspace>/KREA_EXP_SHARE_{SOLO,LEAD,HELPER,SMOKE_*}.json`
 
-## Deferred (slice 2+)
+## Deferred roadmap
 
-Helper-failure catch-up (lead re-trains the helper's items), degrade-to-solo,
-adaptive frac from measured round times, cross-machine transport (cache keys
-embed absolute model paths — a second machine re-encodes once; Fizgig's
-token-trimmed text-cache transfer), previews on the helper, move-a-run.
+**Adaptive frac — SHIPPED** (see Config above).
+
+**Helper catch-up / degrade-to-solo (slice 2, designed not built):** today a
+missed delta deadline kills the run. The design: on timeout the lead marks the
+round's helper-owned items as *owed*, folds them into its own side of the next
+round's filter (on top of its regular share, so every image still trains), and
+carries on; the helper's late delta is already ignored (round-number guard) and
+it rejoins at the next start. The lead needs loop-budget headroom for the extra
+steps (inflate like the adaptive helper, ×1.25). Systematic failure needs an
+escape: after N consecutive owed rounds the lead owes everything — which IS
+degrade-to-solo, the same mechanism with the whole dataset owed. Estimated ~80
+lines plus tests, all lead-side; the helper needs no changes.
+
+**Cross-machine transport (slice 3, designed not built):** the file protocol is
+already transport-agnostic — an SMB/NFS mount of `share.dir` works as-is. The
+gaps, in order of importance:
+1. *Model parity check* — add the DiT/VAE/TE file hashes to round-1 job.json;
+   the helper refuses on mismatch (a different build trains a different loss
+   landscape; merges would be meaningless). Small, high value.
+2. *Split-key normalization* — splits key on absolute dataset paths, so both
+   machines must mount the dataset at the same path (works today via drive
+   mapping); a `share.key_mode: relpath` option (relative path + size) removes
+   the constraint if it ever annoys.
+3. *Cache parity* — cache files are content-addressed but their KEYS embed
+   absolute model paths, so a second machine re-encodes the dataset once into
+   its own cache (correct, just slower). Shipping the lead's cache needs a
+   path-rekey tool; Fizgig instead trims Krea-2 text caches to each caption's
+   real tokens (~1/8 size) for transfer.
+4. *Bandwidth* — per round moves ~2× the LoRA in fp32; on slow links add a
+   `transport_dtype: bf16` knob (halves bytes, rounding-level effect — Fizgig
+   does this under ~160 Mb/s) and raise `timeout_s`.
+
+**Previews on the helper / move-a-run:** not assessed in depth; both are
+Fizgig-proven patterns that would build on the same round-file protocol.

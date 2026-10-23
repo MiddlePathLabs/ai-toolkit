@@ -3847,7 +3847,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # make sure all params require grad
         self.ensure_params_requires_grad(force=True)
 
-        self._share = self._share_setup(dataloader)
+        self._share = self._share_setup(dataloader, optimizer)
 
 
         ###################################################################
@@ -3905,7 +3905,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
         self.done_hook()
 
-    def _share_setup(self, dataloader):
+    def _share_setup(self, dataloader, optimizer):
         """Build the training-share state from the process config (None when off).
 
         Lead: refuse a stale share dir, snapshot the current LoRA, open round 1.
@@ -3921,12 +3921,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not keys:
             raise ValueError("training share: no dataset items found to split")
         validate_share_setup(cfg, self.train_config, self.datasets_reg is not None, n_items=len(keys))
+        if cfg.adaptive and cfg.role == 'helper':
+            # adaptive: the helper's actual step total drifts with frac (banded
+            # to +/-0.15), so its loop budget gets headroom and it stops on the
+            # lead's final.json; its LR comes from the lead's round job, so its
+            # own scheduler is neutralized (the scheduler was already built
+            # with the planned total, which the loop budget must not change)
+            planned = self.train_config.steps
+            self.train_config.steps = planned * 2
+            self.lr_scheduler = None
+            print_acc(
+                f"[share] adaptive helper: loop budget {planned} -> {planned * 2} steps "
+                f"(LR from the lead each round; stops on final.json)"
+            )
         share = ShareState(
             cfg.role, cfg.dir, cfg.frac, cfg.seed,
             launch_id=f"{os.getpid()}_{int(time.time())}",
             timeout_s=cfg.timeout_s, log=print_acc,
-            total_steps=self.train_config.steps,
+            # the handshake budget check is a fixed-frac concept; adaptive
+            # helpers carry 0 so it is skipped
+            total_steps=0 if cfg.adaptive else self.train_config.steps,
+            adaptive=cfg.adaptive,
         )
+        share.bind(self.network, optimizer)
         share.set_keys(keys)
         share.bind(self.network)
         if cfg.role == 'lead':
