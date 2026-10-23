@@ -230,6 +230,7 @@ class BaseModel:
         
         # set true for models that encode control image into text embeddings
         self.encode_control_in_text_embeddings = False
+        self.encode_control_in_negative_prompt = True
         # control files may be VIDEOS (cached like dataset items, exposed on
         # the batch as control_video_latents_list); see minimax_h3 ref2va
         self.supports_video_control_images = False
@@ -780,7 +781,7 @@ class BaseModel:
                                 gen_config.negative_prompt,
                                 gen_config.negative_prompt_2,
                                 force_all=True,
-                                control_images=ctrl_img,
+                                control_images=ctrl_img if self.encode_control_in_negative_prompt else None,
                                 target_size=(gen_config.width, gen_config.height),
                             )
                             if isinstance(self.adapter, CustomAdapter):

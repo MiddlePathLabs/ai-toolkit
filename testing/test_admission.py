@@ -209,6 +209,66 @@ def test_dopsd_static_variant_and_batch_rules():
     assert RULE_DOPSD_BATCH in ids
 
 
+@pytest.mark.parametrize("arch,model_kwargs", [
+    ("minimax_h3_omni", {}),
+    ("minimax_h3_ref2va", {}),
+    ("minimax_h3", {"partition": "ref2va"}),
+    ("minimax_h3", {"partition": "ref2va_pruned"}),
+])
+def test_dopsd_ref2va_variants_are_admitted(arch, model_kwargs):
+    process = _process(model={
+        "name_or_path": "base",
+        "arch": arch,
+        "model_kwargs": {"dopsd": True, **model_kwargs},
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert result["valid"], result["diagnostics"]
+    assert RULE_DOPSD_VARIANT not in _ids(result)
+
+
+def test_omni_assistant_adapter_and_dopsd_are_admitted_together():
+    process = _process(model={
+        "name_or_path": "FastVideo/FastH3-Omni-Comfy",
+        "arch": "minimax_h3_omni",
+        "assistant_lora_path": "ostris/minimax_h3_training_adapter/fastvideo_fasth3_omni_training_adapter_v1.safetensors",
+        "model_kwargs": {"dopsd": True},
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert result["valid"], result["diagnostics"]
+
+
+@pytest.mark.parametrize("arch,model_kwargs", [
+    ("minimax_h3", {}),
+    ("minimax_h3", {"partition": "t2v"}),
+    ("minimax_h3_vsa", {}),
+    ("sdxl", {"partition": "ref2va"}),
+])
+def test_dopsd_unsupported_architectures_and_partitions_stay_rejected(arch, model_kwargs):
+    process = _process(model={
+        "name_or_path": "base",
+        "arch": arch,
+        "model_kwargs": {"dopsd": True, **model_kwargs},
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert not result["valid"]
+    assert RULE_DOPSD_VARIANT in _ids(result)
+
+
+@pytest.mark.parametrize("options", [
+    {"dopsd_ref_mode": "unknown"},
+    {"dopsd_group_by": "class"},
+])
+def test_omni_dopsd_still_rejects_invalid_modes(options):
+    process = _process(model={
+        "name_or_path": "base",
+        "arch": "minimax_h3_omni",
+        "model_kwargs": {"dopsd": True, **options},
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    assert not result["valid"]
+    assert RULE_DOPSD_VARIANT in _ids(result)
+
+
 def test_krea_conflicts_cache_augmentation_low_vram_and_vae_anchor():
     process = {
         "model": {"name_or_path": "krea", "arch": "krea2", "low_vram": True},

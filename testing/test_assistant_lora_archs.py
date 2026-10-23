@@ -20,6 +20,7 @@ ACCEPTED = [
     "flux",
     "flex1",
     "minimax_h3",
+    "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",
     "qwen_image_2",
@@ -77,5 +78,6 @@ def test_every_ui_adapter_default_is_allowed():
         if re.search(r'"config\.process\[0\]\.model\.assistant_lora_path": \[\s*"', block):
             defaults.append(name)
     assert "zimage:turbo" in defaults and "ming_image" in defaults
+    assert "minimax_h3_omni" in defaults
     for name in defaults:
         assert name.split(":")[0] in ASSISTANT_LORA_ARCHS, name

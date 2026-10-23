@@ -955,7 +955,7 @@ class SDTrainer(BaseSDTrainProcess):
                     ).to('cpu')
                     negative = self.sd.encode_prompt(
                         gen_img_config.negative_prompt,
-                        control_images=ctrl_img,
+                        control_images=ctrl_img if self.sd.encode_control_in_negative_prompt else None,
                         target_size=target_size,
                     ).to('cpu')
                 else:

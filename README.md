@@ -323,6 +323,11 @@ train:
 - [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
 - [microsoft/Mage-Flow-Edit-Base](https://huggingface.co/microsoft/Mage-Flow-Edit-Base) (Mage-Flow Edit)
 
+#### Edit and Omni training notes
+
+- FastH3 Omni (`model.arch: minimax_h3_omni`) accepts its training adapter through `assistant_lora_path` and supports Ref2VA D-OPSD training through `model.model_kwargs.dopsd`.
+- Fibo 2.0 edit training supports multiple samples with `train.do_cfg`: each sample's encoded reference latents condition both CFG branches. Preview negative prompts remain text-only, with or without `train.cache_text_embeddings`; reference latents still condition both branches.
+
 ### Video
 - [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (Wan 2.1 1.3B)
 - [Wan-AI/Wan2.1-I2V-14B-480P-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers) (Wan 2.1 I2V 14B-480P)

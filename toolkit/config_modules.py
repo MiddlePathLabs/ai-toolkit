@@ -20,6 +20,7 @@ SaveFormat = Literal['safetensors', 'diffusers']
 ASSISTANT_LORA_ARCHS = (
     "flux",
     "minimax_h3",
+    "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",
     "qwen_image_2",

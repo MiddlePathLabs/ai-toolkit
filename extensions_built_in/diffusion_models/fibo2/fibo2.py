@@ -86,6 +86,7 @@ class Fibo2Model(BaseModel):
         )
         # edit when the dataset has control images, text-to-image otherwise
         self.encode_control_in_text_embeddings = True
+        self.encode_control_in_negative_prompt = False
         self.has_multiple_control_images = True
         # references are sized in prepare_references, identically for the
         # cached prompt and the training latents
@@ -229,12 +230,6 @@ class Fibo2Model(BaseModel):
                 self.match_target_res,
             )
             ref_latents = self._encode_crops(crops)
-            # the vendor's negative is text only (the references still
-            # condition both passes); the sampler encoded it with them
-            if gen_config.negative_prompt.strip() and self.sample_prompts_cache is None:
-                unconditional_embeds = self.get_prompt_embeds(
-                    gen_config.negative_prompt
-                )
 
         result = pipeline(
             conditional_embeds=conditional_embeds,
@@ -315,11 +310,17 @@ class Fibo2Model(BaseModel):
             control = batch.control_tensor
         if control is None:
             return None
+        reference_batch_size = len(batch.file_items)
+        if batch_size not in (reference_batch_size, 2 * reference_batch_size):
+            raise ValueError(
+                f"got {batch_size} latent samples for {reference_batch_size} reference sets; "
+                "expected the original batch size or twice that size for CFG"
+            )
         samples = [
             self._encode_crops(
                 prepare_references(images, target_size, self.match_target_res)
             )
-            for images in self._normalize_control_images(control, batch_size)
+            for images in self._normalize_control_images(control, reference_batch_size)
         ]
         if not any(samples):
             return None
@@ -329,7 +330,11 @@ class Fibo2Model(BaseModel):
                 "every sample in a batch needs the same number and size of references; "
                 f"got {sorted(shapes)}. Use match_target_res or batch size 1."
             )
-        return [torch.cat(refs, 0) for refs in zip(*samples)]
+        ref_latents = [torch.cat(refs, 0) for refs in zip(*samples)]
+        if batch_size == 2 * reference_batch_size:
+            # BaseModel.predict_noise orders unconditional, then conditional samples.
+            ref_latents = [torch.cat([refs, refs], 0) for refs in ref_latents]
+        return ref_latents
 
     # ------------------------------------------------------------------
     # Training hooks

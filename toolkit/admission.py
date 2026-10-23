@@ -82,6 +82,7 @@ RULE_IDENTITY_ISOLATION = "admission.identity_isolation"
 _ASSISTANT_LORA_ARCHS = frozenset({
     "flux",
     "minimax_h3",
+    "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",
     "qwen_image_2",
@@ -950,13 +951,13 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             "Enable D-OPSD on a supported Ref2VA model, or set dopsd_ref_mode: self and dopsd_identity_first: false.",
         )
     if dopsd:
-        ref_role = "ref2va" in base or "ref2va" in variant or str(model_kwargs.get("partition", "")).lower().startswith("ref2va")
+        ref_role = base == "minimax_h3_omni" or "ref2va" in base or "ref2va" in variant or str(model_kwargs.get("partition", "")).lower().startswith("ref2va")
         if not h3 or not ref_role:
             collector.add(
                 RULE_DOPSD_VARIANT,
                 [f"{p}.model.model_kwargs.dopsd", f"{p}.model.arch", f"{p}.model.model_kwargs.partition"],
-                "D-OPSD requires a MiniMax-H3 Ref2VA/Ref2VA-partition model with one loaded DiT.",
-                "Use model.arch minimax_h3_ref2va (or partition ref2va/ref2va_pruned), or disable model_kwargs.dopsd.",
+                "D-OPSD requires a MiniMax-H3 Ref2VA/Omni/Ref2VA-partition model with one loaded DiT.",
+                "Use model.arch minimax_h3_ref2va or minimax_h3_omni (or partition ref2va/ref2va_pruned), or disable model_kwargs.dopsd.",
             )
         if (not math.isclose(_number(model_kwargs.get("dopsd_loss_mag_weight", 1.0), 1.0), 1.0) or not math.isclose(_number(model_kwargs.get("dopsd_loss_dc_weight", 1.0), 1.0), 1.0)) and loss_type != "mse":
             collector.add(
