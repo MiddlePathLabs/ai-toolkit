@@ -12,6 +12,7 @@ from toolkit.training_share import (
     ShareState,
     ShareTimeout,
     _load_meta,
+    adaptive_helper_budget,
     compute_delta,
     merge,
     next_frac,
@@ -312,6 +313,13 @@ def test_validate_share_setup_rejects_incompatible_recipes():
         validate_share_setup(_share_cfg(), TrainConfig(batch_size=2), has_reg_datasets=False)
     with pytest.raises(ValueError, match="gradient_accumulation"):
         validate_share_setup(_share_cfg(), TrainConfig(gradient_accumulation=2), has_reg_datasets=False)
+    # the per-iteration accumulation window is a separate knob and equally
+    # incompatible: a partial window cannot be exchanged as a round delta
+    for bad_steps in (4, -1):
+        with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+            validate_share_setup(
+                _share_cfg(), TrainConfig(gradient_accumulation_steps=bad_steps), has_reg_datasets=False
+            )
     with pytest.raises(ValueError, match="EMA"):
         validate_share_setup(
             _share_cfg(), TrainConfig(ema_config={"use_ema": True}), has_reg_datasets=False
@@ -345,6 +353,29 @@ def test_next_frac_gives_the_slower_card_the_smaller_share():
     # degenerate timings leave the share alone
     assert next_frac(0.0, 2.0, 0.5, 0.5) == 0.5
     assert next_frac(1.0, 0.0, 0.5, 0.5) == 0.5
+
+
+def test_adaptive_helper_budget_covers_the_banded_worst_case():
+    # reviewer's case 1: center 0.1 pins frac at the band ceiling 0.25
+    # (min(0.1+0.15, 0.75)); 100 items, lead 900 -> 12 rounds x 25 helper
+    # steps = 300. The old flat x2 of the helper's own 100 gave 200 and the
+    # helper ran dry at step 200 with the lead still waiting.
+    assert adaptive_helper_budget(100, 900, 0.1) == 300
+    # reviewer's case 2: small-N rounding. 4 items at center 0.5 can draw a
+    # 3-vs-1 split every round: 20 lead steps = 20 rounds x 3 helper steps =
+    # 60 (the observed need was 48; the old x2 gave 40).
+    assert adaptive_helper_budget(4, 20, 0.5) == 60
+    # the bound must dominate every frac next_frac can actually produce
+    for center in (0.05, 0.1, 0.25, 0.5, 0.75, 0.9):
+        n, lead_steps = 40, 2000
+        budget = adaptive_helper_budget(n, lead_steps, center)
+        for t_lead, t_helper in ((1.0, 4.0), (4.0, 1.0), (1.0, 1.0)):
+            frac = center
+            for _ in range(200):
+                frac = next_frac(t_lead, t_helper, frac, center)
+                helper_n = len(split_for_round(42, 1, _keys(n), frac))
+                needed = -(-lead_steps // max(n - helper_n, 1)) * helper_n
+                assert budget >= needed
 
 
 def test_adaptive_roundtrip_over_files(tmp_path):
@@ -501,12 +532,107 @@ def test_helper_excludes_owed_items_and_zero_deltas_an_empty_round(tmp_path):
     assert os.path.exists(os.path.join(rd, "delta.safetensors"))
 
 
-def test_write_delta_recreates_a_pruned_round_dir(tmp_path):
+def test_write_delta_discards_a_retired_round(tmp_path):
+    # a round the lead already pruned can never consume our delta (the lead
+    # only reads its CURRENT round), so a late delta is discarded quietly and
+    # must not resurrect an orphan round dir
     lead, helper = _states(tmp_path)
     lead.hook_begin()
     helper.hook_begin()
     import shutil
 
-    shutil.rmtree(os.path.join(str(tmp_path / "share"), "round_000001"), ignore_errors=True)
+    rd = os.path.join(str(tmp_path / "share"), "round_000001")
+    shutil.rmtree(rd, ignore_errors=True)
     helper.write_delta(1, compute_delta(helper._current_sd(), helper._start_sd))
-    assert os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001", "delta.safetensors"))
+    assert not os.path.exists(rd)
+
+    # a live round still takes the delta
+    lead2, helper2 = _states(tmp_path / "b")
+    lead2.hook_begin()
+    helper2.hook_begin()
+    helper2.write_delta(1, compute_delta(helper2._current_sd(), helper2._start_sd))
+    assert os.path.exists(os.path.join(str(tmp_path / "b"), "share", "round_000001", "delta.safetensors"))
+
+
+def test_write_delta_tolerates_the_lead_pruning_mid_write(tmp_path, monkeypatch):
+    # the lead can prune the round dir between our liveness check and the
+    # atomic rename; that must discard the delta, not crash the helper
+    import toolkit.training_share as ts
+
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+
+    def pruned_mid_write(path, sd, metadata=None):
+        raise FileNotFoundError(3, "round dir pruned mid-write")
+
+    monkeypatch.setattr(ts, "_save_sd", pruned_mid_write)
+    helper.write_delta(1, {"weight": torch.zeros(6, 6)})  # must not raise
+    assert not os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001", "delta.safetensors"))
+
+
+def test_late_helper_skips_retired_rounds_to_rejoin(tmp_path):
+    # reviewer's scenario: the lead misses rounds 1-3 (helper presumed slow)
+    # and advances to round 4, pruning 1-3. A helper still finishing round 1
+    # must not wait for the pruned round 2 -- it skips to the lead's live
+    # round and rejoins there instead of dying on ShareTimeout.
+    from safetensors.torch import load_file
+
+    lead, helper = _states(tmp_path)
+    lead.catch_up = True
+    lead.timeout_s = 0.3
+    helper.timeout_s = 5.0
+    lead.hook_begin()
+    helper.hook_begin()
+    for _round in range(3):  # the lead closes rounds 1-3 on misses, solo at 3
+        for _ in range(lead.my_target_steps(lead.round_no)):
+            lead.hook_end_of_step(0, False, False, False)
+    assert lead.round_no == 4 and lead._consecutive_missed == 3
+    assert not os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001"))
+
+    # the helper finishes round 1: the delta is discarded (round retired) and
+    # its next wait skips straight to the live round 4
+    for _ in range(helper.my_target_steps(1)):
+        helper.hook_end_of_step(0, False, False, False)
+    assert helper.round_no == 2 and helper._waiting
+    t0 = time.time()
+    helper.hook_step_top()
+    assert helper.round_no == 4 and not helper._waiting
+    assert time.time() - t0 < 4.0  # no ShareTimeout sit-out for rounds 2-3
+    start4 = load_file(os.path.join(str(tmp_path / "share"), "round_000004", "start.safetensors"))
+    assert torch.allclose(helper._current_sd()["weight"], start4["weight"])
+    # the discarded delta did not resurrect the pruned round
+    assert not os.path.exists(os.path.join(str(tmp_path / "share"), "round_000001"))
+
+
+def test_helper_save_cadence_never_closes_or_holds_its_round(tmp_path):
+    # only the lead's save/sample cadence is snapped to round boundaries; a
+    # helper-local save step used to force its rounds closed early and
+    # under-train its share every round. The protocol must ignore it.
+    lead, helper = _states(tmp_path)
+    lead.hook_begin()
+    helper.hook_begin()
+    target = helper.my_target_steps(1)
+    for _ in range(target - 1):
+        helper.hook_end_of_step(0, is_save_step=True, is_sample_step=True, is_last_step=False)
+        assert helper.round_no == 1
+    # at the target with a next-step save pending, hold is ignored too
+    helper.hook_end_of_step(0, False, False, False, hold=True)
+    assert helper.round_no == 2 and helper.steps_this_round == 0
+
+
+def test_stale_check_tolerates_tmp_debris_but_not_protocol_files(tmp_path):
+    lead, _ = _states(tmp_path)
+    rd = os.path.join(str(tmp_path / "share"), "round_000001")
+    os.makedirs(rd)
+    with open(os.path.join(rd, "delta.safetensors.tmp"), "w") as f:
+        f.write("debris from a crashed write")
+    lead.hook_begin()  # leftover tmp alone is not a foreign-delta hazard
+
+    lead2, _ = _states(tmp_path / "b")
+    rd2 = os.path.join(str(tmp_path / "b"), "share", "round_000001")
+    os.makedirs(rd2)
+    with open(os.path.join(rd2, "delta.safetensors"), "w") as f:
+        f.write("stale foreign delta")
+    with pytest.raises(ShareProtocolError):
+        lead2.hook_begin()

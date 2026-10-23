@@ -3915,25 +3915,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         cfg = getattr(self, 'share_config', None)
         if cfg is None or not cfg.enabled:
             return None
-        from toolkit.training_share import ShareState, collect_item_paths, validate_share_setup
+        from toolkit.training_share import (
+            ShareState, adaptive_helper_budget, collect_item_paths, validate_share_setup,
+        )
 
         keys = collect_item_paths(dataloader)
         if not keys:
             raise ValueError("training share: no dataset items found to split")
         validate_share_setup(cfg, self.train_config, self.datasets_reg is not None, n_items=len(keys))
-        if cfg.adaptive and cfg.role == 'helper':
-            # adaptive: the helper's actual step total drifts with frac (banded
-            # to +/-0.15), so its loop budget gets headroom and it stops on the
-            # lead's final.json; its LR comes from the lead's round job, so its
-            # own scheduler is neutralized (the scheduler was already built
-            # with the planned total, which the loop budget must not change)
-            planned = self.train_config.steps
-            self.train_config.steps = planned * 2
-            self.lr_scheduler = None
-            print_acc(
-                f"[share] adaptive helper: loop budget {planned} -> {planned * 2} steps "
-                f"(LR from the lead each round; stops on final.json)"
-            )
         share = ShareState(
             cfg.role, cfg.dir, cfg.frac, cfg.seed,
             launch_id=f"{os.getpid()}_{int(time.time())}",
@@ -3946,7 +3935,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         share.bind(self.network, optimizer)
         share.set_keys(keys)
-        share.bind(self.network)
         if cfg.role == 'lead':
             # A combine must precede every save and sample, and rounds close
             # cleanly at whole-round step counts: snap the lead's cadences to
@@ -3966,6 +3954,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             f"every save/sample must hold both halves)"
                         )
         share.hook_begin()
+        if cfg.adaptive and cfg.role == 'helper':
+            # adaptive: the helper's actual step total drifts with frac (banded
+            # to +/-0.15), so its loop budget covers the worst banded split of
+            # the LEAD's published budget and it stops on the lead's
+            # final.json; its LR comes from the lead's round job, so its own
+            # scheduler is neutralized (the scheduler was already built with
+            # the planned total, which the loop budget must not change). A
+            # flat x2 of the helper's own budget is NOT a bound: center 0.1
+            # pins frac at 0.25 (2.5x the configured share) and small
+            # datasets round the split further (4 items can draw 3-vs-1).
+            planned = self.train_config.steps
+            self.train_config.steps = max(
+                adaptive_helper_budget(len(keys), share.lead_steps or planned, cfg.frac),
+                planned,
+            )
+            self.lr_scheduler = None
+            print_acc(
+                f"[share] adaptive helper: loop budget {planned} -> {self.train_config.steps} steps "
+                f"(lead budget {share.lead_steps}; worst banded split; stops on final.json)"
+            )
         return share
 
     def _run_training_loop(

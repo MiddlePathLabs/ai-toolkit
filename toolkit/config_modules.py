@@ -1436,7 +1436,8 @@ class ShareConfig:
     helper ``steps - that``; each side's LR schedule runs over its own budget,
     which reproduces the solo LR trajectory at any fixed frac.
 
-    Requires batch_size 1, gradient_accumulation 1, EMA off and no
+    Requires batch_size 1, gradient_accumulation 1, gradient_accumulation_steps 1
+    (a round delta must carry whole optimizer updates), EMA off and no
     ``datasets_reg`` (validated with the other configs at trainer init).
     Slice 1 assumes both processes see identical dataset paths (one machine).
     """
