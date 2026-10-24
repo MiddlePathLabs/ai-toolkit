@@ -102,6 +102,24 @@ never silently translates, removes, or downgrades those fields. A scrubbed
 accepted character recipe is maintained at
 `testing/fixtures/admission/accepted_h3_character.yaml`.
 
+### Automagic v4 optimizer runtime
+
+`train.optimizer: automagic4` defaults to fused-backward updates. Admission and
+runtime validation reject multi-backward configurations: modern accumulation
+above 1, legacy accumulation other than 1, single-item batching, and mean-flow.
+The default `max_grad_norm: 1.0` cannot clip those completed backward updates;
+admission warns unless clipping is explicitly disabled with `max_grad_norm: 0`.
+Set `optimizer_params: {fused: false}` for step-time updates that support normal
+accumulation and trainer clipping. Independent legacy-accumulation and
+model-specific mean-flow admission restrictions still apply.
+
+Both modes support runtime final-update scaling, including weight decay, but
+not active-parameter masks or modality block routing. The first update measures
+sensitivity without moving weights; subsequent updates use the live
+`state["lr"]`, not the parameter-group LR. V4 remains group-pooled: automatic
+module-family tagging is reserved for v3 until v4 supplies family-pool votes.
+Identity isolation remains restricted to AdamW/Rose.
+
 ### Release capability contract (Krea/H3 remediation)
 
 This fork's Krea/H3 admission and training behavior is evidence-scoped. A CPU regression result does not certify a real checkpoint, GPU precision path, or visual/audio quality. The following labels are intentional:

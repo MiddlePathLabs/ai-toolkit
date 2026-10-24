@@ -3382,6 +3382,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Tag trainable params with their module path so the optimizer can
             # pool its lr votes per module family (attn / mlp / ...); inert for
             # every other optimizer.
+            # V4 stays group-pooled until its vote path also fills family pools.
             from toolkit.optimizers.automagic3 import tag_param_families
 
             tag_param_families(

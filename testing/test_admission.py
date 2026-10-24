@@ -138,6 +138,22 @@ def test_fused_backward_clip_noop_silent_when_disabled_or_step_time():
     assert RULE_FUSED_CLIP_NOOP not in _ids(collect_admission_diagnostics(raw))
 
 
+@pytest.mark.parametrize("optimizer_params", [{}, {"fused": False}])
+def test_automagic4_accumulation_admission_respects_fused_mode(optimizer_params):
+    process = _process(train={
+        "optimizer": "automagic4",
+        "optimizer_params": optimizer_params,
+        "gradient_accumulation": 4,
+    })
+    result = collect_admission_diagnostics({"process": [process]})
+    if optimizer_params.get("fused", True):
+        assert not result["valid"]
+        assert {RULE_FUSED_BACKWARD, RULE_FUSED_CLIP_NOOP} <= _ids(result)
+    else:
+        assert result["valid"]
+        assert not ({RULE_FUSED_BACKWARD, RULE_FUSED_CLIP_NOOP} & _ids(result))
+
+
 def test_permanent_accumulation_mean_flow_and_target_collision_rules():
     process = _process(
         train={

@@ -9,6 +9,7 @@ Compares speed (ms/step) and peak VRAM across:
   - Automagic v1
   - Automagic v2 (fused-backward)
   - Automagic v3 (fused-backward and traditional/unfused)
+  - Automagic v4 (fused-backward and traditional/unfused)
   - Automagic AdamW (fused-backward and traditional/unfused)
   - AdamConvRot (AdamW with ConvRot-quantized moments; 8, 4 and 2 bit,
     traditional/unfused and fused-backward)
@@ -182,6 +183,7 @@ def main():
     from toolkit.optimizers.automagic import Automagic
     from toolkit.optimizers.automagic2 import Automagic2
     from toolkit.optimizers.automagic3 import Automagic3
+    from toolkit.optimizers.automagic4 import Automagic4
     from toolkit.optimizers.automagicEXPERIMENT import AutomagicEXPERIMENT
     from toolkit.optimizers.adamconvrot import AdamConvRot
     from toolkit.optimizers.adafactor import Adafactor
@@ -196,6 +198,8 @@ def main():
         ("automagic2", "Automagic v2", lambda p: Automagic2(p, lr=1e-4)),
         ("automagic3", "Automagic v3 fused", lambda p: Automagic3(p, lr=1e-4, fused=True)),
         ("automagic3", "Automagic v3 unfused", lambda p: Automagic3(p, lr=1e-4, fused=False)),
+        ("automagic4", "Automagic v4 fused", lambda p: Automagic4(p, lr=1e-4, fused=True)),
+        ("automagic4", "Automagic v4 unfused", lambda p: Automagic4(p, lr=1e-4, fused=False)),
         ("automagicEXPERIMENT", "AutomagicEXPERIMENT", lambda p: AutomagicEXPERIMENT(p, lr=1e-4, fused=True)),
         ("automagicEXPERIMENT", "AutomagicEXPERIMENT", lambda p: AutomagicEXPERIMENT(p, lr=1e-4, fused=False)),
         ("adamconvrot", "AdamConvRot 8bit", lambda p: AdamConvRot(p, lr=1e-4, eps=1e-6, qtype="convrot8")),

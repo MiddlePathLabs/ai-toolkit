@@ -278,7 +278,7 @@ def _known_fused_backward(train: Mapping[str, Any]) -> bool:
     params = _mapping(train.get("optimizer_params"))
     if optimizer in {"automagic2", "automagicv2"}:
         return True
-    if optimizer in {"automagic3", "automagicexperiment", "automagicexperimental"}:
+    if optimizer in {"automagic3", "automagic4", "automagicexperiment", "automagicexperimental"}:
         return bool(params.get("fused", True))
     if optimizer in {"adamconvrot", "adam_convrot"}:
         return bool(params.get("fused", False))
@@ -290,7 +290,7 @@ def _known_step_scale_support(train: Mapping[str, Any]) -> Optional[bool]:
     params = _mapping(train.get("optimizer_params"))
     if optimizer in {
         "adam", "adamw", "adagrad", "adam8", "adam8bit", "adamw8", "adamw8bit",
-        "rose", "automagic", "automagic2", "automagic3", "automagicexperiment",
+        "rose", "automagic", "automagic2", "automagic3", "automagic4", "automagicexperiment",
         "adamconvrot", "adam_convrot", "prodigy8bit",
     }:
         return True

@@ -172,6 +172,8 @@ def test_classify_factory_branches_cpu():
         ("adafactor", {"scale_parameter": True}, "unsupported", "step", False, True),
         ("automagic", {}, "native", "step", True, True),
         ("automagic3", {"fused": False}, "native", "step", True, False),
+        ("automagic4", {}, "native", "backward", True, False),
+        ("automagic4", {"fused": False}, "native", "step", True, False),
         ("automagicexperiment", {"fused": False}, "native", "step", True, False),
         ("adamconvrot", {}, "native", "step", True, True),
         ("adam8", {}, "group_lr", "step", True, True),
@@ -246,6 +248,54 @@ def test_fused_backward_rejects_multi_backward_windows():
         adapter.validate_for_train_config(_train_cfg(single_item_batching=True))
     with pytest.raises(ValueError, match="mean_flow"):
         adapter.validate_for_train_config(_train_cfg(loss_type="mean_flow"))
+
+
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("options", [
+    {"gradient_accumulation": 4},
+    {"gradient_accumulation_steps": 4},
+    {"single_item_batching": True},
+    {"loss_type": "mean_flow"},
+])
+def test_automagic4_multi_backward_requires_unfused(fused, options):
+    opt = get_optimizer(_params(), "automagic4", 1e-3, {"fused": fused})
+    adapter = OptimizerRuntimeAdapter.inspect(opt)
+    config = _train_cfg(per_image_adaptive_lr=False, **options)
+    if fused:
+        with pytest.raises(ValueError, match="fused-backward"):
+            adapter.validate_for_train_config(config)
+    else:
+        adapter.validate_for_train_config(config)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale", [0.0, 0.25, 1.0])
+def test_automagic4_scales_post_measurement_update_and_weight_decay(fused, dtype, scale):
+    parameter = torch.nn.Parameter(torch.ones(4, 4, dtype=dtype))
+    opt = get_optimizer(
+        [parameter], "automagic4", 0.125,
+        {"fused": fused, "beta2": 0.0, "weight_decay": 0.5},
+    )
+    adapter = OptimizerRuntimeAdapter.inspect(opt)
+    parameter.sum().backward()
+    opt.step()  # Publish sens_ref before exercising a scaled update.
+    before = parameter.detach().clone()
+    expected = before - 0.125 * 1.5 * scale
+
+    if fused:
+        adapter.begin_window(opt, scale)
+    try:
+        parameter.sum().backward()
+        if fused:
+            torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+            adapter.begin_window(opt, scale)
+        opt.step()
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+    finally:
+        adapter.end_window(opt)
 
 
 def test_fused_backward_gate_is_independent_of_adaptive_lr():
@@ -433,9 +483,11 @@ def test_unknown_optimizer_rejects_routing():
         adapter.validate_for_train_config(_routing_cfg())
 
 
-def test_automagic3_routing_fails_closed():
-    opt = get_optimizer(_params(), "automagic3", 1e-6, {})
-    adapter = OptimizerRuntimeAdapter.inspect(opt, optimizer_type="automagic3")
+@pytest.mark.parametrize("optimizer_type", ["automagic3", "automagic4"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_group_vote_automagic_routing_fails_closed(optimizer_type, fused):
+    opt = get_optimizer(_params(), optimizer_type, 1e-6, {"fused": fused})
+    adapter = OptimizerRuntimeAdapter.inspect(opt, optimizer_type=optimizer_type)
     adapter.validate_for_train_config(TrainConfig())
     with pytest.raises(ValueError, match="active-parameter mask"):
         adapter.validate_for_train_config(_routing_cfg())

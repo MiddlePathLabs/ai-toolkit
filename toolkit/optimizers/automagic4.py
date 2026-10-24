@@ -6,6 +6,7 @@ import math
 import torch
 
 from toolkit.optimizers.automagic3 import Automagic3
+from toolkit.optimizers.optimizer_utils import runtime_step_scale
 
 
 class Automagic4(Automagic3):
@@ -199,15 +200,17 @@ class Automagic4(Automagic3):
                 self._group_den[gi].add_(den)
 
         wd = group["weight_decay"]
+        scale = runtime_step_scale(self)
+        apply_lr = lr_t if scale == 1.0 else lr_t * scale
         if p.dtype == torch.float32:
             if wd != 0.0:
                 update.add_(p, alpha=wd)
-            p.addcmul_(update, lr_t, value=-1.0)
+            p.addcmul_(update, apply_lr, value=-1.0)
         else:
             new_p_fp32 = p.to(torch.float32)
             if wd != 0.0:
                 update.add_(new_p_fp32, alpha=wd)
-            new_p_fp32.addcmul_(update, lr_t, value=-1.0)
+            new_p_fp32.addcmul_(update, apply_lr, value=-1.0)
             self._stochastic_copy_(p, new_p_fp32)
 
         p.grad = None

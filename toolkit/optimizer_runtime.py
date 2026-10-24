@@ -216,7 +216,7 @@ def known_fused_backward_from_config(
     params = optimizer_params or {}
     if name in {"automagic2", "automagicv2"}:
         return True
-    if name in {"automagic3", "automagicexperiment", "automagicexperimental"}:
+    if name in {"automagic3", "automagic4", "automagicexperiment", "automagicexperimental"}:
         return bool(params.get("fused", True))
     if name in {"adamconvrot", "adam_convrot"}:
         return bool(params.get("fused", False))
@@ -337,7 +337,7 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
         return native("step")
     if name == "Automagic2":
         return native("backward")
-    if name == "Automagic3":
+    if name in {"Automagic3", "Automagic4"}:
         return native_no_mask(
             "backward" if _is_fused_backward(opt) else "step",
             _AUTOMAGIC_GROUP_VOTE_REASON,
