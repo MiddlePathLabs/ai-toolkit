@@ -4516,10 +4516,12 @@ class SDTrainer(BaseSDTrainProcess):
         _db = getattr(self, '_diffusion_loss_bins', None)
         if _db is not None and _diff_per_sample is not None and _diff_per_sample.dim() > 0:
             _numt = self.sd.noise_scheduler.config.num_train_timesteps
-            for j in range(_diff_per_sample.shape[0]):
-                _tv = float((timesteps[j].float() / _numt).item())
+            # one device sync per tensor, not per sample (2B .item() stalls/step)
+            _tv_list = (timesteps.reshape(-1)[:_diff_per_sample.shape[0]].float() / _numt).tolist()
+            _val_list = _diff_per_sample.tolist()
+            for _tv, _val in zip(_tv_list, _val_list):
                 _bs = int(_tv * 10) / 10.0
-                self._bin_update(_db, f'diffusion_loss_t{int(_bs * 100):02d}', float(_diff_per_sample[j].item()))
+                self._bin_update(_db, f'diffusion_loss_t{int(_bs * 100):02d}', _val)
 
         audio_per_sample, audio_valid = self._audio_loss_per_sample(
             audio_pred, audio_target, audio_mask, loss_multiplier
@@ -4530,10 +4532,11 @@ class SDTrainer(BaseSDTrainProcess):
         if getattr(batch, "dopsd_anchor", False):
             audio_loss = audio_loss * self.sd.dopsd_settings.preservation_weight
         objective_eligible = objective_eligible | audio_valid
-        self.additional_logs['loss/img'] = loss.detach().item()
+        _loss_applied = loss.detach().item()
+        self.additional_logs['loss/img'] = _loss_applied
         # Canonical diffusion/* scalars: applied = what enters the objective
         # (identical to loss/img), weighted = the un-split counterfactual.
-        self.additional_logs['diffusion/loss_applied'] = loss.detach().item()
+        self.additional_logs['diffusion/loss_applied'] = _loss_applied
         if _diff_weighted is not None:
             self.additional_logs['diffusion/loss_weighted'] = _diff_weighted
         if audio_pred is not None and audio_target is not None:
@@ -6319,8 +6322,9 @@ class SDTrainer(BaseSDTrainProcess):
         """Record the diagonal Fisher trace when optimizer state provides it."""
         if self.optimizer is None:
             return
-        total = 0.0
-        found_state = False
+        # sum on-device, sync once: a float() per parameter forces one device
+        # sync per LoRA layer per step and stalls the pipeline
+        total_t = None
         for group in self.optimizer.param_groups:
             for parameter in group.get('params', []):
                 if not getattr(parameter, '_is_lora', False):
@@ -6328,10 +6332,10 @@ class SDTrainer(BaseSDTrainProcess):
                 state = self.optimizer.state.get(parameter)
                 if state is None or state.get('exp_avg_sq') is None:
                     continue
-                total += float(state['exp_avg_sq'].sum())
-                found_state = True
-        if found_state:
-            self._last_fisher_trace = total
+                _sum = state['exp_avg_sq'].sum(dtype=torch.float32)
+                total_t = _sum if total_t is None else total_t + _sum
+        if total_t is not None:
+            self._last_fisher_trace = float(total_t)
 
     def _inject_weight_noise(self) -> None:
         """Inject configured Gaussian noise into tagged LoRA parameter values."""
