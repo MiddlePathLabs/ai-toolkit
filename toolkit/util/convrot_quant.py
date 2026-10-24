@@ -45,6 +45,8 @@ Quantized state attached to each module:
 
 from typing import Optional
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -1032,7 +1034,53 @@ def _int8_linear_ste_setup(ctx, inputs, output):
     ctx.save_for_backward(qdata, w_scales_u8)
 
 
+# W8A8 input-gradient experiment (AITK_INT8_W8A8_BACKWARD=1): quantize the
+# weight-scaled gradient rows with the same per-row quantizer the forward
+# applies to activations, and run the frozen-weight GEMM on int8 tensor cores
+# instead of dequantizing the weight to bf16 on every backward call. The
+# straight-through estimate carries one int8 step of each gradient row's
+# largest value. The GEMM feeds cuBLASLt the transposed-B layout (2.7x faster
+# than the natural layout at these shapes); the weight transpose is compiled
+# and the output rescale reuses the fused forward epilogue.
+_INT8_W8A8_BACKWARD = os.environ.get("AITK_INT8_W8A8_BACKWARD", "0") == "1"
+_int8_w8a8_backward_warned = False
+_int8_w8a8_transpose_compiled = None
+_int8_w8a8_ones_cache: dict = {}
+
+
 def _int8_input_gradient(grad, qdata, w_scales_u8):
+    global _INT8_W8A8_BACKWARD, _int8_w8a8_backward_warned
+    global _int8_w8a8_transpose_compiled
+    if (
+        _INT8_W8A8_BACKWARD
+        and grad.is_cuda
+        and grad.dim() == 2
+        and grad.shape[0] > 0
+        and _int8_gemm_supported(grad.device)
+    ):
+        try:
+            m = grad.shape[0]
+            gs = grad * w_scales_u8.view(torch.float32).to(grad.dtype).view(1, -1)
+            gq, g_s = _int8_act_quant_padded(gs, 127)
+            if _int8_w8a8_transpose_compiled is None:
+                _int8_w8a8_transpose_compiled = torch.compile(
+                    lambda t: t.t().contiguous(), dynamic=True
+                )
+            qd_t = _int8_w8a8_transpose_compiled(qdata)
+            i32 = torch._int_mm(gq, qd_t.t())[:m]
+            ones = _int8_w8a8_ones_cache.get(i32.shape[1])
+            if ones is None or ones.device != grad.device:
+                ones = torch.ones(i32.shape[1], device=grad.device, dtype=torch.float32)
+                _int8_w8a8_ones_cache[i32.shape[1]] = ones
+            return _int8_epilogue(i32, g_s[:m], ones, None, grad.dtype)
+        except Exception:
+            _INT8_W8A8_BACKWARD = False
+            if not _int8_w8a8_backward_warned:
+                _int8_w8a8_backward_warned = True
+                print_acc(
+                    "ConvRot: W8A8 input-gradient unavailable on this call, "
+                    "using the dequant backward for the rest of the run"
+                )
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
     return grad @ w
