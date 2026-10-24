@@ -1032,11 +1032,15 @@ def _int8_linear_ste_setup(ctx, inputs, output):
     ctx.save_for_backward(qdata, w_scales_u8)
 
 
-def _int8_linear_ste_backward(ctx, grad):
-    qdata, w_scales_u8 = ctx.saved_tensors
+def _int8_input_gradient(grad, qdata, w_scales_u8):
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return grad @ w, None, None, None, None, None
+    return grad @ w
+
+
+def _int8_linear_ste_backward(ctx, grad):
+    qdata, w_scales_u8 = ctx.saved_tensors
+    return _int8_input_gradient(grad, qdata, w_scales_u8), None, None, None, None, None
 
 
 _int8_linear_ste_op.register_autograd(

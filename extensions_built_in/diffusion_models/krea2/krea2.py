@@ -490,6 +490,16 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
+        if self.model_config.convrot8_backend == "comfy_kitchen":
+            from toolkit.util.convrot_kitchen import configure_krea_convrot8
+
+            self.convrot8_diagnostics = configure_krea_convrot8(
+                transformer,
+                backend=self.model_config.convrot8_backend,
+                strict=self.model_config.convrot8_backend_strict,
+                compiled=self.model_config.compile,
+            )
+            self.print_and_status_update(f"ConvRot8: {self.convrot8_diagnostics.report()}")
         flush()
 
         tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()

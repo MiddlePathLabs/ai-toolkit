@@ -1026,6 +1026,12 @@ class ModelConfig:
         self.quantize_te = kwargs.get("quantize_te", self.quantize)
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
+        self.convrot8_backend = kwargs.get("convrot8_backend", "native")
+        self.convrot8_backend_strict = kwargs.get("convrot8_backend_strict", False)
+        if self.convrot8_backend not in ("native", "comfy_kitchen"):
+            raise ValueError("convrot8_backend must be native or comfy_kitchen")
+        if self.convrot8_backend_strict and self.convrot8_backend != "comfy_kitchen":
+            raise ValueError("convrot8_backend_strict requires comfy_kitchen")
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
@@ -1121,6 +1127,9 @@ class ModelConfig:
         
         if self.arch == "flex1":
             self.arch = "flux"
+        if self.convrot8_backend == "comfy_kitchen":
+            if self.arch != "krea2" or self.qtype != "convrot8":
+                raise ValueError("comfy_kitchen is experimental and requires arch: krea2 and qtype: convrot8")
             
         
         # handle migrating to new model arch
