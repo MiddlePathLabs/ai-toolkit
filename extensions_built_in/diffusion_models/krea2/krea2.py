@@ -500,6 +500,17 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
                 compiled=self.model_config.compile,
             )
             self.print_and_status_update(f"ConvRot8: {self.convrot8_diagnostics.report()}")
+        # W8A8 backward is process-wide once the trainer starts stepping; the
+        # eligibility gate (arch krea2 + qtype convrot8) is enforced at config
+        # validation, while the env var remains an ungated escape hatch.
+        from toolkit.util.convrot_quant import set_w8a8_backward, w8a8_backward_enabled
+
+        backward_mode = getattr(self.model_config, "convrot8_backward", "native")
+        if backward_mode == "w8a8":
+            set_w8a8_backward(True)
+        if w8a8_backward_enabled():
+            source = "config" if backward_mode == "w8a8" else "env AITK_INT8_W8A8_BACKWARD"
+            self.print_and_status_update(f"ConvRot8 backward: w8a8 (source: {source})")
         flush()
 
         tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()

@@ -6318,6 +6318,25 @@ class SDTrainer(BaseSDTrainProcess):
             self._last_grad_noise_norm = noise_norm
             self._last_grad_noise_snr = gradient_norm / noise_norm if noise_norm > 1e-12 else 0.0
 
+    def _drain_w8a8_backward_diagnostics(self) -> None:
+        """Surface non-finite gradient rows the W8A8 backward quantizer
+        sanitizes; one device sync per W8A8_DIAG_DRAIN_EVERY steps."""
+        if self.step_num % 25 != 0:
+            return
+        from toolkit.util.convrot_quant import drain_w8a8_nonfinite
+
+        count = drain_w8a8_nonfinite()
+        if count > 0 and not getattr(self, "_w8a8_nonfinite_warned", False):
+            self._w8a8_nonfinite_warned = True
+            print_acc(
+                f"W8A8 backward: {count} non-finite gradient row(s) sanitized since "
+                "the last check; inspect loss/LR stability"
+            )
+        elif count > 0:
+            print_acc(
+                f"W8A8 backward: {count} more non-finite gradient row(s) sanitized"
+            )
+
     def _record_fisher_trace(self) -> None:
         """Record the diagonal Fisher trace when optimizer state provides it."""
         if self.optimizer is None:
@@ -6604,6 +6623,7 @@ class SDTrainer(BaseSDTrainProcess):
                         with self.timer('ema_update'):
                             self.ema.update()
                     self._record_fisher_trace()
+                    self._drain_w8a8_backward_diagnostics()
                     self._inject_weight_noise()
             finally:
                 if opened_step_window and runtime is not None:

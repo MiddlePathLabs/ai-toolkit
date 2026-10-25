@@ -1034,23 +1034,52 @@ def _int8_linear_ste_setup(ctx, inputs, output):
     ctx.save_for_backward(qdata, w_scales_u8)
 
 
-# W8A8 input-gradient experiment (AITK_INT8_W8A8_BACKWARD=1): quantize the
-# weight-scaled gradient rows with the same per-row quantizer the forward
-# applies to activations, and run the frozen-weight GEMM on int8 tensor cores
-# instead of dequantizing the weight to bf16 on every backward call. The
-# straight-through estimate carries one int8 step of each gradient row's
-# largest value. The GEMM feeds cuBLASLt the transposed-B layout (2.7x faster
-# than the natural layout at these shapes); the weight transpose is compiled
-# and the output rescale reuses the fused forward epilogue.
+# W8A8 input-gradient (experimental; config model.convrot8_backward: w8a8, or
+# AITK_INT8_W8A8_BACKWARD=1 as a developer escape hatch that bypasses the
+# config eligibility gate): quantize the weight-scaled gradient rows with the
+# same per-row quantizer the forward applies to activations, and run the
+# frozen-weight GEMM on int8 tensor cores instead of dequantizing the weight
+# to bf16 on every backward call. The straight-through estimate carries one
+# int8 step of each gradient row's largest value. The GEMM feeds cuBLASLt the
+# transposed-B layout (2.7x faster than the natural layout at these shapes);
+# the weight transpose is compiled and the output rescale reuses the fused
+# forward epilogue.
 _INT8_W8A8_BACKWARD = os.environ.get("AITK_INT8_W8A8_BACKWARD", "0") == "1"
 _int8_w8a8_backward_warned = False
 _int8_w8a8_transpose_compiled = None
 _int8_w8a8_ones_cache: dict = {}
+_int8_w8a8_nonfinite_acc = None
+
+
+def set_w8a8_backward(enabled: bool) -> None:
+    """Process-wide switch for the W8A8 input-gradient (krea2 loader sets it
+    from model.convrot8_backward; the training process hosts one model)."""
+    global _INT8_W8A8_BACKWARD
+    _INT8_W8A8_BACKWARD = bool(enabled)
+
+
+def w8a8_backward_enabled() -> bool:
+    return _INT8_W8A8_BACKWARD
+
+
+def drain_w8a8_nonfinite() -> int:
+    """Return and reset the count of gradient rows whose W8A8 quantization
+    scale came out non-finite (inf-class divergence; the output rows are
+    non-finite and stay visible here). NaN-only rows sanitize to near-zero
+    contributions inside the int8 clamp and are NOT counted. One device sync
+    per call; callers poll it sparsely."""
+    global _int8_w8a8_nonfinite_acc
+    acc = _int8_w8a8_nonfinite_acc
+    if acc is None:
+        return 0
+    count = int(acc.item())
+    _int8_w8a8_nonfinite_acc = None
+    return count
 
 
 def _int8_input_gradient(grad, qdata, w_scales_u8):
     global _INT8_W8A8_BACKWARD, _int8_w8a8_backward_warned
-    global _int8_w8a8_transpose_compiled
+    global _int8_w8a8_transpose_compiled, _int8_w8a8_nonfinite_acc
     if (
         _INT8_W8A8_BACKWARD
         and grad.is_cuda
@@ -1062,6 +1091,14 @@ def _int8_input_gradient(grad, qdata, w_scales_u8):
             m = grad.shape[0]
             gs = grad * w_scales_u8.view(torch.float32).to(grad.dtype).view(1, -1)
             gq, g_s = _int8_act_quant_padded(gs, 127)
+            # non-finite rows surface as non-finite per-row scales; count them
+            # on-device so the trainer can poll without a per-call sync
+            nonfinite = (~torch.isfinite(g_s[:m])).sum()
+            acc = _int8_w8a8_nonfinite_acc
+            if acc is None or acc.device != nonfinite.device:
+                _int8_w8a8_nonfinite_acc = nonfinite
+            else:
+                _int8_w8a8_nonfinite_acc = acc + nonfinite
             if _int8_w8a8_transpose_compiled is None:
                 _int8_w8a8_transpose_compiled = torch.compile(
                     lambda t: t.t().contiguous(), dynamic=True

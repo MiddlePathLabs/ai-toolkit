@@ -1032,6 +1032,9 @@ class ModelConfig:
             raise ValueError("convrot8_backend must be native or comfy_kitchen")
         if self.convrot8_backend_strict and self.convrot8_backend != "comfy_kitchen":
             raise ValueError("convrot8_backend_strict requires comfy_kitchen")
+        self.convrot8_backward = kwargs.get("convrot8_backward", "native")
+        if self.convrot8_backward not in ("native", "w8a8"):
+            raise ValueError("convrot8_backward must be native or w8a8")
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
@@ -1130,6 +1133,9 @@ class ModelConfig:
         if self.convrot8_backend == "comfy_kitchen":
             if self.arch != "krea2" or self.qtype != "convrot8":
                 raise ValueError("comfy_kitchen is experimental and requires arch: krea2 and qtype: convrot8")
+        if self.convrot8_backward == "w8a8":
+            if self.arch != "krea2" or self.qtype != "convrot8":
+                raise ValueError("convrot8_backward w8a8 is experimental and requires arch: krea2 and qtype: convrot8")
             
         
         # handle migrating to new model arch
