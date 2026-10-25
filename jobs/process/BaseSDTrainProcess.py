@@ -177,6 +177,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             ))
         self.config = _compat.process
         self.isolation_config = configure_isolation(self.config)
+        # per-job reset of the process-wide W8A8 backward flag so a native
+        # (or non-krea2) job never inherits the previous job's mode; the krea2
+        # loader re-enables it from model.convrot8_backward / the env hatch
+        from toolkit.util.convrot_quant import set_w8a8_backward, w8a8_backward_env_requested
+
+        set_w8a8_backward(w8a8_backward_env_requested())
         self.accelerator: Accelerator = get_accelerator()
         if self.accelerator.is_local_main_process:
             transformers.utils.logging.set_verbosity_warning()

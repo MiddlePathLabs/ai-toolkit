@@ -1044,7 +1044,8 @@ def _int8_linear_ste_setup(ctx, inputs, output):
 # transposed-B layout (2.7x faster than the natural layout at these shapes);
 # the weight transpose is compiled and the output rescale reuses the fused
 # forward epilogue.
-_INT8_W8A8_BACKWARD = os.environ.get("AITK_INT8_W8A8_BACKWARD", "0") == "1"
+_INT8_W8A8_BACKWARD_ENV = os.environ.get("AITK_INT8_W8A8_BACKWARD", "0") == "1"
+_INT8_W8A8_BACKWARD = _INT8_W8A8_BACKWARD_ENV
 _int8_w8a8_backward_warned = False
 _int8_w8a8_transpose_compiled = None
 _int8_w8a8_ones_cache: dict = {}
@@ -1060,6 +1061,24 @@ def set_w8a8_backward(enabled: bool) -> None:
 
 def w8a8_backward_enabled() -> bool:
     return _INT8_W8A8_BACKWARD
+
+
+def w8a8_backward_env_requested() -> bool:
+    """The process-start env escape hatch, independent of later toggles."""
+    return _INT8_W8A8_BACKWARD_ENV
+
+
+def resolve_w8a8_backward(config_mode: str):
+    """Per-job resolution of the W8A8 backward mode. config w8a8 or the env
+    escape hatch enable it; anything else RESETS the process-wide flag, so
+    sequential jobs in one process never inherit the previous job's mode.
+    Returns (enabled, source or None)."""
+    enabled = config_mode == "w8a8" or _INT8_W8A8_BACKWARD_ENV
+    set_w8a8_backward(enabled)
+    if not enabled:
+        return False, None
+    source = "config" if config_mode == "w8a8" else "env AITK_INT8_W8A8_BACKWARD"
+    return True, source
 
 
 def drain_w8a8_nonfinite() -> int:

@@ -12,6 +12,7 @@ kitchen suite itself must stay green with the W8A8 flag untouched (default
 off), which test_disabled_by_default pins here.
 """
 
+import copy
 import os
 
 import pytest
@@ -89,6 +90,23 @@ def test_flag_setter_roundtrip():
     assert cq.w8a8_backward_enabled() is True
     cq.set_w8a8_backward(False)
     assert cq.w8a8_backward_enabled() is False
+
+
+def test_resolve_resets_between_sequential_jobs():
+    # env unset in the test process: a native load after a w8a8 job must
+    # reset the process-wide flag rather than inherit it
+    assert cq.w8a8_backward_env_requested() is False
+    cq.set_w8a8_backward(True)  # simulate the previous job's leftover state
+    enabled, source = cq.resolve_w8a8_backward("native")
+    assert enabled is False and source is None
+    assert cq.w8a8_backward_enabled() is False
+
+    enabled, source = cq.resolve_w8a8_backward("w8a8")
+    assert enabled is True and source == "config"
+    assert cq.w8a8_backward_enabled() is True
+
+    enabled, source = cq.resolve_w8a8_backward("native")
+    assert enabled is False and source is None
 
 
 def test_disabled_by_default_matches_dequant_bitexact():
@@ -231,18 +249,35 @@ def test_lora_chain_gradients_and_adamw_update():
     assert worst_cos >= T_LORA_COSINE, f"LoRA grad cosine {worst_cos:.6f} < {T_LORA_COSINE}"
 
     params = list(chain.adapters.parameters())
+
+    # warm the optimizer state with a fixed dummy step so the compared steps
+    # operate in the m/sqrt(v) regime; from empty state the first AdamW step
+    # is ~sign(g)*lr and sign flips of near-zero elements dominate the delta
+    warm_opt = torch.optim.AdamW(params, lr=1e-3, foreach=False)
+    for p in params:
+        p.grad = torch.full_like(p, 0.01)
+    warm_opt.step()
+    state_snap = copy.deepcopy(warm_opt.state_dict())
     param_snap = [p.detach().clone() for p in params]
 
     def adam_step_with(grads):
-        for p, snap, g in zip(params, param_snap, grads[1:]):
+        for p, snap in zip(params, param_snap):
             p.data.copy_(snap)
-            p.grad = g.detach().clone()
         opt = torch.optim.AdamW(params, lr=1e-3, foreach=False)
+        opt.load_state_dict(copy.deepcopy(state_snap))
+        opt.zero_grad(set_to_none=True)
+        for p, g in zip(params, grads[1:]):
+            p.grad = g.detach().clone()
         opt.step()
-        return torch.cat([p.detach().flatten() for p in params])
+        return [p.detach().clone() for p in params]
 
-    delta_off = adam_step_with(grads_off)
-    delta_on = adam_step_with(grads_on)
-    rel = ((delta_on.double() - delta_off.double()).norm()
-           / delta_off.double().norm().clamp_min(1e-30)).item()
-    assert rel <= T_ADAM_REL_DELTA, f"AdamW update relative delta {rel:.4%} > {T_ADAM_REL_DELTA:.0%}"
+    upd_off = adam_step_with(grads_off)
+    upd_on = adam_step_with(grads_on)
+    worst = max(
+        ((a.float() - b.float()).norm()
+         / (b.float() - s.float()).norm().clamp_min(1e-30)).item()
+        for a, b, s in zip(upd_on, upd_off, param_snap)
+    )
+    assert worst <= T_ADAM_REL_DELTA, (
+        f"AdamW update relative delta {worst:.4%} > {T_ADAM_REL_DELTA:.0%}"
+    )
