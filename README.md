@@ -26,6 +26,20 @@ A second GPU trains a share of the dataset each round on its own copy of the LoR
 
 `share.adaptive: true` moves the split toward equal wall-clock each round (the slower card gets the smaller share) and hands the helper its per-round learning rate from the lead. With catch-up (default on) a round whose delta misses its deadline does not kill the run: the lead absorbs the helper's items into its own side of the next round, and after three consecutive misses it trains solo while a slow-but-alive helper can still rejoin; `share.catch_up: false` restores fail-fast. Share runs are federated, not bit-equivalent to a solo run — evaluate share checkpoints with their own pass. Fail-fast requirements: `train.batch_size 1`, no gradient accumulation, EMA off, no regularisation datasets, at least 4 dataset items, and both processes on the same commit with identical dataset paths. See [docs/training_share.md](docs/training_share.md) for the step-budget arithmetic, config and runbook.
 
+### W8A8 int8 backward (Krea 2 ConvRot8)
+
+`model.convrot8_backward: w8a8` (default `native`) replaces the ConvRot8 backward's dequant-to-bf16 input-gradient GEMM with a real int8 one: gradient rows are quantized with the forward's own Triton per-row quantizer (round-to-nearest, dynamic per-row scale) and multiplied through `torch._int_mm` in the transposed-B layout, reusing the forward's fused epilogue. Krea 2 with `qtype: convrot8` only — other arches are rejected at config validation. `AITK_INT8_W8A8_BACKWARD=1` remains as an ungated escape hatch, and the Krea 2 init banner reports the active mode and where it was set. The acceleration follows ZenTrainer's MIT-licensed int8 backward; the implementation is this fork's own and reuses its forward kernels.
+
+```yaml
+model:
+  qtype: convrot8
+  convrot8_backward: w8a8   # default native (dequant backward)
+```
+
+Measured on an RTX 5090 (Krea 2, rank 16, batch size 1, fixed 1024²; median over ~170 steady steps, arm medians reproduced twice in AB/BA order within 0.25%): 2.552 → 2.208 s/step (−13.5%). The gain sits entirely in the backward (−18.3% backward CUDA time, forward time unchanged) and VRAM is unchanged (~21 GiB run peak). It carries into real recipes: a bucketed (512–1024) character-LoRA identity recipe ran 1.683 → 1.423 s/step (−15.4%). Numerics: input-gradient error 0.89–1.04% NRMS vs an fp64 reference across all tested shapes — the same noise class as the forward's own activation-quantization floor (0.91%) — cosine ≥ 0.99995, gradient checkpointing bit-identical to eager, AdamW update deltas 0.002% of the update norm. Round-to-nearest is kept over stochastic rounding after measurement: with a dynamic per-row scale moving the quantization grid every step, RTN showed less bias and better small-signal transfer than SR.
+
+Quality was gated on paired 1500-step identity-recipe runs (identical seed, data, and schedule; arms differing only in the backward): no degradation — the W8A8 arm matched or edged native on solo likeness at every checkpoint from 250 to 1500, twin/leak/no-face metrics were identical to the control, and loss curves were indistinguishable to the 4th decimal. A single seed pair supports "no degradation", not improvement. Caveats: non-finite gradient rows are sanitized to finite values rather than propagated (the per-step finite-loss check is the practical guard); double-backward through the path is unsupported (nothing in diffusion training uses it); benchmarks cover RTX 5090 and RTX PRO 6000 (Blackwell-class) only.
+
 ### Perceptual anchor training (Krea 2, Qwen-Image 2.1)
 
 Auxiliary losses that can anchor a LoRA to structural ground truth; they do not guarantee identity/geometry usefulness without the required model weights and runtime evidence. Each anchor can be enabled independently only when its dependency/admission gate is satisfied, with per-dataset weight and timestep-range overrides (`*_loss_weight`, `*_loss_min_t/max_t`):
