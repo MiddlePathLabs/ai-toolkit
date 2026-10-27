@@ -1097,6 +1097,20 @@ class ModelConfig:
         if self.compile and self.quantize:
             print("Quantized model detected - allowing torch.compile (experimental)")
         self.block_compile = kwargs.get("block_compile", False)
+        # opt-in: allow the block path to run under gradient checkpointing
+        # (validated with native ConvRot8 only; see
+        # validate_block_compile_under_checkpointing for the rejected combos)
+        self.block_compile_with_checkpointing = kwargs.get(
+            "block_compile_with_checkpointing", False
+        )
+        if self.block_compile_with_checkpointing and not (
+            self.compile and self.block_compile
+        ):
+            raise ValueError(
+                "block_compile_with_checkpointing requires compile: true and "
+                "block_compile: true: it only lifts the checkpointing guard on "
+                "the block path, which itself runs inside the compile section"
+            )
         self.compile_mode = kwargs.get("compile_mode", "default")
         valid_compile_modes = {
             "default",
@@ -1228,7 +1242,46 @@ class ModelConfig:
                 f"{', '.join(ASSISTANT_LORA_ARCHS)} (got arch={self.arch!r})."
             )
 
-        
+
+def validate_block_compile_under_checkpointing(
+    model_config: "ModelConfig", gradient_checkpointing: bool
+) -> None:
+    """Fail fast on combinations proven to break when the opt-in
+    ``model.block_compile_with_checkpointing`` key lifts the checkpointing
+    guard on the block-compile path (measured on Krea 2 / ConvRot8, torch
+    2.13; every failure below reproduced on independent fresh runs):
+
+    - comfy_kitchen forward backend: torch.utils.checkpoint raises
+      CheckpointError ("recomputed values have different metadata than during
+      the forward pass") at the first backward, because the recompute pass
+      selects a different compiled graph than the forward pass did.
+    - w8a8 int8 input-gradient backward: hard segfault (exit 139) inside the
+      first training step with no Python exception, so no runtime fallback
+      can catch it.
+    """
+    if not (
+        model_config.block_compile
+        and model_config.block_compile_with_checkpointing
+        and gradient_checkpointing
+    ):
+        return
+    if model_config.convrot8_backend == "comfy_kitchen":
+        raise ValueError(
+            "block_compile under gradient checkpointing is incompatible with "
+            "convrot8_backend: comfy_kitchen: the checkpointed recompute pass "
+            "selects a different compiled graph than forward and raises "
+            "torch.utils.checkpoint CheckpointError at the first backward "
+            "(reproduced on fresh runs). Use convrot8_backend: native or "
+            "unset block_compile_with_checkpointing."
+        )
+    if model_config.convrot8_backward == "w8a8":
+        raise ValueError(
+            "block_compile under gradient checkpointing is incompatible with "
+            "convrot8_backward: w8a8: the combination segfaults (exit 139) "
+            "inside the first training step with no Python exception, so it "
+            "cannot fall back at runtime. Use convrot8_backward: native or "
+            "unset block_compile_with_checkpointing."
+        )
 
 
 class EMAConfig:
@@ -2417,6 +2470,10 @@ def validate_configs(
     
     if train_config.diff_output_preservation and train_config.blank_prompt_preservation:
         raise ValueError("Cannot use both differential output preservation and blank prompt preservation at the same time. Please set one of them to False.")
+
+    validate_block_compile_under_checkpointing(
+        model_config, train_config.gradient_checkpointing
+    )
 
 
 def collect_admission_diagnostics(raw_config, *, source: str = "api"):

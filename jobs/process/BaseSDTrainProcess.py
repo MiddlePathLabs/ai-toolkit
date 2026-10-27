@@ -118,8 +118,22 @@ from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
 
 
-def _use_block_compile(block_compile: bool, gradient_checkpointing: bool) -> bool:
-    return block_compile and not gradient_checkpointing
+def _use_block_compile(
+    block_compile: bool,
+    gradient_checkpointing: bool,
+    allow_under_checkpointing: bool = False,
+) -> bool:
+    # Block compile under gradient checkpointing is opt-in via
+    # model.block_compile_with_checkpointing. The compiled recompute path is
+    # validated only with native ConvRot8: the comfy_kitchen backend and the
+    # w8a8 backward deterministically break under it (first-backward
+    # CheckpointError / first-step segfault) and are rejected at config
+    # validation — see validate_block_compile_under_checkpointing.
+    if not block_compile:
+        return False
+    if gradient_checkpointing:
+        return allow_under_checkpointing
+    return True
 
 
 def _is_out_of_memory(error: BaseException) -> bool:
@@ -3591,12 +3605,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 block_compile = _use_block_compile(
                     requested_block_compile,
                     self.train_config.gradient_checkpointing,
+                    getattr(self.model_config, 'block_compile_with_checkpointing', False),
                 )
                 if requested_block_compile and not block_compile:
                     print_acc(
-                        "Gradient checkpointing is enabled: using whole-model torch.compile "
-                        "instead of block_compile so checkpoint recomputation stays inside "
-                        "the same compiled graph."
+                        "Gradient checkpointing is enabled without "
+                        "block_compile_with_checkpointing: using whole-model "
+                        "torch.compile instead of block_compile (measured ~null "
+                        "on Krea 2; the block path under checkpointing is opt-in "
+                        "and validated only with native ConvRot8)."
+                    )
+                elif block_compile and self.train_config.gradient_checkpointing:
+                    print_acc(
+                        "block_compile engaged under gradient checkpointing "
+                        "(opt-in; validated with native ConvRot8 only)."
                     )
 
                 # quantized + offloaded unet is incompatible with fullgraph; force it off
@@ -3886,6 +3908,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 traceback.print_exc()
             self.logger.commit(step=self.step_num)
         print_acc("")
+        # compile engagement visibility: dynamo frame outcomes and graph
+        # counts, so silent eager fallbacks (suppress_errors) are visible in
+        # the log alongside the "Wrapped N blocks" setup banner
+        if getattr(self.model_config, 'compile', False) or getattr(self.model_config, 'block_compile', False):
+            try:
+                from torch._dynamo.utils import counters
+                summary = {
+                    category: dict(counter)
+                    for category, counter in counters.items()
+                    if category in ("frames", "stats") or "error" in category
+                }
+                print_acc(f"[dynamo-counters] {summary}")
+            except Exception as e:
+                print_acc(f"[dynamo-counters] unavailable: {e}")
         if self.accelerator.is_main_process:
             self.logger.finish()
         self.accelerator.end_training()
