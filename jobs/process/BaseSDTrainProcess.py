@@ -104,6 +104,7 @@ from toolkit.identity_isolation_training import (
     validate_isolation_optimizer,
 )
 from toolkit import force_hf_hub_progress_bars
+from toolkit.hf_token_retry import install_hf_token_retry
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -178,6 +179,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Admission can import the package without Hugging Face. Enable the
         # progress policy only for the actual training runtime.
         force_hf_hub_progress_bars()
+        install_hf_token_retry()
         super().__init__(process_id, job, config)
         # Perceptual-fork configs keep every anchor under face_id; translate
         # before any section is parsed so those losses are not silently dropped.
