@@ -112,6 +112,17 @@ def test_positional_arguments_survive_the_retry():
     assert hub.calls == [SAVED, False]
 
 
+def test_a_non_login_retry_failure_keeps_the_original_login_error():
+    class Offline(Exception):
+        pass
+
+    hub = FakeDownload(anon_error=Offline("connection reset"))
+
+    with pytest.raises(Offline) as caught:
+        hf_token_retry._with_retry(hub, (), {"token": SAVED})
+    assert "token has expired" in str(caught.value.__cause__)
+
+
 def test_install_patches_the_hub_and_rebinds_importers(monkeypatch):
     hub = types.ModuleType("huggingface_hub")
     original_download = FakeDownload()
@@ -140,6 +151,36 @@ def test_install_patches_the_hub_and_rebinds_importers(monkeypatch):
     # idempotent: a second install leaves the wrapper in place
     hf_token_retry.install_hf_token_retry()
     assert hub.hf_hub_download is wrapped_download
+
+
+def test_install_survives_a_module_whose_getattr_raises(monkeypatch):
+    hub = types.ModuleType("huggingface_hub")
+    hub.hf_hub_download = FakeDownload()
+    hub.snapshot_download = FakeDownload()
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    # PEP 562 lazy module: asking for any unknown attribute raises
+    grumpy = types.ModuleType("grumpy_lazy_module")
+
+    def _raise(name):
+        raise RuntimeError(f"lazy import of {name} not available")
+
+    grumpy.__getattr__ = _raise  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "grumpy_lazy_module", grumpy)
+
+    # a sys.modules entry that refuses both getattr and setattr outright
+    class RefusesSet:
+        def __getattr__(self, name):
+            raise RuntimeError("no such attribute")
+
+        def __setattr__(self, name, value):
+            raise RuntimeError("read-only module entry")
+
+    stubborn = RefusesSet()
+    monkeypatch.setitem(sys.modules, "stubborn_module_entry", stubborn)
+
+    hf_token_retry.install_hf_token_retry()  # must not raise
+    assert getattr(hub.hf_hub_download, "_aitk_token_retry", False)
 
 
 def test_module_imports_without_huggingface_hub():

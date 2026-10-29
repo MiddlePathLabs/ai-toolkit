@@ -96,7 +96,7 @@ def _with_retry(fn, args, kwargs):
     except Exception as second:
         if _status(second) in (401, 403) or "gated" in type(second).__name__.lower():
             raise LoginExpired() from first
-        raise
+        raise second from first  # keep the login error that triggered the retry
     if not _noted:
         _noted = True
         print(NOTE)
@@ -126,11 +126,13 @@ def install_hf_token_retry():
         return
     # diffusers and transformers bind these names at import time; rebind what has
     # already been imported so the retry covers them too. Modules imported later pick
-    # the wrapper up from the patched hub package attribute on their own.
+    # the wrapper up from the patched hub package attribute on their own. A module's
+    # __getattr__ may raise for an unknown name (PEP 562 lazy imports), and some
+    # sys.modules entries refuse setattr; neither may break job startup.
     for module in list(sys.modules.values()):
         for name, original, wrapper in replacements:
-            if getattr(module, name, None) is original:
-                try:
+            try:
+                if getattr(module, name, None) is original:
                     setattr(module, name, wrapper)
-                except Exception:
-                    pass
+            except Exception:
+                pass
