@@ -1275,6 +1275,7 @@ class StableDiffusion:
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         unwrap_step_hooks = None
+        unwrap_sigma_override = None
         refiner_pipeline = None
         missing = object()
         sample_step_index = getattr(self, '_sample_step_index', missing)
@@ -1499,6 +1500,8 @@ class StableDiffusion:
             from toolkit.sample_step_hook import install_sample_step_hooks
     
             unwrap_step_hooks = install_sample_step_hooks(self, pipeline)
+            from toolkit.sample_sigmas import install_sample_sigma_override
+            unwrap_sigma_override = install_sample_sigma_override(self, pipeline, image_configs)
     
             refiner_pipeline = None
             if self.refiner_unet:
@@ -1526,6 +1529,7 @@ class StableDiffusion:
     
                     for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
                         gen_config = image_configs[i]
+                        self.sample_sigmas = getattr(gen_config, "sigmas", None)
     
                         extra = {}
                         validation_image = None
@@ -1905,6 +1909,8 @@ class StableDiffusion:
                     cleanup.callback(torch.cuda.empty_cache)
                     if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                         cleanup.callback(self.adapter.clear_memory)
+                    if unwrap_sigma_override is not None:
+                        cleanup.callback(unwrap_sigma_override)
                     if unwrap_step_hooks is not None:
                         cleanup.callback(unwrap_step_hooks)
             except Exception as error:

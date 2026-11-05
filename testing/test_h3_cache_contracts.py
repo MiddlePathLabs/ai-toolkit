@@ -26,6 +26,10 @@ def _toy_prompt_tensor(caption, control_rgb=None):
 def _toy_prompt_embeds(caption, control_images=None):
     from toolkit.prompt_utils import PromptEmbeds
 
+    # the text-embed cache batches plain prompts as a list; a plain
+    # PromptEmbeds return for >1 prompt makes it redo them one at a time
+    if isinstance(caption, (list, tuple)):
+        caption = caption[0]
     if isinstance(control_images, (list, tuple)):
         control_images = control_images[0] if control_images else None
     if torch.is_tensor(control_images):

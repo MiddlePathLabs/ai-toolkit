@@ -23,6 +23,7 @@ ACCEPTED = [
     "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",
+    "p_h3_image",
     "qwen_image_2",
     "zimage:turbo",
     "zimage_l2p",

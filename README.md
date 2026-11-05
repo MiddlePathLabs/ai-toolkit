@@ -365,6 +365,7 @@ train:
 - [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2 Edit Training)
 - [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
 - [microsoft/Mage-Flow-Edit-Base](https://huggingface.co/microsoft/Mage-Flow-Edit-Base) (Mage-Flow Edit)
+- [PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) (P-H3-Image) - text-to-image and editing with up to 8 reference images; it edits when your dataset has control images
 
 #### Edit and Omni training notes
 
