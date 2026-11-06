@@ -473,6 +473,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
         raw_gen_img_config_list = []
+        # preview-checkpoint twins ('both' mode): the same EMA-window items
+        # rendered on the holder's preview DiT (SFT_) after the primary pass
+        sft_gen_img_config_list = []
+        # read defensively: legacy StableDiffusion (not a BaseModel) has no
+        # preview checkpoint hooks
+        preview_checkpoint_mode = getattr(self.sd, "preview_checkpoint_mode", "") or ""
         sample_timestamp = None
 
         sample_config = self.first_sample_config if is_first else self.sample_config
@@ -572,12 +578,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
             image_config.output_path = image_config.get_image_path()
             target_list.append(image_config)
 
+            if preview_checkpoint_mode == "both" and not filename_prefix:
+                # SFT twin: same prompt/seed/steps on the preview checkpoint, so
+                # Base and SFT renders compare directly. raw_weights items stay
+                # on the training model (their pass swaps weights, not models)
+                sft_config = copy.copy(image_config)
+                sft_config.output_filename_no_ext = (
+                    "SFT_" + image_config.output_filename_no_ext
+                )
+                sft_config.output_path = sft_config.get_image_path()
+                sft_gen_img_config_list.append(sft_config)
+
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
         raw_gen_img_config_list = self.post_process_generate_image_config_list(raw_gen_img_config_list)
+        sft_gen_img_config_list = self.post_process_generate_image_config_list(sft_gen_img_config_list)
 
         planned_samples = []
-        for configs in (gen_img_config_list, raw_gen_img_config_list):
+        for configs in (gen_img_config_list, raw_gen_img_config_list, sft_gen_img_config_list):
             for image_config in configs:
                 image_config.output_filename_no_ext = re.sub(
                     r"_seed--?\d+_steps-\d+$", "", image_config.output_filename_no_ext
@@ -634,7 +652,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # send to be generated
                 if len(gen_img_config_list) > 0:
-                    self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+                    rendered = False
+                    if preview_checkpoint_mode == "sft":
+                        # previews render on the preview checkpoint, not the
+                        # training model; on failure the preview checkpoint
+                        # turns off and this round renders on the training
+                        # model below
+                        rendered = self._generate_on_preview_checkpoint(
+                            gen_img_config_list, sample_config, step
+                        )
+                    if not rendered:
+                        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+
+                # preview-checkpoint pass ('both'): the SFT_ twins of the
+                # EMA-window items, still inside the ema.eval() window so the
+                # frozen clone carries the shadow weights, mirroring the
+                # primary samples. Isolated like the raw pass below; a failure
+                # here only turns the preview checkpoint off, not all previews.
+                if len(sft_gen_img_config_list) > 0:
+                    self._generate_on_preview_checkpoint(
+                        sft_gen_img_config_list, sample_config, step
+                    )
 
                 # raw-weight sample pass: items flagged raw_weights are ROUTED here
                 # (not duplicated — the EMA set is the unflagged items only), generated
@@ -672,6 +710,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.ema is not None:
                     self.ema.train()
         print_acc("") # add a line break
+
+    def _generate_on_preview_checkpoint(self, image_configs, sample_config, step) -> bool:
+        """One generate pass on the holder's preview checkpoint. Returns True
+        when it rendered. Any failure (OOM, or a LoRA that does not carry over)
+        turns the preview checkpoint off for the rest of the run instead of
+        ending training or disabling every preview."""
+        try:
+            with self.sd.preview_checkpoint_context():
+                self.sd.generate_images(image_configs, sampler=sample_config.sampler)
+        except Exception as e:
+            if isinstance(e, PreviewStateRestorationError):
+                raise
+            if not _is_out_of_memory(e):
+                print_acc(f"[sample] preview-checkpoint sampling failed: {e}")
+                traceback.print_exc()
+            self.sd.disable_preview_checkpoint(step, e)
+            return False
+        return True
 
     def _disable_previews_after_oom(self, step, error):
         self._previews_disabled_by_oom = True
@@ -797,6 +853,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "model": (
                 "preview_lora_path", "preview_lora_strength",
                 "preview_lora_schedule", "inference_lora_path",
+                "preview_checkpoint", "preview_checkpoint_path",
+                "preview_checkpoint_qtype",
                 "vae_device", "te_device", "model_paths", "in_context",
             ),
             "face_id": ("identity_loss_decoded_det_threshold",),
@@ -3170,9 +3228,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     train_embedding=self.embed_config is not None,
                 )
 
-                self.network = NetworkClass(
-                    text_encoder=text_encoder,
-                    unet=self.sd.get_model_to_train(),
+                network_ctor_kwargs = dict(
                     lora_dim=self.network_config.linear,
                     multiplier=1.0,
                     alpha=self.network_config.linear_alpha,
@@ -3201,6 +3257,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     base_model=self.sd,
                     **network_kwargs
                 )
+                self.network = NetworkClass(
+                    text_encoder=text_encoder,
+                    unet=self.sd.get_model_to_train(),
+                    **network_ctor_kwargs
+                )
+                # the arguments minus the model objects, so a holder can build a
+                # structurally identical network on a second model (MOSS-Image
+                # preview_checkpoint); keeping text_encoder / unet here would pin
+                # them in memory after the trainer releases them
+                self.network.aitk_ctor_kwargs = network_ctor_kwargs
 
 
                 # todo switch everything to proper mixed precision like this

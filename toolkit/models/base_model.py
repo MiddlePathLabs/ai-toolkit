@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import copy
 import gc
 import inspect
@@ -514,6 +514,28 @@ class BaseModel:
             print_acc("Unloading inference lora")
             self.assistant_lora.is_active = False
             self.assistant_lora.force_to('cpu', self.torch_dtype)
+
+    # ---- preview checkpoint (sample-round model swap) ---------------------------------
+    # Holders whose training model differs from the checkpoint the LoRA will be
+    # used on (e.g. MOSS-Image: train on Base, preview on SFT) override these
+    # to render sample rounds elsewhere. Training weights and the trajectory
+    # are never touched.
+
+    @property
+    def preview_checkpoint_mode(self) -> str:
+        """'' = sample rounds render on the training model; holders that
+        support a preview checkpoint return 'sft' or 'both'."""
+        return ""
+
+    def preview_checkpoint_context(self):
+        """Context around a generate pass that should use the preview
+        checkpoint. The default holds nothing."""
+        return nullcontext()
+
+    def disable_preview_checkpoint(self, step=None, error=None):
+        """Turn the preview checkpoint off for the rest of the run (e.g. after
+        OOM). No-op on holders without one."""
+        pass
 
     def _emit_sample_step(self, latents, step_index=None, num_steps=None):
         """For holders whose sampling loop bypasses scheduler.step: report one

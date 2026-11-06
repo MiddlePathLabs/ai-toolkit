@@ -20,6 +20,8 @@ Flow convention matches ai-toolkit (sigma 1 = noise, target = noise - clean).
 
 import math
 import os
+import weakref
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -50,6 +52,7 @@ from .src.checkpoints import (
     QWEN35_9B_REPO,
     SFT_REPO,
     VENDOR_VAE_FILE,
+    comfy_sft_transformer_file,
     comfy_text_encoder_file,
     comfy_transformer_file,
     comfy_vae_file,
@@ -156,6 +159,93 @@ def _drop_repeats(images):
     return kept
 
 
+def build_frozen_lora_clone(network, dit):
+    """A frozen structural clone of a training LoRA network, attached to a
+    second DiT of the same architecture (the preview checkpoint).
+
+    The training Network cannot be reused: its modules are bound to the first
+    model's module objects. The clone is built with the trainer's own
+    constructor arguments (``network.aitk_ctor_kwargs``: same filters, ranks,
+    naming and full-layer rules), so discovery on the identical module tree
+    finds exactly the training network's transformer modules. Weights move
+    over with ``load_live_lora_weights``. LoRA / fullrank networks only."""
+    net_type = str(getattr(network, "network_type", "lora") or "lora").lower()
+    if net_type not in ("lora", "fullrank"):
+        raise RuntimeError(
+            f"preview_checkpoint supports LoRA networks; the training network is "
+            f"{net_type!r}. Leave preview_checkpoint unset for this run."
+        )
+    if getattr(network, "is_lorm", False):
+        raise RuntimeError(
+            "preview_checkpoint does not support LoRM networks. Leave "
+            "preview_checkpoint unset for this run."
+        )
+    ctor_kwargs = getattr(network, "aitk_ctor_kwargs", None)
+    if ctor_kwargs is None:
+        raise RuntimeError(
+            "preview_checkpoint: the training network carries no recorded "
+            "constructor arguments (aitk_ctor_kwargs), so it cannot be cloned"
+        )
+    kwargs = dict(ctor_kwargs)
+    kwargs.update(
+        text_encoder=None,
+        unet=dit,
+        multiplier=1.0,
+        train_unet=True,
+        train_text_encoder=False,
+        is_assistant_adapter=True,
+    )
+    if kwargs.get("target_lin_modules") is not None:
+        # the ctor can extend this list in place (conv targets); never let it
+        # reach back into the holder's target_lora_modules
+        kwargs["target_lin_modules"] = list(kwargs["target_lin_modules"])
+    frozen = type(network)(**kwargs)
+    frozen.apply_to(None, dit, apply_text_encoder=False, apply_unet=True)
+    frozen.requires_grad_(False)
+    frozen.eval()
+    frozen.is_active = False
+    # the ctor set the multiplier before modules existed, so the assignment
+    # above never primed the torch multiplier; do it explicitly, as the
+    # trainer does after apply_to
+    frozen._update_torch_multiplier()
+    trained = {m.lora_name for m in getattr(network, "unet_loras", [])}
+    cloned = {m.lora_name for m in frozen.unet_loras}
+    if not cloned or cloned != trained:
+        raise RuntimeError(
+            "preview_checkpoint: the training LoRA's transformer modules do not "
+            f"match the preview DiT ({len(trained)} trained, {len(cloned)} "
+            f"cloned, {len(trained ^ cloned)} differ; a different architecture?)"
+        )
+    return frozen
+
+
+def load_live_lora_weights(clone, network):
+    """Copy the training network's current weights into the clone (the EMA
+    shadow weights while ema.eval() holds them). Only the clone's keys move:
+    text-encoder modules the clone does not carry are skipped, while a clone
+    key missing from the training network is an error."""
+    live = network.state_dict()
+    wanted = list(clone.state_dict().keys())
+    missing = [k for k in wanted if k not in live]
+    if missing:
+        raise RuntimeError(
+            f"preview_checkpoint: {len(missing)} clone weights are missing from "
+            f"the training network (first: {missing[0]!r})"
+        )
+    clone.load_state_dict({k: live[k] for k in wanted}, strict=True)
+
+
+def bind_clone_modules(clone, network):
+    """Point the clone's modules at ``network`` for their runtime state
+    (is_active, multiplier, CFG branch bookkeeping). Bound to the training
+    network during a preview pass, the clone follows whatever generate_images
+    sets on it (per-sample network_multiplier included); bound back to the
+    clone afterwards."""
+    ref = weakref.ref(network)
+    for module in clone.get_all_modules():
+        module.network_ref = ref
+
+
 class MossImageModel(BaseModel):
     arch = "moss_image"
 
@@ -197,6 +287,14 @@ class MossImageModel(BaseModel):
         self.has_multiple_control_images = self.is_edit
         self.use_raw_control_images = self.is_edit
         self.image_processor = None
+
+        # preview checkpoint (model.preview_checkpoint): a second DiT (the SFT
+        # checkpoint) parked on CPU that sample rounds can render on. Training
+        # weights, saves and the trajectory are untouched. self.network
+        # (BaseModel) is set by the trainer once the LoRA network exists.
+        self._preview_dit = None
+        self._preview_network = None
+        self._preview_checkpoint_disabled = False
 
     @staticmethod
     def get_train_scheduler():
@@ -348,6 +446,7 @@ class MossImageModel(BaseModel):
         self.tokenizer = tokenizer
         self.model = transformer
         self.pipeline = MossImagePipeline(self)
+        self._maybe_load_preview_checkpoint()
         self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------
@@ -355,6 +454,124 @@ class MossImageModel(BaseModel):
     # ------------------------------------------------------------------
     def get_generation_pipeline(self):
         return MossImagePipeline(self)
+
+    # ------------------------------------------------------------------
+    # Preview checkpoint (train on Base, preview on SFT)
+    # ------------------------------------------------------------------
+    def _maybe_load_preview_checkpoint(self):
+        """``model.preview_checkpoint``: load the SFT DiT sample rounds can
+        render on, parked on CPU between rounds. The LoRA will mostly be used
+        on SFT (OpenMOSS's aesthetics checkpoint) while Base is the training
+        substrate, and a Base-trained LoRA carries over only partly."""
+        mc = self.model_config
+        mode = str(getattr(mc, "preview_checkpoint", "") or "")
+        if not mode:
+            return
+        qtype = mc.preview_checkpoint_qtype or None
+        if mc.preview_checkpoint_path:
+            path = resolve_hub_file(
+                mc.preview_checkpoint_path,
+                hf_token=HF_TOKEN,
+                status_fn=self.print_and_status_update,
+            )
+        else:
+            path = comfy_sft_transformer_file(
+                qtype=qtype, hf_token=HF_TOKEN, status_fn=self.print_and_status_update
+            )
+        self.print_and_status_update(f"Loading preview checkpoint DiT: {path}")
+        dit = MossImageTransformer.load_model(
+            path, dtype=self.torch_dtype, qtype=qtype, quantize_on_load=False
+        )
+        # keeps a matching shipped convrot quant as-is; fresh-quantizes a bf16
+        # file when a qtype is set; parks on CPU either way
+        dit.aitk_post_load(
+            qtype=qtype, dtype=self.torch_dtype, device=torch.device("cpu")
+        )
+        dit.eval().requires_grad_(False)
+        self._preview_dit = dit
+        self.print_and_status_update(
+            f"Preview checkpoint ready ({mode}): parked on CPU; sample rounds "
+            + ("also render on it (SFT_ files)" if mode == "both" else "render on it")
+        )
+
+    @property
+    def preview_checkpoint_mode(self) -> str:
+        if self._preview_dit is None or self._preview_checkpoint_disabled:
+            return ""
+        return str(self.model_config.preview_checkpoint or "")
+
+    def disable_preview_checkpoint(self, step=None, error=None):
+        if self._preview_dit is not None and not self._preview_checkpoint_disabled:
+            self._preview_checkpoint_disabled = True
+            when = f" at step {step}" if step is not None else ""
+            why = f": {error}" if error is not None else ""
+            self.print_and_status_update(
+                f"Preview checkpoint disabled{when}; further sample rounds render "
+                f"on the training model{why}"
+            )
+
+    @contextmanager
+    def preview_checkpoint_context(self):
+        """Render one generate pass on the preview DiT: the holder's model is
+        swapped for the parked preview DiT carrying a frozen copy of the
+        training LoRA at its CURRENT weights (enter inside the EMA eval window
+        to preview the shadow weights, as the sample round does). The training
+        model is restored untouched on exit."""
+        if self._preview_dit is None or self._preview_checkpoint_disabled:
+            yield
+            return
+        if self.model is self._preview_dit:  # already swapped (nested generate)
+            yield
+            return
+        network = getattr(self, "network", None)
+        if network is None:
+            # e.g. a full fine-tune: there is no LoRA to carry over (the
+            # trainer turns the preview checkpoint off on this error)
+            raise RuntimeError(
+                "preview_checkpoint needs a LoRA training network; none exists"
+            )
+        network = getattr(network, "module", network)  # unwrap accelerator/DDP
+        if self._preview_network is None:
+            self._preview_network = build_frozen_lora_clone(
+                network, self._preview_dit
+            )
+        clone = self._preview_network
+        training_dit = self.model
+        merge_ok = network.can_merge_in
+        # low_vram: park the frozen training DiT on CPU for the pass so only
+        # one transformer sits on the GPU (its LoRA modules stay put)
+        offload_training = bool(
+            getattr(self.model_config, "low_vram", False)
+            and not getattr(self.model_config, "layer_offloading", False)
+        )
+        # a Base-side merge_in during this pass would bake the LoRA into the
+        # training model and render the swapped model WITHOUT it
+        network.can_merge_in = False
+        try:
+            clone.force_to(self.device_torch, torch.float32)
+            # exact fp32 transfer of the live weights (the shadow weights
+            # while ema.eval() holds them), GPU to GPU now that the clone is
+            # on the device
+            load_live_lora_weights(clone, network)
+            # the clone's modules read is_active / multiplier / CFG state from
+            # the training network, so per-sample network_multiplier applies
+            bind_clone_modules(clone, network)
+            if offload_training:
+                training_dit.to("cpu")
+                flush()
+            self._preview_dit.to(self.device_torch)
+            self._preview_dit.eval()
+            self.model = self._preview_dit
+            yield
+        finally:
+            self.model = training_dit
+            bind_clone_modules(clone, clone)
+            network.can_merge_in = merge_ok
+            clone.force_to("cpu", torch.float32)
+            self._preview_dit.to("cpu")
+            flush()
+            if offload_training:
+                training_dit.to(self.device_torch)
 
     def generate_single_image(
         self,

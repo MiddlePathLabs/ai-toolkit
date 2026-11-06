@@ -6,13 +6,15 @@ Comfy-Org/MOSS-Image repack (DiT: the vendor's keys with q/k/v fused).
 - ``OpenMOSS-Team/MOSS-Image-SFT`` / ``-Base`` (vendor, the UI defaults): a
   repack DiT file already on disk wins (best precision for the requested
   qtype; int8 only for convrot). Otherwise Base downloads the repack's bf16
-  (byte-identical to the vendor shards); SFT, which the repack has no bf16
-  of, downloads the vendor's diffusers shards once and merges them into
-  ``diffusion_models/moss_image_sft_bf16.safetensors`` in the Comfy layout.
+  (byte-identical to the vendor shards); SFT merges the vendor's diffusers
+  shards once into ``diffusion_models/moss_image_sft_bf16.safetensors`` (the
+  repack's bf16 SFT file of the same name is used when already on disk, but
+  is not downloaded in place of the vendor weights: VENDOR_MIRROR lists only
+  checkpoints verified byte-identical).
   Other hub repos (fine-tunes) merge into a file named after the repo, never
   substituted.
-- ``Comfy-Org/MOSS-Image``: the repack's SFT DiT (int8 convrot only; a local
-  merged bf16 SFT also counts).
+- ``Comfy-Org/MOSS-Image``: the repack's SFT DiT (int8 convrot or bf16,
+  ranked for the requested qtype; a local merged bf16 SFT also counts).
 - ``org/repo/path/file.safetensors``: that file, downloaded to its comfy spot.
 
 The vendor text_encoder/ is stock Qwen3.5-9B (A_log / gated norm stored in
@@ -55,16 +57,20 @@ COMFY_VAE_FILE = "vae/flux2-vae.safetensors"
 # an already-downloaded full file keeps winning (local candidates resolve first)
 COMFY_VAE_SMALL_FILE = "vae/flux2-vae_small.safetensors"
 
-# variant -> (files in the repack, extra local-only candidates). The merged
-# vendor SFT is the bf16 SFT the repack does not ship.
+# variant -> (files in the repack, extra local-only candidates). The repack
+# ships int8 convrot + bf16 for both checkpoints (verified 6 Nov 2026; the
+# earlier `_attn`-suffixed names do not exist there).
 COMFY_TRANSFORMER_FILES = {
     "sft": (
-        ["diffusion_models/moss_image_sft_int8_convrot_attn.safetensors"],
-        ["diffusion_models/moss_image_sft_bf16.safetensors"],
+        [
+            "diffusion_models/moss_image_sft_int8_convrot.safetensors",
+            "diffusion_models/moss_image_sft_bf16.safetensors",
+        ],
+        [],
     ),
     "base": (
         [
-            "diffusion_models/moss_image_base_int8_convrot_attn.safetensors",
+            "diffusion_models/moss_image_base_int8_convrot.safetensors",
             "diffusion_models/moss_image_base_bf16.safetensors",
         ],
         [],
@@ -173,6 +179,26 @@ def comfy_transformer_file(
     merge_safetensors(shards, target, fuse_qkv=True)
     shutil.rmtree(staging, ignore_errors=True)
     return target
+
+
+def comfy_sft_transformer_file(
+    qtype: Optional[str] = "convrot8",
+    hf_token: Optional[str] = None,
+    status_fn: Optional[Callable[[str], None]] = None,
+) -> str:
+    """The SFT DiT for preview rounds (``model.preview_checkpoint``).
+
+    A convrot qtype takes the repack's int8 file (about 5.4 GB, attaches
+    as-is); anything else means full precision: a local bf16 SFT file, else
+    the vendor shards merged once into it (see VENDOR_MIRROR).
+    """
+    if (qtype or "").lower().startswith("convrot"):
+        return comfy_transformer_file(
+            COMFY_REPO, qtype=qtype, hf_token=hf_token, status_fn=status_fn
+        )
+    return comfy_transformer_file(
+        SFT_REPO, qtype=qtype, hf_token=hf_token, status_fn=status_fn
+    )
 
 
 def comfy_text_encoder_file(

@@ -997,6 +997,18 @@ class ModelConfig:
         # auto = 'viggle' when the file name says so, else 'turbo' (Comfy-Org /
         # Qwen Turbo: 8 fixed sigmas, CFG 1, no shift)
         self.preview_lora_schedule = str(kwargs.get('preview_lora_schedule', 'auto')).lower()
+        # MOSS-Image preview checkpoint: render training previews on the SFT DiT
+        # (OpenMOSS's aesthetics-tuned checkpoint) instead of, or beside, the
+        # training Base. 'sft' = previews on SFT only; 'both' = Base previews
+        # plus SFT_-prefixed twins. Sample-round-only; training weights and the
+        # trajectory are untouched.
+        self.preview_checkpoint = str(kwargs.get('preview_checkpoint', '') or '').lower()
+        # optional explicit DiT file (bf16 or comfy int8 convrot .safetensors);
+        # unset = the SFT checkpoint through the normal resolver
+        self.preview_checkpoint_path = kwargs.get('preview_checkpoint_path', None)
+        # precision of the preview DiT (int8 convrot by default). A bf16 file
+        # is quantized to it on load; null keeps full precision
+        self.preview_checkpoint_qtype = kwargs.get('preview_checkpoint_qtype', 'convrot8')
 
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
@@ -1236,6 +1248,27 @@ class ModelConfig:
                     "inference_lora_path is only supported for Flux and Krea 2 "
                     f"models (got arch={self.arch!r}). On minimax_h3 and "
                     "qwen_image_2 use preview_lora_path for turbo previews."
+                )
+        if self.preview_checkpoint:
+            base_arch = self.arch.partition(':')[0]
+            if base_arch != "moss_image":
+                raise ValueError(
+                    "preview_checkpoint is only supported for model.arch "
+                    "'moss_image' (SFT previews beside a Base-trained LoRA); "
+                    f"got arch={self.arch!r}."
+                )
+            if self.preview_checkpoint not in ("sft", "both"):
+                raise ValueError(
+                    "preview_checkpoint must be 'sft' (previews on the SFT "
+                    "checkpoint only) or 'both' (Base previews plus SFT_-prefixed "
+                    f"twins), got {self.preview_checkpoint!r}."
+                )
+            if self.preview_checkpoint_qtype is not None and not isinstance(
+                self.preview_checkpoint_qtype, str
+            ):
+                raise ValueError(
+                    "preview_checkpoint_qtype must be a qtype string (e.g. "
+                    f"'convrot8') or null, got {self.preview_checkpoint_qtype!r}."
                 )
         if (
             self.assistant_lora_path is not None
