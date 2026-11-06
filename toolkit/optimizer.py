@@ -129,6 +129,42 @@ def get_optimizer(
         from toolkit.optimizers.adamconvrot import AdamConvRot
         optimizer_params.setdefault('eps', 1e-6)
         optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'muon':
+        # Muon — Newton-Schulz orthogonalized momentum.  Defaults are
+        # RMS-matched to AdamW (adjust_lr_fn=match_rms_adamw), so existing
+        # AdamW learning rates carry over unchanged (the pairing Fizgig
+        # measured across their Krea 2 / Qwen 2.1 LoRA presets, v9.0.8).
+        # torch.optim.Muon directly when every parameter is 2D (PyTorch
+        # 2.10+; this repo pins 2.13); the vendored copy covers non-2D
+        # tensors (conv factors, biases, norms).
+        params = list(params)
+        if params and isinstance(params[0], dict):
+            # Materialize each group's params exactly once.  A group may carry
+            # a generator (or a bare tensor); the dimension check below would
+            # otherwise exhaust the generator and hand the optimizer empty
+            # groups — a silent no-update run.  Mirrors the replacement
+            # torch's add_param_group performs on these same dicts anyway.
+            # Groups without a "params" key stay untouched so torch raises
+            # the same KeyError every other factory branch produces.
+            for group in params:
+                group_params = group.get('params')
+                if isinstance(group_params, torch.Tensor):
+                    group['params'] = [group_params]
+                elif group_params is not None:
+                    group['params'] = list(group_params)
+            flat = [p for group in params for p in group.get('params', ())]
+        else:
+            flat = params
+        optimizer_params.setdefault('adjust_lr_fn', 'match_rms_adamw')
+        optimizer_params.setdefault('weight_decay', 0.01)
+        optimizer_params.setdefault('momentum', 0.95)
+        optimizer_params.setdefault('nesterov', True)
+        optimizer_params.setdefault('ns_steps', 5)
+        if hasattr(torch.optim, 'Muon') and all(getattr(p, 'ndim', 0) == 2 for p in flat):
+            optimizer = torch.optim.Muon(params, lr=float(learning_rate), **optimizer_params)
+        else:
+            from toolkit.optimizers.muon import Muon
+            optimizer = Muon(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     # New factory branches must be classified in toolkit/optimizer_runtime.py

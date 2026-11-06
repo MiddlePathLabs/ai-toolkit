@@ -1000,6 +1000,7 @@ export default function SimpleJob({
                     { value: 'adam', label: 'Adam' },
                     { value: 'adamw', label: 'AdamW' },
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
+                    { value: 'muon', label: 'Muon' },
                     { value: 'automagic', label: 'Automagic' },
                     { value: 'automagic2', label: 'Automagic v2' },
                     { value: 'automagic3', label: 'Automagic v3' },

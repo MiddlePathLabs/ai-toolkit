@@ -292,7 +292,7 @@ def _known_step_scale_support(train: Mapping[str, Any]) -> Optional[bool]:
     if optimizer in {
         "adam", "adamw", "adagrad", "adam8", "adam8bit", "adamw8", "adamw8bit",
         "rose", "automagic", "automagic2", "automagic3", "automagic4", "automagicexperiment",
-        "adamconvrot", "adam_convrot", "prodigy8bit",
+        "adamconvrot", "adam_convrot", "prodigy8bit", "muon",
     }:
         return True
     if optimizer == "adafactor":

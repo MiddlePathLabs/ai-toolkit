@@ -220,6 +220,8 @@ def known_fused_backward_from_config(
         return bool(params.get("fused", True))
     if name in {"adamconvrot", "adam_convrot"}:
         return bool(params.get("fused", False))
+    if name == "muon":
+        return False
     return None
 
 
@@ -305,6 +307,14 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
 
     if name in ("Adam", "AdamW", "Adagrad") and "torch.optim" in module:
         # torch fused=True is a step-time CUDA kernel, not fused-backward.
+        return group_lr("step")
+
+    if name == "Muon":
+        # Covers both torch.optim.Muon and the vendored toolkit copy.  Muon
+        # reads group["lr"] exactly once per step() and skips params without
+        # grads, so a transient group-LR scale is a faithful final-update
+        # scale (momentum buffer and orthogonalized update are lr-independent)
+        # and a grad-none mask is a faithful inactive-param mask.
         return group_lr("step")
 
     if name == "Adam8bit" and "toolkit.optimizers.adam8bit" in module:

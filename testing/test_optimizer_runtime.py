@@ -179,6 +179,7 @@ def test_classify_factory_branches_cpu():
         ("adam8", {}, "group_lr", "step", True, True),
         ("adamw8", {}, "group_lr", "step", True, True),
         ("prodigy8bit", {}, "native", "step", True, True),
+        ("muon", {}, "group_lr", "step", True, True),
         ("prodigy", {}, "unsupported", "step", False, True),
     ]
     for name, params, strategy, phase, supported, mask in cases:
@@ -208,6 +209,35 @@ def test_classify_fused_backward_families():
     assert caps.mask_strategy == "native"
 
 
+
+
+def test_muon_factory_routes_and_updates_non_2d_params():
+    # All-2D params go to torch.optim.Muon; anything else (bias, conv) must
+    # fall back to the vendored copy, classify the same way, and update
+    # every parameter — including ones handed over as a generator group.
+    opt = get_optimizer(_params(), "muon", 1e-3, {})
+    assert type(opt).__module__.startswith("torch.optim")
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(2, 4, 3, padding=1),
+        torch.nn.Flatten(),
+        torch.nn.Linear(4 * 4 * 4, 3),
+    )
+    opt = get_optimizer([{"params": (p for p in model.parameters())}], "muon", 1e-2, {})
+    assert type(opt).__module__ == "toolkit.optimizers.muon"
+    assert len(opt.param_groups[0]["params"]) == 4
+    caps = classify_optimizer(opt)
+    assert caps.step_scale_strategy == "group_lr"
+    assert caps.update_phase == "step"
+    assert caps.supports_active_param_mask is True
+
+    before = [p.detach().clone() for p in model.parameters()]
+    model(torch.randn(2, 2, 4, 4)).square().mean().backward()
+    opt.step()
+    for old, new in zip(before, model.parameters()):
+        assert torch.isfinite(new).all()
+        assert not torch.equal(old, new)
 
 
 def test_unknown_optimizer_is_unsupported():
