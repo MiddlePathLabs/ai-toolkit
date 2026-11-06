@@ -159,6 +159,10 @@ def _drop_repeats(images):
     return kept
 
 
+# network types build_frozen_lora_clone can rebuild on the preview DiT
+PREVIEW_CLONE_NETWORK_TYPES = ("lora", "fullrank", "lokr", "dora")
+
+
 def build_frozen_lora_clone(network, dit):
     """A frozen structural clone of a training LoRA network, attached to a
     second DiT of the same architecture (the preview checkpoint).
@@ -168,12 +172,18 @@ def build_frozen_lora_clone(network, dit):
     constructor arguments (``network.aitk_ctor_kwargs``: same filters, ranks,
     naming and full-layer rules), so discovery on the identical module tree
     finds exactly the training network's transformer modules. Weights move
-    over with ``load_live_lora_weights``. LoRA / fullrank networks only."""
+    over with ``load_live_lora_weights``. Any network type LoRASpecialNetwork
+    builds works (lora, fullrank, lokr, dora): the type and its module options
+    ride along in the recorded kwargs. LyCORIS networks (a different class)
+    and LoRM are not supported."""
+    from toolkit.lora_special import LoRASpecialNetwork
+
     net_type = str(getattr(network, "network_type", "lora") or "lora").lower()
-    if net_type not in ("lora", "fullrank"):
+    if not isinstance(network, LoRASpecialNetwork) or net_type not in PREVIEW_CLONE_NETWORK_TYPES:
         raise RuntimeError(
-            f"preview_checkpoint supports LoRA networks; the training network is "
-            f"{net_type!r}. Leave preview_checkpoint unset for this run."
+            "preview_checkpoint supports lora / fullrank / lokr / dora networks; "
+            f"the training network is {net_type!r}. Leave preview_checkpoint "
+            "unset for this run."
         )
     if getattr(network, "is_lorm", False):
         raise RuntimeError(

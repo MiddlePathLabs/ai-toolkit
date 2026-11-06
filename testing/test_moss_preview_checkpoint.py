@@ -49,8 +49,8 @@ class MossImageTransformer(nn.Module):
         return x
 
 
-def _training_network(dit, rank=4, targets=None, **extra):
-    config = NetworkConfig(type="lora", linear=rank, linear_alpha=rank)
+def _training_network(dit, rank=4, targets=None, network_type="lora", **extra):
+    config = NetworkConfig(type=network_type, linear=rank, linear_alpha=rank)
     # the trainer builds the network from these and records them on it
     ctor_kwargs = dict(
         lora_dim=rank,
@@ -59,7 +59,7 @@ def _training_network(dit, rank=4, targets=None, **extra):
         train_unet=True,
         train_text_encoder=False,
         network_config=config,
-        network_type="lora",
+        network_type=network_type,
         is_transformer=True,
         target_lin_modules=TARGETS if targets is None else targets,
         ignore_if_contains=["text_embedder"],
@@ -152,8 +152,8 @@ class TestFrozenLoraClone:
     def test_non_lora_network_rejected(self):
         training_dit = MossImageTransformer()
         net = _training_network(training_dit)
-        net.network_type = "lokr"
-        with pytest.raises(RuntimeError, match="supports LoRA networks"):
+        net.network_type = "locon"
+        with pytest.raises(RuntimeError, match="supports lora / fullrank"):
             build_frozen_lora_clone(net, MossImageTransformer())
 
     def test_untracked_network_rejected(self):
@@ -210,3 +210,32 @@ class TestFrozenLoraClone:
             assert not torch.equal(training_dit(x), preview_dit(x))
         finally:
             net.is_active = False
+
+    @pytest.mark.parametrize("network_type", ["lokr", "dora"])
+    def test_non_lora_types_clone_exactly(self, network_type):
+        torch.manual_seed(0)
+        training_dit = MossImageTransformer()
+        preview_dit = MossImageTransformer()
+        preview_dit.load_state_dict(training_dit.state_dict())
+        net = _training_network(training_dit, network_type=network_type)
+        with torch.no_grad():  # a non-trivial delta in every adapter weight
+            for p in net.parameters():
+                p.normal_(0, 0.5)
+        clone = build_frozen_lora_clone(net, preview_dit)
+        assert type(clone.unet_loras[0]) is type(net.unet_loras[0])
+        expected = {"lokr": "LokrModule", "dora": "DoRAModule"}[network_type]
+        assert type(net.unet_loras[0]).__name__ == expected
+        load_live_lora_weights(clone, net)
+        bind_clone_modules(clone, net)
+        x = torch.randn(2, W)
+        net.is_active = True
+        try:
+            for strength in (1.0, 0.5):
+                net.multiplier = strength
+                out = training_dit(x)
+                assert torch.allclose(out, preview_dit(x))
+        finally:
+            net.is_active = False
+            bind_clone_modules(clone, clone)
+        # the adapter really changed the output
+        assert not torch.allclose(training_dit(x), out)
