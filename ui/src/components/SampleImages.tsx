@@ -13,7 +13,13 @@ import classNames from 'classnames';
 import { FaCaretDown, FaCaretUp } from 'react-icons/fa';
 import SampleImageViewer from './SampleImageViewer';
 import { openConfirm } from './ConfirmModal';
-import { buildSampleMatrix, getSampleItems, getSampleMetadata, parseSampleFilename } from '@/utils/sampleImages';
+import {
+  buildSampleMatrix,
+  getSampleItems,
+  getSampleMetadata,
+  isPreviewCheckpointRow,
+  parseSampleFilename,
+} from '@/utils/sampleImages';
 import SampleComparisonViewer from './SampleComparisonViewer';
 import useIdentityEval from '@/hooks/useIdentityEval';
 import IdentityEvalPanel from './IdentityEvalPanel';
@@ -420,7 +426,8 @@ export default function SampleImages({ job }: SampleImagesProps) {
             <option value="">Jump to step</option>
             {rows.map((row, index) => (
               <option key={row.key} value={row.key}>
-                {rowSteps.get(row.key)?.toLocaleString() ?? 'Unknown step'} · row {index + 1}
+                {rowSteps.get(row.key)?.toLocaleString() ?? 'Unknown step'}
+                {isPreviewCheckpointRow(row) ? ' · SFT' : ''} · row {index + 1}
               </option>
             ))}
           </select>
@@ -548,6 +555,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
                   <div className="pb-1">
                     <div className="px-2 py-1 text-xs text-gray-600 dark:text-gray-400">
                       Training step {rowSteps.get(row.key)?.toLocaleString() ?? 'Unknown'}
+                      {isPreviewCheckpointRow(row) && ' · SFT preview checkpoint'}
                     </div>
                     <div className="grid gap-1" style={gridStyle}>
                       {row.paths.map((sample, column) =>

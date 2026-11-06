@@ -6,6 +6,7 @@ import {
   getAdjacentSamplePath,
   getSampleItems,
   getSampleMetadata,
+  isPreviewCheckpointRow,
   parseSampleFilename,
 } from '../src/utils/sampleImages';
 
@@ -28,6 +29,7 @@ test('parses new metadata and RAW prefix on Windows and POSIX paths', () => {
     trainingStep: 1400,
     sampleIndex: 3,
     isRaw: true,
+    isPreviewCheckpoint: false,
     seed: 4294967295,
     inferenceSteps: 12,
     hasMetadata: true,
@@ -126,6 +128,7 @@ test('filename metadata wins over saved config and prompt seed/step overrides', 
     seed: 4294967295,
     inferenceSteps: 30,
     isRaw: true,
+    isPreviewCheckpoint: false,
   });
 });
 
@@ -252,4 +255,49 @@ test('ghost reruns preserve whole empty rows and navigation skips them', () => {
   assert.deepEqual(rows[1].missing, ['deleted', 'not-generated']);
   assert.deepEqual(rows[1].paths, [null, null]);
   assert.equal(getAdjacentSamplePath(rows, before, 'down'), after);
+});
+
+test('SFT_ preview-checkpoint twins parse and form their own row after the training row', () => {
+  const settings = config([{ prompt: 'a' }, { prompt: 'raw', raw_weights: true }, { prompt: 'c' }]);
+  const a = filename(0, 0, false, 1000);
+  const raw = filename(0, 1, true, 1000);
+  const c = filename(0, 2, false, 1000);
+  const sftA = `SFT_${a}`;
+  const sftC = `SFT_${c}`;
+  const later = filename(100, 0, false, 2000);
+  const info = parseSampleFilename(`E:\\samples\\${sftA}`);
+  assert.equal(info?.isPreviewCheckpoint, true);
+  assert.equal(info?.isRaw, false);
+  assert.equal(info?.trainingStep, 0);
+  assert.equal(info?.sampleIndex, 0);
+  assert.equal(parseSampleFilename(a)?.isPreviewCheckpoint, false);
+  assert.equal(parseSampleFilename(`RAW_SFT_${a}`), null);
+
+  const rows = buildSampleMatrix([sftC, later, c, sftA, raw, a], settings);
+  assert.deepEqual(
+    rows.map(row => row.key),
+    ['0:1000', '0:1000:sft', '100:2000'],
+  );
+  assert.deepEqual(
+    rows.map(row => row.paths),
+    [
+      [a, raw, c],
+      [sftA, null, sftC],
+      [later, null, null],
+    ],
+  );
+  assert.deepEqual(rows.map(isPreviewCheckpointRow), [false, true, false]);
+  assert.equal(getAdjacentSamplePath(rows, a, 'down'), sftA);
+  assert.equal(getSampleMetadata(sftA, settings, 0).isPreviewCheckpoint, true);
+  assert.equal(getSampleMetadata(sftA, settings, 0).trainingStep, 0);
+});
+
+test('planned SFT_ twins that were not generated keep their own row', () => {
+  const settings = config([{ prompt: 'a' }]);
+  const a = filename(0, 0, false, 1000);
+  const rows = buildSampleMatrix([a], settings, 1, { plannedSamples: [a, `SFT_${a}`], deletedSamples: [] });
+  assert.deepEqual(rows, [
+    { key: '0:1000', paths: [a], missing: [null] },
+    { key: '0:1000:sft', paths: [null], missing: ['not-generated'] },
+  ]);
 });

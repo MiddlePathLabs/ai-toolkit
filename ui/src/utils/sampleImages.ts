@@ -6,6 +6,9 @@ export interface SampleFilename {
   trainingStep: number;
   sampleIndex: number;
   isRaw: boolean;
+  // SFT_ prefix: rendered on the holder's preview checkpoint (MOSS-Image
+  // preview_checkpoint 'both'), a twin of the un-prefixed sample
+  isPreviewCheckpoint: boolean;
   seed: number | null;
   inferenceSteps: number | null;
   hasMetadata: boolean;
@@ -22,23 +25,33 @@ export interface SampleMetadata {
   seed: number | null;
   inferenceSteps: number | null;
   isRaw: boolean;
+  isPreviewCheckpoint: boolean;
+}
+
+// Rows of preview-checkpoint (SFT_) twins sit right after the training-model
+// row of the same round, keyed with this suffix so the two never collide.
+export const PREVIEW_CHECKPOINT_ROW_SUFFIX = ':sft';
+
+export function isPreviewCheckpointRow(row: SampleRow): boolean {
+  return row.key.endsWith(PREVIEW_CHECKPOINT_ROW_SUFFIX);
 }
 
 export function parseSampleFilename(path: string): SampleFilename | null {
   const filename = path.split(/[\\/]/).pop() ?? '';
-  const match = /^(RAW_)?(\d+)__(\d+)_(\d+)(?:_seed-(-?\d+)_steps-(\d+))?\.[^.]+$/.exec(filename);
+  const match = /^(SFT_)?(RAW_)?(\d+)__(\d+)_(\d+)(?:_seed-(-?\d+)_steps-(\d+))?\.[^.]+$/.exec(filename);
   if (!match) return null;
-  const values = [match[2], match[3], match[4], match[5], match[6]];
+  const values = [match[3], match[4], match[5], match[6], match[7]];
   if (values.some(value => value !== undefined && !Number.isSafeInteger(Number(value)))) return null;
   return {
     filename,
-    timestamp: Number(match[2]),
-    trainingStep: Number(match[3]),
-    sampleIndex: Number(match[4]),
-    isRaw: Boolean(match[1]),
-    seed: match[5] === undefined ? null : Number(match[5]),
-    inferenceSteps: match[6] === undefined ? null : Number(match[6]),
-    hasMetadata: match[5] !== undefined,
+    timestamp: Number(match[3]),
+    trainingStep: Number(match[4]),
+    sampleIndex: Number(match[5]),
+    isRaw: Boolean(match[2]),
+    isPreviewCheckpoint: Boolean(match[1]),
+    seed: match[6] === undefined ? null : Number(match[6]),
+    inferenceSteps: match[7] === undefined ? null : Number(match[7]),
+    hasMetadata: match[6] !== undefined,
   };
 }
 
@@ -74,6 +87,7 @@ export function buildSampleMatrix(
     if (!a.info || !b.info) return a.info ? -1 : b.info ? 1 : a.path.localeCompare(b.path);
     return (
       a.info.trainingStep - b.info.trainingStep ||
+      Number(a.info.isPreviewCheckpoint) - Number(b.info.isPreviewCheckpoint) ||
       a.info.timestamp - b.info.timestamp ||
       a.info.sampleIndex - b.info.sampleIndex ||
       a.path.localeCompare(b.path)
@@ -89,6 +103,7 @@ export function buildSampleMatrix(
       !entry.info ||
       !previous?.[0].info ||
       previous[0].info.trainingStep !== entry.info.trainingStep ||
+      previous[0].info.isPreviewCheckpoint !== entry.info.isPreviewCheckpoint ||
       seen.has(identity)
     ) {
       iterations.push([]);
@@ -102,7 +117,9 @@ export function buildSampleMatrix(
     const first = iteration[0];
     const hasRaw = iteration.some(entry => entry.info?.isRaw);
     const row: SampleRow = {
-      key: first.info ? `${first.info.trainingStep}:${first.info.timestamp}` : first.path,
+      key: first.info
+        ? `${first.info.trainingStep}:${first.info.timestamp}${first.info.isPreviewCheckpoint ? PREVIEW_CHECKPOINT_ROW_SUFFIX : ''}`
+        : first.path,
       paths: Array(columns).fill(null),
       missing: Array(columns).fill('unavailable'),
     };
@@ -183,5 +200,6 @@ export function getSampleMetadata(path: string, config: SampleConfig | null, col
     seed: seed === -1 ? null : seed,
     inferenceSteps,
     isRaw: info?.isRaw ?? false,
+    isPreviewCheckpoint: info?.isPreviewCheckpoint ?? false,
   };
 }

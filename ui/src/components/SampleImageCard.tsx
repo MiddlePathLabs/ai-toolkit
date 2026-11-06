@@ -150,7 +150,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
         ref={cardRef}
         role="button"
         tabIndex={0}
-        aria-label={`${alt}, training step ${metadata.trainingStep ?? 'unknown'}${metadata.isRaw ? ', raw weights' : ''}`}
+        aria-label={`${alt}, training step ${metadata.trainingStep ?? 'unknown'}${metadata.isRaw ? ', raw weights' : ''}${metadata.isPreviewCheckpoint ? ', SFT preview checkpoint' : ''}`}
         aria-pressed={selected}
         onKeyDown={e => {
           if (e.key === 'Enter' || e.key === ' ') {

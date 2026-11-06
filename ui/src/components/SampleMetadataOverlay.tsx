@@ -13,6 +13,9 @@ export default function SampleMetadataOverlay({ metadata }: { metadata: SampleMe
         {metadata.isRaw && (
           <span className="rounded-sm bg-white/20 px-1 text-[0.85em] font-semibold uppercase tracking-wide">Raw</span>
         )}
+        {metadata.isPreviewCheckpoint && (
+          <span className="rounded-sm bg-white/20 px-1 text-[0.85em] font-semibold uppercase tracking-wide">SFT</span>
+        )}
         <span>
           <span className="text-white/60">Step</span> {metadata.trainingStep?.toLocaleString() ?? '?'}
         </span>
