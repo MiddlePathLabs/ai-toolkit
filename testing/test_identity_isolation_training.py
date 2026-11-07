@@ -21,6 +21,7 @@ from toolkit.identity_isolation_training import (
     validate_isolation_training,
 )
 from toolkit.optimizer_runtime import OptimizerRuntimeAdapter
+from toolkit.optimizers.muon import Muon
 from toolkit.optimizers.rose import Rose
 from toolkit.prompt_utils import PromptEmbeds
 
@@ -304,7 +305,7 @@ def test_production_preservation_loss_uses_real_hook_sample_normalization():
     assert trainer.additional_logs["isolation/preservation_pass_count"] == 2
 
 
-@pytest.mark.parametrize("optimizer_cls", [torch.optim.AdamW, Rose])
+@pytest.mark.parametrize("optimizer_cls", [torch.optim.AdamW, Rose, Muon])
 def test_composite_runtime_actual_step_group_ratio_and_scheduler_restoration(
     optimizer_cls,
 ):
@@ -397,7 +398,7 @@ def test_mixed_category_rejected_by_actual_hook_before_backward():
 def test_unsupported_actual_optimizer_rejected_even_if_label_says_adamw():
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.1)
     runtime = OptimizerRuntimeAdapter.inspect(optimizer, optimizer_type="adamw")
-    with pytest.raises(ValueError, match="actual torch AdamW or toolkit Rose"):
+    with pytest.raises(ValueError, match="requires actual torch AdamW, toolkit Rose or Muon"):
         validate_isolation_optimizer(_config(), optimizer, runtime)
     validate_isolation_optimizer(None, optimizer, runtime)
     actual = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
@@ -565,6 +566,8 @@ def test_process_preflight_shares_guards_without_preparing_assets_or_mutation():
     process["train"]["optimizer"] = "adamw8bit"
     with pytest.raises(ValueError, match="configured optimizer"):
         validate_isolation_process(process, _config())
+    process["train"]["optimizer"] = "muon"
+    validate_isolation_process(process, _config())
     process["train"]["optimizer"] = "adamw"
     process["datasets"][0]["is_reg"] = True
     with pytest.raises(ValueError, match="is_reg/prior_reg"):

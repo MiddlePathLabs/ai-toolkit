@@ -106,9 +106,9 @@ def validate_isolation_training(trainer) -> None:
     if getattr(train, "blank_prompt_preservation", False):
         problems.append("blank_prompt_preservation conflicts with isolation")
     raw = getattr(trainer, "config", {})
-    if str(train.optimizer).lower() not in ("adamw", "rose"):
+    if str(train.optimizer).lower() not in ("adamw", "rose", "muon"):
         problems.append(
-            "the configured optimizer must be adamw or rose; actual optimizer capability is checked at runtime"
+            "the configured optimizer must be adamw, rose or muon; actual optimizer capability is checked at runtime"
         )
     if any(
         dataset.get("is_reg") or dataset.get("prior_reg")
@@ -145,16 +145,22 @@ def validate_isolation_training(trainer) -> None:
 def validate_isolation_optimizer(config, optimizer, runtime) -> None:
     if config is None:
         return
+    from toolkit.optimizers.muon import Muon
     from toolkit.optimizers.rose import Rose
 
+    accepted = (torch.optim.AdamW, Rose, Muon)
+    torch_muon = getattr(torch.optim, "Muon", None)
+    if torch_muon is not None:
+        accepted += (torch_muon,)
     actual = unwrap_optimizer(optimizer)
     if (
-        type(actual) not in (torch.optim.AdamW, Rose)
+        type(actual) not in accepted
         or runtime.update_phase != "step"
         or not runtime.supports_step_scale
     ):
         raise ValueError(
-            "identity_isolation requires actual torch AdamW or toolkit Rose with step-time optimizer runtime; fused-backward is unsupported"
+            "identity_isolation requires actual torch AdamW, toolkit Rose or Muon "
+            "with step-time optimizer runtime; fused-backward is unsupported"
         )
 
 
