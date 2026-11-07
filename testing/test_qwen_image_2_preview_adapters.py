@@ -90,6 +90,15 @@ def test_resolve_preview_schedule(schedule, name, expected):
     assert pl.resolve_preview_schedule(schedule, f"/some/dir/{name}") == expected
 
 
+def test_resolve_preview_schedule_reads_configured_hub_path():
+    resolved = "/models/loras/preview_adapters/lora.safetensors"
+    source = "viggle-ai/Qwen-Image-2.1-viggle-turbo/lora.safetensors"
+    assert pl.resolve_preview_schedule("auto", resolved, source=source) == "viggle"
+    assert pl.resolve_preview_schedule("auto", resolved, source="a/b/lora.safetensors") == "turbo"
+    # the user/org segment alone does not count
+    assert pl.resolve_preview_schedule("auto", resolved, source="viggle/b/lora.safetensors") == "turbo"
+
+
 def test_resolve_preview_schedule_rejects_unknown():
     with pytest.raises(ValueError):
         pl.resolve_preview_schedule("lightning", "x.safetensors")

@@ -1101,7 +1101,9 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
                 "Retain bind_tread/validate_tread_span and fail closed before the first batch.",
             )
 
-    if (h3 or base.startswith("qwen_image_2")) and _nonempty(model.get("preview_lora_path")):
+    if (
+        h3 or base.startswith("qwen_image_2") or base == "moss_image"
+    ) and _nonempty(model.get("preview_lora_path")):
         collector.defer(
             RULE_PREVIEW_LORA,
             [f"{p}.model.preview_lora_path"],
@@ -1122,7 +1124,7 @@ def _validate_process(process: Mapping[str, Any], process_index: int, collector:
             f"inference_lora_path is only supported on flux/krea2; config "
             f"validation rejects arch {base!r} before the model loads.",
             "Remove inference_lora_path, or use preview_lora_path on "
-            "minimax_h3/qwen_image_2 for turbo previews.",
+            "minimax_h3/qwen_image_2/moss_image for turbo previews.",
         )
     # flex1 is renamed to flux before config validation; an empty base is
     # inferred later from name_or_path, so leave that to config validation.

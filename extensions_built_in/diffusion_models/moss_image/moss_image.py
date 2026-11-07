@@ -22,7 +22,7 @@ import math
 import os
 import weakref
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -68,6 +68,7 @@ from .src.transformer import MossImageTransformer
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+    from toolkit.preview_lora import PreviewTurbo
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MAX_TEXT_TOKENS = 4096
@@ -306,6 +307,16 @@ class MossImageModel(BaseModel):
         self._preview_network = None
         self._preview_checkpoint_disabled = False
 
+        # preview turbo LoRA (model.preview_lora_path): a frozen sampling-only
+        # few-step adapter, wrapped on every DiT sample rounds can render on
+        # (training Base, plus the SFT preview DiT when preview_checkpoint is
+        # set) so Base and SFT_ previews stay directly comparable under the
+        # same turbo recipe. Inactive and CPU-parked between rounds.
+        self._preview_turbos: List[Tuple[torch.nn.Module, "PreviewTurbo"]] = []
+        self._preview_turbo_schedule = ""
+        self._turbo_cfg_notice = False
+        self._turbo_steps_notice = False
+
     @staticmethod
     def get_train_scheduler():
         return CustomFlowMatchEulerDiscreteScheduler(
@@ -457,6 +468,7 @@ class MossImageModel(BaseModel):
         self.model = transformer
         self.pipeline = MossImagePipeline(self)
         self._maybe_load_preview_checkpoint()
+        self._maybe_load_preview_turbo()
         self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------
@@ -583,6 +595,115 @@ class MossImageModel(BaseModel):
             if offload_training:
                 training_dit.to(self.device_torch)
 
+    # ------------------------------------------------------------------
+    # Preview turbo LoRA (few-step distilled previews)
+    # ------------------------------------------------------------------
+    def _maybe_load_preview_turbo(self):
+        """``model.preview_lora_path``: a frozen, sampling-only Turbo LoRA
+        (few-step distilled community adapter). One adapter file, one network
+        per DiT: the training Base, and — when ``preview_checkpoint`` is set —
+        the SFT preview DiT, so a Base/SFT_ twin pair renders under the SAME
+        turbo recipe and stays directly comparable. Attached after
+        quantization (it must wrap the quantized Linears), inactive and
+        CPU-parked between rounds; never trained, never saved, and the
+        sampling recipe (CFG 1 + the schedule's step count) applies to sample
+        rounds only."""
+        if self.model_config.preview_lora_path is None:
+            return
+        from toolkit.paths import MODELS_PATH
+        from toolkit.preview_lora import load_frozen_lora, resolve_preview_lora_path
+
+        from .preview_turbo import resolve_moss_preview_schedule
+
+        self.print_and_status_update("Loading preview Turbo LoRA")
+        configured_path = self.model_config.preview_lora_path
+        lora_path = resolve_preview_lora_path(configured_path, MODELS_PATH)
+        self.model_config.preview_lora_path = lora_path
+        # the configured path too: a hub repo name often carries the recipe
+        # hint the downloaded file's own name does not
+        self._preview_turbo_schedule = resolve_moss_preview_schedule(
+            self.model_config.preview_lora_schedule,
+            lora_path,
+            source=configured_path,
+        )
+        dits = [(self.model, "training DiT")]
+        if self._preview_dit is not None:
+            dits.append((self._preview_dit, "preview checkpoint DiT"))
+        for dit, label in dits:
+            turbo = load_frozen_lora(
+                dit,
+                lora_path,
+                self.model_config.preview_lora_strength,
+                target_lin_modules=self.target_lora_modules,
+                label="MOSS preview LoRA",
+                tag="moss-preview-lora",
+            )
+            self._preview_turbos.append((dit, turbo))
+            self.print_and_status_update(f"{label}: {turbo.report.summary()}")
+        self.print_and_status_update(
+            f"Preview Turbo LoRA ready: {self._preview_turbo_schedule} schedule "
+            "(CFG 1, few-step previews; training weights untouched)"
+        )
+
+    @property
+    def has_preview_turbo(self) -> bool:
+        return bool(self._preview_turbos)
+
+    def _turbo_for(self, dit):
+        """The turbo network wrapped on THIS DiT (identity match; the SFT
+        pass swaps self.model before the generate hooks fire)."""
+        for candidate, turbo in self._preview_turbos:
+            if candidate is dit:
+                return turbo
+        return None
+
+    def _enter_generate_adapters(self):
+        super()._enter_generate_adapters()
+        turbo = self._turbo_for(self.model)
+        if turbo is not None:
+            self.print_and_status_update("Loading preview Turbo LoRA")
+            turbo.activate(self.model, self.device_torch, self.torch_dtype)
+
+    def _exit_generate_adapters(self):
+        turbo = self._turbo_for(self.model)
+        if turbo is not None:
+            self.print_and_status_update("Unloading preview Turbo LoRA")
+            turbo.deactivate()
+        super()._exit_generate_adapters()
+
+    def _turbo_sample_settings(self, gen_config) -> Tuple[int, Optional[List[float]], float]:
+        """(steps, sigmas, guidance) for a sample under the turbo recipe: CFG
+        forced to 1 (the adapters are distilled without it) and the schedule's
+        step count replacing the configured one — explicit per-prompt sigmas
+        give way too, the turbo owns its schedule window."""
+        guidance = gen_config.guidance_scale
+        if guidance != 1.0:
+            if not self._turbo_cfg_notice:
+                self.print_and_status_update(
+                    "[moss-preview-lora] turbo previews run without CFG; "
+                    "forcing guidance_scale to 1.0"
+                )
+                self._turbo_cfg_notice = True
+            guidance = 1.0
+        from .preview_turbo import moss_turbo_steps
+
+        steps = moss_turbo_steps(
+            self._preview_turbo_schedule,
+            gen_config.num_inference_steps,
+            gen_config.width,
+            gen_config.height,
+        )
+        if steps != gen_config.num_inference_steps or gen_config.sigmas is not None:
+            if not self._turbo_steps_notice:
+                extra = " and explicit sigmas" if gen_config.sigmas is not None else ""
+                self.print_and_status_update(
+                    f"[moss-preview-lora] {self._preview_turbo_schedule} recipe: "
+                    f"{steps} steps replace sample_steps="
+                    f"{gen_config.num_inference_steps}{extra} for previews"
+                )
+                self._turbo_steps_notice = True
+        return steps, None, guidance
+
     def generate_single_image(
         self,
         pipeline: MossImagePipeline,
@@ -620,14 +741,23 @@ class MossImageModel(BaseModel):
                     )
                 ]
 
+        if self._preview_turbos:
+            num_inference_steps, sigmas, guidance_scale = self._turbo_sample_settings(
+                gen_config
+            )
+        else:
+            num_inference_steps = gen_config.num_inference_steps
+            sigmas = gen_config.sigmas
+            guidance_scale = gen_config.guidance_scale
+
         result = pipeline(
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
             height=gen_config.height,
             width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            sigmas=gen_config.sigmas,
-            guidance_scale=gen_config.guidance_scale,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
             latents=gen_config.latents,
             generator=generator,
             shift=self.sample_shift,

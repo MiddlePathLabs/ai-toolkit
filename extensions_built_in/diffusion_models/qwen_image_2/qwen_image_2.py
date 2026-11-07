@@ -304,9 +304,8 @@ class QwenImage2Model(BaseModel):
         from .preview_lora import load_preview_lora, resolve_preview_lora_path
 
         self.print_and_status_update("Loading preview Turbo LoRA")
-        lora_path = resolve_preview_lora_path(
-            self.model_config.preview_lora_path, MODELS_PATH
-        )
+        configured_path = self.model_config.preview_lora_path
+        lora_path = resolve_preview_lora_path(configured_path, MODELS_PATH)
         self.model_config.preview_lora_path = lora_path
         turbo = load_preview_lora(
             transformer,
@@ -314,6 +313,7 @@ class QwenImage2Model(BaseModel):
             self.model_config.preview_lora_strength,
             target_lin_modules=self.target_lora_modules,
             schedule=self.model_config.preview_lora_schedule,
+            source=configured_path,
         )
         self.print_and_status_update(
             f"{turbo.report.summary()}, {turbo.schedule} schedule"

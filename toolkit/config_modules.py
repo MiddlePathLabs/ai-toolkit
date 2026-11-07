@@ -993,9 +993,12 @@ class ModelConfig:
         # H3 sampling-only Turbo LoRA. Default-off; never trained or saved.
         self.preview_lora_path = kwargs.get('preview_lora_path', None)
         self.preview_lora_strength = float(kwargs.get('preview_lora_strength', 1.0))
-        # qwen_image_2 only: which sampling recipe the preview LoRA needs.
-        # auto = 'viggle' when the file name says so, else 'turbo' (Comfy-Org /
-        # Qwen Turbo: 8 fixed sigmas, CFG 1, no shift)
+        # which sampling recipe the preview LoRA needs. qwen_image_2: auto =
+        # 'viggle' when the file name says so, else 'turbo' (Comfy-Org / Qwen
+        # Turbo: 8 fixed sigmas, CFG 1, no shift). moss_image: auto by file
+        # name, else 'dmd' (lodestones DMD 4-8 steps, CFG 1, stock shift-5
+        # grid); 'sft4' (akhaliq 4/6/8 steps by resolution) and 'c16'
+        # (Coffmeteor 16 steps) are the other known recipes — all CFG 1.
         self.preview_lora_schedule = str(kwargs.get('preview_lora_schedule', 'auto')).lower()
         # MOSS-Image preview checkpoint: render training previews on the SFT DiT
         # (OpenMOSS's aesthetics-tuned checkpoint) instead of, or beside, the
@@ -1217,10 +1220,11 @@ class ModelConfig:
             else:
                 self.arch = 'sd1'
         if self.preview_lora_path is not None:
-            if self.arch not in ("minimax_h3", "qwen_image_2"):
+            if self.arch not in ("minimax_h3", "qwen_image_2", "moss_image"):
                 raise ValueError(
                     "preview_lora_path is only supported for model.arch "
-                    "'minimax_h3' and 'qwen_image_2' (turbo preview adapters); "
+                    "'minimax_h3', 'qwen_image_2' and 'moss_image' "
+                    "(turbo preview adapters); "
                     f"got arch={self.arch!r}."
                 )
             if self.inference_lora_path is not None:
@@ -1233,9 +1237,14 @@ class ModelConfig:
                 raise ValueError(
                     f"preview_lora_strength must be a finite number, got {strength}"
                 )
-            if self.preview_lora_schedule not in ("auto", "turbo", "viggle"):
+            if self.arch == "moss_image":
+                allowed_schedules = ("auto", "dmd", "sft4", "c16")
+            else:  # minimax_h3 / qwen_image_2
+                allowed_schedules = ("auto", "turbo", "viggle")
+            if self.preview_lora_schedule not in allowed_schedules:
                 raise ValueError(
-                    "preview_lora_schedule must be 'auto', 'turbo' or 'viggle', "
+                    f"preview_lora_schedule must be one of {allowed_schedules} "
+                    f"for arch {self.arch!r}, "
                     f"got {self.preview_lora_schedule!r}"
                 )
         elif self.inference_lora_path is not None:
