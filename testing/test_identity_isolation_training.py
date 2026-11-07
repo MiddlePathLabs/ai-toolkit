@@ -504,23 +504,49 @@ def test_first_and_regular_preview_prompts_are_fused_before_cache_encoding():
 
 
 @pytest.mark.parametrize(
-    "model",
+    "model, arch",
     [
-        {"arch": "krea2:turbo"},
-        {"arch": "krea2:o_edit"},
-        {"arch": "krea2", "name_or_path": "krea/Krea-2-Turbo"},
+        ({"arch": "krea2:turbo"}, "krea2"),
+        ({"arch": "krea2:o_edit"}, "krea2"),
+        ({"arch": "krea2", "name_or_path": "krea/Krea-2-Turbo"}, "krea2"),
+        ({"arch": "moss_image:sft"}, "moss_image"),
+        ({"arch": "moss_image:edit"}, "moss_image"),
+        # bare moss_image is the SFT registry entry: without Base evidence
+        # (a :base variant or a Base source) the role is not RAW.
+        ({"arch": "moss_image"}, "moss_image"),
+        ({"arch": "moss_image", "name_or_path": "OpenMOSS-Team/MOSS-Image-SFT"}, "moss_image"),
     ],
 )
-def test_non_raw_declared_roles_are_rejected(model):
+def test_non_raw_declared_roles_are_rejected(model, arch):
     trainer = SimpleNamespace(
         isolation_config=_config(),
         train_config=TrainConfig(),
-        model_config=SimpleNamespace(arch="krea2", model_kwargs={}),
+        model_config=SimpleNamespace(arch=arch, model_kwargs={}),
         network_config=SimpleNamespace(type="lora"),
         config={"model": model},
     )
     with pytest.raises(ValueError, match="RAW"):
         validate_isolation_training(trainer)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"arch": "moss_image:base", "name_or_path": "OpenMOSS-Team/MOSS-Image-Base"},
+        # base_v1-style config: bare arch with an explicit Base source.
+        {"arch": "moss_image", "name_or_path": "OpenMOSS-Team/MOSS-Image-Base"},
+        {"arch": "moss_image:base", "name_or_path": "local/moss-image-base"},
+    ],
+)
+def test_moss_image_base_raw_role_is_accepted(model):
+    trainer = SimpleNamespace(
+        isolation_config=_config(),
+        train_config=TrainConfig(optimizer="adamw"),
+        model_config=SimpleNamespace(arch="moss_image", model_kwargs={}),
+        network_config=SimpleNamespace(type="lora"),
+        config={"model": model},
+    )
+    validate_isolation_training(trainer)
 
 
 def test_process_preflight_shares_guards_without_preparing_assets_or_mutation():
@@ -542,5 +568,18 @@ def test_process_preflight_shares_guards_without_preparing_assets_or_mutation():
     process["train"]["optimizer"] = "adamw"
     process["datasets"][0]["is_reg"] = True
     with pytest.raises(ValueError, match="is_reg/prior_reg"):
+        validate_isolation_process(process, _config())
+    process = {
+        "model": {
+            "arch": "moss_image:base",
+            "name_or_path": "OpenMOSS-Team/MOSS-Image-Base",
+        },
+        "network": {"type": "lora"},
+        "train": {"optimizer": "adamw"},
+        "datasets": [{"folder_path": "does-not-exist"}],
+    }
+    validate_isolation_process(process, _config())
+    process["model"]["name_or_path"] = "OpenMOSS-Team/MOSS-Image-SFT"
+    with pytest.raises(ValueError, match="RAW"):
         validate_isolation_process(process, _config())
     validate_isolation_process({}, None)

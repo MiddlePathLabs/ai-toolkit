@@ -55,7 +55,21 @@ def validate_isolation_training(trainer) -> None:
         .rstrip("/")
         .lower()
     )
-    if variant not in ("", "raw") or source == "krea/krea-2-turbo":
+    if str(model.arch) == "moss_image":
+        # MOSS-Image's raw role is the Base checkpoint; the bare registry
+        # entry is the SFT (aesthetics-tuned) checkpoint, the analog of
+        # Krea 2 Turbo. Accept an explicit :base variant or a Base source,
+        # mirroring how krea2 accepts any non-turbo source.
+        is_edit = (
+            variant in ("edit", "base_edit", "sft")
+            or source.endswith("moss-image-sft")
+        )
+        is_base = variant == "base" or source.endswith("moss-image-base")
+        if is_edit or not is_base:
+            problems.append(
+                "the declared model role must be RAW (MOSS-Image-Base), not SFT/edit"
+            )
+    elif variant not in ("", "raw") or source == "krea/krea-2-turbo":
         problems.append("the declared model role must be RAW, not turbo/edit")
     if any(
         getattr(model, name, None)
@@ -64,8 +78,13 @@ def validate_isolation_training(trainer) -> None:
         problems.append(
             "training assistant/recovery adapters are not validated for isolation"
         )
-    if model.arch != "krea2" or getattr(model, "model_kwargs", {}).get("edit", False):
-        problems.append("only Krea 2 RAW text-to-image is supported")
+    if (
+        str(model.arch) not in ("krea2", "moss_image")
+        or getattr(model, "model_kwargs", {}).get("edit", False)
+    ):
+        problems.append(
+            "only Krea 2 RAW and MOSS-Image-Base text-to-image are supported"
+        )
     if trainer.network_config is None or trainer.network_config.type != "lora":
         problems.append("network.type must be lora (not full fine-tuning)")
     if any(
