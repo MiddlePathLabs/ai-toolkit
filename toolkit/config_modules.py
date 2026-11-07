@@ -58,14 +58,22 @@ class LoggingConfig:
         self.project_name: str = kwargs.get('project_name', 'ai-toolkit')
         self.run_name: str = kwargs.get('run_name', None)
 
+def _prompt_present(prompt) -> bool:
+    # None (item never sets a prompt) and ""/whitespace are not sampleable
+    return prompt is not None and str(prompt).strip() != ""
+
+
 class SampleItem:
     def __init__(
         self,
         sample_config: 'SampleConfig',
         **kwargs
     ):
-        # prompt should always be in the kwargs
-        self.prompt = kwargs.get('prompt', None)
+        # prompt should always be in the kwargs. Absent/empty text normalizes
+        # to "" so control-image-only items flow through prompt injection
+        # unchanged (and never pass None into string ops downstream)
+        raw_prompt = kwargs.get('prompt', None)
+        self.prompt = raw_prompt if _prompt_present(raw_prompt) else ""
         self.width: int = kwargs.get('width', sample_config.width)
         self.height: int = kwargs.get('height', sample_config.height)
         self.neg: str = kwargs.get('neg', sample_config.neg)
@@ -100,6 +108,16 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
+    @property
+    def has_control_image(self) -> bool:
+        return any([self.ctrl_img, self.ctrl_img_1, self.ctrl_img_2, self.ctrl_img_3])
+
+    @property
+    def is_sampleable(self) -> bool:
+        # an empty text prompt is only sampleable when a control image
+        # carries the conditioning instead of the prompt text
+        return _prompt_present(self.prompt) or self.has_control_image
+
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
@@ -129,21 +147,28 @@ class SampleConfig:
             self.ext = 'webp'
         
         prompts: list[str] = kwargs.get('prompts', [])
-        
+
         self.samples: Optional[List[SampleItem]] = None
-        # use the legacy prompts if it is passed that way to get samples object
+        # empty prompts are skipped: they render blank previews and would
+        # desync the prompts[i] / samples[i] pairing in the sample loop.
+        # Control-image items keep their empty prompt (SampleItem.is_sampleable)
+        # — the image carries the conditioning. Plain strings from the legacy
+        # prompts list can never be control items, so empties are just dropped.
         default_samples_kwargs = [
-            {"prompt": x} for x in prompts
+            {"prompt": x} for x in prompts if _prompt_present(x)
         ]
         raw_samples = kwargs.get('samples', default_samples_kwargs)
-        self.samples = [SampleItem(self, **item) for item in raw_samples]
+        items = [SampleItem(self, **item) for item in raw_samples]
+        self.samples = [item for item in items if item.is_sampleable]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
         
     @property
     def prompts(self):
-        # for backwards compatibility as this is checked for length frequently
-        return [sample.prompt for sample in self.samples if sample.prompt is not None]
+        # for backwards compatibility as this is checked for length frequently.
+        # Mirrors SampleItem.is_sampleable so prompts[i] stays paired with
+        # samples[i] in the sample loop
+        return [sample.prompt for sample in self.samples if sample.is_sampleable]
   
                 
 
