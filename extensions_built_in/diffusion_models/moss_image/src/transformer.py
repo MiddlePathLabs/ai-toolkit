@@ -23,6 +23,7 @@ from typing import Iterable, List, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
@@ -95,7 +96,26 @@ def _attention(
         )
         out = torch.cat((live, ref), 2)
     else:
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if mask is None or not mask.is_cuda:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            # A masked attention (a batch's padded captions): cuDNN first. With
+            # a mask, PyTorch's default choice falls back to its slow
+            # memory-efficient kernel, and cuDNN takes the mask at almost no
+            # cost — MOSS-Image batch 3 went 1.60 -> 1.31 s a step on an A6000
+            # with the captions padded to a multiple of 16 (Fizgig #221, v9.2.0),
+            # so cuDNN plans only a few shapes. Unmasked attention keeps
+            # PyTorch's default (flash). A preference: a shape cuDNN can't take
+            # falls back.
+            with sdpa_kernel(
+                [
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ],
+                set_priority=True,
+            ):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
     return out.transpose(1, 2).flatten(2)
 
 
@@ -261,6 +281,10 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         self.final_linear_video = nn.Linear(dim, params.latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
         self.gradient_checkpointing = False
+        # Round a ragged batch's text span up to a multiple of this many tokens
+        # (set from model_kwargs.text_len_pad_multiple; 0/1 = off) so masked
+        # SDPA sees a handful of sequence lengths instead of one per batch.
+        self.text_len_pad_multiple = 0
         self._bands = {}
 
     @property
@@ -400,6 +424,21 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
             raise ValueError("each sample needs at least one valid text token")
         text_len = int(lengths.max())
         padded = bool((lengths < text_len).any())
+        if (
+            self.text_len_pad_multiple > 1
+            and padded
+            and text_len % self.text_len_pad_multiple
+        ):
+            # Round the ragged text span up (Fizgig #221 pads to 16) so cuDNN
+            # plans only a few shapes. Only when the batch is already ragged —
+            # a uniform batch keeps the unmasked flash path, which a pad would
+            # forfeit. The pad columns sort to the end of the compacted
+            # sequence below and are key-masked out of every attention, so
+            # their values never matter (the output reads image tokens only).
+            extra = -text_len % self.text_len_pad_multiple
+            context = F.pad(context, (0, 0, 0, extra))
+            mask = F.pad(mask, (0, extra))
+            text_len += extra
         if padded or not bool(mask[:, :text_len].all()):
             # valid tokens first, in order (the vendor selects them by mask)
             order = torch.argsort((~mask).to(torch.int8), dim=1, stable=True)

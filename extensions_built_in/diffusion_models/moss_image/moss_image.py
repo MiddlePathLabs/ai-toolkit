@@ -448,6 +448,14 @@ class MossImageModel(BaseModel):
         self.print_and_status_update("Loading MOSS-Image model")
 
         transformer = self._load_transformer()
+        # model_kwargs.text_len_pad_multiple: round a ragged batch's text span
+        # up to a multiple of this many tokens (16) so the cuDNN-first masked
+        # attention plans only a few shapes (Fizgig #221, v9.2.0: MOSS batch 3
+        # 1.60 -> 1.31 s/step). Uniform batches keep the unmasked fast path.
+        # 0/1 = off.
+        transformer.text_len_pad_multiple = int(
+            self.model_config.model_kwargs.get("text_len_pad_multiple", 0)
+        )
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
