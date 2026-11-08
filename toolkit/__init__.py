@@ -6,6 +6,16 @@ Hugging Face progress hook is exposed lazily for the real training bootstrap.
 """
 import importlib
 import logging
+import os
+
+# No telemetry.  onnxruntime's Linux builds from 1.29 send a device ID and
+# machine details to Microsoft unless ORT_DISABLE_TELEMETRY=1 (it is read when
+# onnxruntime first imports — always later than this package, whose modules
+# import it lazily for face_id / pose controls); Hugging Face usage reporting
+# goes off with HF_HUB_DISABLE_TELEMETRY=1.  An existing value always wins.
+# Mirrors Fizgig v9.2.0 (fe07178c).
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 
 def force_hf_hub_progress_bars() -> None:
