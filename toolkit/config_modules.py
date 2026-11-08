@@ -1188,6 +1188,22 @@ class ModelConfig:
         
         if self.arch == "flex1":
             self.arch = "flux"
+
+        # Krea 2: `compile: true` selects the measured fast path by default —
+        # per-block compile (whole-model compile measured ~null on this fork's
+        # stack) plus the checkpointing-guard lift (real-recipe validated on
+        # native ConvRot8). Each key stays individually overridable, and the
+        # w8a8 / comfy_kitchen combinations still fail fast in
+        # validate_block_compile_under_checkpointing.
+        _krea2_compile_default = self.compile and self.arch == "krea2"
+        if _krea2_compile_default and "block_compile" not in kwargs:
+            self.block_compile = True
+        if (
+            _krea2_compile_default
+            and self.block_compile
+            and "block_compile_with_checkpointing" not in kwargs
+        ):
+            self.block_compile_with_checkpointing = True
         if self.convrot8_backend == "comfy_kitchen":
             if self.arch != "krea2" or self.qtype != "convrot8":
                 raise ValueError("comfy_kitchen is experimental and requires arch: krea2 and qtype: convrot8")
@@ -1342,16 +1358,18 @@ def validate_block_compile_under_checkpointing(
             "convrot8_backend: comfy_kitchen: the checkpointed recompute pass "
             "selects a different compiled graph than forward and raises "
             "torch.utils.checkpoint CheckpointError at the first backward "
-            "(reproduced on fresh runs). Use convrot8_backend: native or "
-            "unset block_compile_with_checkpointing."
+            "(reproduced on fresh runs). Use convrot8_backend: native, or set "
+            "model.block_compile_with_checkpointing: false (on krea2 it "
+            "defaults to true under compile)."
         )
     if model_config.convrot8_backward == "w8a8":
         raise ValueError(
             "block_compile under gradient checkpointing is incompatible with "
             "convrot8_backward: w8a8: the combination segfaults (exit 139) "
             "inside the first training step with no Python exception, so it "
-            "cannot fall back at runtime. Use convrot8_backward: native or "
-            "unset block_compile_with_checkpointing."
+            "cannot fall back at runtime. Use convrot8_backward: native, or "
+            "set model.block_compile_with_checkpointing: false (on krea2 it "
+            "defaults to true under compile)."
         )
 
 

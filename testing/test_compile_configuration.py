@@ -86,9 +86,9 @@ def test_opt_in_rejects_w8a8_backward_under_checkpointing():
         validate_block_compile_under_checkpointing(config, True)
 
 
-def test_broken_backends_pass_without_the_opt_in_key():
-    # the combos only matter when the opt-in key would lift the guard;
-    # without it the guard keeps block compile off under checkpointing
+def test_broken_backends_pass_with_guard_explicitly_off():
+    # the combos only matter when the guard lift would engage; since krea2
+    # compile now defaults the lift on, opting out requires the explicit key
     kitchen = ModelConfig(
         name_or_path="test",
         arch="krea2",
@@ -96,6 +96,50 @@ def test_broken_backends_pass_without_the_opt_in_key():
         qtype="convrot8",
         compile=True,
         block_compile=True,
+        block_compile_with_checkpointing=False,
         convrot8_backend="comfy_kitchen",
     )
     validate_block_compile_under_checkpointing(kitchen, True)
+
+
+def test_krea2_compile_defaults_to_the_block_path():
+    # compile: true alone on krea2 now selects per-block compile and lifts
+    # the checkpointing guard (whole-model compile measured ~null here)
+    config = ModelConfig(
+        name_or_path="test", arch="krea2", quantize=True, qtype="convrot8",
+        compile=True,
+    )
+    assert config.block_compile is True
+    assert config.block_compile_with_checkpointing is True
+
+
+def test_krea2_compile_defaults_respect_explicit_overrides():
+    config = ModelConfig(
+        name_or_path="test", arch="krea2", quantize=True, qtype="convrot8",
+        compile=True, block_compile=False,
+    )
+    assert config.block_compile is False
+    assert config.block_compile_with_checkpointing is False
+    config = ModelConfig(
+        name_or_path="test", arch="krea2", quantize=True, qtype="convrot8",
+        compile=True, block_compile_with_checkpointing=False,
+    )
+    assert config.block_compile is True
+    assert config.block_compile_with_checkpointing is False
+
+
+def test_other_arches_keep_block_compile_opt_in():
+    config = ModelConfig(name_or_path="test", arch="flux", compile=True)
+    assert config.block_compile is False
+    assert config.block_compile_with_checkpointing is False
+
+
+def test_krea2_compile_w8a8_rejected_by_default():
+    # with the guard lift now defaulting on, a krea2 compile user who also
+    # sets w8a8 gets the fail-fast rejection instead of the segfault
+    config = ModelConfig(
+        name_or_path="test", arch="krea2", quantize=True, qtype="convrot8",
+        compile=True, convrot8_backward="w8a8",
+    )
+    with pytest.raises(ValueError, match="w8a8"):
+        validate_block_compile_under_checkpointing(config, True)
