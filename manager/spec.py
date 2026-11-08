@@ -55,11 +55,21 @@ from .util import REPO_ROOT
 
 # ---- version pins (edit these to move the fleet forward) -------------------
 
-TORCH = {"torch": "2.13.0", "torchvision": "0.28.0", "torchaudio": "2.11.0"}
-TORCH_TAG = "2.13"  # as it appears in flash-attn / natten wheel names
+# 2026-11-07: fleet moved to torch 2.15.0 + cu134 (needs driver 580+/CUDA 13.4+;
+# this box runs 617.42). Driver of the move: 2.15's compiled-block activation
+# retention under gradient checkpointing — measured on our 5090 krea2 harness,
+# eager 2.552 -> 2.45 s/it and block-compile 1.954 -> 1.862 s/it. torchaudio
+# stayed on the maintenance line (2.11.1, pure-python wheel, torch-agnostic).
+# Windows flash-attn prebuilts for cu134/torch2.15 are at release v1.6.1; no
+# linux cu134 torch2.15 prebuilts existed at move time (optional → warn+skip).
+TORCH = {"torch": "2.15.0", "torchvision": "0.29.2", "torchaudio": "2.11.1"}
+TORCH_TAG = "2.15"  # as it appears in flash-attn / natten wheel names
 
-TORCHCODEC = "torchcodec==0.15.0"
-TRITON_WINDOWS = "triton-windows>=3.7,<3.8"
+# 0.17 supports FFmpeg 8/9 (0.15 only tried 4-8; our env carries FFmpeg 9 DLLs)
+TORCHCODEC = "torchcodec==0.17.0"
+# ==3.7.0.post26 is the build Fizgig ships with torch 2.15; 3.8.x is built
+# against a newer torch and hung Krea 2 previews on Windows — bump WITH torch.
+TRITON_WINDOWS = "triton-windows==3.7.0.post26"
 
 NATTEN_VERSION = "0.21.7"
 NATTEN_FIND_LINKS = "https://whl.natten.org"
@@ -73,11 +83,15 @@ _FA_BASE = (
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/"
 )
 # (os, arch) -> (release tag, wheel platform tag) — tags are per torch
-# version; these carry the torch2.13 builds
+# version. windows x86_64 carries the cu134/torch2.15 build (v1.6.1, verified
+# 2026-11-07: flash_attn-2.8.3+cu134torch2.15-cp312-win_amd64.whl); the linux
+# entries still point at torch2.13-era tags — no cu134 torch2.15 linux prebuilts
+# existed at move time, so on linux the URL 404s and flash-attn is skipped
+# (optional_packages only warn).
 _FA_BUILDS = {
     ("linux", "x86_64"): ("v0.9.47", "manylinux_2_24_x86_64.manylinux_2_28_x86_64"),
     ("linux", "aarch64"): ("v0.9.48", "manylinux_2_34_aarch64"),
-    ("windows", "x86_64"): ("v0.9.52", "win_amd64"),
+    ("windows", "x86_64"): ("v1.6.1", "win_amd64"),
 }
 
 # helper build tools some sdists need on Windows
@@ -272,9 +286,17 @@ def _cuda_flavor(detection):
             cuda = None
     if cuda is None:
         # driver present but version unknown — assume current
-        return "cu130", []
+        return "cu134", []
+    if cuda >= (13, 4):
+        return "cu134", []
     if cuda >= (13, 0):
-        return "cu130", []
+        # torch 2.15 ships cu134 wheels only — a CUDA 13.0-13.3 driver cannot
+        # run them; ask for the driver update instead of failing mid-install.
+        raise RuntimeError(
+            "NVIDIA driver supports CUDA %s but the pinned torch 2.15 wheels "
+            "are cu134-only. Update your NVIDIA driver (580+ / CUDA 13.4 era) "
+            "and re-run." % nvidia["cuda_version"]
+        )
     # non-GPU rows (the NPU on ARM hybrids) report compute_cap as "[N/A]"
     caps = []
     for g in nvidia.get("gpus", []):

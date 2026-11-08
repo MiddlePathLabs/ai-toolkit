@@ -689,7 +689,10 @@ def write_sitecustomize(dry_run=False, spec=None):
     target = os.path.join(site_packages, "sitecustomize.py")
     dll_dirs = [ffmpeg.bin_dir()] + list(getattr(spec, "runtime_dll_dirs", []) or [])
     runtime_env = dict(getattr(spec, "runtime_env", {}) or {})
-    if getattr(spec, "backend", None) == "cu134":
+    if getattr(spec, "backend", None) == "cu134" and spec.uv_python:
+        # Spark native stack only (arch-pinned spec): triton's runtime
+        # launcher JIT needs the MSVC environment. Plain x64 cu134 leaves
+        # uv_python unset and its bundled triton finds MSVC via PATH.
         # triton's runtime launcher JIT needs the MSVC environment
         msvc_env, msvc_bins = _msvc_runtime_env()
         runtime_env.update(msvc_env)
@@ -737,8 +740,9 @@ def sync(spec, detection, dry_run=False, force=False):
         warn(note)
     uvbin.ensure_uv(dry_run=dry_run)
     gitwin.ensure_git(dry_run=dry_run)
-    if spec.backend == "cu134":
-        # native Spark stack: provision CUDA/cuDNN/APL runtime DLLs, VC
+    if spec.backend == "cu134" and spec.uv_python:
+        # native Spark stack only (arch-pinned spec — x64 cu134 must NOT
+        # provision Spark runtimes): provision CUDA/cuDNN/APL runtime DLLs, VC
         # redist, and (best-effort) MSVC for triton's kernel launcher JIT
         from . import sparkdeps
 
