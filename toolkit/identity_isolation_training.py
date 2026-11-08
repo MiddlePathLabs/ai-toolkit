@@ -145,10 +145,10 @@ def validate_isolation_training(trainer) -> None:
 def validate_isolation_optimizer(config, optimizer, runtime) -> None:
     if config is None:
         return
-    from toolkit.optimizers.muon import Muon
+    from toolkit.optimizers.muon import BatchedMuon, Muon
     from toolkit.optimizers.rose import Rose
 
-    accepted = (torch.optim.AdamW, Rose, Muon)
+    accepted = (torch.optim.AdamW, Rose, Muon, BatchedMuon)
     torch_muon = getattr(torch.optim, "Muon", None)
     if torch_muon is not None:
         accepted += (torch_muon,)

@@ -309,9 +309,11 @@ def classify_optimizer(optimizer: Any) -> OptimizerCapabilities:
         # torch fused=True is a step-time CUDA kernel, not fused-backward.
         return group_lr("step")
 
-    if name == "Muon":
-        # Covers both torch.optim.Muon and the vendored toolkit copy.  Muon
-        # reads group["lr"] exactly once per step() and skips params without
+    if name in ("Muon", "BatchedMuon"):
+        # Covers torch.optim.Muon, the vendored toolkit copy and BatchedMuon
+        # (torch.optim.Muon's update with the per-matrix Newton-Schulz work
+        # batched; same updates, same momentum_buffer state).  Muon reads
+        # group["lr"] exactly once per step() and skips params without
         # grads, so a transient group-LR scale is a faithful final-update
         # scale (momentum buffer and orthogonalized update are lr-independent)
         # and a grad-none mask is a faithful inactive-param mask.

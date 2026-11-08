@@ -134,9 +134,12 @@ def get_optimizer(
         # RMS-matched to AdamW (adjust_lr_fn=match_rms_adamw), so existing
         # AdamW learning rates carry over unchanged (the pairing Fizgig
         # measured across their Krea 2 / Qwen 2.1 LoRA presets, v9.0.8).
-        # torch.optim.Muon directly when every parameter is 2D (PyTorch
-        # 2.10+; this repo pins 2.13); the vendored copy covers non-2D
-        # tensors (conv factors, biases, norms).
+        # BatchedMuon (torch.optim.Muon's update with Newton-Schulz batched
+        # over same-shaped matrices, Fizgig #221 v9.2.0 — a LoRA's hundreds
+        # of small matrices made the per-matrix loop ~0.33 s of each MOSS
+        # batch-3 step; batched, the optimizer step is 12x faster and the
+        # updates match) when every parameter is 2D; the vendored copy
+        # covers non-2D tensors (conv factors, biases, norms).
         params = list(params)
         if params and isinstance(params[0], dict):
             # Materialize each group's params exactly once.  A group may carry
@@ -160,8 +163,9 @@ def get_optimizer(
         optimizer_params.setdefault('momentum', 0.95)
         optimizer_params.setdefault('nesterov', True)
         optimizer_params.setdefault('ns_steps', 5)
-        if hasattr(torch.optim, 'Muon') and all(getattr(p, 'ndim', 0) == 2 for p in flat):
-            optimizer = torch.optim.Muon(params, lr=float(learning_rate), **optimizer_params)
+        if all(getattr(p, 'ndim', 0) == 2 for p in flat):
+            from toolkit.optimizers.muon import BatchedMuon
+            optimizer = BatchedMuon(params, lr=float(learning_rate), **optimizer_params)
         else:
             from toolkit.optimizers.muon import Muon
             optimizer = Muon(params, lr=float(learning_rate), **optimizer_params)
