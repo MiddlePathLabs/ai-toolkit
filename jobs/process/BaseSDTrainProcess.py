@@ -1,4 +1,3 @@
-import contextlib
 import copy
 import glob
 import inspect
@@ -84,6 +83,8 @@ from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adap
 from toolkit.scheduler import get_lr_scheduler
 from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork, PreviewStateRestorationError
+# the previews' force-eager stance, shared with the training-maps trigger probe
+from toolkit.util.eager_stance import force_eager_stance as _force_eager_stance
 
 from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, add_base_model_info_to_meta, \
@@ -141,33 +142,6 @@ def _is_out_of_memory(error: BaseException) -> bool:
     if isinstance(error, torch.cuda.OutOfMemoryError):
         return True
     return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
-
-
-@contextlib.contextmanager
-def _force_eager_stance(enabled: bool):
-    """Run the body with torch's ``force_eager`` compiler stance when enabled:
-    every torch.compile'd module executes its original eager code, so previews
-    never pay the first-call Dynamo/inductor build (minutes of Triton work per
-    new shape) that otherwise lands on the first sample after every start or
-    resume. Training steps outside the stance keep their compiled graphs.
-    Degrades to a no-op where the stance is unavailable (older torch)."""
-    if not enabled:
-        yield
-        return
-    stance = None
-    try:
-        stance = torch.compiler.set_stance("force_eager")
-        stance.__enter__()
-    except Exception:
-        stance = None
-    try:
-        yield
-    finally:
-        if stance is not None:
-            try:
-                stance.__exit__(None, None, None)
-            except Exception:
-                pass
 
 
 class BaseSDTrainProcess(BaseTrainProcess):

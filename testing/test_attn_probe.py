@@ -1,7 +1,5 @@
 """Tests for toolkit/attn_probe.py: the trigger-attention probe math and the
 trigger-to-token position mapping."""
-import math
-
 import pytest
 import torch
 
@@ -33,11 +31,14 @@ class FakeTok:
         return out
 
 
-def _manual_share(q, k, img_rows, cols, valid):
-    """Softmax(q k^T / sqrt(d)) summed over the trigger columns, all heads."""
+def _manual_share(q, k, img_rows, cols, valid, drop=()):
+    """Softmax(q k^T / sqrt(d)) summed over the trigger columns, all heads.
+    Keys in `drop` are masked out (padding) before the softmax."""
     qi = q[0, :, img_rows[0]:img_rows[1]]         # [H, Ni, D]
     kk = k[0, :, :valid]                          # [H, valid, D]
     s = qi @ kk.transpose(-1, -2) * qi.shape[-1] ** -0.5
+    if drop:
+        s[..., list(drop)] = float("-inf")
     share = s.softmax(dim=-1)[..., cols].sum(-1)  # [H, Ni]
     return share.mean(0)
 
@@ -90,11 +91,13 @@ def test_probe_masks_padded_tail():
     k = torch.randn(1, 2, total, 8)
     mask = torch.ones(1, total, dtype=torch.bool)
     mask[0, valid:] = False
+    mask[0, 2] = False       # a masked text slot INSIDE the window, so the
+                             # masked_fill_ branch actually sees a False
     with capturing([1]) as probe:
         layout(img_span, 0, total, valid=valid, key_mask=mask)
         see(q, k)
         r = probe.result()
-    manual = _manual_share(q, k, img_span, [1], valid)
+    manual = _manual_share(q, k, img_span, [1], valid, drop=(2,))
     assert torch.allclose(r, manual, atol=1e-5)
 
 
@@ -153,6 +156,18 @@ def test_trigger_positions_absent_or_unsafe():
     # a caption long enough to hit the encoder's truncation window
     long_caption = " ".join(["word"] * 600)
     assert trigger_positions(tok, PREFIX, long_caption, "word", prefix_idx=4, max_length=512) == []
+
+
+def test_trigger_positions_exactly_filling_window_kept():
+    # the encoder truncates at max_length + prefix_idx and only drops tokens
+    # PAST that, so a caption whose tokens exactly fill the window is kept
+    # whole and the mapping stays valid
+    tok = FakeTok()
+    caption = " ".join(["word"] * 512)        # 4 prefix + 512 caption = the full window
+    pos = trigger_positions(tok, PREFIX, caption, "word", prefix_idx=4, max_length=512)
+    assert len(pos) == 512
+    assert trigger_positions(tok, PREFIX, caption + " word", "word",
+                             prefix_idx=4, max_length=512) == []      # one past: truncated
 
 
 def test_trigger_positions_needs_offset_capable_tokenizer():

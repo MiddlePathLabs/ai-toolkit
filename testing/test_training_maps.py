@@ -202,6 +202,9 @@ def test_tokens_to_map_row_major():
     m = TrainingMaps._tokens_to_map(attn, torch.zeros(1, 4, 6, 10))
     assert m.shape == (3, 5)
     assert m[0, 0] == 0 and m[0, 4] == 4 and m[1, 0] == 5 and m[2, 4] == 14
+    # the model's configured patch is honored when given
+    assert TrainingMaps._tokens_to_map(
+        attn, torch.zeros(1, 4, 6, 10), patch=2).shape == (3, 5)
     # a token count that can't tile the grid raises
     with pytest.raises(RuntimeError):
         TrainingMaps._tokens_to_map(torch.arange(17, dtype=torch.float32), torch.zeros(1, 4, 6, 10))

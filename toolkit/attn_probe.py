@@ -128,10 +128,13 @@ def trigger_positions(tokenizer, prefix, caption, trigger, max_length=512, prefi
         offsets = enc["offset_mapping"]
         drop = len(tokenizer(prefix)["input_ids"])
     except Exception as e:                   # offset mapping needs a fast tokenizer
-        raise ValueError(f"tokenizer cannot provide offset mappings ({e})") from e
+        raise ValueError(
+            f"tokenizer cannot provide offset mappings ({type(e).__name__}: {e})") from e
     if prefix_idx is not None and drop != int(prefix_idx):
         return []                            # the encoder's slice is not the prefix's tokens
-    if len(enc["input_ids"]) >= int(prefix_idx or drop) + int(max_length):
+    # the encoder truncates at max_length + prefix_idx and only drops tokens
+    # past that, so a caption whose tokens exactly fill the window is kept whole
+    if len(enc["input_ids"]) > int(prefix_idx or drop) + int(max_length):
         return []                            # caption long enough to be truncated
     spans = []
     for word in words:

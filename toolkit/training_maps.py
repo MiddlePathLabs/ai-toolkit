@@ -30,9 +30,10 @@ preview weights (the EMA shadow weights when EMA is on), inside _sample's
 force-eager + fork_rng window when recurring. A failure is never fatal: one
 console line and the maps are off for the rest of the run.
 
-Output, in <save_root>/training_maps/: probes.json ({keys, timesteps, crops}) and
-maps.jsonl, one line per capture {"step", "maps": {key: {t: {"loss": grid,
-"effect": grid}}}} (grids pooled to <= MAX_SIDE, 4 significant figures; the same
+Output, in <save_root>/training_maps/: probes.json ({keys, timesteps, crops, attn
+-- the keys carrying a trigger-word map}) and maps.jsonl, one line per capture
+{"step", "maps": {key: {t: {"loss": grid, "effect": grid, "attn": grid}}}}
+(grids pooled to <= MAX_SIDE, 4 significant figures; the same
 step captured twice keeps the later render). Rendered composites (three labelled
 panels over the exact bucket-cropped photo) land in samples/ as
 MAP_<time>_<step>_p<N>.jpg so the job's sample gallery shows them next to the
@@ -112,6 +113,9 @@ class TrainingMaps:
         self.sample_dir = os.path.join(process.save_root, 'samples')
         self.failed = False
         self.last_rendered_step = None
+        # one console line per run when the eager stance the trigger map needs
+        # can't be engaged (its rows would silently render n/a otherwise)
+        self._warned_stance = False
         # per (key, t) baseline loss grid {"key": {t_str: grid}}, for the
         # "learned" render; loaded from maps.jsonl on resume, else the step-0 capture
         self.first_loss = {}
@@ -234,14 +238,13 @@ class TrainingMaps:
         """path -> the trigger's text positions, for the probe pictures whose
         caption contains it. Krea 2 only for now: the mapping needs the
         encoder's own template arithmetic (the instruction prefix's token count
-        is sliced off the features the DiT sees). One console line when the
+        is sliced off the features the DiT sees). The trigger is resolved per
+        item: a dataset can set its own trigger_word while the process one is
+        None, and get_caption() injects the item's. One console line when the
         trigger map is off for the run; a bad tokenizer mapping disables it
         without touching the loss/effect maps."""
         sd = self.process.sd
         if getattr(sd, 'arch', '') != 'krea2':
-            return {}
-        trigger = getattr(self.process, 'trigger_word', None)
-        if not str(trigger or '').strip():
             return {}
         out = {}
         try:
@@ -254,16 +257,29 @@ class TrainingMaps:
             if tokenizer is None:
                 return {}
             max_length = int(getattr(sd, 'max_text_length', 512) or 512)
+            process_trigger = getattr(self.process, 'trigger_word', None)
             for path, item in items_by_path.items():
+                trigger = getattr(item, 'trigger_word', None) or process_trigger
+                if not str(trigger or '').strip():
+                    continue
                 caption = getattr(item, 'caption', None)
                 if caption is None:
                     caption = item.get_caption()
                 if not caption:
                     continue
-                pos = trigger_positions(
-                    tokenizer, PROMPT_TEMPLATE_ENCODE_PREFIX, caption, trigger,
-                    max_length=max_length, prefix_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
-                )
+                try:
+                    pos = trigger_positions(
+                        tokenizer, PROMPT_TEMPLATE_ENCODE_PREFIX, caption, trigger,
+                        max_length=max_length, prefix_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
+                    )
+                except ValueError:
+                    raise             # tokenizer-level: every item fails the same way
+                except Exception as e:
+                    # one broken item (a weird caption, say) must not sink the
+                    # trigger map for the pictures that are fine
+                    logger.debug(f"[maps] trigger positions failed for {path}: "
+                                 f"{type(e).__name__}: {e}")
+                    continue
                 if pos:
                     out[path] = pos
         except ValueError as e:
@@ -274,7 +290,9 @@ class TrainingMaps:
                    f"({type(e).__name__}: {str(e)[:160]})")
             return {}
         if not out:
-            _print(f"[maps] no trigger-word map: '{str(trigger).strip()}' isn't in the "
+            named = (f"'{str(process_trigger).strip()}'"
+                     if str(process_trigger or '').strip() else "the trigger word")
+            _print(f"[maps] no trigger-word map: {named} isn't in the "
                    "probe pictures' captions")
         return out
 
@@ -491,10 +509,9 @@ class TrainingMaps:
                             # the trigger's attention, on this same forward, run
                             # eagerly (a compiled block doesn't call the probe)
                             from toolkit import attn_probe
-                            stance = (torch.compiler.set_stance("force_eager")
-                                      if hasattr(torch.compiler, "set_stance")
-                                      else contextlib.nullcontext())
-                            with stance, attn_probe.capturing(self.trig[key]) as probe:
+                            from toolkit.util.eager_stance import force_eager_stance
+                            with force_eager_stance() as eager, \
+                                    attn_probe.capturing(self.trig[key]) as trig_probe:
                                 with net_ctx:
                                     pred = sd.predict_noise(
                                         latents=noisy,
@@ -502,7 +519,13 @@ class TrainingMaps:
                                         timestep=timestep,
                                         batch=None,
                                     ).float()
-                            attn = probe.result()
+                            if not eager and not self._warned_stance:
+                                self._warned_stance = True
+                                _print("[maps] torch's force-eager stance is unavailable "
+                                       "here, so the trigger-attention map can't be "
+                                       "captured (a compiled block never calls the probe); "
+                                       "the other maps are unaffected.")
+                            attn = trig_probe.result()
                         else:
                             with net_ctx:
                                 pred = sd.predict_noise(
@@ -522,7 +545,8 @@ class TrainingMaps:
                         loss_map = (pred - target).pow(2).mean(dim=1)[0]             # (h, w)
                         maps = {"loss": _grid(loss_map)}
                         if attn is not None:
-                            maps["attn"] = _grid(self._tokens_to_map(attn, latents))
+                            maps["attn"] = _grid(self._tokens_to_map(
+                                attn, latents, patch=getattr(sd, 'patch_size', None)))
                         if step > 0 and had_network and net_multiplier is not None:
                             network.multiplier = 0.0
                             with net_ctx:
@@ -546,13 +570,17 @@ class TrainingMaps:
         return out
 
     @staticmethod
-    def _tokens_to_map(attn, latents):
+    def _tokens_to_map(attn, latents, patch=None):
         """The probe's per-image-token attention share (N,) laid out row by row
         on the latent's patch grid (N = (h/p) * (w/p); krea2 packs its image
-        tokens row-major in prepare())."""
+        tokens row-major in prepare()). `patch` is the model's configured patch
+        size when the caller knows it (krea2 exposes sd.patch_size); otherwise
+        it is inferred from the token count, which only holds while the
+        sequence is image tokens alone."""
         h, w = latents.shape[-2], latents.shape[-1]
         n = attn.numel()
-        p = max(1, round((h * w / max(1, n)) ** 0.5))
+        p = int(patch) if patch and int(patch) >= 1 \
+            else max(1, round((h * w / max(1, n)) ** 0.5))
         gh, gw = -(-h // p), -(-w // p)
         if gh * gw != n:
             gh, gw = h // p, w // p
