@@ -65,6 +65,7 @@ def _bare_maps(tmpdir, photo_size=(160, 96)):
     }}
     obj.scales = {}
     obj.first_loss = {}
+    obj.trig = {}
     obj.sample_dir = str(tmpdir)
     obj.dir = str(tmpdir)
     obj.failed = False
@@ -193,3 +194,29 @@ def test_start_writes_probes_json_without_paths(tmp_path):
     assert '/' not in json.dumps(p) and '\\' not in json.dumps(p)
     # a fresh start cleared any stale jsonl
     assert not os.path.exists(tmp_path / 'job' / 'maps.jsonl')
+
+
+def test_tokens_to_map_row_major():
+    # h=6, w=10 latent with patch 2 -> 15 tokens on a (3, 5) grid, row-major
+    attn = torch.arange(15, dtype=torch.float32)
+    m = TrainingMaps._tokens_to_map(attn, torch.zeros(1, 4, 6, 10))
+    assert m.shape == (3, 5)
+    assert m[0, 0] == 0 and m[0, 4] == 4 and m[1, 0] == 5 and m[2, 4] == 14
+    # a token count that can't tile the grid raises
+    with pytest.raises(RuntimeError):
+        TrainingMaps._tokens_to_map(torch.arange(17, dtype=torch.float32), torch.zeros(1, 4, 6, 10))
+
+
+def test_render_trigger_row_only_when_present(tmp_path):
+    maps = _bare_maps(tmp_path)
+    caps = _fake_maps(0)
+    TrainingMaps._render(maps, 0, caps)          # no trig: 3 rows
+    maps2 = _bare_maps(tmp_path)
+    maps2.trig = {'x.jpg': [3]}
+    for t in (0.25, 0.5, 0.75):
+        caps['x.jpg'][f'{t:g}']['attn'] = _grid(torch.rand(3, 5))
+    TrainingMaps._render(maps2, 50, caps)        # trig + attn grids: taller canvas
+    files = sorted(f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_'))
+    a = Image.open(os.path.join(str(tmp_path), files[0]))
+    b = Image.open(os.path.join(str(tmp_path), files[1]))
+    assert b.size[1] > a.size[1]

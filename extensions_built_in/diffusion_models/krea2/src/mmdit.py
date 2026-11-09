@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import torch
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+from toolkit import attn_probe          # training maps: trigger-word attention probe
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -254,6 +255,8 @@ class Attention(torch.nn.Module):
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
+        if attn_probe._ACTIVE is not None:      # training maps: q/k as attention sees them
+            attn_probe.see(q, k)
         if kv_capture is not None and ref_span is not None:
             # Stash this block's post-RoPE ref K/V so later denoising steps can
             # run without the ref tokens in the sequence (clone: drop the view
@@ -587,6 +590,9 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             mask = torch.cat((mask, extra), dim=3)
 
         freqs = self.posemb(pos)
+        if attn_probe._ACTIVE is not None:      # training maps: joint-sequence layout
+            attn_probe.layout((txtlen, txtlen + imglen), 0, combined.shape[1],
+                              txtlen + imglen, padmask)
 
         for block, blockkv in zip(self.blocks, blockcaches):
             if self.gradient_checkpointing and torch.is_grad_enabled():

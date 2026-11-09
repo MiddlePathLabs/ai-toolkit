@@ -16,6 +16,12 @@ seeded noise. Captured once before training and at every preview round
   * "learned"- loss(step 0) - loss(now) at the same noise, so the picture's own
                texture cancels; green where learning happened, magenta where it
                got worse. Rendered, not stored (recomputed from the two captures).
+  * "attn"   - (krea2 only, when the run has a trigger word in the probe
+               captions) the trigger's share of each image token's attention,
+               mean over heads and blocks (toolkit/attn_probe.py), captured on
+               the LoRA-on forward, run eagerly. Watch it settle on the subject;
+               attention parked on a logo, sign or the background means the
+               trigger is being tied to that instead.
 
 Gated to still-image flow-matching models (krea2 / qwen_image_2 / moss_image,
 anything with sd.is_flow_matching and straight-path add_noise); other families
@@ -32,6 +38,7 @@ panels over the exact bucket-cropped photo) land in samples/ as
 MAP_<time>_<step>_p<N>.jpg so the job's sample gallery shows them next to the
 previews of the same round.
 """
+import contextlib
 import json
 import logging
 import os
@@ -110,6 +117,10 @@ class TrainingMaps:
         self.first_loss = {}
         # running per-key scales so a colour fading really is the error falling
         self.scales = {}
+        # probe key -> the trigger word's positions in the text the model sees
+        # (empty when the family has no attention probe or the captions lack
+        # the trigger); filled by _collect_probes
+        self.trig = {}
         # path -> probe payload
         self.probes = self._collect_probes(images)
         self.keys = list(self.probes.keys())
@@ -175,7 +186,9 @@ class TrainingMaps:
 
         probes = {}
         used_names = set()
-        for path in _pick_keys(items_by_path.keys(), images):
+        picked = _pick_keys(items_by_path.keys(), images)
+        trig_by_path = self._trigger_positions({p: items_by_path[p] for p in picked})
+        for path in picked:
             item = items_by_path[path]
             try:
                 # read the caches straight from disk: probing must never mutate
@@ -204,7 +217,10 @@ class TrainingMaps:
                 photo = self._probe_photo(item, cached_uint8)
                 if photo is None:
                     continue
-                probes[_display_name(path, used_names)] = {
+                key = _display_name(path, used_names)
+                if path in trig_by_path:
+                    self.trig[key] = trig_by_path[path]
+                probes[key] = {
                     "latent": latent,          # (C, h, w) fp32 on CPU
                     "embeds": embeds,
                     "photo": photo,            # PIL image, the exact trained view
@@ -213,6 +229,54 @@ class TrainingMaps:
             except Exception as e:
                 logger.debug(f"[maps] could not use probe {path}: {type(e).__name__}: {e}")
         return probes
+
+    def _trigger_positions(self, items_by_path):
+        """path -> the trigger's text positions, for the probe pictures whose
+        caption contains it. Krea 2 only for now: the mapping needs the
+        encoder's own template arithmetic (the instruction prefix's token count
+        is sliced off the features the DiT sees). One console line when the
+        trigger map is off for the run; a bad tokenizer mapping disables it
+        without touching the loss/effect maps."""
+        sd = self.process.sd
+        if getattr(sd, 'arch', '') != 'krea2':
+            return {}
+        trigger = getattr(self.process, 'trigger_word', None)
+        if not str(trigger or '').strip():
+            return {}
+        out = {}
+        try:
+            from extensions_built_in.diffusion_models.krea2.src.text_encoder import (
+                PROMPT_TEMPLATE_ENCODE_PREFIX,
+                PROMPT_TEMPLATE_ENCODE_START_IDX,
+            )
+            from toolkit.attn_probe import trigger_positions
+            tokenizer = getattr(sd, 'tokenizer', None)
+            if tokenizer is None:
+                return {}
+            max_length = int(getattr(sd, 'max_text_length', 512) or 512)
+            for path, item in items_by_path.items():
+                caption = getattr(item, 'caption', None)
+                if caption is None:
+                    caption = item.get_caption()
+                if not caption:
+                    continue
+                pos = trigger_positions(
+                    tokenizer, PROMPT_TEMPLATE_ENCODE_PREFIX, caption, trigger,
+                    max_length=max_length, prefix_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
+                )
+                if pos:
+                    out[path] = pos
+        except ValueError as e:
+            _print(f"[maps] the trigger-word map is off for this run ({str(e)[:160]})")
+            return {}
+        except Exception as e:
+            _print(f"[maps] the trigger-word map is off for this run "
+                   f"({type(e).__name__}: {str(e)[:160]})")
+            return {}
+        if not out:
+            _print(f"[maps] no trigger-word map: '{str(trigger).strip()}' isn't in the "
+                   "probe pictures' captions")
+        return out
 
     @staticmethod
     def _load_latent_from_cache(item):
@@ -306,10 +370,12 @@ class TrainingMaps:
                 "keys": self.keys,
                 "timesteps": list(self.ts),
                 "crops": self.crops,
+                "attn": sorted(self.trig),
             }, f)
         _print(f"[maps] training maps on: {len(self.keys)} picture(s) x {len(self.ts)} noise level(s), "
                "captured before training and at every preview round "
-               f"(output: {self.dir}, rendered into samples/)")
+               f"(output: {self.dir}, rendered into samples/)"
+               + (f"; the trigger word's attention on {len(self.trig)} of them" if self.trig else ""))
 
     def _load_first_loss(self):
         """The earliest capture's loss grids from maps.jsonl, if one exists. Streams
@@ -390,7 +456,6 @@ class TrainingMaps:
         network = getattr(process, 'network', None)
         had_network = network is not None
         net_multiplier = getattr(network, 'multiplier', None) if had_network else None
-        import contextlib
         net_ctx = network if had_network else contextlib.nullcontext()
         out = {}
         try:
@@ -421,13 +486,31 @@ class TrainingMaps:
                         # the multiplier toggle alone does nothing outside it
                         if had_network:
                             network.multiplier = 1.0
-                        with net_ctx:
-                            pred = sd.predict_noise(
-                                latents=noisy,
-                                conditional_embeddings=embeds,
-                                timestep=timestep,
-                                batch=None,
-                            ).float()
+                        attn = None
+                        if key in self.trig:
+                            # the trigger's attention, on this same forward, run
+                            # eagerly (a compiled block doesn't call the probe)
+                            from toolkit import attn_probe
+                            stance = (torch.compiler.set_stance("force_eager")
+                                      if hasattr(torch.compiler, "set_stance")
+                                      else contextlib.nullcontext())
+                            with stance, attn_probe.capturing(self.trig[key]) as probe:
+                                with net_ctx:
+                                    pred = sd.predict_noise(
+                                        latents=noisy,
+                                        conditional_embeddings=embeds,
+                                        timestep=timestep,
+                                        batch=None,
+                                    ).float()
+                            attn = probe.result()
+                        else:
+                            with net_ctx:
+                                pred = sd.predict_noise(
+                                    latents=noisy,
+                                    conditional_embeddings=embeds,
+                                    timestep=timestep,
+                                    batch=None,
+                                ).float()
                         batch_shim = _LossTargetBatch(latents=latents)
                         if hasattr(sd, 'get_loss_target'):
                             target = sd.get_loss_target(
@@ -438,6 +521,8 @@ class TrainingMaps:
                             target = (noise - latents).float()
                         loss_map = (pred - target).pow(2).mean(dim=1)[0]             # (h, w)
                         maps = {"loss": _grid(loss_map)}
+                        if attn is not None:
+                            maps["attn"] = _grid(self._tokens_to_map(attn, latents))
                         if step > 0 and had_network and net_multiplier is not None:
                             network.multiplier = 0.0
                             with net_ctx:
@@ -459,6 +544,21 @@ class TrainingMaps:
             if isinstance(unet, torch.nn.Module) and was_training is not None:
                 unet.train(was_training)
         return out
+
+    @staticmethod
+    def _tokens_to_map(attn, latents):
+        """The probe's per-image-token attention share (N,) laid out row by row
+        on the latent's patch grid (N = (h/p) * (w/p); krea2 packs its image
+        tokens row-major in prepare())."""
+        h, w = latents.shape[-2], latents.shape[-1]
+        n = attn.numel()
+        p = max(1, round((h * w / max(1, n)) ** 0.5))
+        gh, gw = -(-h // p), -(-w // p)
+        if gh * gw != n:
+            gh, gw = h // p, w // p
+        if gh * gw != n:
+            raise RuntimeError(f"can't lay {n} attention tokens on a {h}x{w} latent grid")
+        return attn.detach().float().cpu().view(gh, gw)
 
     # ------------------------------------------------------------------
     # rendering (the job gallery lists samples/, so composites land there)
@@ -513,20 +613,30 @@ class TrainingMaps:
                     ))
                 return imgs
 
-            # reading order follows Fizgig: learned first, then not-learned, then the effect
-            learned_imgs = render_seq(
-                [learned_of(i) for i in range(len(self.ts))], 'learned', diverging=True)
-            loss_imgs = render_seq(
-                [map_of(maps, i, 'loss') for i in range(len(self.ts))], 'loss')
-            effect_imgs = render_seq(
-                [map_of(maps, i, 'effect') for i in range(len(self.ts))], 'effect')
+            # reading order follows Fizgig: learned first, then not-learned, then
+            # the effect, then (when the run has a trigger in the probe captions)
+            # the trigger word's attention
+            rows = [
+                (render_seq([learned_of(i) for i in range(len(self.ts))], 'learned', diverging=True),
+                 "Learned since the start", "green=better  magenta=worse"),
+                (render_seq([map_of(maps, i, 'loss') for i in range(len(self.ts))], 'loss'),
+                 "Not learned yet", "red worst / yellow / blue / none best"),
+                (render_seq([map_of(maps, i, 'effect') for i in range(len(self.ts))], 'effect'),
+                 "Where the LoRA acts", "red strongest / yellow / blue / none"),
+            ]
+            if key in self.trig or any(
+                (maps.get(key) or {}).get(f"{t:g}", {}).get("attn") is not None for t in self.ts):
+                rows.append((
+                    render_seq([map_of(maps, i, 'attn') for i in range(len(self.ts))], 'attn'),
+                    "Trigger word attention", "red most attention / yellow / blue / none",
+                ))
 
             row_h = ph + 16          # panel row height incl. its level labels
             header, gap, label_w = 26, 6, 152
             n_levels = len(self.ts)
             canvas = Image.new('RGB', (
                 label_w + n_levels * (pw + gap),
-                header + 3 * (row_h + 26),
+                header + len(rows) * (row_h + 26),
             ), (24, 24, 28))
             draw = ImageDraw.Draw(canvas)
             draw.text((8, 7), f"{key}  step {step}", fill=(220, 220, 225))
@@ -535,11 +645,7 @@ class TrainingMaps:
                 labels = ["low t={:g}".format(self.ts[0]), "mid t={:g}".format(self.ts[1]),
                           "high t={:g}".format(self.ts[2])]
             y = header
-            for imgs, title, legend in (
-                (learned_imgs, "Learned since the start", "green=better  magenta=worse"),
-                (loss_imgs, "Not learned yet", "red worst / yellow / blue / none best"),
-                (effect_imgs, "Where the LoRA acts", "red strongest / yellow / blue / none"),
-            ):
+            for imgs, title, legend in rows:
                 draw.text((8, y + ph // 2), title, fill=(200, 200, 210))
                 panel = self._panel(imgs, pw, ph, labels)
                 canvas.paste(panel, (label_w, y))
