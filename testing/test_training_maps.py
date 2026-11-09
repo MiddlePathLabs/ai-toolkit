@@ -149,7 +149,8 @@ def test_capture_writes_valid_jsonl_and_renders(tmp_path):
     assert {'loss', 'effect'} <= set(one.keys()) and {'w', 'h', 'v'} <= set(one['loss'].keys())
     # first_loss locked to the earliest capture, MAP renders for both steps
     assert set(maps.first_loss.keys()) == {'x.jpg'}
-    assert len([f for f in os.listdir(tmp_path / 'job') if f.startswith('MAP_')]) == 2
+    maps_files = [f for f in os.listdir(tmp_path / 'job') if '__' in f and f.endswith('.png')]
+    assert len(maps_files) == 2
 
 
 def test_capture_write_failure_never_fatal(tmp_path):
@@ -201,7 +202,7 @@ def test_render_baseline_and_step(tmp_path):
     maps = _bare_maps(tmp_path)
     maps.first_loss = _fake_maps(0)
     TrainingMaps._render(maps, 60, _fake_maps(60))
-    files = [f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_')]
+    files = [f for f in os.listdir(str(tmp_path)) if f.endswith('.png')]
     assert len(files) == 1
     img = Image.open(os.path.join(str(tmp_path), files[0]))
     assert img.mode == 'RGB' and img.size[0] > 0
@@ -209,14 +210,14 @@ def test_render_baseline_and_step(tmp_path):
     # a fresh baseline render (no first_loss) must not raise and marks panels n/a
     maps.first_loss = {}
     TrainingMaps._render(maps, 0, _fake_maps(0))
-    assert len([f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_')]) == 2
+    assert len([f for f in os.listdir(str(tmp_path)) if f.endswith('.png')]) == 2
 
 
 def test_render_tiny_photo(tmp_path):
     # a photo below the 64px panel clamp must render, not IndexError
     maps = _bare_maps(tmp_path, photo_size=(20, 30))
     TrainingMaps._render(maps, 10, _fake_maps(0))
-    assert any(f.startswith('MAP_') for f in os.listdir(str(tmp_path)))
+    assert any(f.endswith('.png') for f in os.listdir(str(tmp_path)))
 
 
 def test_crop_box_fractions():
@@ -272,7 +273,7 @@ def test_render_trigger_row_only_when_present(tmp_path):
     for t in (0.25, 0.5, 0.75):
         caps['x.jpg'][f'{t:g}']['attn'] = _grid(torch.rand(3, 5))
     TrainingMaps._render(maps2, 50, caps)        # trig + attn grids: taller canvas
-    files = sorted(f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_'))
+    files = sorted(f for f in os.listdir(str(tmp_path)) if f.endswith('.png'))
     a = Image.open(os.path.join(str(tmp_path), files[0]))
     b = Image.open(os.path.join(str(tmp_path), files[1]))
     assert b.size[1] > a.size[1]
@@ -296,7 +297,7 @@ def test_render_per_trigger_rows_when_several_words(tmp_path):
                     caps['x.jpg'][f'{t:g}']['attn_by'] = {
                         'fyxo': _grid(torch.rand(3, 5)), 'zwxem': _grid(torch.rand(3, 5))}
         TrainingMaps._render(maps, 50, caps)
-        f = next(f for f in os.listdir(str(d)) if f.startswith('MAP_'))
+        f = next(f for f in os.listdir(str(d)) if f.endswith('.png'))
         return Image.open(os.path.join(str(d), f)).size[1]
 
     h6 = render('six', {'x.jpg': {'fyxo': [3], 'zwxem': [7]}}, True)

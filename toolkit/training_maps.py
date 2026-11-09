@@ -42,10 +42,11 @@ and maps.jsonl, one line per capture
 {"step", "maps": {key: {t: {"loss": grid, "effect": grid, "attn": grid,
 "attn_by": {word: grid}}}}} (attn_by only when several triggers share a caption)
 (grids pooled to <= MAX_SIDE, 4 significant figures; the same
-step captured twice keeps the later render). Rendered composites (three labelled
-panels over the exact bucket-cropped photo) land in samples/ as
-MAP_<time>_<step>_p<N>.jpg so the job's sample gallery shows them next to the
-previews of the same round.
+step captured twice keeps the later render). Rendered composites (three or four
+labelled panels over the exact bucket-cropped photo) land in samples/ named like
+samples (<ts>__<step>_<90+N>.png) so the job's sample gallery interleaves them
+with the previews of the same round; the 90+ index never collides with real
+prompt indices and .png keeps them out of the .jpg-locked README widgets.
 """
 import contextlib
 import json
@@ -773,9 +774,14 @@ class TrainingMaps:
                 canvas.paste(panel, (label_w, y))
                 draw.text((label_w, y + row_h), legend, fill=(150, 150, 160))
                 y += row_h + 26
-            filename = f"MAP_{int(time.time() * 1000)}_{str(step).zfill(9)}_p{j}.jpg"
+            # named to match the sample gallery's <ts>__<step>_<idx> pattern so
+            # composites interleave with their preview round instead of clumping
+            # at the bottom; sample index 90+ never collides with real prompt
+            # indices, and .png keeps them out of the README widget generator,
+            # which is .jpg-locked (and zips prompt indices to files)
+            filename = f"{int(time.time() * 1000)}__{str(step).zfill(9)}_{90 + j}.png"
             os.makedirs(self.sample_dir, exist_ok=True)
-            canvas.save(os.path.join(self.sample_dir, filename), quality=88)
+            canvas.save(os.path.join(self.sample_dir, filename))
 
     @staticmethod
     def _grid_to_tensor(grid):
