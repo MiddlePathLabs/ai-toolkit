@@ -848,6 +848,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "skip_first_sample", "force_first_sample",
                 "show_turbo_outputs", "max_loss_debug",
                 "validation_config",
+                # training maps are trajectory-neutral (own generator, fork_rng,
+                # no_grad): toggling them or the probe count must not reject a resume
+                "training_maps", "training_maps_images",
             ),
             "save": (
                 "save_every", "max_step_saves_to_keep",
@@ -871,17 +874,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "adapter": ("test_img_path",),
         },
         {  # v3
-            "train": ("resume_mode", "steps"),
+            # training_maps fields postdate v3 states; exclude so a current
+            # config (which materializes the defaults) still matches them
+            "train": ("resume_mode", "steps", "training_maps", "training_maps_images"),
             "save": ("save_every", "max_step_saves_to_keep"),
             "sample": (),
             "first_sample": (),
         },
         {  # v2
-            "train": ("resume_mode", "steps"),
+            "train": ("resume_mode", "steps", "training_maps", "training_maps_images"),
             "save": ("save_every", "max_step_saves_to_keep"),
         },
         {  # v1
-            "train": ("resume_mode",),
+            "train": ("resume_mode", "training_maps", "training_maps_images"),
         },
     )
 
@@ -1827,7 +1832,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             maps = TrainingMaps.maybe_create(self)
             if maps is None:
                 return
-            resume = int(getattr(self, 'step_num', 0) or 0) > 0
+            # an actual loaded trajectory state (NOT a start_step warm start, which
+            # sets step_num > 0 on a fresh run): only that keeps the old maps and
+            # skips the baseline capture
+            resume = getattr(self, '_resume_state', None) is not None
             maps.start(resume=resume)
             if not resume:
                 maps.capture_baseline()

@@ -42,8 +42,6 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-if logging.getLogger("console") is not None and len(logging.getLogger("console").handlers) > 0:
-    logger = logging.getLogger("console")
 
 DIRNAME = "training_maps"
 TIMESTEPS = (0.25, 0.5, 0.75)    # flow-time noise levels: 0.25 detail, 0.75 layout
@@ -52,11 +50,8 @@ SEED = 1234                      # base seed; per (probe, level) = SEED*1000003 
 
 
 def _print(string):
-    try:
-        from toolkit.util.print_utils import print_acc
-        print_acc(string)
-    except Exception:
-        print(string)
+    from toolkit.print import print_acc
+    print_acc(string)
 
 
 def _pick_keys(paths, n):
@@ -68,8 +63,26 @@ def _pick_keys(paths, n):
     return [keys[round(i * (len(keys) - 1) / (n - 1))] for i in range(n)]
 
 
+def _display_name(path, used):
+    """A probe's key: its file name, suffixed for uniqueness across datasets. Keys
+    appear in probes.json / maps.jsonl, so absolute dataset paths never leak."""
+    base = os.path.basename(str(path))
+    name, ext = os.path.splitext(base)
+    key, i = base, 2
+    while key in used:
+        key = f"{name}-{i}{ext}"
+        i += 1
+    used.add(key)
+    return key
+
+
 def _grid(m):
-    """A (h, w) map -> {"w", "h", "v"}, pooled to <= MAX_SIDE on its long side, 4 significant figures."""
+    """A (h, w) map -> {"w", "h", "v"}, pooled to <= MAX_SIDE on its long side, 4
+    significant figures. Non-finite input raises (capture() then turns the maps
+    off for the run -- broken weights shouldn't render as a map, and json.dumps
+    must never emit NaN/Infinity)."""
+    if not torch.isfinite(m).all():
+        raise ValueError("non-finite map values")
     m = m.float()
     h, w = m.shape
     k = max(1, -(-max(h, w) // MAX_SIDE))
@@ -120,21 +133,28 @@ class TrainingMaps:
             reasons.append("audio models are not supported")
         if not getattr(sd, 'is_flow_matching', False):
             reasons.append(f"arch {getattr(sd, 'arch', '?')} is not flow-matching")
+        if getattr(sd, 'is_edit', False):
+            # edit variants ride reference/control latents through the batch;
+            # probes pass batch=None, so their conditioning would differ from
+            # training and the maps would describe the wrong thing
+            reasons.append("edit variants condition on reference images the probes don't carry")
+        if any(len(getattr(c, 'controls', []) or []) > 0 for c in getattr(process, 'dataset_configs', []) or []):
+            reasons.append("control datasets condition on references the probes don't carry")
         if reasons:
             _print(f"[maps] training maps are off for this run ({'; '.join(reasons)}).")
             return None
         maps = TrainingMaps(
             process,
-            images=getattr(train_config, 'training_maps_images', 3),
+            images=getattr(train_config, 'training_maps_images', None) or 3,
         )
         if not maps.keys:
             _print("[maps] training maps are off for this run (no probe picture had both a "
                    "cached latent and a cached text embedding; enable cache_latents and "
                    "cache_text_embeddings).")
             return None
-        dropped = len(maps.probes)
-        if dropped < getattr(train_config, 'training_maps_images', 3):
-            _print(f"[maps] note: only {len(maps.probes)} of {getattr(train_config, 'training_maps_images', 3)} "
+        wanted = getattr(train_config, 'training_maps_images', None) or 3
+        if len(maps.probes) < wanted:
+            _print(f"[maps] note: only {len(maps.probes)} of {wanted} "
                    "requested probe pictures were usable.")
         return maps
 
@@ -154,8 +174,9 @@ class TrainingMaps:
                 items_by_path.setdefault(str(item.path), item)
 
         probes = {}
-        for key in _pick_keys(items_by_path.keys(), images):
-            item = items_by_path[key]
+        used_names = set()
+        for path in _pick_keys(items_by_path.keys(), images):
+            item = items_by_path[path]
             try:
                 # read the caches straight from disk: probing must never mutate
                 # the shared dataset items (the dataloader deepcopies them per
@@ -163,6 +184,10 @@ class TrainingMaps:
                 latent, cached_uint8 = self._load_latent_from_cache(item)
                 if latent is None:
                     continue
+                if latent.dtype == torch.uint8:
+                    # pixel-space latents cached as uint8, like get_latent decodes
+                    from toolkit.dataloader_mixins import _latent_from_uint8
+                    latent = _latent_from_uint8(latent)
                 if latent.dim() == 5:      # (B, C, T, h, w): stills only
                     latent = latent[0, :, 0]
                 elif latent.dim() == 4 and latent.shape[0] == 1:
@@ -179,16 +204,14 @@ class TrainingMaps:
                 photo = self._probe_photo(item, cached_uint8)
                 if photo is None:
                     continue
-                name = os.path.basename(key)
-                probes[key] = {
-                    "name": name,
+                probes[_display_name(path, used_names)] = {
                     "latent": latent,          # (C, h, w) fp32 on CPU
                     "embeds": embeds,
                     "photo": photo,            # PIL image, the exact trained view
                     "crop": self._crop_box(item),
                 }
             except Exception as e:
-                logger.debug(f"[maps] could not use probe {key}: {type(e).__name__}: {e}")
+                logger.debug(f"[maps] could not use probe {path}: {type(e).__name__}: {e}")
         return probes
 
     @staticmethod
@@ -197,10 +220,17 @@ class TrainingMaps:
         the disk cache without touching the shared item. Falls back to
         get_latent() + cleanup for memory-cached datasets, restoring the item."""
         from safetensors.torch import load_file
+
+        def decode(latent):
+            if latent is not None and latent.dtype == torch.uint8:
+                from toolkit.dataloader_mixins import _latent_from_uint8
+                return _latent_from_uint8(latent)
+            return latent
+
         path = item.get_latent_path()
         if path and os.path.exists(path):
             state_dict = load_file(path, device='cpu')
-            return state_dict.get('latent'), state_dict.get('tensor')
+            return decode(state_dict.get('latent')), state_dict.get('tensor')
         latent = item.get_latent()
         if latent is None:
             return None, None
@@ -208,7 +238,7 @@ class TrainingMaps:
             from toolkit.dto import DTO
             if isinstance(latent, DTO):
                 latent = latent.tensor
-            latent = latent.detach().float().cpu().clone()
+            latent = decode(latent).detach().float().cpu().clone()
             cached = getattr(item, '_cached_tensor_uint8', None)
             return latent, cached
         finally:
@@ -274,7 +304,6 @@ class TrainingMaps:
         with open(os.path.join(self.dir, "probes.json"), "w", encoding="utf-8") as f:
             json.dump({
                 "keys": self.keys,
-                "names": {k: v["name"] for k, v in self.probes.items()},
                 "timesteps": list(self.ts),
                 "crops": self.crops,
             }, f)
@@ -283,17 +312,28 @@ class TrainingMaps:
                f"(output: {self.dir}, rendered into samples/)")
 
     def _load_first_loss(self):
-        """The earliest capture's loss grids from maps.jsonl, if one exists."""
+        """The earliest capture's loss grids from maps.jsonl, if one exists. Streams
+        the file (a long run's jsonl is large) and keeps only the minimum-step row;
+        a trailing partial line -- a run crashed mid-write -- is skipped."""
         path = os.path.join(self.dir, "maps.jsonl")
+        best_step, best_maps = None, None
         try:
             with open(path, encoding="utf-8") as f:
-                rows = [json.loads(line) for line in f if line.strip()]
-        except (OSError, ValueError):
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue                     # still being written, or a torn tail
+                    step = int(row.get("step", 0))
+                    if best_step is None or step < best_step:
+                        best_step, best_maps = step, (row.get("maps") or {})
+        except OSError:
             return
-        if not rows:
-            return
-        first = min(rows, key=lambda r: int(r.get("step", 0)))
-        self.first_loss = first.get("maps") or {}
+        if best_maps is not None:
+            self.first_loss = best_maps
 
     def capture_baseline(self):
         """The step-0 capture (weights as loaded; the EMA shadow is identical here)."""
@@ -301,8 +341,12 @@ class TrainingMaps:
 
     def capture_in_sample(self, step):
         """Recurring capture, called from inside _sample's force-eager + fork_rng +
-        EMA-eval window so probes see exactly the weights the previews see."""
+        EMA-eval window so probes see exactly the weights the previews see. The
+        pre-loop baseline sample also lands here at step 0; the baseline capture
+        already made that row, so don't write it twice."""
         if step is None:
+            return
+        if int(step) == 0 and self.first_loss:
             return
         self.capture(step=int(step))
 
@@ -312,7 +356,14 @@ class TrainingMaps:
         t0 = time.time()
         try:
             maps = self._run(step)
+            os.makedirs(self.dir, exist_ok=True)   # start() usually made it; don't depend on it
+            with open(os.path.join(self.dir, "maps.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"step": int(step), "maps": maps}) + "\n")
+            if not self.first_loss:
+                self.first_loss = maps
         except Exception as e:
+            # never fatal: a failed forward OR a failed maps.jsonl write (full
+            # disk, permissions) only turns the maps off for this run
             self.failed = True
             _print(f"[maps] the training maps failed (step {step}), so they're off for the rest of "
                    f"this run. Training carries on. ({type(e).__name__}: {str(e)[:200]})")
@@ -320,10 +371,6 @@ class TrainingMaps:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return
-        with open(os.path.join(self.dir, "maps.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"step": int(step), "maps": maps}) + "\n")
-        if not self.first_loss:
-            self.first_loss = maps
         try:
             self._render(step, maps)
         except Exception as e:
@@ -353,7 +400,12 @@ class TrainingMaps:
                 for j, key in enumerate(self.keys):
                     probe = self.probes[key]
                     latents = probe["latent"][None].to(device=device, dtype=dtype)   # (1, C, h, w)
+                    # PromptEmbeds.to() mutates in place, so never move the stored
+                    # probe embeds themselves: clone first (AdvancedPromptEmbeds.to
+                    # already returns a new object, but cloning it too is harmless)
                     embeds = probe["embeds"]
+                    if hasattr(embeds, "clone"):
+                        embeds = embeds.clone()
                     if hasattr(embeds, "to"):
                         embeds = embeds.to(device=device, dtype=dtype)
                     per = {}
@@ -396,6 +448,7 @@ class TrainingMaps:
                                     batch=None,
                                 ).float()
                             maps["effect"] = _grid((pred - base).abs().mean(dim=1)[0])
+                            del base
                         per[f"{t:g}"] = maps
                         del noise, timestep, noisy, pred, target, loss_map
                     out[key] = per
@@ -425,8 +478,11 @@ class TrainingMaps:
         for j, key in enumerate(self.keys):
             probe = self.probes[key]
             photo = probe["photo"]
-            pw, ph = photo.size
-            pw, ph = max(pw, 64), max(ph, 64)
+            pw, ph = max(photo.size[0], 64), max(photo.size[1], 64)
+            if photo.size != (pw, ph):
+                # the panels and overlays are sized (pw, ph); a photo smaller than
+                # the clamp must be resized to match or the overlay indexing breaks
+                photo = photo.resize((pw, ph))
 
             def map_of(capture, i, kind):
                 t = f"{self.ts[i]:g}"
@@ -467,12 +523,17 @@ class TrainingMaps:
 
             row_h = ph + 16          # panel row height incl. its level labels
             header, gap, label_w = 26, 6, 152
+            n_levels = len(self.ts)
             canvas = Image.new('RGB', (
-                label_w + 3 * (pw + gap),
+                label_w + n_levels * (pw + gap),
                 header + 3 * (row_h + 26),
             ), (24, 24, 28))
             draw = ImageDraw.Draw(canvas)
-            draw.text((8, 7), f"{probe['name']}  step {step}", fill=(220, 220, 225))
+            draw.text((8, 7), f"{key}  step {step}", fill=(220, 220, 225))
+            labels = [f"t={t:g}" for t in self.ts]
+            if n_levels == 3:
+                labels = ["low t={:g}".format(self.ts[0]), "mid t={:g}".format(self.ts[1]),
+                          "high t={:g}".format(self.ts[2])]
             y = header
             for imgs, title, legend in (
                 (learned_imgs, "Learned since the start", "green=better  magenta=worse"),
@@ -480,7 +541,7 @@ class TrainingMaps:
                 (effect_imgs, "Where the LoRA acts", "red strongest / yellow / blue / none"),
             ):
                 draw.text((8, y + ph // 2), title, fill=(200, 200, 210))
-                panel = self._panel(imgs, pw, ph)
+                panel = self._panel(imgs, pw, ph, labels)
                 canvas.paste(panel, (label_w, y))
                 draw.text((label_w, y + row_h), legend, fill=(150, 150, 160))
                 y += row_h + 26
@@ -502,13 +563,12 @@ class TrainingMaps:
         return torch.from_numpy(np.array(img, dtype=np.float32, copy=True))
 
     @staticmethod
-    def _panel(imgs, w, h):
-        """A row of the three noise levels; missing levels render as a placeholder."""
+    def _panel(imgs, w, h, labels):
+        """A row of the noise levels; missing levels render as a placeholder."""
         from PIL import Image, ImageDraw
         gap = 4
-        canvas = Image.new('RGB', (3 * (w + gap), h + 16), (24, 24, 28))
+        canvas = Image.new('RGB', (len(imgs) * (w + gap), h + 16), (24, 24, 28))
         draw = ImageDraw.Draw(canvas)
-        labels = ["low t=0.25", "mid t=0.50", "high t=0.75"]
         for i, img in enumerate(imgs):
             x = i * (w + gap)
             if img is not None:

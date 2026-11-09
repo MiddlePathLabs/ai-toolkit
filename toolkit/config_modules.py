@@ -615,7 +615,9 @@ class TrainConfig:
         # training and at every preview round (sample_every), rendered into the
         # job's samples/ gallery. Flow-matching still-image models only.
         self.training_maps: bool = kwargs.get('training_maps', False)
-        self.training_maps_images: int = int(kwargs.get('training_maps_images', 3))
+        # UI-saved configs can carry an explicit null; treat it as the default
+        _tmap_images = kwargs.get('training_maps_images', None)
+        self.training_maps_images: int = int(_tmap_images) if _tmap_images is not None else 3
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)

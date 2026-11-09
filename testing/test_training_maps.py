@@ -1,13 +1,12 @@
-"""Pure-function tests for toolkit/training_maps.py (no GPU / model needed)."""
+"""Tests for toolkit/training_maps.py (pure functions + the never-fatal capture path)."""
 import json
 import os
-import tempfile
 
 import pytest
 import torch
 from PIL import Image
 
-from toolkit.training_maps import TrainingMaps, _grid, _pick_keys
+from toolkit.training_maps import TrainingMaps, _display_name, _grid, _pick_keys
 
 
 def test_pick_keys_even_spread_dedupes_and_sorts():
@@ -35,19 +34,45 @@ def test_grid_small_grid_untouched():
     assert len(g['v']) == 100
 
 
-def _bare_maps(tmpdir):
+def test_grid_rejects_nonfinite():
+    m = torch.rand(6, 6)
+    m[2, 2] = float('nan')
+    with pytest.raises(ValueError):
+        _grid(m)
+    m[2, 2] = float('inf')
+    with pytest.raises(ValueError):
+        _grid(m)
+
+
+def test_display_name_dedupes_and_leaks_no_paths():
+    used = set()
+    a = _display_name('E:/datasets/foo/img.jpg', used)
+    b = _display_name('E:/other/bar/img.jpg', used)
+    assert a == 'img.jpg'
+    assert b != a and b.startswith('img-') and b.endswith('.jpg')
+    assert '/' not in b and '\\' not in b
+
+
+def _bare_maps(tmpdir, photo_size=(160, 96)):
     """A TrainingMaps with just the render/capture bookkeeping fields."""
     obj = object.__new__(TrainingMaps)
     obj.ts = (0.25, 0.5, 0.75)
-    obj.keys = ['x']
-    obj.probes = {'x': {'name': 'probe_x.jpg', 'photo': Image.new('RGB', (160, 96), (110, 80, 60)), 'crop': None}}
+    obj.keys = ['x.jpg']
+    obj.probes = {'x.jpg': {
+        'latent': torch.zeros(4, 6, 10),
+        'photo': Image.new('RGB', photo_size, (110, 80, 60)),
+        'crop': None,
+    }}
     obj.scales = {}
     obj.first_loss = {}
-    obj.sample_dir = tmpdir
+    obj.sample_dir = str(tmpdir)
+    obj.dir = str(tmpdir)
+    obj.failed = False
+    obj.process = None
     return obj
 
 
-def _fake_capture(step):
+def _fake_maps(step):
     per = {}
     for t in (0.25, 0.5, 0.75):
         h, w = 6, 10
@@ -59,13 +84,72 @@ def _fake_capture(step):
             eff = 0.4 * torch.exp(
                 -((torch.arange(h)[:, None] - 2) ** 2 + (torch.arange(w)[None, :] - 3) ** 2) / 4)
             per[f'{t:g}']['effect'] = _grid(eff)
-    return {'x': per}
+    return {'x.jpg': per}
+
+
+def test_capture_writes_valid_jsonl_and_renders(tmp_path):
+    maps = _bare_maps(tmp_path / 'job')
+    maps._run = lambda step: _fake_maps(step)          # instance attr shadows the method
+    maps.capture(0)
+    maps.capture(50)
+    rows = [json.loads(l) for l in open(tmp_path / 'job' / 'maps.jsonl')]
+    assert [r['step'] for r in rows] == [0, 50]
+    one = rows[1]['maps']['x.jpg']['0.5']
+    assert {'loss', 'effect'} <= set(one.keys()) and {'w', 'h', 'v'} <= set(one['loss'].keys())
+    # first_loss locked to the earliest capture, MAP renders for both steps
+    assert set(maps.first_loss.keys()) == {'x.jpg'}
+    assert len([f for f in os.listdir(tmp_path / 'job') if f.startswith('MAP_')]) == 2
+
+
+def test_capture_write_failure_never_fatal(tmp_path):
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    maps = _bare_maps(tmp_path / 'job')
+    maps.dir = str(blocker)                            # maps.jsonl under a file: open fails
+    maps._run = lambda step: _fake_maps(step)
+    maps.capture(10)                                   # must not raise
+    assert maps.failed is True
+
+
+def test_capture_run_failure_never_fatal(tmp_path):
+    maps = _bare_maps(tmp_path / 'job')
+
+    def boom(step):
+        raise RuntimeError('gpu said no')
+
+    maps._run = boom
+    maps.capture(10)                                   # must not raise
+    assert maps.failed is True
+    assert not os.path.exists(tmp_path / 'job' / 'maps.jsonl')
+
+
+def test_capture_skips_duplicate_step_zero(tmp_path):
+    maps = _bare_maps(tmp_path / 'job')
+    calls = []
+    maps._run = lambda step: (calls.append(step), _fake_maps(step))[1]
+    maps.first_loss = {'x.jpg': {}}                    # baseline already captured
+    maps.capture_in_sample(0)                          # the pre-loop sample also fires step 0
+    assert calls == [] and not os.path.exists(tmp_path / 'job' / 'maps.jsonl')
+    maps.capture_in_sample(250)
+    assert calls == [250]
+
+
+def test_load_first_loss_streams_min_step_and_tolerates_torn_tail(tmp_path):
+    d = tmp_path / 'job'
+    d.mkdir()
+    with open(d / 'maps.jsonl', 'w') as f:
+        f.write(json.dumps({'step': 100, 'maps': {'x.jpg': {}}}) + '\n')
+        f.write(json.dumps({'step': 50, 'maps': {'x.jpg': {'0.5': {'loss': _grid(torch.rand(3, 3))}}}}) + '\n')
+        f.write('{"step": 40, "maps": {"x.jpg"')       # torn tail from a crashed write
+    maps = _bare_maps(tmp_path / 'job')
+    maps._load_first_loss()
+    assert '0.5' in maps.first_loss['x.jpg']           # the minimum-step row won
 
 
 def test_render_baseline_and_step(tmp_path):
-    maps = _bare_maps(str(tmp_path))
-    maps.first_loss = _fake_capture(0)
-    TrainingMaps._render(maps, 60, _fake_capture(60))
+    maps = _bare_maps(tmp_path)
+    maps.first_loss = _fake_maps(0)
+    TrainingMaps._render(maps, 60, _fake_maps(60))
     files = [f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_')]
     assert len(files) == 1
     img = Image.open(os.path.join(str(tmp_path), files[0]))
@@ -73,14 +157,14 @@ def test_render_baseline_and_step(tmp_path):
 
     # a fresh baseline render (no first_loss) must not raise and marks panels n/a
     maps.first_loss = {}
-    TrainingMaps._render(maps, 0, _fake_capture(0))
+    TrainingMaps._render(maps, 0, _fake_maps(0))
     assert len([f for f in os.listdir(str(tmp_path)) if f.startswith('MAP_')]) == 2
 
 
-def test_render_missing_grids_placeholders(tmp_path):
-    maps = _bare_maps(str(tmp_path))
-    # a capture with neither effect nor baseline: everything renders with placeholders
-    TrainingMaps._render(maps, 10, _fake_capture(0))
+def test_render_tiny_photo(tmp_path):
+    # a photo below the 64px panel clamp must render, not IndexError
+    maps = _bare_maps(tmp_path, photo_size=(20, 30))
+    TrainingMaps._render(maps, 10, _fake_maps(0))
     assert any(f.startswith('MAP_') for f in os.listdir(str(tmp_path)))
 
 
@@ -99,11 +183,13 @@ def test_crop_box_fractions():
     assert TrainingMaps._crop_box(Bad()) is None
 
 
-def test_jsonl_row_shape_matches_fizgig_schema(tmp_path):
-    # {"step", "maps": {key: {t: {"loss", "effect"}}}} with pooled grids
-    row = {"step": 5, "maps": _fake_capture(5)}
-    text = json.dumps(row)
-    loaded = json.loads(text)
-    assert loaded['step'] == 5
-    one = loaded['maps']['x']['0.5']['loss']
-    assert {'w', 'h', 'v'} <= set(one.keys())
+def test_start_writes_probes_json_without_paths(tmp_path):
+    maps = _bare_maps(tmp_path / 'job')
+    maps.keys = list(maps.probes.keys())
+    maps.crops = {}
+    maps.start(resume=False)
+    p = json.load(open(tmp_path / 'job' / 'probes.json'))
+    assert p['keys'] == ['x.jpg'] and p['timesteps'] == [0.25, 0.5, 0.75]
+    assert '/' not in json.dumps(p) and '\\' not in json.dumps(p)
+    # a fresh start cleared any stale jsonl
+    assert not os.path.exists(tmp_path / 'job' / 'maps.jsonl')
