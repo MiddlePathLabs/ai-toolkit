@@ -650,6 +650,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
                     self.adapter.is_sampling = True
 
+                # training maps: capture before the previews render, still inside
+                # the force-eager + fork_rng + EMA-eval window so the probes see
+                # exactly the weights the previews see. capture is never fatal.
+                if getattr(self, 'training_maps', None) is not None:
+                    self.training_maps.capture_in_sample(step)
+
                 # send to be generated
                 if len(gen_img_config_list) > 0:
                     rendered = False
@@ -1800,7 +1806,39 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
-        
+        self._maybe_start_training_maps()
+
+    def _maybe_start_training_maps(self):
+        """Training maps (toolkit/training_maps.py): heatmap probes over a few
+        fixed dataset pictures -- where the model is still wrong and where the
+        LoRA acts -- captured before training and at every preview round. Off or
+        unsupported configs return quietly; any failure is never fatal. The hook
+        can fire more than once (trainer chains); only the first starts maps."""
+        if getattr(self, '_training_maps_started', False):
+            return
+        self._training_maps_started = True
+        self.training_maps = None
+        if not getattr(self.train_config, 'training_maps', False):
+            return
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            from toolkit.training_maps import TrainingMaps
+            maps = TrainingMaps.maybe_create(self)
+            if maps is None:
+                return
+            resume = int(getattr(self, 'step_num', 0) or 0) > 0
+            maps.start(resume=resume)
+            if not resume:
+                maps.capture_baseline()
+            self.training_maps = maps
+        except Exception as e:
+            self.training_maps = None
+            print_acc(
+                f"[maps] training maps could not start "
+                f"({type(e).__name__}: {str(e)[:200]}); training carries on."
+            )
+
     def sample_step_hook(self, img_num, total_imgs):
         pass
     

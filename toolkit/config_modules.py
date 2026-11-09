@@ -609,6 +609,13 @@ class TrainConfig:
         self.noise_offset = kwargs.get('noise_offset', 0.0)
         self.skip_first_sample = kwargs.get('skip_first_sample', False)
         self.force_first_sample = kwargs.get('force_first_sample', False)
+        # Training maps (toolkit/training_maps.py): heatmap probes over a few
+        # fixed dataset pictures -- where the model is still wrong, where it has
+        # learned since the start, and where the LoRA acts -- captured before
+        # training and at every preview round (sample_every), rendered into the
+        # job's samples/ gallery. Flow-matching still-image models only.
+        self.training_maps: bool = kwargs.get('training_maps', False)
+        self.training_maps_images: int = int(kwargs.get('training_maps_images', 3))
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
