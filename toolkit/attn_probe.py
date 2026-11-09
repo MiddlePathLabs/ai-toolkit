@@ -21,10 +21,12 @@ never calls back into Python):
 
 The probe computes softmax(q k^T / sqrt(d)) itself, over every key (the
 trigger's share of each row needs the whole row's normaliser), a few heads at a
-time, and keeps only the trigger's columns, summed. trigger_positions maps the
-trigger word to its positions in the text tokens the model sees, using the
-encoder's own template arithmetic (krea2: the instruction prefix is tokenized
-and its token count sliced off the features -- see krea2/src/text_encoder.py).
+time, and keeps only the trigger's columns, summed. A caption naming several
+triggers (a comma list, or two subjects' triggers) gets each on its own as well
+as all together. trigger_positions maps the trigger word to its positions in
+the text tokens the model sees, using the encoder's own template arithmetic
+(krea2: the instruction prefix is tokenized and its token count sliced off the
+features -- see krea2/src/text_encoder.py).
 """
 import re
 from contextlib import contextmanager
@@ -36,8 +38,18 @@ HEADS_PER_CHUNK = 4
 
 
 class TriggerProbe:
+    """positions: a list (one trigger, all of it together) or a dict
+    {trigger word: positions} (several -- each kept on its own as well as all
+    together under ""). The union "" group is what result()[""] returns."""
+
     def __init__(self, positions):
-        self.pos = sorted({int(p) for p in positions})
+        groups = dict(positions) if isinstance(positions, dict) else {"": positions}
+        self.groups = {w: sorted({int(p) for p in ps}) for w, ps in groups.items() if ps}
+        if not self.groups:
+            self.groups = {"": []}          # keep the union key so see()'s bail stays simple
+        if "" not in self.groups:
+            self.groups[""] = sorted({p for ps in self.groups.values() for p in ps})
+        self.pos = self.groups[""]
         self.layout = None
         self.key_mask = None
         self.acc = None
@@ -49,8 +61,8 @@ class TriggerProbe:
         (a, b), t0, total, valid = self.layout
         if q.shape[-2] != total or k.shape[-2] != total:
             return                      # not the joint sequence (e.g. text refiner)
-        cols = [t0 + p for p in self.pos if t0 + p < valid]
-        if not cols:
+        cols = {w: [t0 + p for p in ps if t0 + p < valid] for w, ps in self.groups.items()}
+        if not cols[""]:
             return
         qi = q[0, :, a:b].float()                                   # [H, Ni, D]
         kk = k[0, :, :valid].float()                                # [Hk, valid, D]
@@ -62,22 +74,31 @@ class TriggerProbe:
         if self.key_mask is not None and self.key_mask.dtype == torch.bool:
             km = self.key_mask.reshape(self.key_mask.shape[0], -1)[0, :valid]
         scale = qi.shape[-1] ** -0.5
-        out = torch.zeros(qi.shape[1], device=qi.device)
+        out = {w: torch.zeros(qi.shape[1], device=qi.device) for w, c in cols.items() if c}
         for h in range(0, qi.shape[0], HEADS_PER_CHUNK):
             s = qi[h:h + HEADS_PER_CHUNK] @ kk[h:h + HEADS_PER_CHUNK].transpose(-1, -2) * scale  # [h, Ni, valid]
             if km is not None:
                 s.masked_fill_(~km, float("-inf"))
             lse = torch.logsumexp(s, dim=-1, keepdim=True)
-            out += (s[..., cols] - lse).exp().sum(-1).sum(0)
+            for w in out:
+                out[w] += (s[..., cols[w]] - lse).exp().sum(-1).sum(0)
             del s, lse
-        out /= qi.shape[0]
-        self.acc = out if self.acc is None else self.acc + out
+        for w in out:
+            out[w] /= qi.shape[0]
+        if self.acc is None:
+            self.acc = out
+        else:
+            for w in out:
+                self.acc[w] = self.acc.get(w, 0) + out[w]
         self.n += 1
 
     def result(self):
-        """The trigger's mean share of each image token's attention, over the
-        blocks seen, or None."""
-        return None if self.acc is None or not self.n else self.acc / self.n
+        """{word: the mean share of each image token's attention over the blocks
+        seen}, with "" the triggers together, or None. A word whose positions all
+        fell past the valid keys is absent from the dict."""
+        if self.acc is None or not self.n:
+            return None
+        return {w: a / self.n for w, a in self.acc.items()}
 
 
 def layout(img_span, txt_start, total, valid=None, key_mask=None):

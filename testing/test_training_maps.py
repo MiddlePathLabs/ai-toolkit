@@ -6,7 +6,9 @@ import pytest
 import torch
 from PIL import Image
 
-from toolkit.training_maps import TrainingMaps, _display_name, _grid, _pick_keys
+from toolkit.training_maps import (
+    TrainingMaps, _COMPOSITE_MARKER, _display_name, _grid, _pick_keys, _pick_probes,
+)
 
 
 def test_pick_keys_even_spread_dedupes_and_sorts():
@@ -16,6 +18,54 @@ def test_pick_keys_even_spread_dedupes_and_sorts():
     # deterministic across shuffles
     shuffled = ['e', 'a', 'c', 'b', 'd']
     assert _pick_keys(shuffled, 5) == _pick_keys(sorted(shuffled), 5)
+
+
+def _is_composite(path):
+    return _COMPOSITE_MARKER in os.path.basename(path)
+
+
+def test_pick_probes_single_dataset_is_the_plain_spread():
+    paths = [f'ds0/a{i}.jpg' for i in range(9)]
+    group_of = {p: 'ds000' for p in paths}
+    assert _pick_probes(paths, group_of, 3) == _pick_keys(paths, 3)
+
+
+def test_pick_probes_one_per_dataset_composites_last_more_than_n():
+    # two subjects' datasets + their two side-by-side composite datasets
+    subj1 = [f's1/own{i}.jpg' for i in range(5)]
+    subj2 = [f's2/mine{i}.jpg' for i in range(5)]
+    comp1 = [f'cache1/{_COMPOSITE_MARKER}{i:02d}.png' for i in range(3)]
+    comp2 = [f'cache2/{_COMPOSITE_MARKER}{i:02d}.png' for i in range(3)]
+    paths = subj1 + subj2 + comp1 + comp2
+    group_of = {}
+    for i, group in enumerate([subj1, subj2, comp1, comp2]):
+        for p in group:
+            group_of[p] = f'ds{i:03d}'
+    # n=3 but four datasets: one per dataset, more than n, composites after subjects
+    picked = _pick_probes(paths, group_of, 3)
+    assert len(picked) == 4
+    assert not any(_is_composite(p) for p in picked[:2])
+    assert all(_is_composite(p) for p in picked[2:])
+    assert {group_of[p] for p in picked} == set(group_of.values())
+    # with room to fill (n=6): the fill comes from the subjects' own pictures only
+    picked6 = _pick_probes(paths, group_of, 6)
+    assert len(picked6) == 6
+    assert sum(_is_composite(p) for p in picked6) == 2
+    # deterministic
+    assert _pick_probes(list(reversed(paths)), group_of, 3) == picked
+
+
+def test_pick_probes_mixed_dataset_prefers_its_composite_representative():
+    own = [f'ds0/own{i}.jpg' for i in range(5)]
+    stray = [f'ds0/{_COMPOSITE_MARKER}07.png']      # a hand-built mixed folder
+    other = [f'ds1/mine{i}.jpg' for i in range(5)]
+    paths = own + stray + other
+    group_of = {p: ('ds000' if p.startswith('ds0/') else 'ds001') for p in paths}
+    picked = _pick_probes(paths, group_of, 2)
+    assert len(picked) == 2
+    # the mixed dataset stands for its composite; the fill never adds composites
+    assert picked[1] == stray[0]                    # composite datasets sort last
+    assert picked[0] in other
 
 
 def test_grid_pools_to_max_side_and_roundtrips():
@@ -188,9 +238,12 @@ def test_start_writes_probes_json_without_paths(tmp_path):
     maps = _bare_maps(tmp_path / 'job')
     maps.keys = list(maps.probes.keys())
     maps.crops = {}
+    maps.trig = {'x.jpg': {'fyxo': [3], 'zwxem': [7]}}   # two subjects, one caption
     maps.start(resume=False)
     p = json.load(open(tmp_path / 'job' / 'probes.json'))
     assert p['keys'] == ['x.jpg'] and p['timesteps'] == [0.25, 0.5, 0.75]
+    assert p['attn'] == ['x.jpg']
+    assert p['attn_words'] == {'x.jpg': ['fyxo', 'zwxem']}
     assert '/' not in json.dumps(p) and '\\' not in json.dumps(p)
     # a fresh start cleared any stale jsonl
     assert not os.path.exists(tmp_path / 'job' / 'maps.jsonl')
@@ -215,7 +268,7 @@ def test_render_trigger_row_only_when_present(tmp_path):
     caps = _fake_maps(0)
     TrainingMaps._render(maps, 0, caps)          # no trig: 3 rows
     maps2 = _bare_maps(tmp_path)
-    maps2.trig = {'x.jpg': [3]}
+    maps2.trig = {'x.jpg': {'fyxo': [3]}}
     for t in (0.25, 0.5, 0.75):
         caps['x.jpg'][f'{t:g}']['attn'] = _grid(torch.rand(3, 5))
     TrainingMaps._render(maps2, 50, caps)        # trig + attn grids: taller canvas
@@ -223,3 +276,32 @@ def test_render_trigger_row_only_when_present(tmp_path):
     a = Image.open(os.path.join(str(tmp_path), files[0]))
     b = Image.open(os.path.join(str(tmp_path), files[1]))
     assert b.size[1] > a.size[1]
+
+
+def test_render_per_trigger_rows_when_several_words(tmp_path):
+    # a caption naming two subjects: the union attention row plus one row per
+    # word (each trigger on its own). Row heights are uniform, so 6 rows beats
+    # 4 (union only) by exactly twice what 4 beats 3 (no trigger rows).
+    def render(dirname, trig, with_attn_by):
+        d = tmp_path / dirname
+        maps = _bare_maps(d)
+        maps.trig = trig
+        caps = _fake_maps(50)
+        if trig:
+            # attn grids alone light the union row, so only add them when a
+            # trigger is in play
+            for t in (0.25, 0.5, 0.75):
+                caps['x.jpg'][f'{t:g}']['attn'] = _grid(torch.rand(3, 5))
+                if with_attn_by:
+                    caps['x.jpg'][f'{t:g}']['attn_by'] = {
+                        'fyxo': _grid(torch.rand(3, 5)), 'zwxem': _grid(torch.rand(3, 5))}
+        TrainingMaps._render(maps, 50, caps)
+        f = next(f for f in os.listdir(str(d)) if f.startswith('MAP_'))
+        return Image.open(os.path.join(str(d), f)).size[1]
+
+    h6 = render('six', {'x.jpg': {'fyxo': [3], 'zwxem': [7]}}, True)
+    h4 = render('four', {'x.jpg': {'fyxo': [3]}}, False)
+    h3 = render('three', {}, False)
+    assert h4 - h3 > 0                              # the union row
+    assert h6 - h4 == 2 * (h4 - h3)                 # then one row per trigger word
+

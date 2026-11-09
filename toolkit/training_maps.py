@@ -2,10 +2,14 @@
 and where the LoRA changes its prediction (port of Fizgig v9.3.0's training maps,
 adapted to the toolkit trainer; see Fizgig docs/TRAINING_MAPS.md).
 
-Probes are a few dataset pictures (spread evenly through the sorted paths, so the
-same dataset picks the same ones), each at three fixed noise levels with fixed
-seeded noise. Captured once before training and at every preview round
-(BaseSDTrainProcess._sample cadence), only the weights change between captures:
+Probes are a few dataset pictures (one from each dataset at least -- Multi
+Concept / identity-isolation subjects live in their own datasets, and one of
+isolation's side-by-side composites shows whether each trigger lands on its own
+person and not the stranger -- then the rest spread evenly through the sorted
+paths, so the same datasets pick the same ones), each at three fixed noise
+levels with fixed seeded noise. Captured once before training and at every
+preview round (BaseSDTrainProcess._sample cadence), only the weights change
+between captures:
 
   * "loss"   - per-position squared error of the model's prediction against the
                training target (sd.get_loss_target), channel-meaned. The viewer
@@ -21,7 +25,9 @@ seeded noise. Captured once before training and at every preview round
                mean over heads and blocks (toolkit/attn_probe.py), captured on
                the LoRA-on forward, run eagerly. Watch it settle on the subject;
                attention parked on a logo, sign or the background means the
-               trigger is being tied to that instead.
+               trigger is being tied to that instead. A caption naming several
+               triggers (two subjects, say) also gets each one on its own, as
+               "attn_by" grids rendered as their own rows.
 
 Gated to still-image flow-matching models (krea2 / qwen_image_2 / moss_image,
 anything with sd.is_flow_matching and straight-path add_noise); other families
@@ -31,8 +37,10 @@ force-eager + fork_rng window when recurring. A failure is never fatal: one
 console line and the maps are off for the rest of the run.
 
 Output, in <save_root>/training_maps/: probes.json ({keys, timesteps, crops, attn
--- the keys carrying a trigger-word map}) and maps.jsonl, one line per capture
-{"step", "maps": {key: {t: {"loss": grid, "effect": grid, "attn": grid}}}}
+-- the keys carrying a trigger-word map -- and attn_words: {key: [trigger words]})
+and maps.jsonl, one line per capture
+{"step", "maps": {key: {t: {"loss": grid, "effect": grid, "attn": grid,
+"attn_by": {word: grid}}}}} (attn_by only when several triggers share a caption)
 (grids pooled to <= MAX_SIDE, 4 significant figures; the same
 step captured twice keeps the later render). Rendered composites (three labelled
 panels over the exact bucket-cropped photo) land in samples/ as
@@ -69,6 +77,49 @@ def _pick_keys(paths, n):
     if n <= 1:
         return keys[len(keys) // 2:len(keys) // 2 + 1] if n == 1 else []
     return [keys[round(i * (len(keys) - 1) / (n - 1))] for i in range(n)]
+
+
+# identity_isolation_composites.PREFIX: every generated side-by-side sheet is
+# named fizgig_mp_<n>.<ext>, whatever subject's cache folder it landed in
+_COMPOSITE_MARKER = "fizgig_mp_"
+
+
+def _pick_probes(paths, group_of, n):
+    """The probe pictures: one from each dataset first (Multi Concept / identity
+    isolation subjects live in their own datasets), the side-by-side composite
+    datasets after them (the subject beside a stranger: on the trigger map each
+    trigger should land on its own person, not the stranger), then the rest
+    spread evenly through the subjects' own pictures. At least one per dataset,
+    so more than n when there are more datasets. A single dataset behaves as
+    the plain spread -- the same pictures the old picker chose."""
+    keys = sorted(set(str(k) for k in paths))
+    composite = {k for k in keys if _COMPOSITE_MARKER in os.path.basename(k)}
+    groups = {}
+    for k in keys:
+        groups.setdefault(group_of.get(k, k), []).append(k)
+    if len(groups) <= 1:
+        return _pick_keys(keys, n)
+    has_comp = {g: any(k in composite for k in members) for g, members in groups.items()}
+
+    def representative(g):
+        # a dataset that carries composites stands for them (they are their own
+        # datasets in this fork, but a hand-built mixed folder still prefers one)
+        own = [k for k in groups[g] if k in composite] if has_comp[g] \
+            else [k for k in groups[g] if k not in composite]
+        if not own:
+            own = groups[g]
+        return _pick_keys(own, 1)[0]
+
+    out = [representative(g) for g in sorted(groups, key=lambda g: (has_comp[g], str(g)))]
+    # the fill comes from the subjects' own pictures: composites already have
+    # their slot, and extra composite slots would crowd out the subjects
+    fillable = [k for k in keys if k not in composite]
+    for k in _pick_keys(fillable, max(n, len(out)) + len(out)):
+        if len(out) >= max(n, len(groups)):
+            break
+        if k not in out:
+            out.append(k)
+    return out
 
 
 def _display_name(path, used):
@@ -171,6 +222,9 @@ class TrainingMaps:
         if len(maps.probes) < wanted:
             _print(f"[maps] note: only {len(maps.probes)} of {wanted} "
                    "requested probe pictures were usable.")
+        elif len(maps.probes) > wanted:
+            _print(f"[maps] note: {len(maps.probes)} probe pictures (more than "
+                   f"the {wanted} requested) so every dataset gets one.")
         return maps
 
     def _collect_probes(self, images):
@@ -178,7 +232,8 @@ class TrainingMaps:
         from toolkit.prompt_utils import PromptEmbeds
 
         items_by_path = {}
-        for dataset in get_dataloader_datasets(self.process.data_loader):
+        group_of = {}
+        for ds_index, dataset in enumerate(get_dataloader_datasets(self.process.data_loader)):
             for item in getattr(dataset, 'file_list', []) or []:
                 if getattr(item, 'is_reg', False):
                     continue
@@ -186,11 +241,13 @@ class TrainingMaps:
                     continue
                 if int(getattr(item, 'num_frames', 1) or 1) != 1:
                     continue
-                items_by_path.setdefault(str(item.path), item)
+                path = str(item.path)
+                items_by_path.setdefault(path, item)
+                group_of.setdefault(path, f"ds{ds_index:03d}")
 
         probes = {}
         used_names = set()
-        picked = _pick_keys(items_by_path.keys(), images)
+        picked = _pick_probes(items_by_path.keys(), group_of, images)
         trig_by_path = self._trigger_positions({p: items_by_path[p] for p in picked})
         for path in picked:
             item = items_by_path[path]
@@ -235,14 +292,18 @@ class TrainingMaps:
         return probes
 
     def _trigger_positions(self, items_by_path):
-        """path -> the trigger's text positions, for the probe pictures whose
-        caption contains it. Krea 2 only for now: the mapping needs the
-        encoder's own template arithmetic (the instruction prefix's token count
-        is sliced off the features the DiT sees). The trigger is resolved per
-        item: a dataset can set its own trigger_word while the process one is
-        None, and get_caption() injects the item's. One console line when the
-        trigger map is off for the run; a bad tokenizer mapping disables it
-        without touching the loss/effect maps."""
+        """path -> {trigger word: its text positions}, for the probe pictures
+        whose caption contains one. Several triggers in one caption (a comma
+        list, or two subjects' triggers in a side-by-side composite's caption)
+        are each kept on their own -- the per-trigger attention rows are how a
+        composite shows each trigger landing on its own person. Krea 2 only for
+        now: the mapping needs the encoder's own template arithmetic (the
+        instruction prefix's token count is sliced off the features the DiT
+        sees). The trigger is resolved per item: a dataset can set its own
+        trigger_word while the process one is None, and get_caption() injects
+        the item's. One console line when the trigger map is off for the run; a
+        bad tokenizer mapping disables it without touching the loss/effect
+        maps."""
         sd = self.process.sd
         if getattr(sd, 'arch', '') != 'krea2':
             return {}
@@ -260,28 +321,33 @@ class TrainingMaps:
             process_trigger = getattr(self.process, 'trigger_word', None)
             for path, item in items_by_path.items():
                 trigger = getattr(item, 'trigger_word', None) or process_trigger
-                if not str(trigger or '').strip():
+                words = [w.strip() for w in str(trigger or '').split(',') if w.strip()]
+                if not words:
                     continue
                 caption = getattr(item, 'caption', None)
                 if caption is None:
                     caption = item.get_caption()
                 if not caption:
                     continue
-                try:
-                    pos = trigger_positions(
-                        tokenizer, PROMPT_TEMPLATE_ENCODE_PREFIX, caption, trigger,
-                        max_length=max_length, prefix_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
-                    )
-                except ValueError:
-                    raise             # tokenizer-level: every item fails the same way
-                except Exception as e:
-                    # one broken item (a weird caption, say) must not sink the
-                    # trigger map for the pictures that are fine
-                    logger.debug(f"[maps] trigger positions failed for {path}: "
-                                 f"{type(e).__name__}: {e}")
-                    continue
-                if pos:
-                    out[path] = pos
+                per = {}
+                for word in words:
+                    try:
+                        pos = trigger_positions(
+                            tokenizer, PROMPT_TEMPLATE_ENCODE_PREFIX, caption, word,
+                            max_length=max_length, prefix_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
+                        )
+                    except ValueError:
+                        raise             # tokenizer-level: every item fails the same way
+                    except Exception as e:
+                        # one broken item (a weird caption, say) must not sink the
+                        # trigger map for the pictures that are fine
+                        logger.debug(f"[maps] trigger positions failed for {path}: "
+                                     f"{type(e).__name__}: {e}")
+                        break
+                    if pos:
+                        per[word] = pos
+                if per:
+                    out[path] = per
         except ValueError as e:
             _print(f"[maps] the trigger-word map is off for this run ({str(e)[:160]})")
             return {}
@@ -389,6 +455,7 @@ class TrainingMaps:
                 "timesteps": list(self.ts),
                 "crops": self.crops,
                 "attn": sorted(self.trig),
+                "attn_words": {k: list(v) for k, v in self.trig.items()},
             }, f)
         _print(f"[maps] training maps on: {len(self.keys)} picture(s) x {len(self.ts)} noise level(s), "
                "captured before training and at every preview round "
@@ -545,8 +612,16 @@ class TrainingMaps:
                         loss_map = (pred - target).pow(2).mean(dim=1)[0]             # (h, w)
                         maps = {"loss": _grid(loss_map)}
                         if attn is not None:
+                            # every trigger in the caption together; and each on
+                            # its own when several share the caption
+                            patch = getattr(sd, 'patch_size', None)
                             maps["attn"] = _grid(self._tokens_to_map(
-                                attn, latents, patch=getattr(sd, 'patch_size', None)))
+                                attn[""], latents, patch=patch))
+                            if len(attn) > 2:
+                                maps["attn_by"] = {
+                                    w: _grid(self._tokens_to_map(a, latents, patch=patch))
+                                    for w, a in attn.items() if w
+                                }
                         if step > 0 and had_network and net_multiplier is not None:
                             network.multiplier = 0.0
                             with net_ctx:
@@ -658,6 +733,25 @@ class TrainingMaps:
                     render_seq([map_of(maps, i, 'attn') for i in range(len(self.ts))], 'attn'),
                     "Trigger word attention", "red most attention / yellow / blue / none",
                 ))
+                # each trigger on its own when several share the caption (the
+                # side-by-side composites: does each trigger sit on its own
+                # person, not the stranger?). One shared attention scale: the
+                # shares are fractions of the same attention, so a word's map
+                # going quiet next to its partner's is the informative outcome.
+                words = sorted({w for t in self.ts
+                                for w in ((maps.get(key) or {}).get(f"{t:g}", {})
+                                          .get("attn_by") or {})})
+
+                def word_of(i, word):
+                    grid = (maps.get(key) or {}).get(f"{self.ts[i]:g}", {}) \
+                        .get("attn_by", {}).get(word)
+                    return self._grid_to_tensor(grid) if grid is not None else None
+
+                for word in words:
+                    rows.append((
+                        render_seq([word_of(i, word) for i in range(len(self.ts))], 'attn'),
+                        f"Trigger: {word}", "red most attention / yellow / blue / none",
+                    ))
 
             row_h = ph + 16          # panel row height incl. its level labels
             header, gap, label_w = 26, 6, 152

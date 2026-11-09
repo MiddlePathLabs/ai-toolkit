@@ -56,8 +56,31 @@ def test_probe_share_matches_softmax():
         see(q, k)
         r = probe.result()
     manual = _manual_share(q, k, img_span, [txt_start + c for c in cols if txt_start + c < valid], valid)
-    assert r is not None and r.shape == (img_span[1] - img_span[0],)
-    assert torch.allclose(r, manual, atol=1e-5)
+    # a plain list is one group, reported under "" (the union key)
+    assert r is not None and set(r) == {""} and r[""].shape == (img_span[1] - img_span[0],)
+    assert torch.allclose(r[""], manual, atol=1e-5)
+
+
+def test_probe_groups_each_word_and_their_union():
+    torch.manual_seed(5)
+    total, valid, img_span = 40, 36, (8, 32)
+    q = torch.randn(1, 4, total, 8)
+    k = torch.randn(1, 4, total, 8)
+    groups = {"alpha": [1], "beta": [3, 5]}
+    with capturing(groups) as probe:
+        layout(img_span, 0, total, valid=valid,
+               key_mask=torch.ones(1, total, dtype=torch.bool))
+        see(q, k)
+        r = probe.result()
+    assert r is not None and set(r) == {"", "alpha", "beta"}
+    for word, cols in groups.items():
+        manual = _manual_share(q, k, img_span, cols, valid)
+        assert torch.allclose(r[word], manual, atol=1e-5)
+    # the union is the two words' columns together; disjoint columns of the
+    # same softmax row, so it is exactly the sum of the separate shares
+    manual_union = _manual_share(q, k, img_span, [1, 3, 5], valid)
+    assert torch.allclose(r[""], manual_union, atol=1e-5)
+    assert torch.allclose(r[""], r["alpha"] + r["beta"], atol=1e-5)
 
 
 def test_probe_gqa_matches_expanded():
@@ -70,7 +93,7 @@ def test_probe_gqa_matches_expanded():
     with capturing(cols) as probe:
         layout(img_span, 0, total, key_mask=torch.ones(1, total, dtype=torch.bool))
         see(q, k)
-        r = probe.result()
+        r = probe.result()[""]
     k_exp = k.repeat_interleave(H // Hk, dim=1)
     manual = _manual_share(q, k_exp, img_span, cols, valid)
     assert r is not None and torch.allclose(r, manual, atol=1e-5)
@@ -96,7 +119,7 @@ def test_probe_masks_padded_tail():
     with capturing([1]) as probe:
         layout(img_span, 0, total, valid=valid, key_mask=mask)
         see(q, k)
-        r = probe.result()
+        r = probe.result()[""]
     manual = _manual_share(q, k, img_span, [1], valid, drop=(2,))
     assert torch.allclose(r, manual, atol=1e-5)
 
@@ -110,7 +133,7 @@ def test_probe_accumulates_over_blocks():
         layout(img_span, 0, total, key_mask=torch.ones(1, total, dtype=torch.bool))
         for q, k in zip(qs, ks):
             see(q, k)
-        r = probe.result()
+        r = probe.result()[""]
     manuals = [_manual_share(q, k, img_span, [1], total) for q, k in zip(qs, ks)]
     mean = torch.stack(manuals).mean(0)
     assert torch.allclose(r, mean, atol=1e-5)
