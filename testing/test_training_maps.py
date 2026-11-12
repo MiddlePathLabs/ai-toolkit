@@ -1,13 +1,15 @@
 """Tests for toolkit/training_maps.py (pure functions + the never-fatal capture path)."""
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 from PIL import Image
 
 from toolkit.training_maps import (
-    TrainingMaps, _COMPOSITE_MARKER, _display_name, _grid, _pick_keys, _pick_probes,
+    TrainingMaps, _COMPOSITE_MARKER, _collect_probe_items, _display_name, _grid,
+    _isolation_trigger, _pick_keys, _pick_probes,
 )
 
 
@@ -66,6 +68,87 @@ def test_pick_probes_mixed_dataset_prefers_its_composite_representative():
     # the mixed dataset stands for its composite; the fill never adds composites
     assert picked[1] == stray[0]                    # composite datasets sort last
     assert picked[0] in other
+
+
+def _probe_item(path, config, **over):
+    item = SimpleNamespace(
+        path=path, dataset_config=config, is_reg=False, is_video=False,
+        is_audio_only=False, num_frames=1,
+    )
+    for key, value in over.items():
+        setattr(item, key, value)
+    return item
+
+
+def test_collect_probe_items_groups_pooled_sources():
+    cfg_a = SimpleNamespace(dataset_path=None, folder_path='E:/ds/a')
+    cfg_b = SimpleNamespace(dataset_path=None, folder_path='E:/ds/b')
+    items = ([_probe_item(f'E:/ds/a/a{i:02d}.jpg', cfg_a) for i in range(5)]
+             + [_probe_item(f'E:/ds/b/b{i:02d}.jpg', cfg_b) for i in range(5)])
+    # a pooled loader scans every source into ONE dataset; grouping by the
+    # loader's dataset index would collapse them all into ds000
+    pooled = SimpleNamespace(file_list=items, dataset_path='pool of 2 datasets')
+    items_by_path, group_of = _collect_probe_items([pooled])
+    assert set(group_of.values()) == {'ds000', 'ds001'}
+    # both groups get their probe: no silent fall back to the plain spread
+    picked = _pick_probes(items_by_path.keys(), group_of, 2)
+    assert {group_of[p] for p in picked} == {'ds000', 'ds001'}
+
+
+def test_collect_probe_items_keeps_loader_order_when_not_pooled():
+    cfg_a = SimpleNamespace(dataset_path=None, folder_path='E:/ds/a')
+    cfg_b = SimpleNamespace(dataset_path=None, folder_path='E:/ds/b')
+    ds_a = SimpleNamespace(file_list=[_probe_item('E:/ds/a/a0.jpg', cfg_a)],
+                           dataset_path='E:/ds/a')
+    ds_b = SimpleNamespace(file_list=[_probe_item('E:/ds/b/b0.jpg', cfg_b)],
+                           dataset_path='E:/ds/b')
+    _, group_of = _collect_probe_items([ds_b, ds_a])      # first seen -> first index
+    assert group_of['E:/ds/b/b0.jpg'] == 'ds000'
+    assert group_of['E:/ds/a/a0.jpg'] == 'ds001'
+
+
+def test_collect_probe_items_skips_reg_video_and_multiframe():
+    cfg = SimpleNamespace(dataset_path=None, folder_path='E:/ds/a')
+    keep = _probe_item('E:/ds/a/keep.jpg', cfg)
+    items = [
+        keep,
+        _probe_item('E:/ds/a/reg.jpg', cfg, is_reg=True),
+        _probe_item('E:/ds/a/clip.mp4', cfg, is_video=True),
+        _probe_item('E:/ds/a/frames.jpg', cfg, num_frames=16),
+    ]
+    items_by_path, _ = _collect_probe_items([SimpleNamespace(file_list=items)])
+    assert list(items_by_path) == ['E:/ds/a/keep.jpg']
+
+
+def _composite_item(category='composite', index=0):
+    return SimpleNamespace(
+        trigger_word=None,
+        dataset_config=SimpleNamespace(
+            isolation_category=category, isolation_subject_index=index
+        ),
+    )
+
+
+def test_isolation_trigger_recovers_the_composites_subject_trigger():
+    iso = SimpleNamespace(
+        fused_captions=False,
+        subjects=[{'trigger': 'zwxem woman', 'fused': 'zwxemwoman',
+                   'class_name': 'woman'}],
+    )
+    process = SimpleNamespace(isolation_config=iso, trigger_word=None)
+    assert _isolation_trigger(process, _composite_item()) == 'zwxem woman'
+    iso.fused_captions = True          # composite captions spell the fused form
+    assert _isolation_trigger(process, _composite_item()) == 'zwxemwoman'
+
+
+def test_isolation_trigger_none_outside_composites_or_on_bad_index():
+    iso = SimpleNamespace(fused_captions=False, subjects=[
+        {'trigger': 'a woman', 'fused': 'awoman', 'class_name': 'woman'}])
+    process = SimpleNamespace(isolation_config=iso, trigger_word=None)
+    assert _isolation_trigger(process, SimpleNamespace(dataset_config=None)) is None
+    assert _isolation_trigger(process, _composite_item(category='normal')) is None
+    assert _isolation_trigger(process, _composite_item(index=2)) is None
+    assert _isolation_trigger(SimpleNamespace(), _composite_item()) is None
 
 
 def test_grid_pools_to_max_side_and_roundtrips():

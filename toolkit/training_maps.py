@@ -26,7 +26,7 @@ between captures:
                the LoRA-on forward, run eagerly. Watch it settle on the subject;
                attention parked on a logo, sign or the background means the
                trigger is being tied to that instead. A caption naming several
-               triggers (two subjects, say) also gets each one on its own, as
+               triggers (a comma list, say) also gets each one on its own, as
                "attn_by" grids rendered as their own rows.
 
 Gated to still-image flow-matching models (krea2 / qwen_image_2 / moss_image,
@@ -121,6 +121,60 @@ def _pick_probes(paths, group_of, n):
         if k not in out:
             out.append(k)
     return out
+
+
+def _isolation_trigger(process, item):
+    """The trigger a composite probe's caption names, recovered from the run's
+    isolation config. Composite datasets are cloned with trigger_word None
+    (their caption files already carry the trigger) and are excluded from
+    process-trigger inheritance, and a multi-subject run sets no process-level
+    trigger -- but each clone still carries its subject's index, so the
+    subject's trigger is recoverable: the fused spelling when the run fuses
+    captions, because that is what the composite captions use. None when the
+    item is not such a composite."""
+    config = getattr(item, 'dataset_config', None)
+    if getattr(config, 'isolation_category', None) != 'composite':
+        return None
+    iso = getattr(process, 'isolation_config', None)
+    index = getattr(config, 'isolation_subject_index', None)
+    subjects = getattr(iso, 'subjects', None) if iso is not None else None
+    if not isinstance(index, int) or not isinstance(subjects, list) \
+            or not 0 <= index < len(subjects):
+        return None
+    subject = subjects[index]
+    word = subject.get('fused' if getattr(iso, 'fused_captions', False) else 'trigger')
+    return str(word or '').strip() or None
+
+
+def _collect_probe_items(datasets):
+    """(items_by_path, group_of) over every still-image item in the datasets.
+    Groups follow each item's own source dataset config, not the loader's
+    dataset index: a pooled loader scans every source into ONE dataset (one
+    file_list), so the index would collapse all sources into a single group
+    and probe picking would silently fall back to the plain spread."""
+    items_by_path = {}
+    group_of = {}
+    groups = {}
+    for dataset in datasets:
+        for item in getattr(dataset, 'file_list', []) or []:
+            if getattr(item, 'is_reg', False):
+                continue
+            if getattr(item, 'is_video', False) or getattr(item, 'is_audio_only', False):
+                continue
+            if int(getattr(item, 'num_frames', 1) or 1) != 1:
+                continue
+            path = str(item.path)
+            items_by_path.setdefault(path, item)
+            config = getattr(item, 'dataset_config', None)
+            if config is not None:
+                key = (str(getattr(config, 'dataset_path', None) or ''),
+                       str(getattr(config, 'folder_path', None) or ''))
+            else:               # not expected for FileItemDTO; keep a stable key
+                key = (str(getattr(dataset, 'dataset_path', None) or ''), '')
+            if key not in groups:
+                groups[key] = f"ds{len(groups):03d}"
+            group_of.setdefault(path, groups[key])
+    return items_by_path, group_of
 
 
 def _display_name(path, used):
@@ -232,19 +286,9 @@ class TrainingMaps:
         from toolkit.data_loader import get_dataloader_datasets
         from toolkit.prompt_utils import PromptEmbeds
 
-        items_by_path = {}
-        group_of = {}
-        for ds_index, dataset in enumerate(get_dataloader_datasets(self.process.data_loader)):
-            for item in getattr(dataset, 'file_list', []) or []:
-                if getattr(item, 'is_reg', False):
-                    continue
-                if getattr(item, 'is_video', False) or getattr(item, 'is_audio_only', False):
-                    continue
-                if int(getattr(item, 'num_frames', 1) or 1) != 1:
-                    continue
-                path = str(item.path)
-                items_by_path.setdefault(path, item)
-                group_of.setdefault(path, f"ds{ds_index:03d}")
+        items_by_path, group_of = _collect_probe_items(
+            get_dataloader_datasets(self.process.data_loader)
+        )
 
         probes = {}
         used_names = set()
@@ -295,16 +339,19 @@ class TrainingMaps:
     def _trigger_positions(self, items_by_path):
         """path -> {trigger word: its text positions}, for the probe pictures
         whose caption contains one. Several triggers in one caption (a comma
-        list, or two subjects' triggers in a side-by-side composite's caption)
-        are each kept on their own -- the per-trigger attention rows are how a
-        composite shows each trigger landing on its own person. Krea 2 only for
-        now: the mapping needs the encoder's own template arithmetic (the
-        instruction prefix's token count is sliced off the features the DiT
-        sees). The trigger is resolved per item: a dataset can set its own
-        trigger_word while the process one is None, and get_caption() injects
-        the item's. One console line when the trigger map is off for the run; a
-        bad tokenizer mapping disables it without touching the loss/effect
-        maps."""
+        list) are each kept on their own, as per-trigger attention rows; a
+        side-by-side composite's caption names its one subject trigger beside
+        the stranger's description, and that trigger's row shows it landing on
+        the subject's own person, not the stranger. Krea 2 only for now: the
+        mapping needs the encoder's own template arithmetic (the instruction
+        prefix's token count is sliced off the features the DiT sees). The
+        trigger is resolved per item: a dataset can set its own trigger_word
+        while the process one is None, and get_caption() injects the item's.
+        Composite items carry no trigger_word (their captions already contain
+        the trigger) and a multi-subject run has no process one, so theirs is
+        recovered from the isolation config (_isolation_trigger). One console
+        line when the trigger map is off for the run; a bad tokenizer mapping
+        disables it without touching the loss/effect maps."""
         sd = self.process.sd
         if getattr(sd, 'arch', '') != 'krea2':
             return {}
@@ -321,7 +368,11 @@ class TrainingMaps:
             max_length = int(getattr(sd, 'max_text_length', 512) or 512)
             process_trigger = getattr(self.process, 'trigger_word', None)
             for path, item in items_by_path.items():
-                trigger = getattr(item, 'trigger_word', None) or process_trigger
+                # a composite's own subject trigger (the fused spelling under
+                # fused captions) beats the process one: it is what its caption
+                # actually says, and the process one may be unset (multi-subject)
+                trigger = getattr(item, 'trigger_word', None) \
+                    or _isolation_trigger(self.process, item) or process_trigger
                 words = [w.strip() for w in str(trigger or '').split(',') if w.strip()]
                 if not words:
                     continue
@@ -734,11 +785,13 @@ class TrainingMaps:
                     render_seq([map_of(maps, i, 'attn') for i in range(len(self.ts))], 'attn'),
                     "Trigger word attention", "red most attention / yellow / blue / none",
                 ))
-                # each trigger on its own when several share the caption (the
-                # side-by-side composites: does each trigger sit on its own
-                # person, not the stranger?). One shared attention scale: the
-                # shares are fractions of the same attention, so a word's map
-                # going quiet next to its partner's is the informative outcome.
+                # each trigger on its own when several share the caption (a
+                # comma-list trigger; a composite names just its one subject
+                # trigger, and the shared row above already shows whether that
+                # one sits on the subject, not the stranger). One shared
+                # attention scale: the shares are fractions of the same
+                # attention, so a word's map going quiet next to its partner's
+                # is the informative outcome.
                 words = sorted({w for t in self.ts
                                 for w in ((maps.get(key) or {}).get(f"{t:g}", {})
                                           .get("attn_by") or {})})
