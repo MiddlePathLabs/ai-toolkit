@@ -241,6 +241,22 @@ Pinned references used for this release ledger:
 - [Diffusers H3 scheduler revision `8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd`](https://github.com/huggingface/diffusers/commit/8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd).
 
 
+### OpenAI-compatible captioning
+
+The remote captioner sends images or sampled video frames, not audio. Use
+visual-only prompts; sound and dialogue cannot be inferred from these inputs.
+Base URLs and full `/chat/completions` URLs preserve query parameters and
+fragments. An explicit root-level `/chat/completions` uses `/models` for model
+discovery; a bare host defaults to `/v1`.
+
+Stopping saves completed captions without waiting for in-flight HTTP requests.
+Unfinished requests run only in daemon threads and do not hold the process open.
+Transport errors, body-read/JSON failures, and retryable HTTP responses use
+`caption.max_retries`. Exhausted connection or timeout retries, and HTTP
+401/403/404 responses, abort the job rather than repeat an endpoint-wide failure
+for every file. The first request still uses `caption.request_timeout` (default
+300 seconds); lower it to detect an unresponsive endpoint sooner.
+
 ### MiniMax-H3 findings ported from musubi-tuner
 
 Measured behaviour from [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner)'s H3 docs (`minimax_h3*.md`), checked against this fork. These change default behaviour on every H3 run:

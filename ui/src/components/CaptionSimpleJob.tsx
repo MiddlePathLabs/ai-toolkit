@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import { isAxiosError } from 'axios';
 import { Plus, RefreshCw, X } from 'lucide-react';
 import { apiClient } from '@/utils/api';
 import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
@@ -56,21 +57,66 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
   const caption = jobConfig.config.process[0].caption;
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
   const [modelsStatus, setModelsStatus] = useState<string | null>(null);
+  const processType = jobConfig.config.process[0].type;
+  const currentProcess = useRef(jobConfig.config.process[0]);
+  const modelRequest = useRef<AbortController | null>(null);
+  const modelEdited = useRef(false);
+  const invalidateRemoteModels = useCallback(() => {
+    modelRequest.current?.abort();
+    modelRequest.current = null;
+    setRemoteModels([]);
+    setModelsStatus(null);
+  }, []);
+  useLayoutEffect(() => {
+    currentProcess.current = jobConfig.config.process[0];
+  });
+  useLayoutEffect(() => {
+    invalidateRemoteModels();
+    // Modal returns null when closed, unmounting this form. Abort there (and
+    // when switching to Advanced) so reopening cannot receive the old result.
+    return () => {
+      modelRequest.current?.abort();
+      modelRequest.current = null;
+    };
+  }, [processType, caption.api_base_url, caption.api_key, invalidateRemoteModels]);
   const fetchRemoteModels = async () => {
+    if (!isRemote) return;
+    modelRequest.current?.abort();
+    const controller = new AbortController();
+    modelRequest.current = controller;
+    modelEdited.current = false;
+    const isCurrent = () => {
+      const current = currentProcess.current;
+      return modelRequest.current === controller && !controller.signal.aborted
+        && current.type === processType
+        && current.caption.api_base_url === caption.api_base_url
+        && current.caption.api_key === caption.api_key;
+    };
     setModelsStatus('Fetching models...');
     try {
       const res = await apiClient.post('/api/caption/models', {
         api_base_url: caption.api_base_url,
         api_key: caption.api_key,
-      });
+      }, { signal: controller.signal });
+      if (!isCurrent()) return;
       const models: string[] = res.data?.models || [];
       setRemoteModels(models);
       setModelsStatus(models.length ? `${models.length} model(s) found` : 'Endpoint returned no models');
-      if (models.length && !caption.model_name_or_path) {
+      if (models.length && !modelEdited.current && !currentProcess.current.caption.model_name_or_path) {
         setJobConfig(models[0], 'config.process[0].caption.model_name_or_path');
       }
-    } catch (e: any) {
-      setModelsStatus(`Could not list models: ${e?.response?.data?.error || e?.message || 'request failed'}`);
+    } catch (e: unknown) {
+      if (!isCurrent()) return;
+      let reason = e instanceof Error ? e.message : 'request failed';
+      if (isAxiosError(e)) {
+        const data: unknown = e.response?.data;
+        if (data && typeof data === 'object' && 'error' in data && typeof data.error === 'string') {
+          reason = data.error;
+        }
+      }
+      setModelsStatus(`Could not list models: ${reason}`);
+    } finally {
+      if (modelRequest.current === controller) modelRequest.current = null;
     }
   };
   const modelOptions = isRemote
@@ -85,6 +131,7 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
             label="Captioner Type"
             value={jobConfig.config.process[0].type}
             onChange={value => {
+              invalidateRemoteModels();
               handleCaptionerTypeChange(jobConfig.config.process[0].type, value, jobConfig, setJobConfig);
             }}
             options={groupedCaptionerTypes}
@@ -107,7 +154,10 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
             label="API Base URL"
             docKey="config.process[0].caption.api_base_url"
             value={caption.api_base_url || ''}
-            onChange={value => setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_base_url')}
+            onChange={value => {
+              invalidateRemoteModels();
+              setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_base_url');
+            }}
             placeholder="http://localhost:8080/v1"
             required
           />
@@ -115,7 +165,10 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
             label="API Key (optional)"
             type="password"
             value={caption.api_key || ''}
-            onChange={value => setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_key')}
+            onChange={value => {
+              invalidateRemoteModels();
+              setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_key');
+            }}
             placeholder="Blank: job uses AITK_CAPTION_API_KEY env var"
           />
         </div>
@@ -126,6 +179,7 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
           value={caption.model_name_or_path}
           docKey={isRemote ? 'config.process[0].caption.api_model' : 'config.process[0].caption.model_name_or_path'}
           onChange={(value: string | null) => {
+            modelEdited.current = true;
             if (value?.trim() === '') {
               value = null;
             }

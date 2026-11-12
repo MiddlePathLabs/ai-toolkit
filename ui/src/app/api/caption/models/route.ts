@@ -9,12 +9,11 @@ export async function POST(request: NextRequest) {
   } catch {
     return NextResponse.json({ error: 'invalid body' }, { status: 400 });
   }
-  let base = String(body?.api_base_url || '').trim().replace(/\/+$/, '');
+  let base = String(body?.api_base_url || '').trim();
   if (!base) {
     return NextResponse.json({ error: 'api_base_url is required' }, { status: 400 });
   }
   if (!/^https?:\/\//i.test(base)) base = `http://${base}`;
-  base = base.replace(/\/chat\/completions$/, '');
   let url: URL;
   try {
     url = new URL(base);
@@ -24,7 +23,10 @@ export async function POST(request: NextRequest) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return NextResponse.json({ error: 'only http and https URLs are allowed' }, { status: 400 });
   }
-  if (url.pathname === '' || url.pathname === '/') base = `${base}/v1`;
+  const path = url.pathname.replace(/\/+$/, '');
+  const hasCompletionsPath = path.endsWith('/chat/completions');
+  const basePath = hasCompletionsPath ? path.slice(0, -'/chat/completions'.length) : path || '/v1';
+  url.pathname = `${basePath}/models`;
 
   // Only a key the caller typed is sent. The server's AITK_CAPTION_API_KEY is never
   // used here, so this route cannot forward it to an arbitrary host.
@@ -32,7 +34,7 @@ export async function POST(request: NextRequest) {
   const apiKey = String(body?.api_key || '').trim();
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   try {
-    const res = await fetch(`${base}/models`, {
+    const res = await fetch(url.toString(), {
       headers,
       redirect: 'manual',
       signal: AbortSignal.timeout(10000),

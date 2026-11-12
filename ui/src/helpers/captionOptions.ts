@@ -348,8 +348,6 @@ export const captionerTypes: CaptionOption[] = [
         },
         captionPrompts: {
             'General (image)': defaultImageCaptionPrompt,
-            'General (video)': defaultVideoCaptionPrompt,
-            'MiniMax H4 T2V': minimaxT2VCaptionPrompt,
             'MiniMax H4 Image': minimaxImageCaptionPrompt,
         },
         additionalSections: [

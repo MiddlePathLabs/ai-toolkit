@@ -16,16 +16,22 @@ Config (under `caption:`):
   concurrency      parallel requests, default 2
   video_frames     stills sampled per video, default 8
   request_timeout  seconds per request, default 300
-  max_retries      retries on connection errors, 408/429/5xx, default 3
+  max_retries      retries on transport/body-read errors, 408/429/5xx, default 3
   extra_body       dict merged into the request body (top_k, chat_template_kwargs, ...)
+Requests use daemon workers so stopping never waits for an in-flight HTTP timeout.
+Completed captions are saved before stopping; unfinished requests are abandoned.
+Exhausted connection/timeout retries or HTTP 401/403/404 abort the job instead of
+retrying the same unavailable endpoint for every file. Other file failures continue.
 """
 
 import base64
 import concurrent.futures
 import io
 import os
+import queue
 import re
 import time
+import threading
 import traceback
 from collections import OrderedDict
 from typing import List, Optional
@@ -43,18 +49,21 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 def normalize_chat_url(base_url: str) -> str:
     """http://host:8080 -> http://host:8080/v1/chat/completions,
     http://host:8080/v1 -> .../v1/chat/completions, a full URL is kept."""
-    from urllib.parse import urlparse
+    from urllib.parse import urlsplit, urlunsplit
 
-    url = (base_url or "").strip().rstrip("/")
+    url = (base_url or "").strip()
     if not url:
         raise ValueError("api_base_url is required for the OpenAI-compatible captioner")
     if not re.match(r"^https?://", url, re.IGNORECASE):
         url = "http://" + url
-    if url.endswith("/chat/completions"):
-        return url
-    if urlparse(url).path in ("", "/"):
-        url += "/v1"
-    return url + "/chat/completions"
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/")
+    explicit_chat = path.endswith("/chat/completions")
+    if explicit_chat:
+        path = path[:-len("/chat/completions")]
+    elif not path:
+        path = "/v1"
+    return urlunsplit(parts._replace(path=path + "/chat/completions"))
 
 
 def clean_caption(text: str) -> str:
@@ -62,7 +71,12 @@ def clean_caption(text: str) -> str:
     text = _THINK_RE.sub("", text or "")
     if "</think>" in text.lower():
         text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+    text = re.split(r"<think>", text, maxsplit=1, flags=re.IGNORECASE)[0]
     return text.strip()
+
+
+class _EndpointUnavailable(RuntimeError):
+    """Endpoint-wide failure: do not repeat it for every input file."""
 
 
 class OpenAICaptionConfig(CaptionConfig):
@@ -232,15 +246,21 @@ class OpenAICaptioner(BaseCaptioner):
                 if resp.status_code in RETRY_STATUS:
                     last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
                 elif resp.status_code >= 400:
+                    if resp.status_code in {401, 403, 404}:
+                        raise _EndpointUnavailable(f"HTTP {resp.status_code}: {resp.text[:500]}")
                     raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
                 else:
                     return resp.json()
-            except (requests.ConnectionError, requests.Timeout) as e:
+            except requests.RequestException as e:
                 last_error = e
             if attempt < cc.max_retries:
                 delay = min(30.0, 2.0 * (2**attempt))
                 print(f"[AITK] Request failed ({last_error}); retry {attempt + 1}/{cc.max_retries} in {delay:.0f}s")
                 time.sleep(delay)
+        if isinstance(last_error, (requests.ConnectionError, requests.Timeout)):
+            raise _EndpointUnavailable(
+                f"endpoint unavailable after {cc.max_retries + 1} attempts: {last_error}"
+            )
         raise RuntimeError(f"request failed after {cc.max_retries + 1} attempts: {last_error}")
 
     def get_caption_for_file(self, file_path: str) -> Optional[str]:
@@ -251,50 +271,94 @@ class OpenAICaptioner(BaseCaptioner):
 
         cc = self.caption_config
         pbar = tqdm_mod.tqdm(total=len(self.file_paths), desc="Captioning files", unit="file")
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=cc.concurrency)
+        # ThreadPoolExecutor registers workers for interpreter-exit joins, even
+        # if made daemonic. Own these daemon threads so sys.exit can stop promptly.
+        work = queue.Queue()
+        stop_workers = threading.Event()
+        pending = {}
         failures = 0
+
+        def worker():
+            while True:
+                task = work.get()
+                if task is None:
+                    return
+                fut, path = task
+                if stop_workers.is_set():
+                    fut.cancel()
+                    continue
+                if not fut.set_running_or_notify_cancel():
+                    continue
+                try:
+                    fut.set_result(self.get_caption_for_file(path))
+                except BaseException as error:
+                    fut.set_exception(error)
+
+        workers = [threading.Thread(target=worker, daemon=True) for _ in range(cc.concurrency)]
+        file_iter = iter(self.file_paths)
+
+        def submit_next():
+            if self.is_stopping or stop_workers.is_set():
+                return
+            path = next(file_iter, None)
+            if path is not None:
+                fut = concurrent.futures.Future()
+                pending[fut] = path
+                work.put((fut, path))
+
+        def save_done(done):
+            nonlocal failures
+            endpoint_error = None
+            for fut in done:
+                path = pending.pop(fut)
+                if fut.cancelled():
+                    continue
+                try:
+                    caption = fut.result()
+                    if caption is not None:
+                        self.save_caption_for_file(path, caption)
+                except _EndpointUnavailable as error:
+                    failures += 1
+                    endpoint_error = error
+                except Exception as error:
+                    failures += 1
+                    print(f"Error captioning {path}: {error}")
+                    if not isinstance(error, (RuntimeError, ValueError)):
+                        traceback.print_exc()
+                self.step_num += 1
+                self.update_step()
+                pbar.update(1)
+            return endpoint_error
+
         try:
-            pending = {}
-            file_iter = iter(self.file_paths)
-
-            def submit_next():
-                path = next(file_iter, None)
-                if path is not None:
-                    pending[executor.submit(self.get_caption_for_file, path)] = path
-
-            for _ in range(cc.concurrency):
+            for thread in workers:
+                thread.start()
+            for _ in workers:
                 submit_next()
             while pending:
                 done, _ = concurrent.futures.wait(
-                    list(pending), timeout=2.0, return_when=concurrent.futures.FIRST_COMPLETED
+                    list(pending), timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED
                 )
+                endpoint_error = save_done(done)
+                if endpoint_error is not None:
+                    raise endpoint_error
                 if self.is_ui_captioner:
-                    try:
-                        self.maybe_stop()
-                    finally:
-                        if self.is_stopping:
-                            for fut in pending:
-                                fut.cancel()
+                    self.maybe_stop()
                 if self.is_stopping:
                     break
-                for fut in done:
-                    path = pending.pop(fut)
-                    try:
-                        caption = fut.result()
-                        if caption is not None:
-                            self.save_caption_for_file(path, caption)
-                    except Exception as e:
-                        failures += 1
-                        print(f"Error captioning {path}: {e}")
-                        if not isinstance(e, (RuntimeError, ValueError)):
-                            traceback.print_exc()
-                    self.step_num += 1
-                    self.update_step()
-                    pbar.update(1)
+                for _ in done:
                     submit_next()
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-            pbar.close()
+            stop_workers.set()
+            for fut in pending:
+                fut.cancel()
+            # Includes completions that raced with stop/KeyboardInterrupt.
+            try:
+                save_done([fut for fut in pending if fut.done()])
+            finally:
+                for _ in workers:
+                    work.put(None)
+                pbar.close()
         if failures:
             print(f"[AITK] {failures} file(s) failed to caption.")
         if self.file_paths and failures == len(self.file_paths):
