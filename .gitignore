@@ -211,3 +211,7 @@ testing/integration/identity_fixtures.local.json
 # graphify code-graph state (in-repo tool output, never commit)
 /graphify-out/
 .triton_cache
+
+# local assistant tool state, never commit
+/.agents/
+/.opencode/
