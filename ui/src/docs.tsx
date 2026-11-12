@@ -235,7 +235,9 @@ const docs: { [key: string]: ConfigDoc } = {
     description: (
       <>
         Any OpenAI-compatible chat completions server with vision (llama.cpp, vLLM, LM Studio, Ollama, or a hosted API).
-        Same settings as the API captioner on the Captioning page.
+        Same settings as the API captioner on the Captioning page. If the server needs a key, set the{' '}
+        <code>AITK_CAPTION_API_KEY</code> environment variable before starting the UI. The key isn't stored in the job,
+        because the job config is saved in the output folder and printed to the log.
       </>
     ),
   },

@@ -1128,19 +1128,6 @@ export default function SimpleJob({
                       placeholder="model the server expects"
                     />
                     <TextInput
-                      label="API Key (optional)"
-                      type="password"
-                      className="pt-2"
-                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.api?.api_key || ''}
-                      onChange={value =>
-                        setJobConfig(
-                          value.trim() === '' ? undefined : value,
-                          'config.process[0].train.per_image_adaptive_lr_recaption.api.api_key',
-                        )
-                      }
-                      placeholder="Blank: uses AITK_CAPTION_API_KEY"
-                    />
-                    <TextInput
                       label="Spare-GPU Captioner Model"
                       className="pt-2"
                       value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.gpu?.model_name_or_path || ''}

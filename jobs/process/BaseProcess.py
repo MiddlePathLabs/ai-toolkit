@@ -1,8 +1,27 @@
 import copy
 import json
+import re
 from collections import OrderedDict
 
 from toolkit.timer import Timer
+
+# api_key, apikey, hf_token, client_secret, password ... but not tokenizer / max_new_tokens
+_SECRET_KEY_RE = re.compile(r"(^|_)(api_?key|token|secret|password)$", re.IGNORECASE)
+
+
+def redact_secrets(value):
+    """Copy of a config with secret-looking values masked, for printing to logs."""
+    if isinstance(value, dict):
+        out = OrderedDict() if isinstance(value, OrderedDict) else {}
+        for k, v in value.items():
+            if isinstance(k, str) and _SECRET_KEY_RE.search(k) and isinstance(v, str) and v:
+                out[k] = "***"
+            else:
+                out[k] = redact_secrets(v)
+        return out
+    if isinstance(value, list):
+        return [redact_secrets(v) for v in value]
+    return value
 
 
 class BaseProcess(object):
@@ -23,7 +42,7 @@ class BaseProcess(object):
         self.timer: Timer = Timer(f'{self.name} Timer')
         self.performance_log_every = self.get_conf('performance_log_every', 0)
 
-        print(json.dumps(self.config, indent=4))
+        print(json.dumps(redact_secrets(self.config), indent=4))
         
     def on_error(self, e: Exception):
         pass

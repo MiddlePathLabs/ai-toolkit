@@ -505,6 +505,11 @@ class RecaptionConfig:
         self.caption_prompt = kwargs.get('caption_prompt', None) or None
         # OpenAI-compatible endpoint (same fields as the OpenAICaptioner caption config)
         self.api: dict = dict(kwargs.get('api', None) or {})
+        if self.api.get('api_key'):
+            # still honored, but the training config is saved in the output folder
+            # (.job_config.json) and stored with the job, so the env var is the safe place
+            print("[recaption] warning: api.api_key in the training config is saved with the job; "
+                  "prefer the AITK_CAPTION_API_KEY environment variable")
         # local captioner run in a separate process on a spare GPU
         gpu = dict(kwargs.get('gpu', None) or {})
         gpu.setdefault('captioner', 'Qwen3VLCaptioner')
