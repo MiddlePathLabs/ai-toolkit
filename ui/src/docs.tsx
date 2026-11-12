@@ -176,7 +176,8 @@ const docs: { [key: string]: ConfigDoc } = {
         The experimental <code>lr</code> mode leaves loss terms unchanged and scales the whole optimizer update instead.
         Tune <code>audio_loss_multiplier</code> after this joint/voice semantics cutover; <code>num_repeats</code> changes
         sampling frequency and is not a loss multiplier. Needs a few evaluation windows of history before acting. The
-        window auto-sizes to unique image count; on short runs lower the warmup if needed.
+        window auto-sizes to unique image count; on short runs lower the warmup if needed. Turning off both adaptive
+        LR modes also removes the auto-recaption configuration.
       </>
     ),
   },
@@ -196,10 +197,10 @@ const docs: { [key: string]: ConfigDoc } = {
     description: (
       <>
         Runs the per-image loss watcher in observation-only mode. The stuck / suspect / exhausted
-        / healthy verdicts and per-resolution average loss lines still print each window, but NO
-        loss multiplier is ever applied — training is byte-for-byte identical to leaving adaptive
-        LR off. Useful for inspecting what the classifier would do on your dataset before
-        committing to it. Also applies (stats-only wins) if both this and the live toggle are on.
+        / healthy verdicts and per-resolution average loss lines still print each window, but no adaptive loss
+        multiplier or optimizer-update scaling is applied. Useful for inspecting what the classifier would do on
+        your dataset before committing to it. If auto-recaption is enabled, suggested captions are written as
+        proposals only; they never change the captions used for training. Stats Only wins if both modes are on.
       </>
     ),
   },
@@ -209,12 +210,16 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         When adaptive LR confirms an image is stuck (high loss that isn't improving), it gets a new caption while
         training keeps running. The caption is written with <code>[trigger]</code>, which is replaced by your trigger
-        word. After the new caption is applied, the image is judged from scratch. If it gets stuck again it gets one more
-        try; after that it keeps whichever caption fit best and is left alone. Your original caption is saved next
-        to the caption file as <code>.orig</code>. To restore every original, run{' '}
-        <code>python -m toolkit.recaption revert &lt;output folder&gt;/recaption_state.json</code>. With
-        Cache Text Embeddings on, new captions can't be encoded mid-run, so they are only written as proposals.
-        No recaptions start in the last 25% of the run.
+        word. After a new caption is applied, the image is judged from scratch. By default it gets up to two attempts,
+        then keeps whichever caption fit best and is left alone. Original captions, including captions from JSON
+        datasets, are recorded in <code>recaption_state.json</code> in the output folder. Existing sidecar caption
+        files are also backed up as <code>&lt;caption file&gt;.orig</code>; JSON sources get a{' '}
+        <code>&lt;source file&gt;.orig</code> snapshot of the entire JSON file, not a separate caption per image.
+        To restore the original captions recorded in the state file, run{' '}
+        <code>python -m toolkit.recaption revert &lt;output folder&gt;/recaption_state.json</code>. Adaptive LR Stats Only
+        or Cache Text Embeddings (including dataset-level caching) forces proposals only: new captions are not
+        applied to the dataset or training. With cached embeddings, the text encoder is unloaded and cannot encode
+        new captions mid-run. By default, no recaptions start in the last 25% of the run.
       </>
     ),
   },
@@ -255,7 +260,9 @@ const docs: { [key: string]: ConfigDoc } = {
     description: (
       <>
         Writes each suggested caption next to the image as <code>.recaption_proposal.txt</code> and logs the old and new
-        text, but doesn't change your captions or training.
+        text, but doesn't change your captions or training. Adaptive LR Stats Only or Cache Text Embeddings
+        (including dataset-level caching) forces this behavior even when <code>proposals_only</code> is false in the
+        job configuration. Turn off those modes to make this setting editable and allow live caption updates.
       </>
     ),
   },
@@ -276,7 +283,8 @@ const docs: { [key: string]: ConfigDoc } = {
         <br />
         Caching text embeddings will process and cache all the text embeddings from the text encoder to the disk. The
         text encoder will be unloaded from the GPU. This does not work with things that dynamically change the prompt
-        such as trigger words, caption dropout, etc.
+        such as trigger words, caption dropout, etc. Auto-recaption is forced to write proposals only while text
+        embeddings are cached, including when caching is enabled on an individual dataset.
       </>
     ),
   },

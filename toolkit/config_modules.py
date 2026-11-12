@@ -486,7 +486,9 @@ class RecaptionConfig:
             )
         self.prefer: str = prefer
         # attempts per image before giving up (each attempt is one new caption)
-        self.max_attempts: int = max(1, int(kwargs.get('max_attempts', 2)))
+        self.max_attempts: int = int(kwargs.get('max_attempts', 2))
+        if self.max_attempts < 1:
+            raise ValueError("per_image_adaptive_lr_recaption.max_attempts must be at least 1")
         # no new recaptions after this fraction of train.steps: a caption written later
         # can't be judged before the run ends
         self.stop_after: float = float(kwargs.get('stop_after', 0.75))
@@ -517,6 +519,10 @@ class RecaptionConfig:
         self.min_free_vram_gb: float = float(kwargs.get('min_free_vram_gb', 20))
         # GPU worker exits after this long with nothing to do (frees the card again)
         self.idle_shutdown_seconds: float = float(kwargs.get('idle_shutdown_seconds', 180))
+        if not self.min_free_vram_gb >= 0:
+            raise ValueError("per_image_adaptive_lr_recaption.min_free_vram_gb must be non-negative")
+        if not self.idle_shutdown_seconds >= 0:
+            raise ValueError("per_image_adaptive_lr_recaption.idle_shutdown_seconds must be non-negative")
 
     @property
     def has_api(self) -> bool:

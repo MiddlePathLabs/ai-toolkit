@@ -659,6 +659,34 @@ replaced.
 Images are never upscaled but they are downscaled and placed in buckets for batching. **You do not need to crop/resize your images**.
 The loader will automatically resize them and can handle varying aspect ratios. 
 
+### Adaptive LR auto-recaption
+
+Enable `train.per_image_adaptive_lr_recaption.enabled` with Per-Image Adaptive LR to caption
+confirmed-stuck images through an OpenAI-compatible endpoint or a spare-GPU captioner.
+Temporary GPU unavailability is retried at later watcher windows; per-file errors do not
+restart a healthy worker. Failed requests and proposal writes stop retrying after three failures.
+`max_attempts` must be at least one; `min_free_vram_gb` and `idle_shutdown_seconds` must be non-negative.
+
+Stats Only or cached text embeddings (including dataset-level caching) force proposals:
+`<image stem>.recaption_proposal.txt` is written without changing training captions.
+Use proposals while editing captions in another tool; live caption updates are not coordinated
+with external editors. In particular, dataset JSON updates replace the whole file after editing
+the selected entry, so do not modify that JSON concurrently.
+
+Original captions are recorded in `<output folder>/recaption_state.json`. Existing sidecars
+also get a `.orig` backup; JSON sources get a whole-file `.orig` snapshot. Restore the
+per-image originals without replacing unrelated JSON entries:
+
+```sh
+python -m toolkit.recaption revert "<output folder>/recaption_state.json"
+```
+
+Restore failures are logged per image; other images are still restored.
+New training checkpoints record the recaption reset cursor with watcher history, so distributed
+resume replays only later resets. Legacy checkpoints lack this cursor: resume warns and preserves
+their history without replaying the old log; changes made after that checkpoint cannot be identified.
+
+
 
 ## Training Specific Layers
 

@@ -87,6 +87,16 @@ export default function SimpleJob({
 
   const weightNoise = jobConfig.config.process[0].train.weight_noise;
   const gradientNoise = jobConfig.config.process[0].train.gradient_noise;
+  const trainConfig = jobConfig.config.process[0].train;
+  const adaptiveLrEnabled = Boolean(trainConfig.per_image_adaptive_lr || trainConfig.per_image_adaptive_lr_stats_only);
+  const recaptionConfig = trainConfig.per_image_adaptive_lr_recaption;
+  const recaptionProposalsForced = Boolean(
+    trainConfig.per_image_adaptive_lr_stats_only ||
+      trainConfig.cache_text_embeddings ||
+      jobConfig.config.process[0].datasets.some(
+        dataset => 'cache_text_embeddings' in dataset && dataset.cache_text_embeddings,
+      ),
+  );
 
   const depthConfig = jobConfig.config.process[0].depth_consistency;
   const depthEnabled = (depthConfig?.loss_weight ?? 0) > 0;
@@ -1045,6 +1055,9 @@ export default function SimpleJob({
                     } else {
                       setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr');
                       setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_warmup_windows');
+                      if (!trainConfig.per_image_adaptive_lr_stats_only) {
+                        setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_recaption');
+                      }
                     }
                   }}
                 />
@@ -1061,10 +1074,13 @@ export default function SimpleJob({
                     } else {
                       setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_stats_only');
                       setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_warmup_windows');
+                      if (!trainConfig.per_image_adaptive_lr) {
+                        setJobConfig(undefined, 'config.process[0].train.per_image_adaptive_lr_recaption');
+                      }
                     }
                   }}
                 />
-                {(jobConfig.config.process[0].train.per_image_adaptive_lr || jobConfig.config.process[0].train.per_image_adaptive_lr_stats_only) && (
+                {adaptiveLrEnabled && (
                   <NumberInput
                     label="Adaptive LR Warmup (windows)"
                     className="pt-2"
@@ -1075,21 +1091,23 @@ export default function SimpleJob({
                     min={0}
                   />
                 )}
-                {(jobConfig.config.process[0].train.per_image_adaptive_lr || jobConfig.config.process[0].train.per_image_adaptive_lr_stats_only) && (
+                {adaptiveLrEnabled && (
                   <Checkbox
                     label="Auto-Recaption Stuck Images"
                     className="pt-2"
-                    checked={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.enabled || false}
+                    checked={recaptionConfig?.enabled || false}
                     docKey={'train.per_image_adaptive_lr_recaption'}
                     onChange={value =>
                       setJobConfig(
-                        value ? { enabled: true, prefer: 'api', max_attempts: 2 } : undefined,
+                        value
+                          ? { prefer: 'api', max_attempts: 2, ...recaptionConfig, enabled: true }
+                          : { ...recaptionConfig, enabled: false },
                         'config.process[0].train.per_image_adaptive_lr_recaption',
                       )
                     }
                   />
                 )}
-                {jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.enabled && (
+                {adaptiveLrEnabled && recaptionConfig?.enabled && (
                   <>
                     <SelectInput
                       label="Recaption With"
@@ -1153,7 +1171,8 @@ export default function SimpleJob({
                     <Checkbox
                       label="Proposals Only (don't apply)"
                       className="pt-2"
-                      checked={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.proposals_only || false}
+                      checked={recaptionProposalsForced || recaptionConfig?.proposals_only || false}
+                      disabled={recaptionProposalsForced}
                       docKey={'train.per_image_adaptive_lr_recaption.proposals_only'}
                       onChange={value =>
                         setJobConfig(
@@ -1162,6 +1181,12 @@ export default function SimpleJob({
                         )
                       }
                     />
+                    {recaptionProposalsForced && (
+                      <p className="text-xs text-gray-400 pt-2">
+                        Proposals Only is required while Adaptive LR Stats Only or Cache Text Embeddings is on
+                        (including dataset-level caching). Suggested captions won't be applied.
+                      </p>
+                    )}
                   </>
                 )}
               </div>

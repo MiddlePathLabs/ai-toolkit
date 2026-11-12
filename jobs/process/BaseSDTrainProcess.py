@@ -1312,6 +1312,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
         if self.loss_watch is not None and self._resume_state.get("loss_watch") is not None:
             self.loss_watch.load_state_dict(copy.deepcopy(self._resume_state["loss_watch"]))
+            # The reset cursor and watcher history describe the same checkpoint.
+            # Using the current sidecar cursor here would lose caption changes
+            # that happened after this checkpoint was saved.
+            if "recaption_reset_seq" in self._resume_state:
+                self._recaption_peer_seq = int(self._resume_state["recaption_reset_seq"])
+            else:
+                # Legacy checkpoints cannot distinguish resets already reflected
+                # in the saved history from later caption edits. Preserve that
+                # history rather than replaying the entire reset log.
+                from toolkit.recaption import STATE_FILENAME
+                self._recaption_peer_seq = 0
+                try:
+                    with open(os.path.join(self.save_root, STATE_FILENAME), "r", encoding="utf-8") as f:
+                        self._recaption_peer_seq = int(json.load(f).get("reset_seq", 0))
+                except (OSError, ValueError, TypeError):
+                    pass
+                if self._recaption_peer_seq:
+                    print_acc(
+                        "[recaption] legacy checkpoint has no reset cursor; preserving restored watcher "
+                        "history at the current reset sequence. Post-checkpoint caption changes cannot "
+                        "be distinguished from older resets."
+                    )
         if self.category_stop is not None and self._resume_state.get("category_stop") is not None:
             category_state = self._resume_state["category_stop"]
             self.category_stop._announced = set(category_state.get("announced", ()))
@@ -1368,6 +1390,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             },
             "data": {"train": train_data, "reg": reg_data},
             "loss_watch": self._cpu_state(self.loss_watch.state_dict()) if self.loss_watch is not None else None,
+            "recaption_reset_seq": (
+                int(self.recaption.reset_seq) if getattr(self, "recaption", None) is not None
+                else int(getattr(self, "_recaption_peer_seq", 0))
+            ),
             "category_stop": category_state,
         }
 
@@ -1883,9 +1909,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         elif self.is_caching_text_embeddings:
             reason = ("text embeddings are cached and the text encoder is unloaded, so a new caption "
                       "can't be encoded mid-run; turn off Cache Text Embeddings to apply captions live")
-        from toolkit.recaption import RecaptionManager
+        from toolkit.recaption import RecaptionManager, STATE_FILENAME, sync_peer_resets
         self._recaption_dataloader = dataloader
         try:
+            # Both ranks start from the checkpoint cursor, not the latest
+            # sidecar sequence: replay only post-checkpoint caption changes.
+            self._recaption_peer_seq = sync_peer_resets(
+                os.path.join(self.save_root, STATE_FILENAME), self.loss_watch, self._recaption_peer_seq)
+            if (self._resume_state is not None and self._resume_state.get("loss_watch") is not None
+                    and not self.train_config.per_image_adaptive_lr_stats_only):
+                for ds in get_dataloader_datasets(dataloader):
+                    for file_item in getattr(ds, 'file_list', []):
+                        file_item.loss_multiplier = self.loss_watch.multiplier(file_item.path)
             if self.accelerator.is_main_process:
                 self.recaption = RecaptionManager(
                     cfg,
@@ -1895,6 +1930,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     proposals_only_reason=reason,
                     log_fn=print_acc,
                 )
+                # A sidecar save can lag behind the raw checkpoint. Never reuse
+                # reset sequence numbers already included in restored history.
+                self.recaption.reset_seq = max(self.recaption.reset_seq, self._recaption_peer_seq)
             else:
                 self._recaption_peer = True
         except Exception as e:
@@ -1925,15 +1963,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc(f"[recaption] applying a caption failed ({e})")
 
     def _recaption_close(self):
-        if self.recaption is None:
+        manager = self.recaption
+        if manager is None:
             return
         try:
             self._recaption_poll()
-            self.recaption.summary(self.loss_watch)
-            self.recaption.close()
+            manager.summary(self.loss_watch)
         except Exception as e:
             print_acc(f"[recaption] shutdown failed ({e})")
-        self.recaption = None
+        finally:
+            try:
+                manager.close()
+            except Exception as e:
+                print_acc(f"[recaption] shutdown failed ({e})")
+            finally:
+                self._recaption_peer_seq = manager.reset_seq
+                self.recaption = None
 
     def _record_adaptive_lr_members(self, batch):
         if not uses_adaptive_lr_step_scale(self.train_config):
@@ -4570,13 +4615,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         and self.step_num % self._adaptive_lr_window_steps == 0):
                     window_idx = self.step_num // self._adaptive_lr_window_steps
                     self.loss_watch.epoch_boundary(window_idx)
+                    # Replaying a peer reset must precede multiplier writes, so
+                    # this boundary does not retain the pre-caption throttle.
+                    self._recaption_on_window()
                     # stats-only mode: epoch_boundary still ran (printing verdicts), but we do NOT
                     # write any multiplier — training stays identical to the feature being off.
                     if not getattr(self.train_config, 'per_image_adaptive_lr_stats_only', False):
                         for ds in get_dataloader_datasets(dataloader):
                             for file_item in getattr(ds, 'file_list', []):
                                 file_item.loss_multiplier = self.loss_watch.multiplier(file_item.path)
-                    self._recaption_on_window()
                 self._recaption_poll()
 
         self._recaption_close()

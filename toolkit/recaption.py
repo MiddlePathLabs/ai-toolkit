@@ -132,9 +132,9 @@ def caption_target(file_item) -> dict:
         try:
             with open(source, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if file_item.path in data:
+            entry = data.get(file_item.path)
+            if isinstance(entry, str) or (isinstance(entry, dict) and "caption" in entry):
                 use_short = bool(getattr(file_item.dataset_config, "use_short_captions", False))
-                entry = data[file_item.path]
                 field = "caption"
                 if use_short and isinstance(entry, dict) and "caption_short" in entry:
                     field = "caption_short"
@@ -197,7 +197,11 @@ def revert_all(state_path: str, log_fn: Callable[[str], None] = print) -> int:
     for key, entry in (state.get("items") or {}).items():
         if not entry.get("touched") or "target" not in entry:
             continue
-        write_caption(entry["target"], entry.get("original"))
+        try:
+            write_caption(entry["target"], entry.get("original"))
+        except (OSError, ValueError) as e:
+            log_fn(f"[recaption] couldn't restore {os.path.basename(key)} ({e})")
+            continue
         restored += 1
         log_fn(f"[recaption] restored original caption for {os.path.basename(key)}")
     return restored
@@ -348,6 +352,10 @@ class ApiBackend:
             session.close()
 
 
+class CaptionRequestError(RuntimeError):
+    """A worker rejected one file but can continue serving requests."""
+
+
 class GpuWorkerBackend:
     """A local captioner in its own process, pinned to one spare GPU."""
 
@@ -367,19 +375,28 @@ class GpuWorkerBackend:
         env["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
         env["PYTHONUNBUFFERED"] = "1"
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._close_lock = threading.Lock()
         self._log = open(log_path, "a", encoding="utf-8", errors="replace")
-        self.proc = subprocess.Popen(
-            [sys.executable, "-m", "toolkit.recaption_worker"],
-            cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
-            text=True, encoding="utf-8", bufsize=1,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-m", "toolkit.recaption_worker"],
+                cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
+                text=True, encoding="utf-8", bufsize=1,
+            )
+        except BaseException:
+            self._log.close()
+            raise
         self._responses: "queue.Queue[dict]" = queue.Queue()
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        self._send({"captioner": uid, "caption": cfg})
-        msg = self._wait(ready_timeout)
-        if not msg.get("ready"):
+        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader.start()
+        try:
+            self._send({"captioner": uid, "caption": cfg})
+            msg = self._wait(ready_timeout)
+            if not msg.get("ready"):
+                raise RuntimeError(f"captioner worker failed to start: {msg.get('error', msg)} (see {log_path})")
+        except BaseException:
             self.close()
-            raise RuntimeError(f"captioner worker failed to start: {msg.get('error', msg)} (see {log_path})")
+            raise
 
     def _read_stdout(self):
         try:
@@ -418,24 +435,28 @@ class GpuWorkerBackend:
             if msg.get("id") != req_id:
                 continue
             if "error" in msg:
-                raise RuntimeError(msg["error"])
+                raise CaptionRequestError(msg["error"])
             return msg["caption"]
 
     def close(self):
-        try:
-            if self.proc.poll() is None:
-                self.proc.stdin.close()
-                try:
-                    self.proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-        except Exception:
-            pass
-        finally:
+        with self._close_lock:
+            if self._log.closed:
+                return
             try:
-                self._log.flush()
-            except Exception:
-                pass
+                if self.proc.poll() is None:
+                    try:
+                        self.proc.stdin.close()
+                        self.proc.wait(timeout=30)
+                    except (OSError, subprocess.TimeoutExpired):
+                        self.proc.kill()
+                        self.proc.wait()
+                else:
+                    self.proc.wait()
+            finally:
+                self._reader.join()
+                self.proc.stdout.close()
+                self.proc.stdin.close()
+                self._log.close()
 
 
 # ---------------------------------------------------------------------------------------
@@ -464,6 +485,7 @@ class RecaptionManager:
         self._results: "queue.Queue[dict]" = queue.Queue()
         self._backend_factory = backend_factory or self._default_backend
         self._backend = None
+        self._backend_lock = threading.Lock()
         self._gpu_retry_after = 0.0
         self._no_backend_logged = False
         self._cutoff_logged = False
@@ -533,7 +555,7 @@ class RecaptionManager:
         changed = False
         candidates = set(watcher.newly_stuck)
         for key, entry in self.items.items():
-            if (entry.get("status") == "error" and key in watcher._confirmed_stuck
+            if (entry.get("status") in ("error", "deferred") and key in watcher._confirmed_stuck
                     and entry.get("request_failures", 0) < _MAX_REQUEST_FAILURES):
                 candidates.add(key)
         for key in sorted(candidates):
@@ -547,6 +569,8 @@ class RecaptionManager:
     def _consider(self, step, key, file_item, watcher, file_items_by_path) -> bool:
         entry = self.items.get(key)
         if entry is not None and entry.get("status") in ("pending", "gave_up", "proposed", "skipped"):
+            return False
+        if entry is not None and entry.get("request_failures", 0) >= _MAX_REQUEST_FAILURES:
             return False
         reason = self._skip_reason(file_item)
         if reason:
@@ -645,12 +669,14 @@ class RecaptionManager:
             return
         name = os.path.basename(key)
         if "error" in result:
-            entry["status"] = "error"
-            entry["request_failures"] = entry.get("request_failures", 0) + 1
-            if result.get("no_backend"):
+            if result.get("no_backend") and (self.cfg.has_api or self.cfg.has_gpu_model):
+                entry["status"] = "deferred"
+            elif result.get("no_backend"):
                 entry["status"] = "skipped"
-                entry["reason"] = "no captioner available"
+                entry["reason"] = "no captioner configured"
             else:
+                entry["status"] = "error"
+                entry["request_failures"] = entry.get("request_failures", 0) + 1
                 self._log(f"[recaption] {name}: captioning failed ({result['error']})")
             return
         try:
@@ -668,6 +694,7 @@ class RecaptionManager:
             except OSError as e:
                 self._log(f"[recaption] {name}: couldn't write proposal ({e})")
                 entry["status"] = "error"
+                entry["request_failures"] = entry.get("request_failures", 0) + 1
                 return
             entry["status"] = "proposed"
             entry["proposal"] = caption
@@ -709,9 +736,10 @@ class RecaptionManager:
             self._log(f"[recaption] to restore every original caption: python -m toolkit.recaption revert \"{self.state_path}\"")
 
     def close(self, wait: float = 5.0):
-        if self._closed:
-            return
-        self._closed = True
+        with self._backend_lock:
+            if self._closed:
+                return
+            self._closed = True
         self._requests.put(None)
         self._thread.join(timeout=wait)
         self._close_backend()
@@ -741,20 +769,32 @@ class RecaptionManager:
         return None
 
     def _close_backend(self):
-        if self._backend is not None:
+        with self._backend_lock:
+            backend, self._backend = self._backend, None
+        if backend is not None:
             try:
-                self._backend.close()
+                backend.close()
             except Exception:
                 pass
-            self._backend = None
 
     def _get_backend(self):
-        backend = self._backend
+        with self._backend_lock:
+            if self._closed:
+                return None
+            backend = self._backend
         if backend is not None and getattr(backend, "name", "") == "gpu" and not backend.alive():
             self._close_backend()
-        if self._backend is None:
-            self._backend = self._backend_factory()
-        return self._backend
+            backend = None
+        if backend is None:
+            backend = self._backend_factory()
+            with self._backend_lock:
+                if not self._closed:
+                    self._backend = backend
+                    return backend
+            if backend is not None:
+                backend.close()
+            return None
+        return backend
 
     def _worker_loop(self):
         last_used = time.time()
@@ -768,7 +808,8 @@ class RecaptionManager:
                     self._log("[recaption] spare-GPU captioner idle, shutting it down")
                     self._close_backend()
                 continue
-            if req is None:
+            if req is None or self._closed:
+                self._close_backend()
                 return
             result = {"key": req["key"], "trigger": req.get("trigger")}
             try:
@@ -778,13 +819,14 @@ class RecaptionManager:
                     if not self._no_backend_logged:
                         self._no_backend_logged = True
                         self._log("[recaption] no captioner available (no endpoint set, no spare GPU); "
-                                  "stuck images are only logged")
+                                  "configured captioners will be retried at later windows")
                 else:
                     result["caption"] = backend.caption(req["path"], req["prompt"])
                     result["backend"] = backend.describe
             except Exception as e:
                 result["error"] = str(e) or e.__class__.__name__
-                if self._backend is not None and getattr(self._backend, "name", "") == "gpu":
+                if (self._backend is not None and getattr(self._backend, "name", "") == "gpu"
+                        and (not isinstance(e, CaptionRequestError) or not self._backend.alive())):
                     self._close_backend()
             last_used = time.time()
             self._results.put(result)

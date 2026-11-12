@@ -416,3 +416,202 @@ def test_gpu_worker_process_protocol(server, tmp_path):
     finally:
         backend.close()
     assert not backend.alive()
+    assert backend._log.closed
+
+
+@pytest.mark.parametrize("failure", ["send", "wait", "not_ready", "kill"])
+def test_failed_handshake_reaps_process_and_closes_log(monkeypatch, tmp_path, failure):
+    popen = rc.subprocess.Popen
+    children = []
+
+    def start_reader(*args, **kwargs):
+        child = popen(
+            [rc.sys.executable, "-c",
+             "import time; time.sleep(60)" if failure == "kill" else "import sys; sys.stdin.read()"],
+            **kwargs,
+        )
+        if failure == "kill":
+            wait = child.wait
+            child.wait = lambda timeout=None: wait(timeout=0.01 if timeout is not None else None)
+        children.append(child)
+        return child
+
+    def fail(*args):
+        raise RuntimeError("handshake failed")
+
+    monkeypatch.setattr(rc.subprocess, "Popen", start_reader)
+    if failure == "send":
+        monkeypatch.setattr(rc.GpuWorkerBackend, "_send", fail)
+    else:
+        monkeypatch.setattr(
+            rc.GpuWorkerBackend, "_wait",
+            fail if failure in ("wait", "kill") else lambda *args: {"ready": False, "error": "load failed"},
+        )
+    with pytest.raises(RuntimeError):
+        rc.GpuWorkerBackend({"index": 1, "uuid": "GPU-test"}, {}, str(tmp_path / "worker.log"))
+    assert children[0].poll() is not None
+    assert children[0].stdin.closed and children[0].stdout.closed
+    # Windows refuses this rename if the parent's log descriptor is still open.
+    (tmp_path / "worker.log").rename(tmp_path / "closed.log")
+
+
+def test_close_during_backend_creation_closes_late_backend(tmp_path):
+    started, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class Backend(_FakeBackend):
+        def close(self):
+            closed.set()
+
+    backend = Backend(["must not be used"])
+
+    def factory():
+        started.set()
+        assert release.wait(10)
+        return backend
+
+    mgr = rc.RecaptionManager(
+        RecaptionConfig(enabled=True), save_root=str(tmp_path), total_steps=100,
+        backend_factory=factory, log_fn=lambda *_: None,
+    )
+    mgr._requests.put({"key": "a", "path": "a", "prompt": "p"})
+    try:
+        assert started.wait(10)
+        mgr.close(wait=0)
+    finally:
+        release.set()
+        mgr._thread.join(10)
+    assert closed.is_set()
+    assert not mgr._thread.is_alive()
+    assert backend.prompts == []
+
+
+@pytest.mark.parametrize("request_error", [True, False])
+def test_gpu_request_failure_only_restarts_broken_worker(tmp_path, request_error):
+    class Backend(_FakeBackend):
+        name = "gpu"
+        closed = False
+        calls = 0
+
+        def alive(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+        def caption(self, path, prompt):
+            self.calls += 1
+            if self.calls == 1:
+                error = rc.CaptionRequestError if request_error else RuntimeError
+                raise error("bad image" if request_error else "worker exited")
+            return "[trigger] better"
+
+    backend = Backend([])
+    mgr = _manager(tmp_path, backend)
+    try:
+        mgr._requests.put({"key": "a", "path": "a", "prompt": "p"})
+        _wait_results(mgr)
+        assert mgr._results.get_nowait()["error"]
+        assert backend.closed is not request_error
+        if request_error:
+            mgr._requests.put({"key": "b", "path": "b", "prompt": "p"})
+            _wait_results(mgr)
+            assert mgr._results.get_nowait()["caption"] == "[trigger] better"
+            assert backend.calls == 2
+    finally:
+        mgr.close()
+
+
+def test_proposal_write_failures_stop_retrying(monkeypatch, tmp_path):
+    path = _image(tmp_path)
+    items = {path: [_item(path)]}
+    backend = _FakeBackend(["[trigger] proposal"] * 3)
+    mgr = _manager(tmp_path, backend, proposals_only=True)
+    watcher = PerImageAdaptiveLR(log_fn=lambda *_: None)
+    atomic_write = rc._atomic_write_text
+
+    def deny_proposal(target, text):
+        if target.endswith(rc.PROPOSAL_SUFFIX):
+            raise PermissionError("read only")
+        atomic_write(target, text)
+
+    monkeypatch.setattr(rc, "_atomic_write_text", deny_proposal)
+    try:
+        _mark_stuck(watcher, path, 1.0)
+        for step in (10, 20, 30):
+            mgr.on_window(step, watcher, items)
+            _wait_results(mgr)
+            mgr.poll(watcher, items)
+            watcher.newly_stuck = set()
+        mgr.on_window(40, watcher, items)
+        assert mgr.items[path]["request_failures"] == 3
+        assert mgr.items[path]["attempts"] == 0
+        assert mgr._requests.empty()
+        assert len(backend.prompts) == 3
+    finally:
+        mgr.close()
+
+
+def test_temporarily_unavailable_backend_is_retried(tmp_path):
+    path = _image(tmp_path)
+    items = {path: [_item(path)]}
+    backend = _FakeBackend(["[trigger] recovered"])
+    available = False
+    mgr = rc.RecaptionManager(
+        RecaptionConfig(enabled=True, gpu={"model_name_or_path": "m"}),
+        save_root=str(tmp_path / "out"), total_steps=100,
+        backend_factory=lambda: backend if available else None, log_fn=lambda *_: None,
+    )
+    watcher = PerImageAdaptiveLR(log_fn=lambda *_: None)
+    try:
+        _mark_stuck(watcher, path, 1.0)
+        for step in (1, 2, 3, 4):
+            mgr.on_window(step, watcher, items)
+            _wait_results(mgr)
+            mgr.poll(watcher, items)
+            watcher.newly_stuck = set()
+        assert mgr.items[path]["status"] == "deferred"
+        assert mgr.items[path].get("request_failures", 0) == 0
+        available = True
+        mgr.on_window(5, watcher, items)
+        _wait_results(mgr)
+        mgr.poll(watcher, items)
+        assert mgr.items[path]["status"] == "applied"
+        assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "[trigger] recovered"
+    finally:
+        mgr.close()
+
+
+def test_revert_continues_after_failed_target(tmp_path):
+    good = tmp_path / "good.txt"
+    good.write_text("new", encoding="utf-8")
+    state = tmp_path / rc.STATE_FILENAME
+    state.write_text(json.dumps({"items": {
+        "bad.png": {"touched": True, "target": {"kind": "sidecar", "path": str(tmp_path / "missing" / "bad.txt")},
+                    "original": "old bad"},
+        "good.png": {"touched": True, "target": {"kind": "sidecar", "path": str(good)}, "original": "old good"},
+    }}), encoding="utf-8")
+    messages = []
+    assert rc.revert_all(str(state), messages.append) == 1
+    assert good.read_text(encoding="utf-8") == "old good"
+    assert any("couldn't restore bad.png" in message for message in messages)
+
+
+@pytest.mark.parametrize("entry", [{"caption_short": "short"}, None, 42])
+def test_invalid_json_caption_entry_uses_sidecar(tmp_path, entry):
+    path = _image(tmp_path, caption="sidecar")
+    source = tmp_path / "captions.json"
+    source.write_text(json.dumps({path: entry}), encoding="utf-8")
+    target = rc.caption_target(_item(path, source=str(source)))
+    assert target["kind"] == "sidecar"
+    rc.write_caption(target, "replacement")
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "replacement"
+    assert json.loads(source.read_text(encoding="utf-8"))[path] == entry
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_attempts": 0}, {"max_attempts": -1}, {"min_free_vram_gb": -0.1},
+    {"idle_shutdown_seconds": -1},
+])
+def test_invalid_resource_limits_are_rejected(kwargs):
+    with pytest.raises(ValueError):
+        RecaptionConfig(**kwargs)
