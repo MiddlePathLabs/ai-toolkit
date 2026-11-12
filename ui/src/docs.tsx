@@ -1310,6 +1310,30 @@ const docs: { [key: string]: ConfigDoc } = {
     summary: 'Batches each worker prepares ahead of the GPU.',
     description: 'Default is 2. Only matters when Data Workers is above 0.',
   },
+  'config.process[0].caption.api_base_url': {
+    title: 'API Base URL',
+    summary: 'OpenAI-compatible server that does the captioning.',
+    description: (
+      <>
+        Any server that speaks the OpenAI chat completions API with image input: llama.cpp (llama-server), vLLM,
+        SGLang, LM Studio, Ollama, TabbyAPI, or a remote machine running one of them. Use the base URL, e.g.{' '}
+        <code>http://localhost:8080/v1</code> (Ollama: <code>http://localhost:11434/v1</code>, LM Studio:{' '}
+        <code>http://localhost:1234/v1</code>). A bare <code>http://host:port</code> gets <code>/v1</code> added, and a
+        full <code>.../chat/completions</code> URL is used as is.
+        <br />
+        <br />
+        Images are sent as base64 JPEGs resized to Max Resolution. Videos are sent as evenly spaced frames. Audio files
+        are not supported. The API key is stored in the job config; leave it blank to use the{' '}
+        <code>AITK_CAPTION_API_KEY</code> environment variable instead.
+      </>
+    ),
+  },
+  'config.process[0].caption.api_model': {
+    title: 'Model Name',
+    summary: 'The model id sent in each request.',
+    description:
+      'Must match a model the server serves. Use "List models from endpoint" to fetch them. Servers that only host one model (llama-server) usually accept any name.',
+  },
   'config.process[0].caption.caption_prompt': {
     title: 'Caption Prompt',
     description: (

@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
-import { Plus, X } from 'lucide-react';
+import { Plus, RefreshCw, X } from 'lucide-react';
+import { apiClient } from '@/utils/api';
 import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
 import {
   Checkbox,
   CreatableSelectInput,
   FormGroup,
+  NumberInput,
   SelectInput,
   SliderInput,
   TextAreaInput,
@@ -16,6 +18,8 @@ import {
   batchSizeOptions,
   captionFormatOptions,
   captionerTypes,
+  concurrencyOptions,
+  videoFramesOptions,
   defaultQtype,
   groupedCaptionerTypes,
   maxNewTokensOptions,
@@ -48,6 +52,30 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
     if (loras.some(l => l.path === pick.path)) return;
     setLoras([...loras, { path: pick.path, name: pick.name, strength: 1.0 }]);
   };
+  const isRemote = !!selectedCaptionOption?.isRemote;
+  const caption = jobConfig.config.process[0].caption;
+  const [remoteModels, setRemoteModels] = useState<string[]>([]);
+  const [modelsStatus, setModelsStatus] = useState<string | null>(null);
+  const fetchRemoteModels = async () => {
+    setModelsStatus('Fetching models...');
+    try {
+      const res = await apiClient.post('/api/caption/models', {
+        api_base_url: caption.api_base_url,
+        api_key: caption.api_key,
+      });
+      const models: string[] = res.data?.models || [];
+      setRemoteModels(models);
+      setModelsStatus(models.length ? `${models.length} model(s) found` : 'Endpoint returned no models');
+      if (models.length && !caption.model_name_or_path) {
+        setJobConfig(models[0], 'config.process[0].caption.model_name_or_path');
+      }
+    } catch (e: any) {
+      setModelsStatus(`Could not list models: ${e?.response?.data?.error || e?.message || 'request failed'}`);
+    }
+  };
+  const modelOptions = isRemote
+    ? remoteModels.map(m => ({ value: m, label: m }))
+    : selectedCaptionOption?.name_or_path_options || [];
 
   return (
     <div className="text-sm text-gray-400">
@@ -73,21 +101,53 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
           </div>
         )}
       </div>
+      {additionalSections.includes('caption.api_endpoint') && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+          <TextInput
+            label="API Base URL"
+            docKey="config.process[0].caption.api_base_url"
+            value={caption.api_base_url || ''}
+            onChange={value => setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_base_url')}
+            placeholder="http://localhost:8080/v1"
+            required
+          />
+          <TextInput
+            label="API Key (optional)"
+            type="password"
+            value={caption.api_key || ''}
+            onChange={value => setJobConfig(value.trim() === '' ? undefined : value, 'config.process[0].caption.api_key')}
+            placeholder="Blank: job uses AITK_CAPTION_API_KEY env var"
+          />
+        </div>
+      )}
       <div className="mt-4">
         <CreatableSelectInput
-          label="Name or Path"
-          value={jobConfig.config.process[0].caption.model_name_or_path}
-          docKey="config.process[0].caption.model_name_or_path"
+          label={isRemote ? 'Model Name' : 'Name or Path'}
+          value={caption.model_name_or_path}
+          docKey={isRemote ? 'config.process[0].caption.api_model' : 'config.process[0].caption.model_name_or_path'}
           onChange={(value: string | null) => {
             if (value?.trim() === '') {
               value = null;
             }
             setJobConfig(value, 'config.process[0].caption.model_name_or_path');
           }}
-          placeholder=""
-          options={selectedCaptionOption?.name_or_path_options || []}
+          placeholder={isRemote ? 'Model name the server expects' : ''}
+          options={modelOptions}
           required
         />
+        {isRemote && (
+          <div className="flex items-center gap-2 mt-1">
+            <button
+              type="button"
+              onClick={fetchRemoteModels}
+              disabled={!caption.api_base_url}
+              className="px-2 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs flex items-center gap-1 disabled:opacity-40"
+            >
+              <RefreshCw className="w-3.5 h-3.5" /> List models from endpoint
+            </button>
+            {modelsStatus && <span className="text-[11px] text-gray-500">{modelsStatus}</span>}
+          </div>
+        )}
       </div>
       {additionalSections.includes('caption.model_name_or_path2') && (
         <div className="mt-4">
@@ -187,20 +247,33 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
       )}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
         <div>
-          <SelectInput
-            label="Quantize"
-            value={jobConfig.config.process[0].caption.quantize ? jobConfig.config.process[0].caption.qtype : ''}
-            onChange={value => {
-              if (value === '') {
-                setJobConfig(false, 'config.process[0].caption.quantize');
-                value = defaultQtype;
-              } else {
-                setJobConfig(true, 'config.process[0].caption.quantize');
-              }
-              setJobConfig(value, 'config.process[0].caption.qtype');
-            }}
-            options={quantizationOptions}
-          />
+          {!isRemote && (
+            <SelectInput
+              label="Quantize"
+              value={jobConfig.config.process[0].caption.quantize ? jobConfig.config.process[0].caption.qtype : ''}
+              onChange={value => {
+                if (value === '') {
+                  setJobConfig(false, 'config.process[0].caption.quantize');
+                  value = defaultQtype;
+                } else {
+                  setJobConfig(true, 'config.process[0].caption.quantize');
+                }
+                setJobConfig(value, 'config.process[0].caption.qtype');
+              }}
+              options={quantizationOptions}
+            />
+          )}
+          {isRemote && (
+            <SelectInput
+              label="Parallel Requests"
+              value={`${caption.concurrency ?? 2}`}
+              onChange={value => {
+                const intVal = parseInt(value);
+                if (!isNaN(intVal)) setJobConfig(intVal, 'config.process[0].caption.concurrency');
+              }}
+              options={concurrencyOptions}
+            />
+          )}
           <div className="mt-4">
             <CreatableSelectInput
               label="Caption Extension"
@@ -245,6 +318,30 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
               />
             </div>
           )}
+          {isRemote && (
+            <>
+              <div className="mt-4">
+                <SelectInput
+                  label="Frames per Video"
+                  value={`${caption.video_frames ?? 8}`}
+                  onChange={value => {
+                    const intVal = parseInt(value);
+                    if (!isNaN(intVal)) setJobConfig(intVal, 'config.process[0].caption.video_frames');
+                  }}
+                  options={videoFramesOptions}
+                />
+              </div>
+              <div className="mt-4">
+                <NumberInput
+                  label="Temperature"
+                  value={caption.temperature ?? 0.2}
+                  onChange={value => setJobConfig(value, 'config.process[0].caption.temperature')}
+                  min={0}
+                  max={2}
+                />
+              </div>
+            </>
+          )}
           {additionalSections.includes('caption.video_fps') && (
             <div className="mt-4">
               <SelectInput
@@ -278,11 +375,13 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
         </div>
         <div>
           <FormGroup label="Options">
-            <Checkbox
-              label="Low VRAM"
-              checked={jobConfig.config.process[0].caption.low_vram}
-              onChange={value => setJobConfig(value, 'config.process[0].caption.low_vram')}
-            />
+            {!isRemote && (
+              <Checkbox
+                label="Low VRAM"
+                checked={jobConfig.config.process[0].caption.low_vram}
+                onChange={value => setJobConfig(value, 'config.process[0].caption.low_vram')}
+              />
+            )}
             <Checkbox
               label="Recaption"
               checked={jobConfig.config.process[0].caption.recaption}

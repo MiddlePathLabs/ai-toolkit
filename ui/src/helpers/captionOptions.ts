@@ -1,7 +1,7 @@
 import { CloudLora, GroupedSelectOption, SelectOption } from "@/types";
 
-type CaptionGroup = 'image' | 'music' | 'video' | 'image/video' | 'image/video/sound';
-type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.fixed_caption' | 'caption.caption_format' | 'caption.extract_vocals_before_transcribe' | 'caption.keep_timestamps' | 'caption.thinking' | 'caption.batch_size' | 'caption.layer_offloading' | 'caption.mtp' | 'caption.cuda_graph' | 'caption.vision_bf16' | 'caption.video_fps' | 'caption.system_prompt';
+type CaptionGroup = 'image' | 'music' | 'video' | 'image/video' | 'image/video/sound' | 'remote api';
+type AdditionalSections = 'caption.api_endpoint' | 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.fixed_caption' | 'caption.caption_format' | 'caption.extract_vocals_before_transcribe' | 'caption.keep_timestamps' | 'caption.thinking' | 'caption.batch_size' | 'caption.layer_offloading' | 'caption.mtp' | 'caption.cuda_graph' | 'caption.vision_bf16' | 'caption.video_fps' | 'caption.system_prompt';
 
 export interface CaptionOption {
     name: string;
@@ -13,6 +13,9 @@ export interface CaptionOption {
     supportsLoras?: boolean;
     // compile is a no-op for this captioner (its decode is already CUDA-graphed)
     noCompile?: boolean;
+    // model runs on an external server: no quantize / low vram / compile here,
+    // and model_name_or_path is the model name the server expects
+    isRemote?: boolean;
     // LoRAs published for this model, offered in the LoRA browser alongside
     // local files. Paths are 'org/repo/path_to/file.safetensors'; the captioner
     // searches the models folder for the file before downloading it to loras/.
@@ -323,6 +326,40 @@ export const captionerTypes: CaptionOption[] = [
             'caption.max_new_tokens',
         ],
     },
+    {
+        name: 'OpenAICaptioner',
+        label: 'OpenAI-Compatible API',
+        group: 'remote api',
+        isRemote: true,
+        noCompile: true,
+        defaults: {
+            'config.process[0].caption.api_base_url': ['http://localhost:8080/v1', undefined],
+            'config.process[0].caption.api_key': [undefined, undefined],
+            'config.process[0].caption.model_name_or_path': ['', defaultNameOrPath],
+            'config.process[0].caption.extensions': [[...extensionsImage, ...extensionsVideo], defaultExtensions],
+            'config.process[0].caption.caption_prompt': [defaultImageCaptionPrompt, undefined],
+            'config.process[0].caption.max_res': [1024, undefined],
+            'config.process[0].caption.max_new_tokens': [512, undefined],
+            'config.process[0].caption.temperature': [0.2, undefined],
+            'config.process[0].caption.concurrency': [2, undefined],
+            'config.process[0].caption.video_frames': [8, undefined],
+            'config.process[0].caption.quantize': [false, true],
+            'config.process[0].caption.compile': [false, false],
+        },
+        captionPrompts: {
+            'General (image)': defaultImageCaptionPrompt,
+            'General (video)': defaultVideoCaptionPrompt,
+            'MiniMax H4 T2V': minimaxT2VCaptionPrompt,
+            'MiniMax H4 Image': minimaxImageCaptionPrompt,
+        },
+        additionalSections: [
+            'caption.api_endpoint',
+            'caption.caption_prompt',
+            'caption.system_prompt',
+            'caption.max_res',
+            'caption.max_new_tokens',
+        ],
+    },
 
 ].sort((a, b) => {
     // Sort by label, case-insensitive
@@ -403,6 +440,21 @@ export const videoFpsOptions: SelectOption[] = [
     { value: '2', label: '2 (default)' },
     { value: '4', label: '4' },
     { value: '8', label: '8' },
+];
+
+export const concurrencyOptions: SelectOption[] = [
+    { value: '1', label: '1' },
+    { value: '2', label: '2 (default)' },
+    { value: '4', label: '4' },
+    { value: '8', label: '8' },
+    { value: '16', label: '16' },
+];
+
+export const videoFramesOptions: SelectOption[] = [
+    { value: '4', label: '4' },
+    { value: '8', label: '8 (default)' },
+    { value: '16', label: '16' },
+    { value: '32', label: '32' },
 ];
 
 export const mtpDepthOptions: SelectOption[] = [

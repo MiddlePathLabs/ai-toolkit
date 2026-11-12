@@ -567,6 +567,15 @@ export interface CaptionProcessConfig {
     vision_bf16?: boolean;
     video_fps?: number;
     system_prompt?: string;
+    // OpenAI-compatible API captioner
+    api_base_url?: string;
+    api_key?: string;
+    temperature?: number;
+    concurrency?: number;
+    video_frames?: number;
+    request_timeout?: number;
+    max_retries?: number;
+    extra_body?: { [key: string]: any };
   };
 }
 
