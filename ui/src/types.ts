@@ -184,6 +184,34 @@ export interface DatasetConfig {
   random_scale?: boolean;
 }
 
+export interface RecaptionConfig {
+  enabled?: boolean;
+  // 'api': endpoint whenever configured, else spare GPU. 'gpu': spare GPU first, else endpoint.
+  prefer?: 'api' | 'gpu';
+  max_attempts?: number;
+  stop_after?: number;
+  on_give_up?: 'best' | 'original';
+  proposals_only?: boolean;
+  caption_prompt?: string;
+  api?: {
+    api_base_url?: string;
+    api_key?: string;
+    model_name_or_path?: string;
+    max_res?: number;
+    max_new_tokens?: number;
+    temperature?: number;
+    system_prompt?: string;
+    [key: string]: any;
+  };
+  gpu?: {
+    captioner?: string;
+    model_name_or_path?: string;
+    [key: string]: any;
+  };
+  min_free_vram_gb?: number;
+  idle_shutdown_seconds?: number;
+}
+
 export interface EMAConfig {
   use_ema: boolean;
   ema_decay: number;
@@ -323,6 +351,7 @@ export interface TrainConfig {
   per_image_adaptive_lr_stats_only?: boolean;
   per_image_adaptive_lr_window_steps?: number | null;
   per_image_adaptive_lr_warmup_windows?: number | null;
+  per_image_adaptive_lr_recaption?: RecaptionConfig;
   ema_config?: EMAConfig;
   weight_noise?: WeightNoiseConfig;
   gradient_noise?: GradientNoiseConfig;

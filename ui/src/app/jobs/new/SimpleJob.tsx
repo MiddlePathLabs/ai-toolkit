@@ -1075,6 +1075,108 @@ export default function SimpleJob({
                     min={0}
                   />
                 )}
+                {(jobConfig.config.process[0].train.per_image_adaptive_lr || jobConfig.config.process[0].train.per_image_adaptive_lr_stats_only) && (
+                  <Checkbox
+                    label="Auto-Recaption Stuck Images"
+                    className="pt-2"
+                    checked={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.enabled || false}
+                    docKey={'train.per_image_adaptive_lr_recaption'}
+                    onChange={value =>
+                      setJobConfig(
+                        value ? { enabled: true, prefer: 'api', max_attempts: 2 } : undefined,
+                        'config.process[0].train.per_image_adaptive_lr_recaption',
+                      )
+                    }
+                  />
+                )}
+                {jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.enabled && (
+                  <>
+                    <SelectInput
+                      label="Recaption With"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.prefer || 'api'}
+                      docKey={'train.per_image_adaptive_lr_recaption.prefer'}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.per_image_adaptive_lr_recaption.prefer')}
+                      options={[
+                        { value: 'api', label: 'API endpoint first, then spare GPU' },
+                        { value: 'gpu', label: 'Spare GPU first, then API endpoint' },
+                      ]}
+                    />
+                    <TextInput
+                      label="API Base URL"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.api?.api_base_url || ''}
+                      docKey={'train.per_image_adaptive_lr_recaption.api'}
+                      onChange={value =>
+                        setJobConfig(
+                          value.trim() === '' ? undefined : value,
+                          'config.process[0].train.per_image_adaptive_lr_recaption.api.api_base_url',
+                        )
+                      }
+                      placeholder="http://localhost:8080/v1"
+                    />
+                    <TextInput
+                      label="API Model Name"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.api?.model_name_or_path || ''}
+                      onChange={value =>
+                        setJobConfig(
+                          value.trim() === '' ? undefined : value,
+                          'config.process[0].train.per_image_adaptive_lr_recaption.api.model_name_or_path',
+                        )
+                      }
+                      placeholder="model the server expects"
+                    />
+                    <TextInput
+                      label="API Key (optional)"
+                      type="password"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.api?.api_key || ''}
+                      onChange={value =>
+                        setJobConfig(
+                          value.trim() === '' ? undefined : value,
+                          'config.process[0].train.per_image_adaptive_lr_recaption.api.api_key',
+                        )
+                      }
+                      placeholder="Blank: uses AITK_CAPTION_API_KEY"
+                    />
+                    <TextInput
+                      label="Spare-GPU Captioner Model"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.gpu?.model_name_or_path || ''}
+                      docKey={'train.per_image_adaptive_lr_recaption.gpu'}
+                      onChange={value =>
+                        setJobConfig(
+                          value.trim() === '' ? undefined : value,
+                          'config.process[0].train.per_image_adaptive_lr_recaption.gpu.model_name_or_path',
+                        )
+                      }
+                      placeholder="eg. Qwen/Qwen3-VL-8B-Instruct"
+                    />
+                    <NumberInput
+                      label="Attempts Per Image"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.max_attempts ?? 2}
+                      onChange={value =>
+                        setJobConfig(value ?? 2, 'config.process[0].train.per_image_adaptive_lr_recaption.max_attempts')
+                      }
+                      min={1}
+                      max={5}
+                    />
+                    <Checkbox
+                      label="Proposals Only (don't apply)"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.per_image_adaptive_lr_recaption?.proposals_only || false}
+                      docKey={'train.per_image_adaptive_lr_recaption.proposals_only'}
+                      onChange={value =>
+                        setJobConfig(
+                          value || undefined,
+                          'config.process[0].train.per_image_adaptive_lr_recaption.proposals_only',
+                        )
+                      }
+                    />
+                  </>
+                )}
               </div>
               {!isLlmModel && (
                 <div>

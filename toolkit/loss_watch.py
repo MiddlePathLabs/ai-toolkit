@@ -1,6 +1,6 @@
 """Per-image adaptive LR: online per-image loss tracking with an adaptive per-item loss
-multiplier. Detection + multiplier only. No auto-recaption,
-no exclusion — those are a separate follow-up.
+multiplier. Detection + multiplier only; auto-recaption lives in toolkit/recaption.py and
+uses `newly_stuck`, `last_residual` and `reset_item()` from here.
 
 Model- and network-agnostic by construction: it only ever sees (item_key, epoch, timestep, loss)
 tuples handed to it from SDTrainer.calculate_loss(), which is the single shared loss path for
@@ -119,6 +119,10 @@ class PerImageAdaptiveLR:
         self._healthy_epochs: dict[str, int] = {}
         self._retired: set[str] = set()  # proved a good run once; suppresses stuck/suspect after
         self._restored_residuals: dict[str, dict[int, float]] = {}  # from a prior run's checkpoint
+        # set by each epoch_boundary(): images that became confirmed-stuck at that boundary,
+        # and each image's latest per-window mean residual (lower = fitting better)
+        self.newly_stuck: set[str] = set()
+        self.last_residual: dict[str, float] = {}
 
     # ---- per-step ------------------------------------------------------------
 
@@ -154,6 +158,7 @@ class PerImageAdaptiveLR:
     def epoch_boundary(self, epoch: int) -> dict[str, str]:
         """Reclassify every image seen so far and refresh self._mult. Call once per epoch, after
         the last step of that epoch has been observe()'d. Returns the verdicts dict."""
+        self.newly_stuck = set()
         try:
             if epoch <= self.warmup_epochs or (not self._records and not self._restored_residuals):
                 return self.verdicts
@@ -192,6 +197,7 @@ class PerImageAdaptiveLR:
             for key, eps in per_key_epoch_mean.items():
                 epochs_sorted = sorted(eps)
                 cur_residual = eps[epochs_sorted[-1]]
+                self.last_residual[key] = cur_residual
 
                 # ---- improving test: recent half vs older half of the trend window ----
                 window_epochs = [e for e in epochs_sorted if e > epoch - self.trend_window]
@@ -297,6 +303,7 @@ class PerImageAdaptiveLR:
 
             added = self._confirmed_stuck - self._last_reported_stuck
             removed = self._last_reported_stuck - self._confirmed_stuck
+            self.newly_stuck = set(added)
             if added:
                 # Which resolution is the worst offender for a key, as of the most recent window
                 # it actually has data for — a diagnostic hint, not part of the classification
@@ -335,6 +342,22 @@ class PerImageAdaptiveLR:
         except Exception as e:
             self._log(f"[adaptive-lr] epoch_boundary failed ({e})")
             return self.verdicts
+
+    def reset_item(self, item_key: str) -> None:
+        """Forget everything known about one image so it is judged from scratch, e.g. after
+        its caption changed: loss history from the old caption no longer says anything about
+        the new one. The shared per-bucket baseline is kept (it describes the whole run)."""
+        key = str(item_key)
+        self._records = [r for r in self._records if r[0] != key]
+        self._restored_residuals.pop(key, None)
+        for d in (self._mult, self.verdicts, self._stuck_votes, self._clear_votes,
+                  self._suspect_votes, self._exhaust_votes, self._stuck_epochs,
+                  self._healthy_epochs, self.last_residual):
+            d.pop(key, None)
+        self._confirmed_stuck.discard(key)
+        self._last_reported_stuck.discard(key)
+        self._retired.discard(key)
+        self.newly_stuck.discard(key)
 
     # ---- persistence -----------------------------------------------------------
 

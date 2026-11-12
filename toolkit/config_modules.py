@@ -465,6 +465,62 @@ class GradientNoiseConfig:
             raise ValueError(f'Invalid gradient noise mode: {self.mode}')
 
 
+class RecaptionConfig:
+    """train.per_image_adaptive_lr_recaption: recaption images the adaptive-LR watcher
+    confirms stuck, while training keeps running. See toolkit/recaption.py.
+
+    Backend choice (`prefer`):
+      'api' (default): use the OpenAI-compatible endpoint whenever api.api_base_url is set,
+             even if a spare GPU exists; otherwise fall back to a spare GPU.
+      'gpu': use a spare GPU (one this job is not training on, with enough free VRAM)
+             when there is one; otherwise fall back to the endpoint.
+    With neither available, stuck images are only logged.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        prefer = str(kwargs.get('prefer', 'api') or 'api').lower()
+        if prefer not in ('api', 'gpu'):
+            raise ValueError(
+                f"per_image_adaptive_lr_recaption.prefer must be 'api' or 'gpu', got {prefer!r}"
+            )
+        self.prefer: str = prefer
+        # attempts per image before giving up (each attempt is one new caption)
+        self.max_attempts: int = max(1, int(kwargs.get('max_attempts', 2)))
+        # no new recaptions after this fraction of train.steps: a caption written later
+        # can't be judged before the run ends
+        self.stop_after: float = float(kwargs.get('stop_after', 0.75))
+        if not 0.0 < self.stop_after <= 1.0:
+            raise ValueError("per_image_adaptive_lr_recaption.stop_after must be in (0, 1]")
+        # 'best' keeps the lowest-loss caption when giving up; 'original' restores yours
+        on_give_up = str(kwargs.get('on_give_up', 'best') or 'best').lower()
+        if on_give_up not in ('best', 'original'):
+            raise ValueError(
+                f"per_image_adaptive_lr_recaption.on_give_up must be 'best' or 'original', got {on_give_up!r}"
+            )
+        self.on_give_up: str = on_give_up
+        # write captions as <stem>.recaption_proposal.txt instead of applying them
+        self.proposals_only: bool = bool(kwargs.get('proposals_only', False))
+        # optional override for the base caption instruction
+        self.caption_prompt = kwargs.get('caption_prompt', None) or None
+        # OpenAI-compatible endpoint (same fields as the OpenAICaptioner caption config)
+        self.api: dict = dict(kwargs.get('api', None) or {})
+        # local captioner run in a separate process on a spare GPU
+        gpu = dict(kwargs.get('gpu', None) or {})
+        gpu.setdefault('captioner', 'Qwen3VLCaptioner')
+        self.gpu: dict = gpu
+        self.min_free_vram_gb: float = float(kwargs.get('min_free_vram_gb', 20))
+        # GPU worker exits after this long with nothing to do (frees the card again)
+        self.idle_shutdown_seconds: float = float(kwargs.get('idle_shutdown_seconds', 180))
+
+    @property
+    def has_api(self) -> bool:
+        return bool(str(self.api.get('api_base_url', '') or '').strip())
+
+    @property
+    def has_gpu_model(self) -> bool:
+        return bool(str(self.gpu.get('model_name_or_path', '') or '').strip())
+
 
 class ModalityBlockRoutingConfig:
     """Default-off H3 trunk-block routing. None/blank per key = that modality
@@ -785,6 +841,13 @@ class TrainConfig:
                 f"per_image_adaptive_lr_mode must be 'loss' or 'lr', got {mode!r}"
             )
         self.per_image_adaptive_lr_mode = mode
+        # Auto-recaption images the watcher confirms stuck (see toolkit/recaption.py). Off
+        # unless per_image_adaptive_lr_recaption.enabled is true; needs the watcher on.
+        recaption_raw = kwargs.get('per_image_adaptive_lr_recaption', None) or {}
+        if isinstance(recaption_raw, RecaptionConfig):
+            self.per_image_adaptive_lr_recaption = recaption_raw
+        else:
+            self.per_image_adaptive_lr_recaption = RecaptionConfig(**recaption_raw)
         routing_raw = kwargs.get("modality_block_routing", None) or {}
         if isinstance(routing_raw, ModalityBlockRoutingConfig):
             self.modality_block_routing = routing_raw

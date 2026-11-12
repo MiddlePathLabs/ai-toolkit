@@ -194,6 +194,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.epoch_num = 0
         self.last_save_step = 0
         self.loss_watch = None
+        self.recaption = None  # toolkit.recaption.RecaptionManager on the main process
+        self._recaption_dataloader = None
+        self._recaption_peer = False
+        self._recaption_peer_seq = 0
         self.optimizer_runtime = None
         self._adaptive_lr_members = {}
         self.modality_router = None
@@ -1862,6 +1866,74 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # if self.data_loader_reg is not None:
         #     self.data_loader_reg = self.accelerator.prepare(self.data_loader_reg)
             
+
+    # ---- auto-recaption for stuck images (toolkit/recaption.py) ----------------------
+
+    def _setup_recaption(self, dataloader):
+        cfg = getattr(self.train_config, 'per_image_adaptive_lr_recaption', None)
+        if cfg is None or not cfg.enabled or self.loss_watch is None:
+            return
+        if self.train_config.unload_text_encoder and not self.is_caching_text_embeddings:
+            print_acc("[recaption] off: unload_text_encoder trains on the trigger/blank prompt only, "
+                      "so captions aren't used")
+            return
+        reason = None
+        if self.train_config.per_image_adaptive_lr_stats_only:
+            reason = "stats-only mode"
+        elif self.is_caching_text_embeddings:
+            reason = ("text embeddings are cached and the text encoder is unloaded, so a new caption "
+                      "can't be encoded mid-run; turn off Cache Text Embeddings to apply captions live")
+        from toolkit.recaption import RecaptionManager
+        self._recaption_dataloader = dataloader
+        try:
+            if self.accelerator.is_main_process:
+                self.recaption = RecaptionManager(
+                    cfg,
+                    save_root=self.save_root,
+                    total_steps=self.train_config.steps,
+                    world_size=self.accelerator.num_processes,
+                    proposals_only_reason=reason,
+                    log_fn=print_acc,
+                )
+            else:
+                self._recaption_peer = True
+        except Exception as e:
+            print_acc(f"[recaption] off: setup failed ({e})")
+            self.recaption = None
+
+    def _recaption_items(self):
+        from toolkit.recaption import group_file_items
+        return group_file_items(get_dataloader_datasets(self._recaption_dataloader))
+
+    def _recaption_on_window(self):
+        try:
+            if self.recaption is not None:
+                self.recaption.on_window(self.step_num, self.loss_watch, self._recaption_items())
+            elif self._recaption_peer:
+                from toolkit.recaption import STATE_FILENAME, sync_peer_resets
+                self._recaption_peer_seq = sync_peer_resets(
+                    os.path.join(self.save_root, STATE_FILENAME), self.loss_watch, self._recaption_peer_seq)
+        except Exception as e:
+            print_acc(f"[recaption] window update failed ({e})")
+
+    def _recaption_poll(self):
+        if self.recaption is None or not self.recaption.has_results():
+            return
+        try:
+            self.recaption.poll(self.loss_watch, self._recaption_items())
+        except Exception as e:
+            print_acc(f"[recaption] applying a caption failed ({e})")
+
+    def _recaption_close(self):
+        if self.recaption is None:
+            return
+        try:
+            self._recaption_poll()
+            self.recaption.summary(self.loss_watch)
+            self.recaption.close()
+        except Exception as e:
+            print_acc(f"[recaption] shutdown failed ({e})")
+        self.recaption = None
 
     def _record_adaptive_lr_members(self, batch):
         if not uses_adaptive_lr_step_scale(self.train_config):
@@ -3948,6 +4020,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 1, round(total_images / max(self.train_config.batch_size, 1)))
             print_acc(f"[adaptive-lr] evaluating every {self._adaptive_lr_window_steps} steps "
                       f"(~one pass over {total_images} unique image(s))")
+            self._setup_recaption(dataloader)
 
         # zero any gradients
         optimizer.zero_grad()
@@ -4503,7 +4576,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         for ds in get_dataloader_datasets(dataloader):
                             for file_item in getattr(ds, 'file_list', []):
                                 file_item.loss_multiplier = self.loss_watch.multiplier(file_item.path)
+                    self._recaption_on_window()
+                self._recaption_poll()
 
+        self._recaption_close()
 
         ###################################################################
         # Flush an incomplete accumulation window at the configured run tail.

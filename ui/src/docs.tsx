@@ -203,6 +203,60 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.per_image_adaptive_lr_recaption': {
+    title: 'Auto-Recaption Stuck Images',
+    description: (
+      <>
+        When adaptive LR confirms an image is stuck (high loss that isn't improving), it gets a new caption while
+        training keeps running. The caption is written with <code>[trigger]</code>, which is replaced by your trigger
+        word. After the new caption is applied, the image is judged from scratch. If it gets stuck again it gets one more
+        try; after that it keeps whichever caption fit best and is left alone. Your original caption is saved next
+        to the caption file as <code>.orig</code>. To restore every original, run{' '}
+        <code>python -m toolkit.recaption revert &lt;output folder&gt;/recaption_state.json</code>. With
+        Cache Text Embeddings on, new captions can't be encoded mid-run, so they are only written as proposals.
+        No recaptions start in the last 25% of the run.
+      </>
+    ),
+  },
+  'train.per_image_adaptive_lr_recaption.prefer': {
+    title: 'Recaption With',
+    description: (
+      <>
+        <b>API endpoint first</b>: whenever an API Base URL is set, captions go through it, even if a spare GPU is
+        available. Without one, a spare GPU is used. <b>Spare GPU first</b>: uses a GPU this job isn't training on
+        (with enough free VRAM and no heavy load), and falls back to the endpoint. The spare-GPU captioner runs as its
+        own process, loads when it's first needed, and shuts down after a few idle minutes. With neither available,
+        stuck images are only logged.
+      </>
+    ),
+  },
+  'train.per_image_adaptive_lr_recaption.api': {
+    title: 'Recaption API Endpoint',
+    description: (
+      <>
+        Any OpenAI-compatible chat completions server with vision (llama.cpp, vLLM, LM Studio, Ollama, or a hosted API).
+        Same settings as the API captioner on the Captioning page.
+      </>
+    ),
+  },
+  'train.per_image_adaptive_lr_recaption.gpu': {
+    title: 'Spare-GPU Captioner Model',
+    description: (
+      <>
+        The model the Qwen 3VL captioner loads on the spare GPU. Leave it blank to never use a spare GPU. Needs about
+        20 GB of free VRAM on that card by default.
+      </>
+    ),
+  },
+  'train.per_image_adaptive_lr_recaption.proposals_only': {
+    title: 'Proposals Only',
+    description: (
+      <>
+        Writes each suggested caption next to the image as <code>.recaption_proposal.txt</code> and logs the old and new
+        text, but doesn't change your captions or training.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (
