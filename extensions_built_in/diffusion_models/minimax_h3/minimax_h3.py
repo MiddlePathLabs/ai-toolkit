@@ -214,6 +214,10 @@ H3_TRAINING_ADAPTERS = {
         "ostris/minimax_h3_training_adapter",
         "minimax_h3_ref2va_training_adapter_v1.safetensors",
     ),
+    "ostris_image": (
+        "ostris/minimax_h3_training_adapter",
+        "minimax_h3_image_training_adapter_v1.safetensors",
+    ),
 }
 
 
@@ -233,8 +237,9 @@ def resolve_h3_training_adapter(value, partition: str = "fl2va_pruned"):
 
 
 def maybe_default_h3_training_adapter(model_config) -> bool:
-    """Default H3 *training* runs to the Circlestone adapter (Fizgig's
-    photo-default A/B) unless the config already names one or opts out via
+    """Default H3 video *training* runs to the Circlestone adapter (Fizgig's
+    photo-default A/B), and H3-Image to its own adapter, unless the config
+    already names one or opts out via
     model_kwargs.training_adapter = "off". Only the trainer calls this, so
     inference/eval jobs never see the default."""
     if model_config is None:
@@ -248,7 +253,11 @@ def maybe_default_h3_training_adapter(model_config) -> bool:
         return False
     if getattr(model_config, "assistant_lora_path", None) is not None:
         return False
-    model_kwargs["training_adapter"] = "circlestone"
+    model_kwargs["training_adapter"] = (
+        "ostris_image"
+        if model_config.arch == "minimax_h3_image"
+        else "circlestone"
+    )
     model_config.model_kwargs = model_kwargs
     return True
 
@@ -382,6 +391,11 @@ class MinimaxH3Model(BaseModel):
         """Extra kwargs for encode_minimax_h3_prompt (P-H3-Image taps several
         hidden states through its text connector)."""
         return {}
+
+    def _num_audio_latents(self, num_frames: int) -> int:
+        """Target audio latents riding with ``num_frames`` video frames
+        (MiniMax-H3-Image has no audio stream: 0)."""
+        return packing.audio_latent_num_frames(num_frames)
 
     def prepare_sample_prompt_context(self, gen_config):
         # sample prompts: video refs are treated at the sample's length, not
@@ -1274,7 +1288,7 @@ class MinimaxH3Model(BaseModel):
                 num_frames = batch.num_frames
             else:
                 num_frames = (t_lat - 2) // 5 * 17 + 5 if t_lat > 1 else 1
-            a_lat = packing.audio_latent_num_frames(num_frames)
+            a_lat = self._num_audio_latents(num_frames)
             dataset_config = getattr(batch, "dataset_config", None)
             do_audio = bool(
                 batch is not None
@@ -1631,6 +1645,14 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             return static_image_video_ref(image, n, fps=packing.FPS)
         return image
 
+    def _reference_pixel_size(
+        self, ref_width: int, ref_height: int, target_height: int, target_width: int
+    ):
+        """(height, width) a still reference is encoded at."""
+        return packing.reference_pixel_size(
+            ref_width, ref_height, target_height, target_width
+        )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # references arrive as a list per sample (multi_control_paths), at
@@ -1708,7 +1730,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         size_fn = (
             packing.reference_video_pixel_size
             if as_video_frames
-            else packing.reference_pixel_size
+            else self._reference_pixel_size
         )
 
         all_rows = []
@@ -2011,11 +2033,12 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                         self._encode_static_image_ref_for_sampling(img, gen_config)
                     )
                 else:
-                    ref_images.append(
-                        packing.prepare_reference_image(
-                            img, gen_config.height, gen_config.width
-                        )
+                    ph, pw = self._reference_pixel_size(
+                        img.size[0], img.size[1], gen_config.height, gen_config.width
                     )
+                    if img.size != (pw, ph):
+                        img = img.resize((pw, ph), Image.Resampling.LANCZOS)
+                    ref_images.append(img)
 
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
 

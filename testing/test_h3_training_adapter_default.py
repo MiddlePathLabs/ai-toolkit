@@ -64,6 +64,15 @@ def test_default_injected_for_h3_training():
     assert mc.model_kwargs["training_adapter"] == "circlestone"
 
 
+def test_image_model_defaults_to_its_own_training_adapter():
+    mc = _mc(arch="minimax_h3_image")
+    assert maybe_default_h3_training_adapter(mc) is True
+    assert resolve_h3_training_adapter(mc.model_kwargs["training_adapter"]) == (
+        "ostris/minimax_h3_training_adapter/"
+        "minimax_h3_image_training_adapter_v1.safetensors"
+    )
+
+
 def test_explicit_choice_not_overridden():
     mc = _mc(model_kwargs={"training_adapter": "ostris"})
     assert maybe_default_h3_training_adapter(mc) is False

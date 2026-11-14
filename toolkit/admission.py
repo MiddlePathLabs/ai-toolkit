@@ -82,6 +82,7 @@ RULE_IDENTITY_ISOLATION = "admission.identity_isolation"
 _ASSISTANT_LORA_ARCHS = frozenset({
     "flux",
     "minimax_h3",
+    "minimax_h3_image",
     "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",

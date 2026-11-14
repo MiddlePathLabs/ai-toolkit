@@ -20,6 +20,7 @@ ACCEPTED = [
     "flux",
     "flex1",
     "minimax_h3",
+    "minimax_h3_image",
     "minimax_h3_omni",
     "minimax_h3_ref2va",
     "minimax_h3_vsa",
