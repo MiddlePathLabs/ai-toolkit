@@ -107,6 +107,11 @@ def bind_low_noise_share(train_config: Any, sd: Any) -> Optional[float]:
         problems.append(
             f"scheduler {type(scheduler).__name__} does not support a training shift override"
         )
+    if getattr(scheduler, "fixed_train_sigmas", None) is not None:
+        problems.append(
+            "the model trains on its own fixed sigma grid (step-distilled), "
+            "which a training shift cannot move"
+        )
     config = getattr(scheduler, "config", None)
     if config is not None:
         if config.get("use_dynamic_shifting", False):

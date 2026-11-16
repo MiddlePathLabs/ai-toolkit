@@ -123,8 +123,11 @@ class MiniMaxH3Pipeline:
             if isinstance(r, dict):
                 lat = r["latent"]
                 a = r.get("audio_rows")
-                a_lat = int(a.shape[0]) // 2 if a is not None else 0
-                ref_blocks.append((lat.shape[1], lat.shape[2], lat.shape[3], a_lat))
+                # the reference's own soundtrack length; a_lat stays the target's
+                ref_a_lat = int(a.shape[0]) // 2 if a is not None else 0
+                ref_blocks.append(
+                    (lat.shape[1], lat.shape[2], lat.shape[3], ref_a_lat)
+                )
             elif isinstance(r, torch.Tensor):
                 ref_blocks.append((r.shape[1], r.shape[2], r.shape[3]))
             else:

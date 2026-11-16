@@ -63,8 +63,17 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # Get the indices of the timesteps. Stochastic train grids (sigmoid,
         # trunc_logit_normal) can repeat a timestep; take the first match so a
         # duplicate resolves deterministically instead of raising.
-        step_indices = [(self.timesteps == t).nonzero().view(-1)[0].item()
-                        for t in timesteps]
+        if self.fixed_train_sigmas is not None:
+            # the grid holds a few sampling sigmas, not the 1000-step linear
+            # grid the weight tables are indexed by (index i <-> timestep
+            # 1000 - i): look each timestep up by its position on that grid
+            n = self.linear_timesteps_weights.shape[0]
+            step_indices = [
+                min(max(int(round(n - float(t))), 0), n - 1) for t in timesteps
+            ]
+        else:
+            step_indices = [(self.timesteps == t).nonzero().view(-1)[0].item()
+                            for t in timesteps]
 
         # Get the weights for the timesteps
         if timestep_type == "weighted":
@@ -137,6 +146,10 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 raise ValueError(f"uniform_frac must be in [0, 1), got {uniform_frac!r}")
         self.timestep_type = timestep_type
         if self.fixed_train_sigmas is not None:
+            if shift_override is not None:
+                raise ValueError(
+                    "shift_override cannot move a fixed training sigma grid"
+                )
             sigmas = torch.tensor(
                 self.fixed_train_sigmas, dtype=torch.float32, device=device
             )
