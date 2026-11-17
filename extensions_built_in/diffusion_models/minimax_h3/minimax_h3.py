@@ -271,7 +271,6 @@ class MinimaxH3Model(BaseModel):
     keyframe_fp16_round = True
     # hub repo for missing files when name_or_path isn't an org/repo id
     comfy_repo = COMFY_REPO
-    use_old_lokr_format = False
 
     def __init__(
         self,
@@ -287,6 +286,9 @@ class MinimaxH3Model(BaseModel):
         )
         self.is_flow_matching = True
         self.is_transformer = True
+        # set here, not on the class: BaseModel.__init__ assigns True on the
+        # instance, which would shadow a class attribute
+        self.use_old_lokr_format = False
         self.target_lora_modules = ["MiniMaxH3Transformer"]
         self.supports_model_paths = True
         # keyframes ride into the Qwen3-VL conditioning as vision blocks, so

@@ -150,6 +150,31 @@ def read_frames_at(cap, indices):
     return frames
 
 
+def fit_ref_audio(
+    waveform: torch.Tensor,  # (C, L)
+    sample_rate: int,
+    num_frames: int,
+    fps: float,
+    trim_tail: bool,
+    preserve_pitch: bool = False,
+) -> torch.Tensor:
+    """Bring a reference clip's soundtrack onto the same timeline as its
+    frames, the way the dataset does for target clips. Trim mode keeps real
+    time and cuts the tail; otherwise the frames are spread evenly over the
+    whole clip, so the whole soundtrack is stretched to the clip's training
+    duration instead of keeping only its first seconds."""
+    target = int(round(num_frames / float(fps) * sample_rate))
+    if trim_tail or target <= 0 or waveform.shape[-1] in (0, target):
+        return waveform[:, :target] if trim_tail else waveform
+    if preserve_pitch:
+        from toolkit.dataloader_mixins import time_stretch_preserve_pitch
+
+        return time_stretch_preserve_pitch(waveform, sample_rate, target)
+    return torch.nn.functional.interpolate(
+        waveform.unsqueeze(0).float(), size=target, mode="linear", align_corners=False
+    ).squeeze(0)
+
+
 def _content_fingerprint(path: str) -> str:
     """Hash the source bytes, never just size/mtime."""
     digest = hashlib.sha256()
@@ -292,6 +317,15 @@ def load_ref_video_latent(
         src_w, src_h, target_height, target_width
     )
     source_audio_present = bool(source["audio_present"])
+    preserve_pitch = bool(getattr(dataset_config, "audio_preserve_pitch", False))
+    audio_recipe = {
+        "sample_rate": int(getattr(model, "sample_rate", 0) or 0),
+        "trim_to_frames": trim_tail,
+    }
+    if not trim_tail:
+        # only the untrimmed recipe changed (soundtrack stretched to the
+        # frames' timeline), so trim-mode caches keep their keys
+        audio_recipe["stretch_to_frames"] = "pitch" if preserve_pitch else "linear"
     hash_dict = {
         "recipe_namespace": "h3_ref_video_condition_v4",
         "source_content_fingerprint": source["source_content_fingerprint"],
@@ -304,10 +338,7 @@ def load_ref_video_latent(
         "trim_tail": trim_tail,
         "auto_frame_count": bool(dataset_config.auto_frame_count),
         "audio_present": source_audio_present,
-        "audio_recipe": {
-            "sample_rate": int(getattr(model, "sample_rate", 0) or 0),
-            "trim_to_frames": trim_tail,
-        },
+        "audio_recipe": audio_recipe,
         "model_identity": _model_cache_identity(model),
         "is_ref_video": True,
     }
@@ -371,18 +402,26 @@ def load_ref_video_latent(
             import torchaudio
 
             waveform, sample_rate = torchaudio.load(path)
-            if trim_tail:
-                keep = int(round(num_frames / dataset_config.fps * sample_rate))
-                waveform = waveform[:, :keep]
+            waveform = fit_ref_audio(
+                waveform,
+                sample_rate,
+                num_frames,
+                dataset_config.fps,
+                trim_tail,
+                preserve_pitch,
+            )
             audio_latent = model.encode_audio(
                 [{"waveform": waveform, "sample_rate": sample_rate}]
             )[0]
             audio_rows = audio_latent.to("cpu", torch.float16)
             state_dict["audio_latent"] = audio_rows
-        except Exception:
+        except Exception as e:
             # The physical source fact remains true even when optional audio
             # decoding/encoding is unavailable; absent rows are not fabricated.
-            pass
+            print(
+                f"WARNING: reference video soundtrack could not be encoded and is "
+                f"cached without audio rows ({path}): {e}"
+            )
 
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     save_file(state_dict, cache_file)
