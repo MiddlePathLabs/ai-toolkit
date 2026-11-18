@@ -1,4 +1,6 @@
 import torch
+from contextlib import contextmanager
+
 from diffusers import AutoencoderKLQwenImage
 
 from .._mixin import OstrisModelMixin
@@ -9,6 +11,37 @@ class QwenImageVAE(AutoencoderKLQwenImage, OstrisModelMixin):
     nucleus_image and krea2."""
 
     aitk_subfolder = "vae"
+
+    # A still (single-frame) pass has no next frame that could reuse the temporal
+    # feature cache, yet every conv's full-resolution features are held in it for
+    # nothing (~2 GiB of extra peak VRAM on an untiled 1024x1024 decode). While a
+    # still pass runs, the two cache slots are held at None so every internal
+    # feat_cache=self._feat_map passes None and the convs skip caching entirely;
+    # videos keep the cache. Same behavior as ComfyUI and Fizgig #369. Implemented
+    # here rather than by patching the installed diffusers the base class lives in.
+    _still_frame_pass = False
+
+    def clear_cache(self):
+        super().clear_cache()
+        if self._still_frame_pass:
+            self._feat_map = None
+            self._enc_feat_map = None
+
+    @contextmanager
+    def _no_frame_cache_for_stills(self, num_frames):
+        self._still_frame_pass = num_frames == 1
+        try:
+            yield
+        finally:
+            self._still_frame_pass = False
+
+    def _encode(self, x):
+        with self._no_frame_cache_for_stills(x.shape[2]):
+            return super()._encode(x)
+
+    def _decode(self, z, return_dict=True):
+        with self._no_frame_cache_for_stills(z.shape[2]):
+            return super()._decode(z, return_dict=return_dict)
 
 
 class QwenImageVAEHolderMixin:

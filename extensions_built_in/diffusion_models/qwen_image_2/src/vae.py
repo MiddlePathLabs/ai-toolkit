@@ -1497,9 +1497,10 @@ class AutoencoderKLQwenImage21(
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
+                # A still image has no next frame to reuse these full-resolution features (ComfyUI does the same).
                 out = self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=self._enc_feat_map if num_frame > 1 else None,
                     feat_idx=self._enc_conv_idx,
                 )
             else:
@@ -1564,7 +1565,8 @@ class AutoencoderKLQwenImage21(
             if i == 0:
                 out = self.decoder(
                     x[:, :, i : i + 1, :, :],
-                    feat_cache=self._feat_map,
+                    # A still image has no next frame to reuse these full-resolution features (ComfyUI does the same).
+                    feat_cache=self._feat_map if num_frame > 1 else None,
                     feat_idx=self._conv_idx,
                     first_chunk=True,
                 )
@@ -1704,7 +1706,10 @@ class AutoencoderKLQwenImage21(
                             j : j + self.tile_sample_min_width,
                         ]
                     tile = self.encoder(
-                        tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
+                        tile,
+                        # A still image has no next frame to reuse these full-resolution features (ComfyUI does the same).
+                        feat_cache=self._enc_feat_map if num_frames > 1 else None,
+                        feat_idx=self._enc_conv_idx,
                     )
                     tile = self.quant_conv(tile)
                     time.append(tile)
@@ -1806,7 +1811,8 @@ class AutoencoderKLQwenImage21(
                     tile = self.post_quant_conv(tile)
                     decoded = self.decoder(
                         tile,
-                        feat_cache=self._feat_map,
+                        # A still image has no next frame to reuse these full-resolution features (ComfyUI does the same).
+                        feat_cache=self._feat_map if num_frames > 1 else None,
                         feat_idx=self._conv_idx,
                         first_chunk=(k == 0),
                     )
