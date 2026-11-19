@@ -329,3 +329,73 @@ def test_load_preview_turbo_inactive_until_activate(tmp_path):
     assert torch.allclose(y0, y2)
     for param in turbo.network.parameters():
         assert param.device.type == "cpu"
+
+
+def test_preview_turbo_forces_distilled_steps_and_sigmas():
+    # The Turbo LoRA samples on its own 6-step schedule: sample_steps AND
+    # explicit sample.sigmas give way (Fizgig 32684eb2; moss/qwen holders
+    # made the same call for their distilled previews).
+    from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
+        H3_PREVIEW_TURBO_STEPS,
+        MinimaxH3Model,
+    )
+
+    notes = []
+    stub = object.__new__(MinimaxH3Model)
+    stub.preview_turbo = None
+    stub._turbo_steps_notice = False
+    stub.print_and_status_update = notes.append
+
+    # no turbo loaded: requested steps and explicit sigmas pass through
+    assert MinimaxH3Model.preview_sampling_sigmas(stub, 20, None).shape[0] == 21
+    # sigmas_with_terminal appends the terminal 0 (pre-existing convention)
+    explicit = MinimaxH3Model.preview_sampling_sigmas(stub, 20, [1.0, 0.5, 0.0])
+    assert explicit.tolist() == [1.0, 0.5, 0.0, 0.0]
+    assert notes == []
+
+    # turbo loaded: its own grid, whatever the sample config says
+    stub.preview_turbo = object()
+    assert MinimaxH3Model.preview_sampling_sigmas(
+        stub, 20, None
+    ).shape[0] == H3_PREVIEW_TURBO_STEPS + 1
+    assert MinimaxH3Model.preview_sampling_sigmas(
+        stub, 20, [1.0, 0.5, 0.0]
+    ).shape[0] == H3_PREVIEW_TURBO_STEPS + 1
+    assert MinimaxH3Model.preview_sampling_sigmas(
+        stub, H3_PREVIEW_TURBO_STEPS, None
+    ).shape[0] == H3_PREVIEW_TURBO_STEPS + 1
+    assert len(notes) == 1 and "sample.sigmas are ignored" in notes[0]
+
+    # the notice fires once per model, not every preview or knob mismatch
+    MinimaxH3Model.preview_sampling_sigmas(stub, 20, None)
+    assert len(notes) == 1
+
+    # ladder backstop contract: a distilled-ladder arch (FastH3) keeps
+    # whatever it was given even if a preview LoRA were somehow loaded
+    stub.t1000_sample_ladder = True
+    assert MinimaxH3Model.preview_sampling_sigmas(stub, 20, None).shape[0] == 21
+    assert MinimaxH3Model.preview_sampling_sigmas(
+        stub, 20, [1.0, 0.5, 0.0]
+    ).tolist() == [1.0, 0.5, 0.0, 0.0]
+
+
+def test_preview_lora_path_refused_for_fasth3_archs():
+    # FastH3 archs never load a preview Turbo LoRA: config refuses the path
+    # (the t1000_sample_ladder check in preview_sampling_sigmas is only the
+    # backstop for that invariant)
+    with pytest.raises(ValueError, match="turbo preview adapters"):
+        _cfg(arch="minimax_h3_vsa", preview_lora_path="t.safetensors")
+
+
+def test_preview_lora_schedule_viggle_is_qwen_only():
+    # Viggle's turbo releases are Qwen-community files; H3 has one preview
+    # family (the larryvrh Turbo LoRA), so viggle is refused for it.
+    with pytest.raises(ValueError, match="preview_lora_schedule must be one of"):
+        _cfg(arch="minimax_h3", preview_lora_path="t.safetensors",
+             preview_lora_schedule="viggle")
+    cfg = _cfg(arch="minimax_h3", preview_lora_path="t.safetensors",
+               preview_lora_schedule="turbo")
+    assert cfg.preview_lora_schedule == "turbo"
+    cfg = _cfg(arch="qwen_image_2", preview_lora_path="t.safetensors",
+               preview_lora_schedule="viggle")
+    assert cfg.preview_lora_schedule == "viggle"

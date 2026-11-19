@@ -52,6 +52,7 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.dto import DTO
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.h3_dopsd import apply_settings_to_model, parse_dopsd_settings
+from toolkit.sample_sigmas import sigmas_with_terminal
 
 from toolkit.models.base_model import BaseModel
 from toolkit.unloader import FakeTextEncoder
@@ -113,6 +114,14 @@ scheduler_config = {
     "shift": packing.VIDEO_SIGMA_SHIFT,
     "use_dynamic_shifting": False,
 }
+
+# The Turbo preview LoRA (larryvrh v4) is distilled for 6 steps. Sample-step
+# counts and explicit sigma grids belong to the undistilled base: a preview
+# that keeps sample_steps=20 (or its own sigmas) on the Turbo LoRA renders
+# artefacts (Fizgig 32684eb2 sent the base step box to a turbo run the same
+# way). qwen_image_2 / moss_image force their distilled schedules in their
+# holders; preview_sampling_sigmas is H3's.
+H3_PREVIEW_TURBO_STEPS = 6
 
 # Comfy-Org repack of the released weights, at ComfyUI's repo-relative paths
 # under MODELS_PATH (diffusion_models/, text_encoders/, vae/). Files are used
@@ -318,6 +327,7 @@ class MinimaxH3Model(BaseModel):
             self.model_config.model_kwargs.get("max_text_length", 512)
         )
         self.preview_turbo = None
+        self._turbo_steps_notice = False
 
     @classmethod
     def get_train_scheduler(cls):
@@ -332,6 +342,30 @@ class MinimaxH3Model(BaseModel):
     def get_frame_count_snapper(self):
         # auto_frame_count: snap dataset clips down to the VAE's 17n+5 grid
         return packing.align_num_frames_down
+
+    def preview_sampling_sigmas(self, num_inference_steps: int, sigmas) -> torch.Tensor:
+        """The video sigma grid a sample denoises on — the pipeline's single
+        source, so every sampling path gets the same treatment. With a
+        preview Turbo LoRA loaded, its distilled 6-step grid owns the
+        preview: requested steps AND explicit sample.sigmas give way (the
+        holder owns the recipe, as the moss/qwen preview adapters decided),
+        with a one-time notice. FastH3 archs cannot load one (config refuses
+        preview_lora_path for them); the ladder check is the backstop."""
+        if getattr(self, "t1000_sample_ladder", False) or self.preview_turbo is None:
+            if sigmas is not None:
+                return torch.tensor(
+                    sigmas_with_terminal(sigmas), dtype=torch.float32
+                )
+            return self.build_sample_sigmas(num_inference_steps)
+        if num_inference_steps != H3_PREVIEW_TURBO_STEPS or sigmas is not None:
+            if not self._turbo_steps_notice:
+                self.print_and_status_update(
+                    f"[h3-preview-lora] the Turbo LoRA samples on its own "
+                    f"{H3_PREVIEW_TURBO_STEPS}-step schedule; sample_steps and "
+                    "explicit sample.sigmas are ignored for previews"
+                )
+                self._turbo_steps_notice = True
+        return self.build_sample_sigmas(H3_PREVIEW_TURBO_STEPS)
 
     def build_sample_sigmas(self, num_inference_steps: int) -> torch.Tensor:
         """Video sigma grid for sampling (steps + 1 entries ending at 0)."""

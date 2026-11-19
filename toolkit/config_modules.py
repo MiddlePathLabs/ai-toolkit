@@ -1364,7 +1364,11 @@ class ModelConfig:
                 )
             if self.arch == "moss_image":
                 allowed_schedules = ("auto", "dmd", "sft4", "c16")
-            else:  # minimax_h3 / qwen_image_2
+            elif self.arch == "minimax_h3":
+                # one preview family (the larryvrh Turbo LoRA): its distilled
+                # 6-step schedule is forced at sample time; no viggle release
+                allowed_schedules = ("auto", "turbo")
+            else:  # qwen_image_2
                 allowed_schedules = ("auto", "turbo", "viggle")
             if self.preview_lora_schedule not in allowed_schedules:
                 raise ValueError(

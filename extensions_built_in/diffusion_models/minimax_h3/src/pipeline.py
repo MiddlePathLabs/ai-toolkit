@@ -19,7 +19,6 @@ Scheduler (the released math, not diffusers'):
 """
 
 from typing import Optional
-from toolkit.sample_sigmas import sigmas_with_terminal
 
 import numpy as np
 import torch
@@ -206,10 +205,11 @@ class MiniMaxH3Pipeline:
 
         # --- schedules -----------------------------------------------------
         video_shift = getattr(model, "video_sigma_shift", VIDEO_SIGMA_SHIFT)
-        if sigmas is not None:
-            sigmas_v = torch.tensor(sigmas_with_terminal(sigmas), dtype=torch.float32).to(device)
-        else:
-            sigmas_v = model.build_sample_sigmas(num_inference_steps).to(device)
+        # the model's preview adapter owns the grid when a Turbo LoRA is
+        # loaded (explicit steps / sigmas give way there)
+        sigmas_v = model.preview_sampling_sigmas(
+            num_inference_steps, sigmas
+        ).to(device)
         # the audio schedule follows the video grid through the closed-form
         # shift remap so both streams sit at the same underlying position
         sigmas_a = remap_sigma(
