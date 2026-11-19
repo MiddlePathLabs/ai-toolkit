@@ -80,6 +80,16 @@ class Automagic4(Automagic3):
         self.sensitivity_quantile = float(sensitivity_quantile)
         self.step_target = float(step_target)
         self._neutral_flip = 0.5 + math.asin(self.step_target / 2.0) / math.pi
+        # working-rate telemetry: per-device brake accumulators for the
+        # current update window. Windowed by an update-cycle counter bumped
+        # once per optimizer update in _apply_group_votes — NOT by per-param
+        # state step, which desyncs for any param that misses an update (no
+        # grad, truncated backward) and would split the window forever after
+        self._brake_acc: dict = {}
+        self._brake_numel = 0
+        self._brake_cycle = 0
+        self._brake_cycle_seen = 0
+        self._brake_stats_cache = None
         super().__init__(params, *args, **kwargs)
 
     # ------------------------------------------------------------------ utils
@@ -108,6 +118,62 @@ class Automagic4(Automagic3):
         ref = self._group_ref[gi] if gi is not None else None
         if ref is not None:
             self.state[p]["sens_ref"] = ref.to(p.device, copy=True)
+
+    # ------------------------------------------------------------- telemetry
+
+    def _accumulate_brake(self, balance: torch.Tensor) -> None:
+        """Gather the brake actually applied, for free while the tensor
+        exists (Fizgig 5b0fbca4: rate x mean brake is the working rate; the
+        voted rate alone reads as a flat ceiling). Accumulator tensors stay
+        device-side; .item() happens only when someone asks. The window rolls
+        lazily on the first accumulation of a new update cycle, so the
+        finished window stays readable for the progress bar."""
+        if self._brake_cycle != self._brake_cycle_seen:
+            self._brake_acc = {}
+            self._brake_numel = 0
+            self._brake_cycle_seen = self._brake_cycle
+            self._brake_stats_cache = None
+        s = balance.sum()
+        b = (balance < 1.0).sum()
+        acc = self._brake_acc.get(balance.device)
+        if acc is None:
+            self._brake_acc[balance.device] = {"sum": s, "braked": b}
+        else:
+            acc["sum"] += s
+            acc["braked"] += b
+        self._brake_numel += balance.numel()
+
+    def brake_stats(self) -> dict:
+        """Mean applied brake and the share of elements braked (balance
+        clamped below 1) over the last completed update cycle. None before a
+        braked update exists: the measurement-only first step has no
+        reference yet. Memoized per window, so the several readers per log
+        step (get_avg_learning_rate, the progress bar) pay one device sync
+        set between them."""
+        if self._brake_stats_cache is None:
+            if not self._brake_acc or self._brake_numel == 0:
+                self._brake_stats_cache = {
+                    "mean_brake": None,
+                    "braked_fraction": None,
+                }
+            else:
+                total = sum(a["sum"].item() for a in self._brake_acc.values())
+                braked = sum(a["braked"].item() for a in self._brake_acc.values())
+                n = float(self._brake_numel)
+                self._brake_stats_cache = {
+                    "mean_brake": total / n,
+                    "braked_fraction": braked / n,
+                }
+        return dict(self._brake_stats_cache)
+
+    def get_avg_learning_rate(self) -> float:
+        # the working rate: the voted rate times the mean brake actually
+        # applied this update
+        base = super().get_avg_learning_rate()
+        stats = self.brake_stats()
+        if stats["mean_brake"] is None:
+            return base
+        return base * stats["mean_brake"]
 
     # -------------------------------------------------------------- per-param
 
@@ -163,6 +229,7 @@ class Automagic4(Automagic3):
         # balance = min(1, ref / sensitivity), sensitivity = sqrt(v / bias_corr)
         balance = inv_sqrt_v.mul_(ref * math.sqrt(bias_corr)).clamp_(max=1.0)
         update.mul_(balance)
+        self._accumulate_brake(balance)
         del balance, inv_sqrt_v
 
         # flip-rate vote (see class docstring), pooled per group, applied in .step()
@@ -220,6 +287,11 @@ class Automagic4(Automagic3):
     def _apply_group_votes(self) -> None:
         self._update_sensitivity_refs()
         super()._apply_group_votes()
+        # one cycle per optimizer update (this runs once, at the end of
+        # step(), fused and non-fused alike): the brake-accumulator window
+        # rolls on the next update's first accumulation, after readers have
+        # seen the finished window
+        self._brake_cycle += 1
 
     def _update_sensitivity_refs(self) -> None:
         # numel-weighted quantile of this step's per-tensor log sensitivities; no GPU sync
@@ -260,3 +332,8 @@ class Automagic4(Automagic3):
                     st["sens_ref"] = ref.to(torch.float32)
                     if self._group_ref[gi] is None:
                         self._group_ref[gi] = st["sens_ref"].clone()
+        # brake telemetry is per-run transient state: drop any stale window
+        self._brake_acc = {}
+        self._brake_numel = 0
+        self._brake_cycle_seen = self._brake_cycle
+        self._brake_stats_cache = None

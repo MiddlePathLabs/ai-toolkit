@@ -4474,6 +4474,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
 
+                    # automagic4: lr above is its working rate (voted rate x
+                    # mean brake); show the parts so a braked run reads right
+                    _brake_stats = getattr(optimizer, 'brake_stats', None)
+                    if callable(_brake_stats):
+                        _stats = _brake_stats()
+                        if _stats.get("mean_brake") is not None:
+                            prog_bar_string += (
+                                f" brake:{_stats['mean_brake']:.2f}"
+                                f" braked:{100.0 * _stats['braked_fraction']:.0f}%"
+                            )
+
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
 
