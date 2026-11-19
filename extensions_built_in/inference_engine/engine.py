@@ -737,9 +737,11 @@ class Engine:
 
 
 def _list_outputs(folder: str) -> List[str]:
+    # glob.escape: a folder named "out [v1]" would otherwise parse [v1] as a
+    # character class and list nothing
     return [
         p
-        for p in glob.glob(os.path.join(folder, "*"))
+        for p in glob.glob(os.path.join(glob.escape(folder), "*"))
         if os.path.isfile(p) and not os.path.basename(p).startswith(".") and not p.endswith(".txt")
     ]
 

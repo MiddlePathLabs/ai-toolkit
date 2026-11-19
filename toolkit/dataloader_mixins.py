@@ -1720,7 +1720,9 @@ class ControlFileItemDTOMixin:
             # find all images in the folder
             img_files = []
             for ext in img_ext_list:
-                img_files += glob.glob(os.path.join(pool_folder, f'*{ext}'))
+                # glob.escape: a folder named "photos [v2]" would otherwise
+                # parse [v2] as a character class and match nothing
+                img_files += glob.glob(os.path.join(glob.escape(pool_folder), f'*{ext}'))
             # remove the current image if len is greater than 1
             if len(img_files) > 1:
                 img_files.remove(self.path)
@@ -1947,7 +1949,9 @@ class ClipImageFileItemDTOMixin:
             # find all images in the folder
             img_files = []
             for ext in img_ext_list:
-                img_files += glob.glob(os.path.join(pool_folder, f'*{ext}'))
+                # glob.escape: a folder named "photos [v2]" would otherwise
+                # parse [v2] as a character class and match nothing
+                img_files += glob.glob(os.path.join(glob.escape(pool_folder), f'*{ext}'))
             # remove the current image if len is greater than 1
             if len(img_files) > 1:
                 img_files.remove(self.path)
