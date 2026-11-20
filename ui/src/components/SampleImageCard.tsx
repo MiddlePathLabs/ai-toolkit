@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState, ReactNode } from 'react';
 import { isVideo, isAudio, isText, encodeFilePathForUrl } from '@/utils/basic';
 import type { SampleMetadata } from '@/utils/sampleImages';
 import SampleMetadataOverlay from './SampleMetadataOverlay';
+import { withReadKey } from '@/utils/readKey';
 
 interface SampleImageCardProps {
   imageUrl: string;
@@ -107,7 +108,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
       // ?thumb=1: the server sends the small pre-generated thumbnail when one
       // exists, otherwise the full file. Videos without a thumb come back as
       // video/* — abort the transfer and render the <video> element instead.
-      fetch(`/api/img/${encodeFilePathForUrl(imageUrl)}?thumb=1`, { signal: controller.signal })
+      fetch(`/api/img/${encodeFilePathForUrl(imageUrl, 'thumb=1')}`, { signal: controller.signal })
         .then(r => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           const contentType = r.headers.get('content-type') || '';
@@ -187,7 +188,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
             ) : isItAudio ? (
               <div className="w-full h-full flex items-center justify-center bg-gray-900">
                 <img
-                  src={`/api/audio/art/${encodeURIComponent(imageUrl)}`}
+                  src={withReadKey(`/api/audio/art/${encodeURIComponent(imageUrl)}`)}
                   alt={alt}
                   className="w-full h-full object-cover"
                   onError={e => {
